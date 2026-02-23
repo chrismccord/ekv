@@ -834,12 +834,12 @@ defmodule EKVTest do
 
     test "Store.open raises on shard count change", %{data_dir: data_dir} do
       # Open with 2 shards
-      {:ok, db} = EKV.Store.open(data_dir, 99, :timer.hours(24 * 7), 2)
+      {:ok, db} = EKV.Store.open(data_dir, 99, :timer.hours(24 * 7), 2, :timer.minutes(5))
       EKV.Store.close(db)
 
       # Re-open with 4 shards — should raise
       assert_raise ArgumentError, ~r/shard count mismatch/, fn ->
-        EKV.Store.open(data_dir, 99, :timer.hours(24 * 7), 4)
+        EKV.Store.open(data_dir, 99, :timer.hours(24 * 7), 4, :timer.minutes(5))
       end
     end
   end

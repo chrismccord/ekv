@@ -36,14 +36,21 @@ defmodule EKV.Store do
   VALUES (?1, ?2, ?3, ?4, ?5, ?6)
   """
 
-  def open(data_dir, shard_index, tombstone_ttl, num_shards) do
+  def open(data_dir, shard_index, tombstone_ttl, num_shards, gc_interval) do
     File.mkdir_p!(data_dir)
     path = Path.join(data_dir, "shard_#{shard_index}.db")
 
     # Check for stale db before opening. If the db exists and its last_active_at
-    # is older than tombstone_ttl, peers will have GC'd tombstones for entries
+    # is older than the safe threshold, peers will have GC'd tombstones for entries
     # deleted while we were away. Wipe and let full sync rebuild from scratch.
-    if stale_db?(path, tombstone_ttl) do
+    #
+    # Safety margin: last_active_at can lag real shutdown by up to gc_interval
+    # (worst case: node crashes right before a GC tick). We subtract gc_interval
+    # from tombstone_ttl so that a node that was truly unreachable for tombstone_ttl
+    # is always detected as stale, even in the worst case.
+    stale_threshold = tombstone_ttl - gc_interval
+
+    if stale_db?(path, stale_threshold) do
       File.rm(path)
       File.rm(path <> "-wal")
       File.rm(path <> "-shm")

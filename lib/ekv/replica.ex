@@ -415,7 +415,9 @@ defmodule EKV.Replica do
     data_dir = Keyword.fetch!(opts, :data_dir)
 
     config = EKV.get_config(name)
-    {:ok, db} = Store.open(data_dir, shard_index, config.tombstone_ttl, num_shards)
+
+    {:ok, db} =
+      Store.open(data_dir, shard_index, config.tombstone_ttl, num_shards, config.gc_interval)
 
     # Open per-scheduler read connections
     db_path = Path.join(data_dir, "shard_#{shard_index}.db")
