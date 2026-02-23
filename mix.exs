@@ -1,7 +1,7 @@
 defmodule EKV.MixProject do
   use Mix.Project
 
-  @version "--forc"
+  @version "0.1.1"
 
   def project do
     [
