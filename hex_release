@@ -99,7 +99,7 @@ fi
 
 # Publish to Hex
 echo "==> Publishing to Hex"
-mix hex.publish
+MIX_ENV=docs mix hex.publish
 
 echo ""
 echo "==> Done! EKV $TAG published to Hex"

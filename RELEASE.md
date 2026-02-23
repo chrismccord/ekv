@@ -31,7 +31,7 @@
 5. **Publish to Hex**
 
    ```bash
-   mix hex.publish
+   MIX_ENV=docs mix hex.publish
    ```
 
    Make sure `checksum-ekv.exs` is listed in the package `files`.
