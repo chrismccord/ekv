@@ -82,8 +82,13 @@ echo "==> Waiting for precompile CI to finish (timeout ${TIMEOUT}s)..."
 elapsed=0
 while true; do
   # Find the workflow run triggered by our tag (skip old run if retrying)
-  RUN_ID=$(gh run list --workflow=precompile.yml --branch="$TAG" --limit=5 --json databaseId,headBranch \
-    --jq "[.[] | select(.headBranch == \"$TAG\") | .databaseId] | map(select(. != ${OLD_RUN_ID:-0})) | first // empty" 2>/dev/null || true)
+  RUN_ID=$(gh run list --workflow=precompile.yml --branch="$TAG" --limit=1 --json databaseId,headBranch \
+    --jq ".[] | select(.headBranch == \"$TAG\") | .databaseId" 2>/dev/null || true)
+
+  # Skip stale run from previous attempt
+  if [ -n "$OLD_RUN_ID" ] && [ "$RUN_ID" = "$OLD_RUN_ID" ]; then
+    RUN_ID=""
+  fi
 
   if [ -n "$RUN_ID" ]; then
     STATUS=$(gh run view "$RUN_ID" --json status,conclusion --jq '.status')
