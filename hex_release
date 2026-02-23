@@ -125,8 +125,8 @@ done
 echo "==> Generating checksums"
 MIX_ENV=prod mix elixir_make.checksum --all --ignore-unavailable
 
-if [ ! -f checksum-ekv.exs ]; then
-  echo "error: checksum-ekv.exs was not created" >&2
+if [ ! -f checksum.exs ]; then
+  echo "error: checksum.exs was not created" >&2
   exit 1
 fi
 

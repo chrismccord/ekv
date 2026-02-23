@@ -1,7 +1,7 @@
 defmodule EKV.MixProject do
   use Mix.Project
 
-  @version "0.1.3"
+  @version "0.1.4"
 
   def project do
     [
@@ -68,7 +68,7 @@ defmodule EKV.MixProject do
         "mix.exs",
         "README.md",
         "LICENSE",
-        "checksum-ekv.exs"
+        "checksum.exs"
       ]
     ]
   end
