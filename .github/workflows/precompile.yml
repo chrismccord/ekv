@@ -31,7 +31,6 @@ jobs:
           - x86_64-linux-gnu
           - aarch64-linux-gnu
           - x86_64-linux-musl
-          - aarch64-linux-musl
     env:
       MIX_ENV: prod
     steps:
@@ -47,20 +46,14 @@ jobs:
       - name: Install cross-compilation toolchains
         timeout-minutes: 5
         run: |
-          sudo NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get update
+          sudo apt-get remove -y needrestart 2>/dev/null || true
+          sudo apt-get update
           case "${{ matrix.target }}" in
             aarch64-linux-gnu)
-              sudo NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y gcc-aarch64-linux-gnu
+              sudo apt-get install -y gcc-aarch64-linux-gnu
               ;;
             x86_64-linux-musl)
-              sudo NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y musl-tools
-              ;;
-            aarch64-linux-musl)
-              sudo NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y gcc-aarch64-linux-gnu musl-tools
-              # Install aarch64 musl cross-compiler
-              wget -q https://musl.cc/aarch64-linux-musl-cross.tgz
-              tar xf aarch64-linux-musl-cross.tgz -C /opt
-              echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
+              sudo apt-get install -y musl-tools
               ;;
           esac
 
