@@ -44,7 +44,7 @@ jobs:
       - run: mix deps.get
 
       - name: Install cross-compilation toolchains
-        timeout-minutes: 5
+        timeout-minutes: 10
         run: |
           sudo apt-get remove -y needrestart 2>/dev/null || true
           sudo apt-get update
@@ -68,7 +68,7 @@ jobs:
       - name: Upload artifacts
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload ${{ github.ref_name }} cache/*.tar.gz --clobber
+        run: gh release upload ${{ github.ref_name }} cache/*${{ matrix.target }}*.tar.gz --clobber
 
   macos-arm:
     needs: create-release

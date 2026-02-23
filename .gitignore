@@ -3,6 +3,7 @@
 
 _build/
 .claude
+checksum.exs
 
 # If you run "mix test --cover", coverage assets end up here.
 /cover/
