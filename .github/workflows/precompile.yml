@@ -27,10 +27,6 @@ jobs:
       matrix:
         otp: ["26", "27"]
         elixir: ["1.19"]
-        target:
-          - x86_64-linux-gnu
-          - aarch64-linux-gnu
-          - x86_64-linux-musl
     env:
       MIX_ENV: prod
     steps:
@@ -43,32 +39,47 @@ jobs:
 
       - run: mix deps.get
 
-      - name: Install cross-compilation toolchains
-        timeout-minutes: 10
-        run: |
-          sudo apt-get remove -y needrestart 2>/dev/null || true
-          sudo apt-get update
-          case "${{ matrix.target }}" in
-            aarch64-linux-gnu)
-              sudo apt-get install -y gcc-aarch64-linux-gnu
-              ;;
-            x86_64-linux-musl)
-              sudo apt-get install -y musl-tools
-              ;;
-          esac
-
       - name: Precompile
         run: |
           export ELIXIR_MAKE_CACHE_DIR=$(pwd)/cache
           mkdir -p "$ELIXIR_MAKE_CACHE_DIR"
-          export CC_PRECOMPILER_PRECOMPILE_ONLY_LOCAL=false
-          export CC_PRECOMPILER_CURRENT_TARGET=${{ matrix.target }}
           mix elixir_make.precompile
 
       - name: Upload artifacts
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload ${{ github.ref_name }} cache/*${{ matrix.target }}*.tar.gz --clobber
+        run: gh release upload ${{ github.ref_name }} cache/*.tar.gz --clobber
+
+  linux-arm:
+    needs: create-release
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        otp: ["26", "27"]
+        elixir: ["1.19"]
+    env:
+      MIX_ENV: prod
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ matrix.otp }}
+          elixir-version: ${{ matrix.elixir }}
+
+      - run: mix deps.get
+
+      - name: Precompile
+        run: |
+          export ELIXIR_MAKE_CACHE_DIR=$(pwd)/cache
+          mkdir -p "$ELIXIR_MAKE_CACHE_DIR"
+          mix elixir_make.precompile
+
+      - name: Upload artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload ${{ github.ref_name }} cache/*.tar.gz --clobber
 
   macos-arm:
     needs: create-release
@@ -100,4 +111,3 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload ${{ github.ref_name }} cache/*.tar.gz --clobber
-
