@@ -1,0 +1,119 @@
+name: precompile
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        otp: ["26", "27", "28"]
+        elixir: ["1.19"]
+        target:
+          - x86_64-linux-gnu
+          - aarch64-linux-gnu
+          - x86_64-linux-musl
+          - aarch64-linux-musl
+    env:
+      MIX_ENV: prod
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ matrix.otp }}
+          elixir-version: ${{ matrix.elixir }}
+
+      - run: mix deps.get
+
+      - name: Install cross-compilation toolchains
+        run: |
+          sudo apt-get update
+          case "${{ matrix.target }}" in
+            aarch64-linux-gnu)
+              sudo apt-get install -y gcc-aarch64-linux-gnu
+              ;;
+            x86_64-linux-musl)
+              sudo apt-get install -y musl-tools
+              ;;
+            aarch64-linux-musl)
+              sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools
+              # Install aarch64 musl cross-compiler
+              wget -q https://musl.cc/aarch64-linux-musl-cross.tgz
+              tar xf aarch64-linux-musl-cross.tgz -C /opt
+              echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
+              ;;
+          esac
+
+      - name: Precompile
+        run: |
+          export ELIXIR_MAKE_CACHE_DIR=$(pwd)/cache
+          mkdir -p "$ELIXIR_MAKE_CACHE_DIR"
+          export CC_PRECOMPILER_PRECOMPILE_ONLY_LOCAL=false
+          export CC_PRECOMPILER_CURRENT_TARGET=${{ matrix.target }}
+          mix elixir_make.precompile
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: cache/*.tar.gz
+
+  macos-x86:
+    runs-on: macos-13
+    strategy:
+      fail-fast: false
+      matrix:
+        otp: ["26", "27", "28"]
+        elixir: ["1.19"]
+    env:
+      MIX_ENV: prod
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ matrix.otp }}
+          elixir-version: ${{ matrix.elixir }}
+
+      - run: mix deps.get
+
+      - name: Precompile
+        run: |
+          export ELIXIR_MAKE_CACHE_DIR=$(pwd)/cache
+          mkdir -p "$ELIXIR_MAKE_CACHE_DIR"
+          mix elixir_make.precompile
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: cache/*.tar.gz
+
+  macos-arm:
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        otp: ["26", "27", "28"]
+        elixir: ["1.19"]
+    env:
+      MIX_ENV: prod
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ matrix.otp }}
+          elixir-version: ${{ matrix.elixir }}
+
+      - run: mix deps.get
+
+      - name: Precompile
+        run: |
+          export ELIXIR_MAKE_CACHE_DIR=$(pwd)/cache
+          mkdir -p "$ELIXIR_MAKE_CACHE_DIR"
+          mix elixir_make.precompile
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: cache/*.tar.gz

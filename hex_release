@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Release EKV to Hex with precompiled NIF binaries.
+#
+# Usage:
+#   ./hex-release           # release current @version from mix.exs
+#   ./hex-release 0.2.0     # bump to 0.2.0, commit, then release
+
+REPO="chrismccord/ekv"
+POLL_INTERVAL=15
+TIMEOUT=900  # 15 minutes
+
+version_from_mix() {
+  grep '@version "' mix.exs | head -1 | sed 's/.*@version "\(.*\)"/\1/'
+}
+
+if [ "${1:-}" != "" ]; then
+  NEW_VERSION="$1"
+  CURRENT=$(version_from_mix)
+  if [ "$CURRENT" != "$NEW_VERSION" ]; then
+    echo "==> Bumping @version $CURRENT -> $NEW_VERSION in mix.exs"
+    sed -i '' "s/@version \"$CURRENT\"/@version \"$NEW_VERSION\"/" mix.exs
+    git add mix.exs
+    git commit -m "Bump version to $NEW_VERSION"
+  fi
+fi
+
+VERSION=$(version_from_mix)
+TAG="v$VERSION"
+
+echo "==> Releasing EKV $TAG"
+
+# Preflight checks
+if ! command -v gh &>/dev/null; then
+  echo "error: gh CLI is required (brew install gh)" >&2
+  exit 1
+fi
+
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  echo "error: working directory is dirty — commit or stash first" >&2
+  exit 1
+fi
+
+if git tag -l "$TAG" | grep -q "$TAG"; then
+  echo "error: tag $TAG already exists" >&2
+  exit 1
+fi
+
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+echo "==> Tagging $TAG on $BRANCH"
+git tag "$TAG"
+git push origin "$BRANCH" "$TAG"
+
+# Wait for all precompile CI jobs to finish
+echo "==> Waiting for precompile CI to finish (timeout ${TIMEOUT}s)..."
+
+elapsed=0
+while true; do
+  # Find the workflow run triggered by our tag
+  RUN_ID=$(gh run list --workflow=precompile.yml --branch="$TAG" --limit=1 --json databaseId,headBranch \
+    --jq ".[] | select(.headBranch == \"$TAG\") | .databaseId" 2>/dev/null || true)
+
+  if [ -n "$RUN_ID" ]; then
+    STATUS=$(gh run view "$RUN_ID" --json status,conclusion --jq '.status')
+    if [ "$STATUS" = "completed" ]; then
+      CONCLUSION=$(gh run view "$RUN_ID" --json conclusion --jq '.conclusion')
+      if [ "$CONCLUSION" = "success" ]; then
+        echo "==> Precompile CI passed"
+        break
+      else
+        echo "error: precompile CI failed (conclusion: $CONCLUSION)" >&2
+        echo "  https://github.com/$REPO/actions/runs/$RUN_ID" >&2
+        exit 1
+      fi
+    fi
+    printf "\r    waiting... %ds (status: %s)  " "$elapsed" "$STATUS"
+  else
+    printf "\r    waiting for run to appear... %ds  " "$elapsed"
+  fi
+
+  sleep "$POLL_INTERVAL"
+  elapsed=$((elapsed + POLL_INTERVAL))
+  if [ "$elapsed" -ge "$TIMEOUT" ]; then
+    echo ""
+    echo "error: timed out waiting for precompile CI after ${TIMEOUT}s" >&2
+    exit 1
+  fi
+done
+
+# Generate checksums from the GitHub release artifacts
+echo "==> Generating checksums"
+MIX_ENV=prod mix elixir_make.checksum --all --ignore-unavailable
+
+if [ ! -f checksum-ekv.exs ]; then
+  echo "error: checksum-ekv.exs was not created" >&2
+  exit 1
+fi
+
+# Publish to Hex
+echo "==> Publishing to Hex"
+mix hex.publish
+
+echo ""
+echo "==> Done! EKV $TAG published to Hex"
+echo "    https://hex.pm/packages/ekv/$VERSION"
