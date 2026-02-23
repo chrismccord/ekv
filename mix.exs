@@ -67,7 +67,7 @@ defmodule EKV.MixProject do
         "Makefile",
         "mix.exs",
         "README.md",
-        "LICENSE",
+        "LICENSE.md",
         "checksum.exs"
       ]
     ]

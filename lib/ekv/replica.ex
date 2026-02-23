@@ -31,17 +31,17 @@ defmodule EKV.Replica do
   Each shard has a single SQLite database (WAL mode, synchronous=NORMAL):
 
       ┌──────────────────────────────────────────────────────────────┐
-      │ SQLite (WAL mode, synchronous=NORMAL)                       │
-      │ File: #{data_dir}/shard_#{i}.db                             │
+      │ SQLite (WAL mode, synchronous=NORMAL)                        │
+      │ File: #{data_dir}/shard_#{i}.db                              │
       │                                                              │
       │ Tables:                                                      │
-      │   kv          — current state, PK (key)                     │
-      │   kv_oplog    — append-only mutation log, AUTOINCREMENT seq │
-      │   kv_peer_hwm — per-peer high-water marks for delta sync   │
-      │   kv_meta     — liveness tracking                           │
+      │   kv          — current state, PK (key)                      │
+      │   kv_oplog    — append-only mutation log, AUTOINCREMENT seq  │
+      │   kv_peer_hwm — per-peer high-water marks for delta sync     │
+      │   kv_meta     — liveness tracking                            │
       │                                                              │
       │ - Single source of truth. Survives process/node crashes.     │
-      │ - kv + oplog writes are atomic (BEGIN IMMEDIATE / COMMIT).  │
+      │ - kv + oplog writes are atomic (BEGIN IMMEDIATE / COMMIT).   │
       └──────────────────────────────────────────────────────────────┘
 
   Each shard opens System.schedulers_online() read connections, stored as a
@@ -75,7 +75,7 @@ defmodule EKV.Replica do
         │   value_binary, opts}    │                          │
         │─────────────────────────>│                          │
         │                          │                          │
-        │                    LWW check vs SQLite               │
+        │                    LWW check vs SQLite              │
         │                    (skip if existing ts is higher)  │
         │                          │                          │
         │                    SQLite put_with_oplog (atomic)   │
