@@ -15,7 +15,10 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create ${{ github.ref_name }} --draft --title ${{ github.ref_name }} || true
+        run: |
+          gh release create ${{ github.ref_name }} --draft --title ${{ github.ref_name }} 2>/dev/null || true
+          # Verify the release exists (may already exist from a previous run)
+          gh release view ${{ github.ref_name }}
 
   linux:
     needs: create-release
