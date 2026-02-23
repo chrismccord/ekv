@@ -31,7 +31,7 @@ defmodule EKV.MixProject do
         make_precompiler_filename: "ekv_sqlite3_nif",
         make_precompiler_nif_versions: ["2.16", "2.17"],
         make_precompiler_priv_paths: ["ekv_sqlite3_nif.*"],
-        cc_precompiler: [cleanup: "make clean"]
+        cc_precompiler: [cleanup: "clean"]
       ]
     end
   end

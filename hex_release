@@ -4,19 +4,30 @@ set -euo pipefail
 # Release EKV to Hex with precompiled NIF binaries.
 #
 # Usage:
-#   ./hex-release           # release current @version from mix.exs
-#   ./hex-release 0.2.0     # bump to 0.2.0, commit, then release
+#   ./hex_release           # release current @version from mix.exs
+#   ./hex_release 0.2.0     # bump to 0.2.0, commit, tag, and release
+#   ./hex_release --force   # retry current version (re-tag and re-run CI)
 
 REPO="chrismccord/ekv"
 POLL_INTERVAL=15
 TIMEOUT=900  # 15 minutes
+FORCE=false
+
+# Parse flags
+for arg in "$@"; do
+  case "$arg" in
+    --force) FORCE=true ;;
+    *)
+      NEW_VERSION="$arg"
+      ;;
+  esac
+done
 
 version_from_mix() {
   grep '@version "' mix.exs | head -1 | sed 's/.*@version "\(.*\)"/\1/'
 }
 
-if [ "${1:-}" != "" ]; then
-  NEW_VERSION="$1"
+if [ "${NEW_VERSION:-}" != "" ]; then
   CURRENT=$(version_from_mix)
   if [ "$CURRENT" != "$NEW_VERSION" ]; then
     echo "==> Bumping @version $CURRENT -> $NEW_VERSION in mix.exs"
@@ -43,8 +54,16 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
 fi
 
 if git tag -l "$TAG" | grep -q "$TAG"; then
-  echo "error: tag $TAG already exists" >&2
-  exit 1
+  if [ "$FORCE" = true ]; then
+    echo "==> Force: deleting existing tag $TAG"
+    git tag -d "$TAG"
+    git push origin ":refs/tags/$TAG" 2>/dev/null || true
+    # Delete existing GitHub release so artifacts are fresh
+    gh release delete "$TAG" --yes 2>/dev/null || true
+  else
+    echo "error: tag $TAG already exists (use --force to retag)" >&2
+    exit 1
+  fi
 fi
 
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
