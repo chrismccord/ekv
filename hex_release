@@ -17,8 +17,12 @@ FORCE=false
 for arg in "$@"; do
   case "$arg" in
     --force) FORCE=true ;;
+    v[0-9]*) NEW_VERSION="${arg#v}" ;;  # strip leading v
+    [0-9]*) NEW_VERSION="$arg" ;;
     *)
-      NEW_VERSION="$arg"
+      echo "error: unknown argument '$arg'" >&2
+      echo "usage: ./hex_release [VERSION] [--force]" >&2
+      exit 1
       ;;
   esac
 done
