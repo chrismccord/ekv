@@ -8,7 +8,17 @@ permissions:
   contents: write
 
 jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create ${{ github.ref_name }} --draft --title ${{ github.ref_name }} || true
+
   linux:
+    needs: create-release
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -59,11 +69,13 @@ jobs:
           export CC_PRECOMPILER_CURRENT_TARGET=${{ matrix.target }}
           mix elixir_make.precompile
 
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: cache/*.tar.gz
+      - name: Upload artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload ${{ github.ref_name }} cache/*.tar.gz --clobber
 
   macos-x86:
+    needs: create-release
     runs-on: macos-13
     strategy:
       fail-fast: false
@@ -88,11 +100,13 @@ jobs:
           mkdir -p "$ELIXIR_MAKE_CACHE_DIR"
           mix elixir_make.precompile
 
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: cache/*.tar.gz
+      - name: Upload artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload ${{ github.ref_name }} cache/*.tar.gz --clobber
 
   macos-arm:
+    needs: create-release
     runs-on: macos-14
     strategy:
       fail-fast: false
@@ -117,6 +131,17 @@ jobs:
           mkdir -p "$ELIXIR_MAKE_CACHE_DIR"
           mix elixir_make.precompile
 
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: cache/*.tar.gz
+      - name: Upload artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload ${{ github.ref_name }} cache/*.tar.gz --clobber
+
+  publish-release:
+    needs: [linux, macos-x86, macos-arm]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit ${{ github.ref_name }} --draft=false
