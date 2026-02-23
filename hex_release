@@ -67,6 +67,11 @@ if git tag -l "$TAG" | grep -q "$TAG"; then
 fi
 
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+# Record any existing run ID so we can skip it when polling for the new one
+OLD_RUN_ID=$(gh run list --workflow=precompile.yml --branch="$TAG" --limit=1 --json databaseId,headBranch \
+  --jq ".[] | select(.headBranch == \"$TAG\") | .databaseId" 2>/dev/null || true)
+
 echo "==> Tagging $TAG on $BRANCH"
 git tag "$TAG"
 git push origin "$BRANCH" "$TAG"
@@ -76,9 +81,9 @@ echo "==> Waiting for precompile CI to finish (timeout ${TIMEOUT}s)..."
 
 elapsed=0
 while true; do
-  # Find the workflow run triggered by our tag
-  RUN_ID=$(gh run list --workflow=precompile.yml --branch="$TAG" --limit=1 --json databaseId,headBranch \
-    --jq ".[] | select(.headBranch == \"$TAG\") | .databaseId" 2>/dev/null || true)
+  # Find the workflow run triggered by our tag (skip old run if retrying)
+  RUN_ID=$(gh run list --workflow=precompile.yml --branch="$TAG" --limit=5 --json databaseId,headBranch \
+    --jq "[.[] | select(.headBranch == \"$TAG\") | .databaseId] | map(select(. != ${OLD_RUN_ID:-0})) | first // empty" 2>/dev/null || true)
 
   if [ -n "$RUN_ID" ]; then
     STATUS=$(gh run view "$RUN_ID" --json status,conclusion --jq '.status')
