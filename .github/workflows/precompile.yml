@@ -16,8 +16,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create ${{ github.ref_name }} --draft --title ${{ github.ref_name }} 2>/dev/null || true
-          # Verify the release exists (may already exist from a previous run)
+          gh release create ${{ github.ref_name }} --title ${{ github.ref_name }} 2>/dev/null || true
           gh release view ${{ github.ref_name }}
 
   linux:
@@ -109,12 +108,3 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload ${{ github.ref_name }} cache/*.tar.gz --clobber
 
-  publish-release:
-    needs: [linux, macos-arm]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Publish release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release edit ${{ github.ref_name }} --draft=false
