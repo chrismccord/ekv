@@ -9,7 +9,7 @@ Data survives node restarts, node death, and network partitions. Replication is 
 ```elixir
 def deps do
   [
-    {:ekv, "~> 0.1.0"}
+    {:ekv, "~> 0.1.5"}
   ]
 end
 ```
