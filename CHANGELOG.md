@@ -1,3 +1,6 @@
+## 0.1.6 (2026-02-26)
+- Add blue_green support
+
 ## 0.1.5 (2026-02-24)
 - Account for edge case in gc cleanup
 
