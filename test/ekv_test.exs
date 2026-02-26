@@ -1317,6 +1317,242 @@ defmodule EKVTest do
     :ok
   end
 
+  # =====================================================================
+  # Blue-green deployment tests
+  # =====================================================================
+
+  describe "blue-green deployment" do
+    setup do
+      bg_name = :"ekv_bg_#{System.unique_integer([:positive])}"
+      bg_dir = Path.join(System.tmp_dir!(), "ekv_bg_test_#{bg_name}")
+
+      on_exit(fn ->
+        File.rm_rf!(bg_dir)
+      end)
+
+      %{bg_name: bg_name, bg_dir: bg_dir}
+    end
+
+    test "first boot creates slot_a with shard files and marker", %{bg_name: name, bg_dir: dir} do
+      {:ok, pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: dir,
+          shards: 2,
+          log: false,
+          blue_green: true,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      :ok = EKV.put(name, "key1", "value1")
+      assert EKV.get(name, "key1") == "value1"
+
+      # Verify slot_a directory exists with shard files
+      assert File.exists?(Path.join([dir, "slot_a", "shard_0.db"]))
+      assert File.exists?(Path.join([dir, "slot_a", "shard_1.db"]))
+
+      # Verify marker
+      {:ok, marker} = File.read(Path.join(dir, "current"))
+      assert String.trim(marker) == "a\t#{node()}"
+
+      Process.flag(:trap_exit, true)
+      Process.exit(pid, :shutdown)
+      Process.sleep(50)
+    end
+
+    test "same-node restart reopens same slot with data intact", %{bg_name: name, bg_dir: dir} do
+      {:ok, _pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: dir,
+          shards: 2,
+          log: false,
+          blue_green: true,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      :ok = EKV.put(name, "persist", "val")
+      assert EKV.get(name, "persist") == "val"
+
+      Process.flag(:trap_exit, true)
+      Supervisor.stop(:"#{name}_ekv_sup", :shutdown)
+      Process.sleep(50)
+
+      {:ok, pid2} =
+        EKV.start_link(
+          name: name,
+          data_dir: dir,
+          shards: 2,
+          log: false,
+          blue_green: true,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      assert EKV.get(name, "persist") == "val"
+
+      # Still on slot_a
+      {:ok, marker} = File.read(Path.join(dir, "current"))
+      assert String.trim(marker) == "a\t#{node()}"
+
+      Process.exit(pid2, :shutdown)
+      Process.sleep(50)
+    end
+
+    test "different node triggers snapshot to other slot", %{bg_name: name, bg_dir: dir} do
+      {:ok, _pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: dir,
+          shards: 2,
+          log: false,
+          blue_green: true,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      :ok = EKV.put(name, "snap_key", "snap_val")
+      assert EKV.get(name, "snap_key") == "snap_val"
+
+      Process.flag(:trap_exit, true)
+      Supervisor.stop(:"#{name}_ekv_sup", :shutdown)
+      Process.sleep(50)
+
+      # Overwrite marker with a fake node name to simulate blue-green deploy
+      File.write!(Path.join(dir, "current"), "a\tfake_old_node@host\n")
+
+      {:ok, pid2} =
+        EKV.start_link(
+          name: name,
+          data_dir: dir,
+          shards: 2,
+          log: false,
+          blue_green: true,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      # Data preserved via snapshot
+      assert EKV.get(name, "snap_key") == "snap_val"
+
+      # Marker flipped to slot_b
+      {:ok, marker} = File.read(Path.join(dir, "current"))
+      assert String.trim(marker) == "b\t#{node()}"
+
+      # Shard files exist in slot_b
+      assert File.exists?(Path.join([dir, "slot_b", "shard_0.db"]))
+      assert File.exists?(Path.join([dir, "slot_b", "shard_1.db"]))
+
+      Process.exit(pid2, :shutdown)
+      Process.sleep(50)
+    end
+
+    test "A→B→A alternation preserves data across three cycles", %{bg_name: name, bg_dir: dir} do
+      Process.flag(:trap_exit, true)
+
+      # Cycle 1: first boot → slot_a
+      {:ok, _} =
+        EKV.start_link(
+          name: name,
+          data_dir: dir,
+          shards: 2,
+          log: false,
+          blue_green: true,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      :ok = EKV.put(name, "cycle/1", "c1")
+      Supervisor.stop(:"#{name}_ekv_sup", :shutdown)
+      Process.sleep(50)
+
+      # Cycle 2: fake node → slot_b
+      File.write!(Path.join(dir, "current"), "a\told_node_1@host\n")
+
+      {:ok, _} =
+        EKV.start_link(
+          name: name,
+          data_dir: dir,
+          shards: 2,
+          log: false,
+          blue_green: true,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      assert EKV.get(name, "cycle/1") == "c1"
+      :ok = EKV.put(name, "cycle/2", "c2")
+      Supervisor.stop(:"#{name}_ekv_sup", :shutdown)
+      Process.sleep(50)
+
+      # Cycle 3: fake node → slot_a
+      File.write!(Path.join(dir, "current"), "b\told_node_2@host\n")
+
+      {:ok, pid3} =
+        EKV.start_link(
+          name: name,
+          data_dir: dir,
+          shards: 2,
+          log: false,
+          blue_green: true,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      assert EKV.get(name, "cycle/1") == "c1"
+      assert EKV.get(name, "cycle/2") == "c2"
+
+      {:ok, marker} = File.read(Path.join(dir, "current"))
+      assert String.trim(marker) == "a\t#{node()}"
+
+      Process.exit(pid3, :shutdown)
+      Process.sleep(50)
+    end
+
+    test "NIF backup copies data correctly", %{bg_dir: dir} do
+      source_dir = Path.join(dir, "backup_src")
+      dest_dir = Path.join(dir, "backup_dst")
+      File.mkdir_p!(source_dir)
+      File.mkdir_p!(dest_dir)
+
+      # Open a db, write data, close
+      {:ok, db} = EKV.Store.open(source_dir, 0, :timer.hours(24 * 7), 2, :timer.minutes(5))
+      stmts = EKV.Store.prepare_cached_stmts(db)
+
+      {:ok, true} =
+        EKV.Store.write_entry(
+          db,
+          stmts.kv_upsert,
+          stmts.oplog_insert,
+          "backup_key",
+          :erlang.term_to_binary("backup_val"),
+          1000,
+          :node_a,
+          nil
+        )
+
+      EKV.Store.release_stmts(db, stmts)
+      EKV.Store.close(db)
+
+      # Backup
+      source_path = Path.join(source_dir, "shard_0.db")
+      dest_path = Path.join(dest_dir, "shard_0.db")
+      assert :ok = EKV.Sqlite3.backup(source_path, dest_path)
+
+      # Open dest and verify data
+      {:ok, db2} = EKV.Store.open(dest_dir, 0, :timer.hours(24 * 7), 2, :timer.minutes(5))
+
+      result = EKV.Store.get(db2, "backup_key")
+      assert result != nil
+      {value_bin, _ts, _origin, _exp, _del} = result
+      assert :erlang.binary_to_term(value_bin) == "backup_val"
+
+      EKV.Store.close(db2)
+    end
+  end
+
   describe "delta sync returns correct entries" do
     test "oplog_since returns exactly the right slice", %{name: name} do
       config = EKV.get_config(name)

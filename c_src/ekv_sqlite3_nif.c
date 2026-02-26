@@ -768,6 +768,85 @@ static ERL_NIF_TERM ekv_fetch_all(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
 }
 
 /* ------------------------------------------------------------------ */
+/* NIF: ekv_backup(source_path, dest_path) -> :ok | {:error, msg}      */
+/*                                                                     */
+/* Standalone backup using SQLite backup API. Opens and closes its own */
+/* connections. Source opened READONLY — safe alongside WAL writers.    */
+/* backup_step(-1) copies all pages in one shot.                       */
+/* ------------------------------------------------------------------ */
+
+static ERL_NIF_TERM ekv_backup(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    (void)argc;
+    ErlNifBinary src_bin, dst_bin;
+
+    if (!enif_inspect_iolist_as_binary(env, argv[0], &src_bin))
+        return enif_make_badarg(env);
+    if (!enif_inspect_iolist_as_binary(env, argv[1], &dst_bin))
+        return enif_make_badarg(env);
+
+    /* Null-terminate paths */
+    char *src_path = enif_alloc(src_bin.size + 1);
+    if (!src_path) return make_error(env, "alloc failed");
+    memcpy(src_path, src_bin.data, src_bin.size);
+    src_path[src_bin.size] = '\0';
+
+    char *dst_path = enif_alloc(dst_bin.size + 1);
+    if (!dst_path) {
+        enif_free(src_path);
+        return make_error(env, "alloc failed");
+    }
+    memcpy(dst_path, dst_bin.data, dst_bin.size);
+    dst_path[dst_bin.size] = '\0';
+
+    /* Open source READONLY */
+    sqlite3 *src_db = NULL;
+    int rc = sqlite3_open_v2(src_path, &src_db, SQLITE_OPEN_READONLY, NULL);
+    enif_free(src_path);
+    if (rc != SQLITE_OK) {
+        const char *msg = src_db ? sqlite3_errmsg(src_db) : "out of memory";
+        ERL_NIF_TERM err = make_error(env, msg);
+        if (src_db) sqlite3_close_v2(src_db);
+        enif_free(dst_path);
+        return err;
+    }
+
+    /* Open dest READWRITE|CREATE */
+    sqlite3 *dst_db = NULL;
+    rc = sqlite3_open_v2(dst_path, &dst_db,
+        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
+    enif_free(dst_path);
+    if (rc != SQLITE_OK) {
+        const char *msg = dst_db ? sqlite3_errmsg(dst_db) : "out of memory";
+        ERL_NIF_TERM err = make_error(env, msg);
+        if (dst_db) sqlite3_close_v2(dst_db);
+        sqlite3_close_v2(src_db);
+        return err;
+    }
+
+    /* Run backup */
+    sqlite3_backup *backup = sqlite3_backup_init(dst_db, "main", src_db, "main");
+    if (!backup) {
+        ERL_NIF_TERM err = make_error(env, sqlite3_errmsg(dst_db));
+        sqlite3_close_v2(dst_db);
+        sqlite3_close_v2(src_db);
+        return err;
+    }
+
+    rc = sqlite3_backup_step(backup, -1);
+    sqlite3_backup_finish(backup);
+
+    sqlite3_close_v2(dst_db);
+    sqlite3_close_v2(src_db);
+
+    if (rc != SQLITE_DONE) {
+        return make_error(env, "backup failed");
+    }
+
+    return atom_ok;
+}
+
+/* ------------------------------------------------------------------ */
 /* NIF table & lifecycle                                               */
 /* ------------------------------------------------------------------ */
 
@@ -782,6 +861,7 @@ static ErlNifFunc nif_funcs[] = {
     {"ekv_write_entry", 5, ekv_write_entry, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_read_entry",  3, ekv_read_entry,  ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_fetch_all",   3, ekv_fetch_all,   ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"ekv_backup",      2, ekv_backup,      ERL_NIF_DIRTY_JOB_IO_BOUND},
 };
 
 static int on_load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info)
