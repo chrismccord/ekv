@@ -103,6 +103,7 @@ defmodule EKV do
   | `:tombstone_ttl` | `604_800_000` (7 days) | How long tombstones (deleted entries) are kept before being permanently purged, in milliseconds. See "Tombstone Lifetime" below. |
   | `:gc_interval` | `300_000` (5 min) | How often garbage collection runs, in milliseconds. GC expires TTL entries, purges old tombstones, and truncates the replication oplog. |
   | `:log` | `:info` | Logging level. `:info` logs cluster events (connects, syncs). `false` disables logging. `:verbose` logs per-shard detail. |
+  | `:blue_green` | `false` | Enable blue-green deployment mode. See "Blue-Green Deployment" below. |
 
   ### Choosing a Shard Count
 
@@ -148,6 +149,55 @@ defmodule EKV do
   Reduce `tombstone_ttl` if storage is tight and your nodes are rarely offline
   for long. Increase it if nodes may be offline for extended maintenance
   windows.
+
+  ## Blue-Green Deployment
+
+  When deploying with a blue-green strategy on a single machine, two BEAM VMs
+  run side by side briefly — the old release and the new one. If both VMs open
+  the same SQLite files, the result is corruption and incoherent oplogs. The
+  `:blue_green` option solves this by giving each VM its own isolated copy of
+  the data.
+
+      {EKV, name: :my_kv, data_dir: "/var/data/ekv", blue_green: true}
+
+  With `blue_green: true`, EKV manages two fixed slot directories (`slot_a/`
+  and `slot_b/`) under `data_dir` and ping-pongs between them across deploys.
+  A marker file (`data_dir/current`) tracks which slot is active and which
+  node owns it.
+
+  **Startup behavior:**
+
+  - **First boot** (no marker file) — creates `slot_a/`, writes the marker,
+    and operates normally.
+
+  - **Same node restart** (marker node matches `node()`) — reopens the same
+    slot. This is a normal EKV restart within the same VM (e.g. supervisor
+    restart, application reload). Data is preserved in place.
+
+  - **Different node** (marker node does not match `node()`) — this is a
+    blue-green deploy. EKV snapshots every shard from the current slot to the
+    other slot using SQLite's backup API, flips the marker, and opens the new
+    slot. The old VM's files are untouched.
+
+  After the snapshot, the new VM's database is a consistent point-in-time copy
+  of the old VM's data. Any writes the old VM made between the snapshot and
+  shutdown are caught up via normal delta sync (HWM/oplog) when the old VM's
+  node connects to the new one during the handoff window, or via full sync if
+  the old VM has already shut down.
+
+  **Requirements:**
+
+  - Each deploy must use a **different node name** (e.g. include a timestamp
+    or release version in the name). If the node name is the same, EKV treats
+    it as a same-node restart and reopens the existing slot without
+    snapshotting.
+
+  - The `data_dir` must be on a **shared filesystem** accessible to both the
+    old and new VMs.
+
+  **Disk space:** Blue-green mode uses approximately 2x the storage of normal
+  mode since both `slot_a/` and `slot_b/` contain full copies of the data.
+  Old slot files are overwritten on the next deploy cycle.
 
   ## Multiple Instances
 

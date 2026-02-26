@@ -102,7 +102,23 @@ while true; do
         echo "==> Precompile CI passed"
         break
       else
-        echo "error: precompile CI failed (conclusion: $CONCLUSION)" >&2
+        # Check for individual failed jobs and retry them once
+        FAILED_JOBS=$(gh run view "$RUN_ID" --json jobs \
+          --jq '[.jobs[] | select(.conclusion == "failure")] | .[].databaseId' 2>/dev/null || true)
+
+        if [ -n "$FAILED_JOBS" ] && [ "${RETRIED:-false}" = false ]; then
+          RETRIED=true
+          FAILED_COUNT=$(echo "$FAILED_JOBS" | wc -l | tr -d ' ')
+          echo ""
+          echo "==> $FAILED_COUNT job(s) failed — retrying once..."
+          for job_id in $FAILED_JOBS; do
+            gh run rerun "$RUN_ID" --job "$job_id" 2>/dev/null || true
+          done
+          sleep 5  # give GitHub a moment to restart jobs
+          continue
+        fi
+
+        echo "error: precompile CI failed after retry (conclusion: $CONCLUSION)" >&2
         echo "  https://github.com/$REPO/actions/runs/$RUN_ID" >&2
         exit 1
       fi

@@ -16,4 +16,5 @@ defmodule EKV.Sqlite3 do
 
   def read_entry(db, stmt, args), do: Sqlite3NIF.ekv_read_entry(db, stmt, args)
   def fetch_all(db, sql, args), do: Sqlite3NIF.ekv_fetch_all(db, sql, args)
+  def backup(source_path, dest_path), do: Sqlite3NIF.ekv_backup(source_path, dest_path)
 end

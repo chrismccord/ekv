@@ -140,6 +140,12 @@ defmodule EKV.Store do
     EKV.Sqlite3.close(db)
   end
 
+  def backup_shard(source_dir, dest_dir, shard_index) do
+    source = Path.join(source_dir, "shard_#{shard_index}.db")
+    dest = Path.join(dest_dir, "shard_#{shard_index}.db")
+    EKV.Sqlite3.backup(source, dest)
+  end
+
   # =====================================================================
   # Cached Statements
   # =====================================================================
