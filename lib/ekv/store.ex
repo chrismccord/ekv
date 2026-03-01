@@ -520,6 +520,58 @@ defmodule EKV.Store do
     end)
   end
 
+  # =====================================================================
+  # Chunked query functions (for cursor-based sync pagination)
+  # =====================================================================
+
+  @full_state_first_chunk_sql """
+  SELECT key, value, timestamp, origin_node, expires_at, deleted_at
+  FROM kv WHERE deleted_at IS NULL OR deleted_at > ?1
+  ORDER BY key LIMIT ?2
+  """
+
+  @full_state_chunk_sql """
+  SELECT key, value, timestamp, origin_node, expires_at, deleted_at
+  FROM kv WHERE (deleted_at IS NULL OR deleted_at > ?1) AND key > ?2
+  ORDER BY key LIMIT ?3
+  """
+
+  @doc """
+  Get a chunk of live entries for full sync, ordered by key with cursor pagination.
+  Pass `nil` as `last_key` for the first chunk.
+  """
+  def full_state_chunk(db, tombstone_cutoff, nil, limit) do
+    {:ok, rows} = EKV.Sqlite3.fetch_all(db, @full_state_first_chunk_sql, [tombstone_cutoff, limit])
+    map_full_state_rows(rows)
+  end
+
+  def full_state_chunk(db, tombstone_cutoff, last_key, limit) do
+    {:ok, rows} = EKV.Sqlite3.fetch_all(db, @full_state_chunk_sql, [tombstone_cutoff, last_key, limit])
+    map_full_state_rows(rows)
+  end
+
+  defp map_full_state_rows(rows) do
+    Enum.map(rows, fn [key, value, timestamp, origin_node, expires_at, deleted_at] ->
+      {key, value, timestamp, String.to_atom(origin_node), expires_at, deleted_at}
+    end)
+  end
+
+  @oplog_since_chunk_sql """
+  SELECT seq, key, value, timestamp, origin_node, expires_at, is_delete
+  FROM kv_oplog WHERE seq > ?1 ORDER BY seq LIMIT ?2
+  """
+
+  @doc """
+  Get a chunk of oplog entries since `seq`, ordered by seq with cursor pagination.
+  """
+  def oplog_since_chunk(db, seq, limit) do
+    {:ok, rows} = EKV.Sqlite3.fetch_all(db, @oplog_since_chunk_sql, [seq, limit])
+
+    Enum.map(rows, fn [seq, key, value, timestamp, origin_node, expires_at, is_delete] ->
+      {seq, key, value, timestamp, String.to_atom(origin_node), expires_at, is_delete == 1}
+    end)
+  end
+
   def touch_last_active(db) do
     now = System.system_time(:nanosecond)
 

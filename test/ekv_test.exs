@@ -2960,4 +2960,621 @@ defmodule EKVTest do
       assert EKV.get(name, key) == nil
     end
   end
+
+  # =====================================================================
+  # Chunked sync tests
+  # =====================================================================
+
+  describe "chunked sync" do
+    setup do
+      name = :"ekv_chunk_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+
+      {:ok, pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: data_dir,
+          shards: 1,
+          log: false,
+          sync_chunk_size: 10,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      shard_name = :"#{name}_ekv_replica_0"
+
+      %{name: name, data_dir: data_dir, shard_name: shard_name}
+    end
+
+    test "full_state_chunk paginates through all entries", %{shard_name: shard_name, name: name} do
+      # Write 35 keys (more than 3 chunks of 10)
+      for i <- 1..35 do
+        key = String.pad_leading("#{i}", 3, "0")
+        :ok = EKV.put(name, "chunk/#{key}", "val_#{i}")
+      end
+
+      state = :sys.get_state(shard_name)
+      tombstone_cutoff = System.system_time(:nanosecond) - :timer.hours(24 * 7) * 1_000_000
+
+      # Paginate through chunks
+      {all_entries, chunk_count} = collect_full_chunks(state.db, tombstone_cutoff, nil, 10, [], 0)
+
+      assert chunk_count == 4  # 10 + 10 + 10 + 5
+      assert length(all_entries) == 35
+
+      # Verify entries are ordered by key
+      keys = Enum.map(all_entries, fn {k, _, _, _, _, _} -> k end)
+      assert keys == Enum.sort(keys)
+    end
+
+    test "oplog_since_chunk paginates through oplog entries", %{shard_name: shard_name, name: name} do
+      for i <- 1..25 do
+        :ok = EKV.put(name, "oplog_chunk/#{i}", "val_#{i}")
+      end
+
+      state = :sys.get_state(shard_name)
+
+      # Paginate through oplog chunks
+      {all_entries, chunk_count} = collect_oplog_chunks(state.db, 0, 10, [], 0)
+
+      assert chunk_count == 3  # 10 + 10 + 5
+      assert length(all_entries) == 25
+
+      # Verify entries are ordered by seq
+      seqs = Enum.map(all_entries, fn {seq, _, _, _, _, _, _} -> seq end)
+      assert seqs == Enum.sort(seqs)
+    end
+
+    test "chunked full sync delivers all data via multiple sync messages", %{shard_name: shard_name, name: name} do
+      # Write 25 keys so full sync needs 3 chunks (chunk_size=10)
+      for i <- 1..25 do
+        key = String.pad_leading("#{i}", 3, "0")
+        :ok = EKV.put(name, "sync/#{key}", "val_#{i}")
+      end
+
+      fake_node = :"chunk_peer@fake"
+
+      :sys.replace_state(shard_name, fn state ->
+        %{state | remote_shards: Map.put(state.remote_shards, fake_node, self())}
+      end)
+
+      :erlang.trace(Process.whereis(shard_name), true, [:send])
+
+      # Directly trigger full sync by sending a continue_full_sync with nil cursor
+      config = EKV.get_config(name)
+      tombstone_cutoff = System.system_time(:nanosecond) - config.tombstone_ttl * 1_000_000
+      state = :sys.get_state(shard_name)
+      my_seq = EKV.Store.max_seq(state.db)
+
+      send(shard_name, {:continue_full_sync, fake_node, nil,
+                        tombstone_cutoff, my_seq, 0, config.sync_chunk_size})
+
+      Process.sleep(200)
+      :sys.get_state(shard_name)
+
+      :erlang.trace(Process.whereis(shard_name), false, [:send])
+
+      sync_count = count_trace_sync_messages()
+
+      # Should have 3 chunks (10 + 10 + 5)
+      assert sync_count == 3
+    end
+
+    test "chunked delta sync delivers all oplog entries", %{shard_name: shard_name, name: name} do
+      # Write 25 keys
+      for i <- 1..25 do
+        :ok = EKV.put(name, "delta/#{i}", "val_#{i}")
+      end
+
+      fake_node = :"delta_peer@fake"
+
+      :sys.replace_state(shard_name, fn state ->
+        %{state | remote_shards: Map.put(state.remote_shards, fake_node, self())}
+      end)
+
+      :erlang.trace(Process.whereis(shard_name), true, [:send])
+
+      config = EKV.get_config(name)
+      state = :sys.get_state(shard_name)
+      my_seq = EKV.Store.max_seq(state.db)
+
+      # Trigger delta sync starting from seq 0
+      send(shard_name, {:continue_delta_sync, fake_node, 0,
+                        my_seq, 0, config.sync_chunk_size})
+
+      Process.sleep(200)
+      :sys.get_state(shard_name)
+
+      :erlang.trace(Process.whereis(shard_name), false, [:send])
+
+      sync_count = count_trace_sync_messages()
+
+      # Should have 3 chunks (10 + 10 + 5)
+      assert sync_count == 3
+    end
+
+    test "peer disconnect aborts ongoing chunked sync", %{shard_name: shard_name, name: name} do
+      # Write enough for multiple chunks
+      for i <- 1..30 do
+        :ok = EKV.put(name, "abort/#{String.pad_leading("#{i}", 3, "0")}", "val_#{i}")
+      end
+
+      fake_node = :"abort_peer@fake"
+
+      :sys.replace_state(shard_name, fn state ->
+        %{state | remote_shards: Map.put(state.remote_shards, fake_node, self())}
+      end)
+
+      config = EKV.get_config(name)
+      tombstone_cutoff = System.system_time(:nanosecond) - config.tombstone_ttl * 1_000_000
+      state = :sys.get_state(shard_name)
+      my_seq = EKV.Store.max_seq(state.db)
+
+      # Suspend the shard, inject the first continue message, then remove the peer
+      :sys.suspend(shard_name)
+
+      send(shard_name, {:continue_full_sync, fake_node, nil,
+                        tombstone_cutoff, my_seq, 0, config.sync_chunk_size})
+
+      # Resume to process just the first chunk (sends chunk + queues next continuation)
+      :sys.resume(shard_name)
+      :sys.get_state(shard_name)
+
+      # Now remove the peer before the next continuation runs
+      :sys.replace_state(shard_name, fn state ->
+        %{state | remote_shards: %{}}
+      end)
+
+      # Start tracing to verify no more sync messages are sent
+      :erlang.trace(Process.whereis(shard_name), true, [:send])
+
+      # Let continuations process — they should check remote_shards and abort
+      Process.sleep(200)
+      :sys.get_state(shard_name)
+
+      :erlang.trace(Process.whereis(shard_name), false, [:send])
+
+      sync_count = count_trace_sync_messages()
+
+      # No sync messages should be sent (continuation aborted)
+      assert sync_count == 0
+
+      # Shard should not crash
+      assert Process.alive?(Process.whereis(shard_name))
+    end
+
+    test "write during chunked sync doesn't break sync", %{shard_name: shard_name, name: name} do
+      # Write enough keys for multiple chunks
+      for i <- 1..20 do
+        :ok = EKV.put(name, "interleave/#{String.pad_leading("#{i}", 3, "0")}", "v#{i}")
+      end
+
+      fake_node = :"interleave_peer@fake"
+
+      :sys.replace_state(shard_name, fn state ->
+        %{state | remote_shards: Map.put(state.remote_shards, fake_node, self())}
+      end)
+
+      config = EKV.get_config(name)
+      tombstone_cutoff = System.system_time(:nanosecond) - config.tombstone_ttl * 1_000_000
+      state = :sys.get_state(shard_name)
+      my_seq = EKV.Store.max_seq(state.db)
+
+      # Suspend, inject first chunk trigger, resume
+      :sys.suspend(shard_name)
+      send(shard_name, {:continue_full_sync, fake_node, nil,
+                        tombstone_cutoff, my_seq, 0, config.sync_chunk_size})
+      :sys.resume(shard_name)
+      :sys.get_state(shard_name)
+
+      # Write a new key while continuations are pending
+      :ok = EKV.put(name, "interleave/new", "new_val")
+
+      # Let continuations complete
+      Process.sleep(200)
+      :sys.get_state(shard_name)
+
+      # Shard is still alive and operational
+      assert Process.alive?(Process.whereis(shard_name))
+      assert EKV.get(name, "interleave/new") == "new_val"
+    end
+
+    test "intermediate sync chunks have seq=0, final chunk has real seq", %{shard_name: shard_name, name: name} do
+      # Write 25 keys for 3 chunks
+      for i <- 1..25 do
+        :ok = EKV.put(name, "seqtest/#{String.pad_leading("#{i}", 3, "0")}", "v#{i}")
+      end
+
+      fake_node = :"seq_peer@fake"
+
+      :sys.replace_state(shard_name, fn state ->
+        %{state | remote_shards: Map.put(state.remote_shards, fake_node, self())}
+      end)
+
+      :erlang.trace(Process.whereis(shard_name), true, [:send])
+
+      config = EKV.get_config(name)
+      tombstone_cutoff = System.system_time(:nanosecond) - config.tombstone_ttl * 1_000_000
+      state = :sys.get_state(shard_name)
+      my_seq = EKV.Store.max_seq(state.db)
+
+      send(shard_name, {:continue_full_sync, fake_node, nil,
+                        tombstone_cutoff, my_seq, 0, config.sync_chunk_size})
+
+      Process.sleep(200)
+      :sys.get_state(shard_name)
+
+      :erlang.trace(Process.whereis(shard_name), false, [:send])
+
+      sync_messages = collect_trace_sync_details()
+
+      assert length(sync_messages) == 3
+
+      # Intermediate chunks should have seq=0
+      {intermediate, [final]} = Enum.split(sync_messages, -1)
+
+      for {_entries_count, seq} <- intermediate do
+        assert seq == 0, "intermediate chunk should have seq=0, got #{seq}"
+      end
+
+      # Final chunk has real seq
+      {_count, final_seq} = final
+      assert final_seq > 0, "final chunk should have non-zero seq"
+    end
+  end
+
+  # =====================================================================
+  # Message ordering tests
+  # =====================================================================
+
+  describe "message ordering" do
+    setup do
+      name = :"ekv_ordering_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+
+      {:ok, pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: data_dir,
+          shards: 1,
+          log: false,
+          cluster_size: 3,
+          node_id: 1,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      shard_name = :"#{name}_ekv_replica_0"
+
+      # Inject fake peers
+      fake_node_a = :"order_a@127.0.0.1"
+      fake_node_b = :"order_b@127.0.0.1"
+
+      :sys.replace_state(shard_name, fn state ->
+        %{state |
+          remote_shards: %{fake_node_a => self(), fake_node_b => self()},
+          peer_node_ids: %{fake_node_a => 2, fake_node_b => 3}
+        }
+      end)
+
+      %{name: name, data_dir: data_dir, shard_name: shard_name}
+    end
+
+    test "stale commit after higher-ballot accept", %{name: name, shard_name: shard_name} do
+      key = "order/stale_commit"
+      now = System.system_time(:nanosecond)
+      origin_str = Atom.to_string(node())
+
+      # Accept with ballot {100, 2}
+      ref1 = make_ref()
+      val1 = :erlang.term_to_binary("v1")
+      entry1 = {key, val1, now, origin_str, nil, nil}
+      send(shard_name, {:ekv_accept, ref1, self(), key, 100, 2, entry1, 0})
+      assert_receive {:ekv_accepted, ^ref1, _, _}, 1000
+
+      # Accept with higher ballot {200, 3} — overwrites kv_paxos
+      ref2 = make_ref()
+      val2 = :erlang.term_to_binary("v2")
+      entry2 = {key, val2, now + 1, origin_str, nil, nil}
+      send(shard_name, {:ekv_accept, ref2, self(), key, 200, 3, entry2, 0})
+      assert_receive {:ekv_accepted, ^ref2, _, _}, 1000
+
+      # Stale commit for ballot {100, 2} — should return :stale, value NOT in kv
+      send(shard_name, {:ekv_cas_committed, key, 100, 2, 0})
+      :sys.get_state(shard_name)
+      assert EKV.get(name, key) == nil
+
+      # Commit for ballot {200, 3} — should succeed
+      send(shard_name, {:ekv_cas_committed, key, 200, 3, 0})
+      :sys.get_state(shard_name)
+      assert EKV.get(name, key) == "v2"
+    end
+
+    test "duplicate commit notification", %{name: name, shard_name: shard_name} do
+      key = "order/dup_commit"
+      now = System.system_time(:nanosecond)
+      origin_str = Atom.to_string(node())
+
+      # Accept
+      ref = make_ref()
+      val = :erlang.term_to_binary("dup_val")
+      entry = {key, val, now, origin_str, nil, nil}
+      send(shard_name, {:ekv_accept, ref, self(), key, 100, 2, entry, 0})
+      assert_receive {:ekv_accepted, ^ref, _, _}, 1000
+
+      # Subscribe to verify no duplicate events
+      :ok = EKV.subscribe(name, "order/")
+      Process.sleep(50)
+
+      # First commit — succeeds
+      send(shard_name, {:ekv_cas_committed, key, 100, 2, 0})
+      :sys.get_state(shard_name)
+      flush_dispatchers(name)
+
+      assert EKV.get(name, key) == "dup_val"
+      assert_receive {:ekv, [%EKV.Event{type: :put, key: ^key, value: "dup_val"}], _}, 1000
+
+      # Second commit (duplicate) — should be :stale, no event
+      send(shard_name, {:ekv_cas_committed, key, 100, 2, 0})
+      :sys.get_state(shard_name)
+      flush_dispatchers(name)
+
+      refute_receive {:ekv, _, _}, 200
+    end
+
+    test "late promise after CAS timeout is silently ignored", %{shard_name: shard_name} do
+      # Manually construct a ref that was part of a CAS that already timed out.
+      # We simulate the scenario: a CAS started, timed out, and then a late
+      # promise arrives with the old ref.
+      old_ref = make_ref()
+
+      # The ref is not in pending_cas (never was, or already cleaned up by timeout).
+      # Sending a promise with this ref should be silently ignored.
+      send(shard_name, {:ekv_promise, old_ref, self(), 2, 0, 0, nil})
+      :sys.get_state(shard_name)
+
+      # Shard is still alive, no crash
+      assert Process.alive?(Process.whereis(shard_name))
+
+      # Also test with other late CAS messages
+      send(shard_name, {:ekv_nack, old_ref, self(), 2, 100, 1})
+      :sys.get_state(shard_name)
+      assert Process.alive?(Process.whereis(shard_name))
+
+      send(shard_name, {:ekv_accepted, old_ref, self(), 2})
+      :sys.get_state(shard_name)
+      assert Process.alive?(Process.whereis(shard_name))
+
+      send(shard_name, {:ekv_accept_nack, old_ref, self(), 2})
+      :sys.get_state(shard_name)
+      assert Process.alive?(Process.whereis(shard_name))
+    end
+
+    test "accept at acceptor after proposer timed out (prepare superseded)", %{shard_name: shard_name} do
+      key = "order/superseded_accept"
+
+      # Send prepare with ballot=100 (accepted by local shard)
+      ref1 = make_ref()
+      send(shard_name, {:ekv_prepare, ref1, self(), key, 100, 2, 0})
+      assert_receive {:ekv_promise, ^ref1, _, _, _, _, _}, 1000
+
+      # Send prepare with higher ballot=200 (supersedes ballot=100)
+      ref2 = make_ref()
+      send(shard_name, {:ekv_prepare, ref2, self(), key, 200, 3, 0})
+      assert_receive {:ekv_promise, ^ref2, _, _, _, _, _}, 1000
+
+      # Now send accept for the old ballot=100 — should be rejected
+      now = System.system_time(:nanosecond)
+      origin_str = Atom.to_string(node())
+      val = :erlang.term_to_binary("stale")
+      entry = {key, val, now, origin_str, nil, nil}
+
+      ref3 = make_ref()
+      send(shard_name, {:ekv_accept, ref3, self(), key, 100, 2, entry, 0})
+      assert_receive {:ekv_accept_nack, ^ref3, _, _}, 1000
+    end
+
+    test "interleaved CAS from two proposers on same key", %{name: name, shard_name: shard_name} do
+      key = "order/interleaved_cas"
+
+      # Write initial value
+      :ok = EKV.put(name, key, "initial")
+
+      # Proposer A prepares with ballot 100 — gets promise from local shard
+      ref_a = make_ref()
+      send(shard_name, {:ekv_prepare, ref_a, self(), key, 100, 2, 0})
+      assert_receive {:ekv_promise, ^ref_a, _, _, _, _, _}, 1000
+
+      # Simulate peer 2 promise for A (quorum: need 2 out of 3)
+      # We respond on behalf of fake node
+
+      # Proposer B prepares with higher ballot 200 — preempts A
+      ref_b = make_ref()
+      send(shard_name, {:ekv_prepare, ref_b, self(), key, 200, 3, 0})
+      assert_receive {:ekv_promise, ^ref_b, _, _, _, _, _}, 1000
+
+      # Now A tries to accept with ballot 100 — should be rejected (promised 200)
+      now = System.system_time(:nanosecond)
+      origin_str = Atom.to_string(node())
+      val_a = :erlang.term_to_binary("from_a")
+      entry_a = {key, val_a, now, origin_str, nil, nil}
+
+      ref_accept_a = make_ref()
+      send(shard_name, {:ekv_accept, ref_accept_a, self(), key, 100, 2, entry_a, 0})
+      assert_receive {:ekv_accept_nack, ^ref_accept_a, _, _}, 1000
+
+      # B's accept should succeed
+      val_b = :erlang.term_to_binary("from_b")
+      entry_b = {key, val_b, now + 1, origin_str, nil, nil}
+
+      ref_accept_b = make_ref()
+      send(shard_name, {:ekv_accept, ref_accept_b, self(), key, 200, 3, entry_b, 0})
+      assert_receive {:ekv_accepted, ^ref_accept_b, _, _}, 1000
+
+      # B commits
+      send(shard_name, {:ekv_cas_committed, key, 200, 3, 0})
+      :sys.get_state(shard_name)
+      assert EKV.get(name, key) == "from_b"
+    end
+
+    test "sync message interleaved with CAS prepare", %{name: name, shard_name: shard_name} do
+      key = "order/sync_during_cas"
+      sync_key = "order/sync_other"
+
+      # Start CAS — prepare locally
+      ref = make_ref()
+      send(shard_name, {:ekv_prepare, ref, self(), key, 100, 2, 0})
+      assert_receive {:ekv_promise, ^ref, _, _, _, _, _}, 1000
+
+      # While CAS is "in progress" (waiting for peer promises), deliver a sync message
+      # with a DIFFERENT key — should process normally
+      now = System.system_time(:nanosecond)
+      origin = node()
+      val_binary = :erlang.term_to_binary("synced_val")
+
+      sync_entries = [{sync_key, val_binary, now, origin, nil, nil}]
+      send(shard_name, {:ekv_sync, :"some_node@host", 0, sync_entries, 5})
+      :sys.get_state(shard_name)
+
+      # Synced key should be available
+      assert EKV.get(name, sync_key) == "synced_val"
+
+      # CAS key should still be unset (only prepared, not accepted/committed)
+      assert EKV.get(name, key) == nil
+
+      # Accept and commit CAS normally
+      val = :erlang.term_to_binary("cas_val")
+      entry = {key, val, now + 1, Atom.to_string(node()), nil, nil}
+
+      ref_accept = make_ref()
+      send(shard_name, {:ekv_accept, ref_accept, self(), key, 100, 2, entry, 0})
+      assert_receive {:ekv_accepted, ^ref_accept, _, _}, 1000
+
+      send(shard_name, {:ekv_cas_committed, key, 100, 2, 0})
+      :sys.get_state(shard_name)
+
+      assert EKV.get(name, key) == "cas_val"
+    end
+
+    test "commit notification to shard that restarted (kv_paxos survives)", %{name: name, shard_name: shard_name} do
+      key = "order/restart_commit"
+      now = System.system_time(:nanosecond)
+      origin_str = Atom.to_string(node())
+      val_bin = :erlang.term_to_binary("survive_restart")
+      entry = {key, val_bin, now, origin_str, nil, nil}
+
+      # Accept (writes to kv_paxos in SQLite)
+      ref = make_ref()
+      send(shard_name, {:ekv_accept, ref, self(), key, 100, 2, entry, 0})
+      assert_receive {:ekv_accepted, ^ref, _, _}, 1000
+
+      # kv_paxos is written, value not in kv yet
+      assert EKV.get(name, key) == nil
+
+      # Kill and restart the shard GenServer (supervised restart)
+      Process.exit(Process.whereis(shard_name), :kill)
+      Process.sleep(200)
+
+      # Shard should be back (supervisor restarts it)
+      assert Process.whereis(shard_name) != nil
+
+      # Re-inject fake peers so the shard thinks it has remotes
+      :sys.replace_state(shard_name, fn state ->
+        %{state |
+          remote_shards: %{:"order_a@127.0.0.1" => self(), :"order_b@127.0.0.1" => self()},
+          peer_node_ids: %{:"order_a@127.0.0.1" => 2, :"order_b@127.0.0.1" => 3}
+        }
+      end)
+
+      # Send commit notification — kv_paxos should still have the accepted value
+      send(shard_name, {:ekv_cas_committed, key, 100, 2, 0})
+      :sys.get_state(shard_name)
+
+      assert EKV.get(name, key) == "survive_restart"
+    end
+  end
+
+  # =====================================================================
+  # Chunked sync helpers
+  # =====================================================================
+
+  defp collect_full_chunks(db, tombstone_cutoff, last_key, limit, acc, chunk_count) do
+    entries = EKV.Store.full_state_chunk(db, tombstone_cutoff, last_key, limit)
+
+    case entries do
+      [] ->
+        {acc, chunk_count}
+
+      _ ->
+        new_acc = acc ++ entries
+
+        if length(entries) < limit do
+          {new_acc, chunk_count + 1}
+        else
+          next_key = elem(List.last(entries), 0)
+          collect_full_chunks(db, tombstone_cutoff, next_key, limit, new_acc, chunk_count + 1)
+        end
+    end
+  end
+
+  defp collect_oplog_chunks(db, seq, limit, acc, chunk_count) do
+    entries = EKV.Store.oplog_since_chunk(db, seq, limit)
+
+    case entries do
+      [] ->
+        {acc, chunk_count}
+
+      _ ->
+        new_acc = acc ++ entries
+
+        if length(entries) < limit do
+          {new_acc, chunk_count + 1}
+        else
+          {max_seq, _, _, _, _, _, _} = List.last(entries)
+          collect_oplog_chunks(db, max_seq, limit, new_acc, chunk_count + 1)
+        end
+    end
+  end
+
+  defp count_trace_sync_messages do
+    count_trace_sync_messages(0)
+  end
+
+  defp count_trace_sync_messages(count) do
+    receive do
+      {:trace, _, :send, {:ekv_sync, _, _, _, _}, _} ->
+        count_trace_sync_messages(count + 1)
+
+      {:trace, _, :send, _, _} ->
+        count_trace_sync_messages(count)
+    after
+      100 -> count
+    end
+  end
+
+  defp collect_trace_sync_details do
+    collect_trace_sync_details([])
+  end
+
+  defp collect_trace_sync_details(acc) do
+    receive do
+      {:trace, _, :send, {:ekv_sync, _, _, entries, seq}, _} ->
+        collect_trace_sync_details([{length(entries), seq} | acc])
+
+      {:trace, _, :send, _, _} ->
+        collect_trace_sync_details(acc)
+    after
+      100 -> Enum.reverse(acc)
+    end
+  end
 end

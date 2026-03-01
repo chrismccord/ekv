@@ -74,7 +74,7 @@ defmodule EKV.Supervisor do
   """
 
   @valid_opts [:name, :data_dir, :shards, :log, :tombstone_ttl, :gc_interval, :blue_green,
-               :cluster_size, :node_id]
+               :cluster_size, :node_id, :sync_chunk_size]
 
   def start_link(opts) do
     opts = Keyword.validate!(opts, @valid_opts)
@@ -93,6 +93,7 @@ defmodule EKV.Supervisor do
     gc_interval = Keyword.get(opts, :gc_interval, :timer.minutes(5))
     cluster_size = Keyword.get(opts, :cluster_size)
     node_id = Keyword.get(opts, :node_id)
+    sync_chunk_size = Keyword.get(opts, :sync_chunk_size, 500)
 
     validate_cas_config!(cluster_size, node_id)
 
@@ -114,7 +115,8 @@ defmodule EKV.Supervisor do
       registry: registry_name,
       sub_count: sub_count,
       cluster_size: cluster_size,
-      node_id: node_id
+      node_id: node_id,
+      sync_chunk_size: sync_chunk_size
     }
 
     :persistent_term.put({EKV, name}, config)

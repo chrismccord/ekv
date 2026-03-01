@@ -9,21 +9,34 @@ defmodule EKV.Replica do
   that created it. EKV entries survive node restarts, node death, and network
   partitions. Data is only removed by explicit delete or TTL expiry.
 
+  The default consistency model is Last-Writer-Wins (LWW) — every node can
+  read and write independently, and conflicts are resolved by timestamp. For
+  keys that need stronger guarantees, an opt-in Compare-And-Swap (CAS) mode
+  provides linearizable read-modify-write via CASPaxos consensus.
+
   Peer discovery is fully self-contained: EKV uses :net_kernel.monitor_nodes/1
-  and Node.list/0 directly. It has no external topology dependency.
+  and Node.list/0 directly. It has no external topology dependency. Zero
+  runtime deps. SQLite is vendored as a C NIF (c_src/sqlite3.c amalgamation).
 
 
   ## Supervision Tree
 
       EKV.Supervisor (rest_for_one)
+      ├── EKV.SubTracker         atomics subscriber count + process monitors
+      ├── Registry               keys: :duplicate, listeners: [sub_tracker]
+      ├── EKV.SubDispatcher.Supervisor (one_for_one)
+      │   ├── EKV.SubDispatcher 0   async event fan-out per shard
+      │   ├── EKV.SubDispatcher 1
+      │   └── ...
       ├── EKV.Replica.Supervisor (one_for_one)
       │   ├── EKV.Replica 0     shard GenServer (writes + replication + SQLite)
       │   ├── EKV.Replica 1
       │   └── ...               N shards (default 8)
       └── EKV.GC                periodic timer, sends :gc to each shard
 
-  rest_for_one means: single Replica crash → only that shard restarts.
-  GC is downstream of Replicas.
+  rest_for_one: SubTracker crash restarts everything. Registry crash
+  restarts Dispatchers + Replicas. Single Replica crash → only that shard
+  restarts. GC is downstream of Replicas.
 
 
   ## Storage: SQLite Only
@@ -38,20 +51,69 @@ defmodule EKV.Replica do
       │   kv          — current state, PK (key)                      │
       │   kv_oplog    — append-only mutation log, AUTOINCREMENT seq  │
       │   kv_peer_hwm — per-peer high-water marks for delta sync     │
-      │   kv_meta     — liveness tracking                            │
+      │   kv_meta     — liveness tracking + ballot counter           │
+      │   kv_paxos    — CAS consensus state per key (opt-in)         │
+      │                                                              │
+      │ Indexes:                                                     │
+      │   idx_kv_deleted  — partial on deleted_at (WHERE NOT NULL)   │
+      │   idx_kv_expires  — partial on expires_at (WHERE NOT NULL)   │
       │                                                              │
       │ - Single source of truth. Survives process/node crashes.     │
       │ - kv + oplog writes are atomic (BEGIN IMMEDIATE / COMMIT).   │
       └──────────────────────────────────────────────────────────────┘
 
-  Each shard opens System.schedulers_online() read connections, stored as a
-  tuple in persistent_term keyed by {EKV, name, :readers, shard_index}.
-  Reads pick a connection by rem(scheduler_id - 1, num_readers) — zero
-  contention, no pool, no GenServer hop. WAL mode ensures readers don't
-  block the writer.
+  Connections per shard:
+    - 1 writer connection (owned by the Replica GenServer)
+    - System.schedulers_online() reader connections
+
+  Reader connections are stored as a tuple of {db, get_stmt} in
+  persistent_term keyed by {EKV, name, :readers, shard_index}. Reads
+  pick a connection by rem(scheduler_id - 1, num_readers) — zero
+  contention, no pool, no GenServer hop. WAL mode ensures readers
+  don't block the writer.
 
   Values are stored as :erlang.term_to_binary/1 blobs. Encoding happens
   in the public EKV module; Replica and Store only see binaries.
+
+
+  ## Custom NIF and Dirty IO Bounces
+
+  EKV vendors sqlite3.c (amalgamation) and uses a custom NIF with no
+  runtime deps. The main latency bottleneck is the dirty IO scheduler
+  bounce (~1μs per NIF call), not SQL parsing.
+
+  Combined NIF functions reduce bounces per operation:
+
+      ┌──────────────────────────────────────────────────────────────┐
+      │ NIF function          │ Bounces │ Operations                 │
+      ├───────────────────────┼─────────┼────────────────────────────│
+      │ write_entry           │    1    │ BEGIN + kv upsert (LWW) +  │
+      │                       │         │ check changes + oplog +    │
+      │                       │         │ COMMIT (or ROLLBACK)       │
+      │ read_entry            │    1    │ reset + bind + step on     │
+      │                       │         │ cached prepared stmt       │
+      │ fetch_all             │    1    │ prepare + bind + step all  │
+      │                       │         │ rows + finalize            │
+      │ paxos_prepare         │    1    │ BEGIN + read/insert/update │
+      │                       │         │ kv_paxos + fallback read   │
+      │                       │         │ from kv + COMMIT           │
+      │ paxos_accept          │    1    │ BEGIN + ballot check +     │
+      │                       │         │ upsert kv_paxos + COMMIT   │
+      │ paxos_promote         │    1    │ BEGIN + read kv_paxos +    │
+      │                       │         │ ballot check + kv upsert + │
+      │                       │         │ oplog insert + clear       │
+      │                       │         │ kv_paxos + COMMIT          │
+      └──────────────────────────────────────────────────────────────┘
+
+  Without combined NIFs, a simple put would be 5 dirty bounces
+  (begin, upsert, check, oplog, commit). write_entry does it in 1.
+
+  Cached prepared statements:
+    - Writer: kv_upsert (LWW), kv_force_upsert (no LWW), oplog_insert
+    - Readers: get statement (per reader connection)
+
+  All IO-touching NIFs use ERL_NIF_DIRTY_JOB_IO_BOUND. The bind NIF
+  runs on a normal scheduler (no IO).
 
 
   ## Sharding
@@ -62,11 +124,15 @@ defmodule EKV.Replica do
   file. Shards on different nodes with the same index are counterparts —
   they replicate to each other and sync on connect.
 
-  Prefix scans (list/keys) cannot be routed to a single shard because
+  Prefix scans (scan/keys) cannot be routed to a single shard because
   the prefix doesn't determine the hash. They fan out to all shards.
 
+  The shard count is immutable — persisted in kv_meta on first open.
+  Changing it raises ArgumentError. Peer connections from nodes with
+  mismatched shard counts are rejected (logged error, no crash).
 
-  ## Write Path
+
+  ## Write Path (LWW)
 
       Client                  Replica (shard i)             Peers
         │                          │                          │
@@ -75,26 +141,28 @@ defmodule EKV.Replica do
         │   value_binary, opts}    │                          │
         │─────────────────────────>│                          │
         │                          │                          │
-        │                    LWW check vs SQLite              │
-        │                    (skip if existing ts is higher)  │
-        │                          │                          │
-        │                    SQLite put_with_oplog (atomic)   │
+        │                    write_entry NIF (1 dirty bounce): │
+        │                      BEGIN IMMEDIATE                │
+        │                      kv upsert (LWW WHERE clause)  │
+        │                      sqlite3_changes() == 0?        │
+        │                        → ROLLBACK (LWW lost)        │
+        │                        → oplog INSERT + COMMIT      │
         │                          │                          │
         │                          │ {:ekv_put, key,          │
         │                          │  value_binary, ts,       │
         │                          │  origin_node, expires_at}│
         │                          │─────────────────────────>│
-        │                          │  (to counterpart shard   │
-        │                          │   on each known peer)    │
+        │                          │  (fire-and-forget to     │
+        │                          │   each known peer)       │
         │                          │                          │
         │<─────────────────────────│                          │
         │         :ok              │                          │
 
-  Delete is identical but sets deleted_at = now and value = nil. The
-  broadcast message is {:ekv_delete, key, ts, origin_node}.
+  Delete is identical but sets deleted_at = now and value = nil.
+  Broadcast message: {:ekv_delete, key, ts, origin_node}.
 
-  Broadcasts go to Map.keys(state.remote_shards) — the set of nodes
-  with a confirmed live counterpart shard for this shard index.
+  On the receiving side, merge_remote_entry calls the same write_entry
+  NIF with the remote's timestamp — LWW decides whether to apply.
 
 
   ## Read Path
@@ -103,38 +171,246 @@ defmodule EKV.Replica do
 
       Client             SQLite (per-scheduler read connection)
         │                 │
-        │  Store.get      │
+        │ read_entry NIF  │
         │────────────────>│   via read_conn(name, shard)
-        │<────────────────│
+        │<────────────────│   1 dirty bounce: reset+bind+step
         │                 │
         │  check deleted_at, expires_at
         │  binary_to_term if live
         │
         │  return value | nil
 
-  No serialization, no message passing. Per-scheduler read connections
-  stored in persistent_term ensure zero contention.
+  No serialization, no message passing. The read_entry NIF reuses a
+  cached prepared statement — reset+bind+step in a single dirty bounce.
 
 
   ## Conflict Resolution: Last-Writer-Wins (LWW)
 
   Every entry carries a nanosecond timestamp and origin_node atom.
 
+  LWW is pushed into SQL via ON CONFLICT ... WHERE:
+
+      INSERT INTO kv (...) VALUES (...)
+      ON CONFLICT(key) DO UPDATE SET ...
+      WHERE excluded.timestamp > kv.timestamp
+        OR (excluded.timestamp = kv.timestamp
+            AND excluded.origin_node > kv.origin_node)
+
+  After the upsert, sqlite3_changes() == 0 means LWW lost — the
+  transaction is rolled back and no oplog entry is written.
+
+  Equivalent logic:
+
       lww_wins?(incoming_ts, incoming_origin, existing_ts, existing_origin)
         incoming_ts > existing_ts
         OR (incoming_ts == existing_ts AND incoming_origin > existing_origin)
 
-  This function is used in ALL write paths:
+  Used in ALL write paths:
     - Local put/delete (timestamp is always "now", so almost always wins)
     - Remote replication receive (ekv_put / ekv_delete)
     - Bulk sync (ekv_sync entries)
     - GC TTL expiry (converting expired entry to tombstone)
 
-  The tiebreaker (origin_node atom comparison) is deterministic across all
-  nodes, preventing mutual-overwrite on equal timestamps.
+  The tiebreaker (origin_node atom comparison) is deterministic across
+  all nodes. Atom ordering matches SQLite TEXT ordering for node names
+  (both lexicographic ASCII).
 
-  A delete is just an entry with deleted_at set. Same LWW applies — a put
-  with a higher timestamp beats a delete, and vice versa.
+  A delete is just an entry with deleted_at set. Same LWW applies — a
+  put with a higher timestamp beats a delete, and vice versa.
+
+
+  ## Compare-And-Swap (CAS) via CASPaxos
+
+  EKV is eventually consistent by default. For keys that need atomic
+  read-modify-write, CAS provides per-key linearizability via a
+  simplified CASPaxos protocol. CAS is opt-in: requires cluster_size
+  and node_id config. Both LWW and CAS writes coexist — different keys
+  can use different consistency models in the same EKV instance.
+
+  ### Why CASPaxos?
+
+  Classic Paxos replicates a log. CASPaxos is simpler — it's a
+  single-decree consensus protocol for values, not logs. Each key is
+  an independent consensus instance. The protocol is:
+
+      1. Prepare (read phase): learn the current value + get promises
+      2. Accept (write phase): propose a new value to acceptors
+      3. Commit: write to kv + oplog, broadcast to all peers
+
+  No log replication, no leader election, no view changes. Any node
+  can be a proposer for any key at any time.
+
+  ### Ballot Numbers
+
+  Each CAS operation gets a unique ballot {counter, node_id}. Counters
+  are monotonically increasing per-shard (max(system_time_ns, prev+1))
+  and persisted in kv_meta to survive restarts. The {counter, node_id}
+  tuple is compared lexicographically — higher counter wins, ties broken
+  by node_id.
+
+  ### SQLite Table: kv_paxos
+
+      key TEXT PRIMARY KEY
+      promised_counter INTEGER    — highest ballot promised
+      promised_node INTEGER
+      accepted_counter INTEGER    — highest ballot accepted
+      accepted_node INTEGER
+      accepted_value BLOB         — tentative value (not yet committed)
+      accepted_timestamp INTEGER
+      accepted_origin TEXT
+      accepted_expires_at INTEGER
+      accepted_deleted_at INTEGER
+
+  kv_paxos is separate from kv. Values only move to kv after commit
+  (via paxos_promote). This prevents phantom reads — a CAS value is
+  invisible to get/scan until consensus is reached.
+
+  ### CAS Write Path (3-phase)
+
+      Proposer (shard i)          Acceptor 1            Acceptor 2
+        │                           │                      │
+        │ ── Phase 1: PREPARE ──    │                      │
+        │                           │                      │
+        │ local paxos_prepare NIF   │                      │
+        │ (kv_paxos: promise +      │                      │
+        │  return accepted value)   │                      │
+        │                           │                      │
+        │ {:ekv_prepare, ref, pid,  │                      │
+        │  key, ballot_c, ballot_n} │                      │
+        │──────────────────────────>│                      │
+        │──────────────────────────────────────────────────>│
+        │                           │                      │
+        │ {:ekv_promise, ref, ...   │                      │
+        │  acc_c, acc_n, kv_row}    │                      │
+        │<──────────────────────────│                      │
+        │<──────────────────────────────────────────────────│
+        │                           │                      │
+        │  quorum promises reached  │                      │
+        │  pick highest accepted    │                      │
+        │  value → apply operation  │                      │
+        │  (compare-and-swap check) │                      │
+        │                           │                      │
+        │ ── Phase 2: ACCEPT ───    │                      │
+        │                           │                      │
+        │ {:ekv_accept, ref, pid,   │                      │
+        │  key, ballot, entry}      │                      │
+        │──────────────────────────>│                      │
+        │──────────────────────────────────────────────────>│
+        │                           │                      │
+        │  acceptors write to       │                      │
+        │  kv_paxos ONLY (not kv)   │                      │
+        │                           │                      │
+        │ {:ekv_accepted, ref, ...} │                      │
+        │<──────────────────────────│                      │
+        │<──────────────────────────────────────────────────│
+        │                           │                      │
+        │  quorum accepts reached   │                      │
+        │                           │                      │
+        │ ── Phase 3: COMMIT ───    │                      │
+        │                           │                      │
+        │  local: paxos_accept +    │                      │
+        │    write_entry (kv+oplog) │                      │
+        │    clear kv_paxos accepted│                      │
+        │                           │                      │
+        │ {:ekv_cas_committed, ...} │  (to acceptors)      │
+        │──────────────────────────>│                      │
+        │──────────────────────────────────────────────────>│
+        │                           │                      │
+        │ {:ekv_put, ...}           │  (LWW to non-        │
+        │──────────────────────────>│   acceptors)         │
+        │                           │                      │
+        │  acceptors: paxos_promote │                      │
+        │  (kv_paxos → kv + oplog)  │                      │
+
+  The proposer defers its own local accept until after remote quorum.
+  This prevents phantom reads — if the proposer crashes before quorum,
+  no value was written to kv locally.
+
+  ### Phantom Prevention
+
+  Key invariant: accepted values in kv_paxos are INVISIBLE to reads.
+
+    - paxos_accept writes to kv_paxos only (not kv, not oplog)
+    - No subscriber events on accept
+    - get/scan/keys read from kv table only
+    - Value appears in kv only after paxos_promote (commit phase)
+
+  If the proposer crashes between accept and commit:
+    - kv_paxos has the tentative value
+    - kv does NOT have it → no phantom read
+    - Next CAS on same key: paxos_prepare reads from kv_paxos, recovers
+      the tentative value, and either re-proposes or overwrites it
+
+  ### Commit Dissemination
+
+  After commit, the proposer sends two types of messages:
+
+    - {:ekv_cas_committed, key, ballot_c, ballot_n, shard}
+      → sent to nodes that participated as acceptors (have kv_paxos state)
+      → receiver calls paxos_promote: reads from kv_paxos, writes to
+        kv + oplog, clears kv_paxos accepted columns
+
+    - {:ekv_put, key, value, ts, origin, expires_at}
+      → sent to nodes that were NOT acceptors (no kv_paxos state)
+      → receiver applies via normal LWW merge (idempotent)
+
+  This split avoids sending the value twice to acceptors (they already
+  have it in kv_paxos) while ensuring non-acceptors still get the data.
+
+  ### paxos_promote (commit on acceptor side)
+
+  Single NIF dirty bounce:
+    1. BEGIN IMMEDIATE
+    2. Read kv_paxos for the key
+    3. Verify ballot matches (if stale → return {:ok, :stale})
+    4. Read previous value from kv (for subscriber events)
+    5. Force-upsert to kv (no LWW — Paxos ballots determine ordering)
+    6. Insert to oplog
+    7. Clear kv_paxos accepted columns
+    8. COMMIT
+
+  Clearing accepted columns means future paxos_prepare reads fall back
+  to kv (committed state). Also allows GC to purge the kv_paxos row
+  when the kv entry itself is tombstone-purged.
+
+  ### Quorum and Failure Handling
+
+  Quorum: floor(cluster_size / 2) + 1
+
+  Before starting CAS, the proposer checks that enough node_ids are
+  reachable. count_alive_node_ids tracks distinct node_ids (not Erlang
+  nodes — multiple Erlang nodes may share a node_id in blue-green).
+
+  Failure modes:
+    - Nack in prepare: ballot too low. If can't reach quorum → fail.
+    - Nack in accept: ballot superseded. If can't reach quorum → fail.
+    - Timeout (5s): no response from enough peers → {:error, :quorum_timeout}
+    - Node death during CAS: fail_pending_cas_if_no_quorum checks all
+      pending ops and fails those that can no longer reach quorum.
+
+  For EKV.update (read-modify-write), failures auto-retry up to 5 times
+  with random backoff (10-60ms). Each retry generates a new ballot.
+
+  ### CAS + LWW Coexistence
+
+  CAS and LWW operate on the same kv table and oplog. They coexist
+  safely because:
+
+    - CAS commit uses kv_force_upsert (no LWW WHERE clause) — Paxos
+      ballots, not timestamps, determine ordering for CAS keys.
+    - LWW broadcast after CAS commit ensures non-CAS-aware peers (or
+      peers that joined after the CAS round) still get the value via
+      normal replication.
+    - kv_paxos state is per-key. A key can switch between LWW puts and
+      CAS operations freely — the last committed value wins.
+    - Sync sends entries from kv (committed state). kv_paxos tentative
+      values are NOT included in sync — they only exist locally until
+      committed.
+
+  CAS operations are serialized per-shard through the GenServer. Two
+  concurrent CAS operations on the same key from different nodes will
+  compete via ballot ordering — the higher ballot wins. update() with
+  auto-retry handles this transparently.
 
 
   ## Peer Discovery and Tracking
@@ -149,14 +425,20 @@ defmodule EKV.Replica do
         send ekv_peer_connect to the new node's counterpart shard
 
       nodedown:
-        remove from remote_shards map. Does not purge any data.
+        remove from remote_shards + peer_node_ids
+        fail any pending CAS ops that lost quorum
 
       DOWN (monitored remote shard pid):
-        remove from remote_shards map
+        remove from remote_shards + peer_node_ids
+        fail any pending CAS ops that lost quorum
 
   remote_shards :: %{node() => pid()} tracks confirmed live counterpart
   shard processes. A node enters this map only after a successful
   peer_connect / peer_connect_ack handshake where its pid is monitored.
+
+  peer_node_ids :: %{node() => integer()} maps Erlang nodes to their
+  configured node_id. Used for CAS quorum counting (distinct node_ids,
+  not Erlang nodes, determine quorum).
 
 
   ## Peer Sync Protocol
@@ -168,30 +450,34 @@ defmodule EKV.Replica do
       Node A (shard i)                        Node B (shard i)
         │                                         │
         │  {:ekv_peer_connect,                    │
-        │   pid_a, i, num_shards, seq_a}          │
-        │───────────────────────────────────────> │
+        │   pid_a, i, num_shards, seq_a, nid_a}  │
+        │────────────────────────────────────────>│
         │                                         │
         │                          validate num_shards match
         │                          monitor pid_a
         │                          add A to remote_shards
+        │                          track A's node_id
         │                                         │
         │  {:ekv_peer_connect_ack,                │
-        │   pid_b, i, num_shards, seq_b}          │
-        │ <───────────────────────────────────────│
+        │   pid_b, i, num_shards, seq_b, nid_b}  │
+        │<────────────────────────────────────────│
         │                                         │
         │                          send_sync_data(A, seq_a):
         │                            look up hwm for A
         │                            if hwm exists & oplog not truncated:
-        │                              delta = oplog entries since hwm
+        │                              delta sync (chunked)
         │                            else:
-        │                              full = all live kv + recent tombstones
+        │                              full sync (chunked)
         │                                         │
-        │  {:ekv_sync, node_b, i, entries, seq_b} │
-        │ <───────────────────────────────────────│
+        │  {:ekv_sync, node_b, i, chunk, seq}     │
+        │<────────────────────────────────────────│
+        │  {:ekv_sync, node_b, i, chunk, seq}     │
+        │<────────────────────────────────────────│
+        │  ...                                    │
         │                                         │
         │  (A does the same for B)                │
-        │───────────────────────────────────────> │
-        │  {:ekv_sync, node_a, i, entries, seq_a} │
+        │────────────────────────────────────────>│
+        │  {:ekv_sync, node_a, i, chunk, seq}     │
         │                                         │
 
   Both sides send data. This is symmetric — each side sends what the
@@ -206,6 +492,7 @@ defmodule EKV.Replica do
       │            contains entries back to that HWM                │
       │                                                             │
       │ Query: SELECT * FROM kv_oplog WHERE seq > peer_hwm          │
+      │        ORDER BY seq LIMIT chunk_size                        │
       │                                                             │
       │ Sends only mutations since the last sync. Efficient for     │
       │ brief disconnects where the oplog hasn't been truncated.    │
@@ -216,8 +503,9 @@ defmodule EKV.Replica do
       │ Condition: no HWM for this peer, OR oplog truncated past    │
       │            the peer's HWM (min_seq > peer_hwm)              │
       │                                                             │
-      │ Query: SELECT * FROM kv WHERE deleted_at IS NULL            │
-      │        OR deleted_at > tombstone_cutoff                     │
+      │ Query: SELECT * FROM kv WHERE (deleted_at IS NULL           │
+      │          OR deleted_at > cutoff) AND key > cursor            │
+      │        ORDER BY key LIMIT chunk_size                        │
       │                                                             │
       │ Sends all live entries + recent tombstones (so the peer     │
       │ learns about deletes that happened while it was away).      │
@@ -227,6 +515,58 @@ defmodule EKV.Replica do
   After receiving sync data, the receiver applies each entry through
   merge_remote_entry (LWW check), then records the sender's advertised
   max_seq as the new HWM for that peer.
+
+
+  ## Chunked Sync
+
+  Both full and delta sync use cursor-based pagination to avoid loading
+  the entire dataset into memory. Default chunk size: 500 entries
+  (configurable via :sync_chunk_size).
+
+  The sender sends one chunk, then yields to other messages via
+  send(self(), {:continue_full_sync, ...}) before sending the next.
+  This prevents the shard GenServer from blocking — CAS messages,
+  regular writes, and other sync operations can interleave between
+  chunks.
+
+      Sender (shard i)
+        │
+        │ send_full_chunk(cursor=nil)
+        │   query chunk 1 (500 entries)
+        │   send {:ekv_sync, entries, seq=0}  ──> peer
+        │   send(self(), {:continue_full_sync, cursor="last_key"})
+        │   return {:noreply, state}
+        │
+        │ ... process other messages ...
+        │
+        │ handle_info(:continue_full_sync)
+        │   check peer still in remote_shards (abort if gone)
+        │   query chunk 2 (500 entries)
+        │   send {:ekv_sync, entries, seq=0}  ──> peer
+        │   send(self(), {:continue_full_sync, cursor="last_key"})
+        │
+        │ ... process other messages ...
+        │
+        │ handle_info(:continue_full_sync)
+        │   query chunk 3 (< 500 entries = final)
+        │   send {:ekv_sync, entries, seq=my_seq}  ──> peer
+        │   set_hwm(peer, remote_seq)
+        │
+
+  HWM safety: intermediate chunks send seq=0 in the sync message.
+  Only the final chunk carries the real my_seq. The receiver's
+  set_hwm uses MAX(current, new), so seq=0 is harmless. If the sender
+  crashes mid-sync, the HWM was never updated — reconnect triggers
+  a fresh sync from the old HWM.
+
+  Continuation handlers check remote_shards before each chunk. If the
+  peer disconnected mid-sync, the continuation silently stops.
+
+  Safety under concurrent activity:
+    - Write between chunks: LWW is idempotent. Duplicates resolved.
+    - CAS between chunks: independent tables (kv_paxos vs kv).
+    - GC between chunks: cursor-based, skips purged entries.
+    - Second sync triggered: LWW + MAX(hwm) make double-sends safe.
 
 
   ## High-Water Marks (HWM)
@@ -239,10 +579,13 @@ defmodule EKV.Replica do
   reconnects, I query oplog entries with seq > hwm[X] and send them.
 
   HWMs are updated in two places:
-    1. In send_sync_data: after deciding what to send, record their
-       advertised seq as our HWM for them.
+    1. In send_sync_data: after the final chunk, record their advertised
+       seq as our HWM for them.
     2. In ekv_sync handler: after applying received data, record the
        sender's seq from the sync message.
+
+  HWM monotonicity: set_hwm uses MAX(current, new) in SQL so HWMs
+  never regress, even if messages arrive out of order.
 
 
   ## Recovery Scenarios
@@ -254,6 +597,7 @@ defmodule EKV.Replica do
         Replica.init:
           Store.open  →  SQLite db still on disk
           open read connections
+          restore ballot_counter from kv_meta
           monitor_nodes + send ekv_peer_connect
         │
         Peer responds with ekv_peer_connect_ack
@@ -263,6 +607,10 @@ defmodule EKV.Replica do
 
   Data survives because SQLite is durable. The oplog enables efficient
   delta sync for the mutations missed while the node was down.
+
+  CAS state (kv_paxos) also survives restart. A commit notification
+  received after restart will successfully promote values that were
+  accepted before the crash.
 
   ### Scenario 2: Fresh node (empty data dir, replacing a dead node)
 
@@ -275,6 +623,7 @@ defmodule EKV.Replica do
         │
         Peers have no HWM for this new node
           → full sync: send all live entries + recent tombstones
+            (chunked, ~500 entries per message)
         │
         New node applies all entries via merge_remote_entry
         Records HWMs for all peers
@@ -291,17 +640,54 @@ defmodule EKV.Replica do
         - C writes to local SQLite only (no peers in remote_shards)
         - No data is lost on either side
         - nodedown fires, C removed from A/B's remote_shards
+        - CAS operations on C fail with {:error, :no_quorum}
+          (cannot reach majority)
+        - CAS operations on A/B succeed if A+B form a majority
 
       Heal:
         - nodeup fires on both sides
         - ekv_peer_connect / ekv_peer_connect_ack exchanged
-        - send_sync_data: if HWMs still valid → delta sync
-                          if oplog truncated  → full sync
+        - send_sync_data: if HWMs still valid → delta sync (chunked)
+                          if oplog truncated  → full sync (chunked)
         - Both sides send their missed mutations
         - LWW resolves any conflicts deterministically:
             * Disjoint keys: union of both sides
             * Same key both sides: higher timestamp wins
             * Put vs delete: whichever has higher timestamp wins
+        - CAS-written keys: already committed to kv via normal sync.
+          kv_paxos state is local only — sync uses kv (committed values).
+
+
+  ## Subscription System
+
+  Subscribers receive {:ekv, [%EKV.Event{}], %{name: name}} messages
+  for keys matching a prefix. Fan-out is async — moved off the shard
+  write path into per-shard SubDispatcher processes.
+
+  On write, the shard does at most:
+    1. atomics read of sub_count (1 cell)
+    2. send({dispatcher, {:dispatch, events}}) if sub_count > 0
+
+  SubDispatcher does prefix decomposition lookup via Registry:
+    key "a/b/c" → lookup prefixes "", "a/", "a/b/", "a/b/c"
+    O(slash_count) ETS hash lookups, not O(N) subscriber scan.
+
+  Subscription matching is at "/" boundaries only:
+    - "foo/" matches "foo/bar", "foo/baz/qux"
+    - "foo" matches exactly "foo" (no trailing slash = exact key)
+    - "" matches all keys
+
+  Events are dispatched for:
+    - Local put/delete (LWW writes)
+    - Remote put/delete (replication receives)
+    - Sync entries (bulk, with batched events)
+    - CAS commit (paxos_promote, with previous value for deletes)
+    - GC TTL expiry (delete events with previous value)
+
+  Events are NOT dispatched for:
+    - CAS accept (kv_paxos write only — no phantom events)
+    - Tombstone purge (already notified on original delete)
+    - LWW-rejected writes (no state change)
 
 
   ## TTL (Time-To-Live)
@@ -310,13 +696,13 @@ defmodule EKV.Replica do
         → expires_at = System.system_time(:nanosecond) + ttl * 1_000_000
 
   expires_at is absolute nanoseconds, stored in SQLite and included
-  in all replication messages.
+  in all replication messages. CAS operations also support :ttl.
 
   Read path: EKV.get checks expires_at lazily — returns nil if past.
 
   GC converts expired entries into tombstones:
     1. Find entries where expires_at < now AND deleted_at IS NULL
-    2. Set deleted_at = now, append to oplog
+    2. Set deleted_at = now, append to oplog (via write_entry NIF)
     3. Broadcast {:ekv_delete, ...} so peers tombstone it too
 
 
@@ -325,7 +711,7 @@ defmodule EKV.Replica do
   Periodic timer sends {:gc, now, tombstone_cutoff} to each shard.
   The shard handles GC inside its own process (serialized with writes).
 
-  Each tick, three phases:
+  Each tick, five phases:
 
       Phase 1: Expire TTL entries
         expired entries → set deleted_at, write oplog, broadcast delete
@@ -333,8 +719,14 @@ defmodule EKV.Replica do
 
       Phase 2: Purge old tombstones
         deleted_at < now - tombstone_ttl → hard delete from SQLite kv
-        (tombstone_ttl default: 7 days — keeps tombstones long enough for
-         partitioned nodes to learn about deletes when they reconnect)
+        (tombstone_ttl default: 7 days — keeps tombstones long enough
+         for partitioned nodes to learn about deletes on reconnect)
+
+      Phase 2b: Purge orphan kv_paxos rows (if CAS enabled)
+        DELETE FROM kv_paxos WHERE key NOT IN (SELECT key FROM kv)
+          AND accepted_counter = 0
+        (cleans up paxos state for tombstone-purged keys, only if
+         no in-flight accept is pending)
 
       Phase 3: Prune stale peer HWMs
         Remove kv_peer_hwm rows for peers not currently connected.
@@ -346,10 +738,47 @@ defmodule EKV.Replica do
         (keeps oplog bounded; entries below the slowest connected
          peer's HWM are no longer needed for delta sync)
 
+      Phase 5: Bump liveness
+        touch_last_active updates kv_meta.last_active_at.
+        Used by stale DB detection on restart.
+
+
+  ## Stale DB Protection
+
+  On Store.open, if an existing db file's last_active_at is older than
+  tombstone_ttl - gc_interval, the db is wiped (deleted and recreated).
+  This prevents zombie resurrection: peers will have GC'd tombstones for
+  entries deleted while the node was away, so a stale db would never learn
+  about them. After wipe, full sync from peers rebuilds from scratch.
+
+
+  ## GenServer State
+
+      %EKV.Replica{
+        name:           atom,           # EKV instance name
+        shard_index:    integer,        # 0..num_shards-1
+        num_shards:     integer,
+        db:             reference,      # SQLite writer connection (NIF resource)
+        data_dir:       string,
+        stmts:          %{              # cached prepared statements
+          kv_upsert:       reference,   #   LWW upsert
+          kv_force_upsert: reference,   #   unconditional upsert (CAS commit)
+          oplog_insert:    reference    #   oplog append
+        },
+        readers:        [{db, stmt}],   # per-scheduler read connections
+        remote_shards:  %{node => pid}, # confirmed live peer shards
+        # CAS fields (nil if CAS not configured):
+        node_id:        integer | nil,  # this node's CAS identity
+        cluster_size:   integer | nil,  # total CAS participants
+        ballot_counter: integer,        # monotonic, persisted in kv_meta
+        peer_node_ids:  %{node => id},  # Erlang node → CAS node_id
+        pending_cas:    %{ref => op}    # in-flight CAS operations
+      }
+
 
   ## Message Reference
 
-  Steady-state replication (per-operation, fire-and-forget):
+  Steady-state LWW replication (per-operation, fire-and-forget):
     {:ekv_put, key, value_binary, timestamp, origin_node, expires_at}
     {:ekv_delete, key, timestamp, origin_node}
 
@@ -357,15 +786,38 @@ defmodule EKV.Replica do
     {:ekv_peer_connect, pid, shard_index, num_shards, my_max_seq, node_id}
     {:ekv_peer_connect_ack, pid, shard_index, num_shards, my_max_seq, node_id}
 
-  Bulk sync (after handshake):
-    {:ekv_sync, from_node, shard_index, entries, sender_max_seq}
+  Chunked sync (after handshake, multiple messages per sync):
+    {:ekv_sync, from_node, shard_index, entries, sender_seq}
       entries: [{key, value_binary, timestamp, origin_node,
                  expires_at, deleted_at}]
+      sender_seq: 0 for intermediate chunks, real seq for final chunk
+
+  Sync continuations (self-messages for chunking):
+    {:continue_full_sync, node, last_key, cutoff, my_seq, remote_seq, chunk_size}
+    {:continue_delta_sync, node, last_seq, my_seq, remote_seq, chunk_size}
+
+  CAS proposer → acceptors:
+    {:ekv_prepare, ref, proposer_pid, key, ballot_c, ballot_n, shard}
+    {:ekv_accept, ref, proposer_pid, key, ballot_c, ballot_n, entry_tuple, shard}
+    {:ekv_cas_committed, key, ballot_c, ballot_n, shard}
+
+  CAS acceptors → proposer:
+    {:ekv_promise, ref, pid, node_id, acc_c, acc_n, kv_row}
+    {:ekv_nack, ref, pid, node_id, promised_c, promised_n}
+    {:ekv_accepted, ref, pid, node_id}
+    {:ekv_accept_nack, ref, pid, node_id}
+
+  CAS internal (self-messages):
+    {:cas_timeout, ref}
+    {:cas_retry, ref, key, operation}
 
   GC (from EKV.GC timer):
     {:gc, now_nanoseconds, tombstone_cutoff_nanoseconds}
 
-  All messages are sent to the counterpart shard by registered name:
+  Subscriber dispatch (shard → SubDispatcher):
+    {:dispatch, [%EKV.Event{}]}
+
+  All peer messages are sent to the counterpart shard by registered name:
     send({:"#{name}_ekv_replica_#{shard}", target_node}, message)
 
   There is no gossip or re-broadcast. Replication is direct: the node
@@ -1004,6 +1456,28 @@ defmodule EKV.Replica do
     {:noreply, state}
   end
 
+  # =====================================================================
+  # Chunked sync continuations
+  # =====================================================================
+
+  def handle_info({:continue_full_sync, remote_node, last_key, tombstone_cutoff,
+                   my_seq, remote_seq, chunk_size}, state) do
+    if Map.has_key?(state.remote_shards, remote_node) do
+      send_full_chunk(state, remote_node, last_key, tombstone_cutoff, my_seq, remote_seq, chunk_size)
+    end
+
+    {:noreply, state}
+  end
+
+  def handle_info({:continue_delta_sync, remote_node, last_seq,
+                   my_seq, remote_seq, chunk_size}, state) do
+    if Map.has_key?(state.remote_shards, remote_node) do
+      send_delta_chunk(state, remote_node, last_seq, my_seq, remote_seq, chunk_size)
+    end
+
+    {:noreply, state}
+  end
+
   def handle_info(_msg, state) do
     {:noreply, state}
   end
@@ -1103,47 +1577,74 @@ defmodule EKV.Replica do
     %{db: db} = state
     config = EKV.get_config(state.name)
     tombstone_cutoff = System.system_time(:nanosecond) - config.tombstone_ttl * 1_000_000
+    chunk_size = config.sync_chunk_size
 
     # Check if we have a HWM for this peer and can do delta sync
     peer_hwm = Store.get_hwm(db, remote_node)
     my_min_seq = Store.min_seq(db)
+    my_seq = Store.max_seq(db)
 
-    {entries, their_seq_to_record} =
-      cond do
-        # Peer told us their seq, so after sync we'll record it as their HWM
-        # Can we send a delta?
-        peer_hwm && peer_hwm >= my_min_seq ->
-          # Delta: send oplog entries since the HWM we have for them
-          oplog_entries = Store.oplog_since(db, peer_hwm)
+    cond do
+      peer_hwm && peer_hwm >= my_min_seq ->
+        send_delta_chunk(state, remote_node, peer_hwm, my_seq, remote_seq, chunk_size)
 
-          entries =
-            Enum.map(oplog_entries, fn {_seq, key, value, timestamp, origin_node, expires_at,
-                                        is_delete} ->
-              deleted_at = if is_delete, do: timestamp, else: nil
-              {key, value, timestamp, origin_node, expires_at, deleted_at}
-            end)
-
-          {entries, remote_seq}
-
-        true ->
-          # Full sync
-          entries = Store.full_state(db, tombstone_cutoff)
-          {entries, remote_seq}
-      end
-
-    if entries != [] do
-      my_seq = Store.max_seq(db)
-
-      send_to_peer(
-        state,
-        remote_node,
-        {:ekv_sync, node(), state.shard_index, entries, my_seq}
-      )
+      true ->
+        send_full_chunk(state, remote_node, nil, tombstone_cutoff, my_seq, remote_seq, chunk_size)
     end
+  end
 
-    # Record their advertised seq as our HWM for them
-    if their_seq_to_record > 0 do
-      Store.set_hwm(db, remote_node, their_seq_to_record)
+  defp send_full_chunk(state, remote_node, last_key, tombstone_cutoff, my_seq, remote_seq, chunk_size) do
+    entries = Store.full_state_chunk(state.db, tombstone_cutoff, last_key, chunk_size)
+
+    case entries do
+      [] ->
+        # Done — record their advertised seq as our HWM for them
+        if remote_seq > 0, do: Store.set_hwm(state.db, remote_node, remote_seq)
+
+      _ ->
+        final? = length(entries) < chunk_size
+        seq_to_send = if final?, do: my_seq, else: 0
+
+        send_to_peer(state, remote_node,
+          {:ekv_sync, node(), state.shard_index, entries, seq_to_send})
+
+        if final? do
+          if remote_seq > 0, do: Store.set_hwm(state.db, remote_node, remote_seq)
+        else
+          next_key = elem(List.last(entries), 0)
+          send(self(), {:continue_full_sync, remote_node, next_key,
+                        tombstone_cutoff, my_seq, remote_seq, chunk_size})
+        end
+    end
+  end
+
+  defp send_delta_chunk(state, remote_node, last_seq, my_seq, remote_seq, chunk_size) do
+    oplog_entries = Store.oplog_since_chunk(state.db, last_seq, chunk_size)
+
+    case oplog_entries do
+      [] ->
+        if remote_seq > 0, do: Store.set_hwm(state.db, remote_node, remote_seq)
+
+      _ ->
+        entries =
+          Enum.map(oplog_entries, fn {_seq, key, value, timestamp, origin_node, expires_at, is_delete} ->
+            deleted_at = if is_delete, do: timestamp, else: nil
+            {key, value, timestamp, origin_node, expires_at, deleted_at}
+          end)
+
+        final? = length(oplog_entries) < chunk_size
+        seq_to_send = if final?, do: my_seq, else: 0
+
+        send_to_peer(state, remote_node,
+          {:ekv_sync, node(), state.shard_index, entries, seq_to_send})
+
+        if final? do
+          if remote_seq > 0, do: Store.set_hwm(state.db, remote_node, remote_seq)
+        else
+          {max_chunk_seq, _, _, _, _, _, _} = List.last(oplog_entries)
+          send(self(), {:continue_delta_sync, remote_node, max_chunk_seq,
+                        my_seq, remote_seq, chunk_size})
+        end
     end
   end
 
