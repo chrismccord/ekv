@@ -72,11 +72,12 @@ defmodule EKV.TestCluster do
 
   @doc "Disconnect two peer nodes from each other"
   def disconnect_nodes(node_a, node_b) do
-    # Set wrong cookie BEFORE disconnect to prevent Erlang auto-reconnect.
-    # Without this, a send({name, node}, msg) on either side can silently
-    # re-establish the distribution connection, defeating the partition.
-    rpc!(node_a, :erlang, :set_cookie, [node_b, :partition])
-    rpc!(node_b, :erlang, :set_cookie, [node_a, :partition])
+    # Set MISMATCHED cookies BEFORE disconnect to prevent Erlang auto-reconnect.
+    # Both sides must disagree — if both used the same cookie (e.g. :partition),
+    # the handshake would succeed and the partition would silently heal when
+    # any process does send({name, node}, msg) before processing nodedown.
+    rpc!(node_a, :erlang, :set_cookie, [node_b, :partition_a])
+    rpc!(node_b, :erlang, :set_cookie, [node_a, :partition_b])
     rpc!(node_a, :erlang, :disconnect_node, [node_b])
   end
 
@@ -125,7 +126,12 @@ defmodule EKV.TestCluster do
   end
 
   def start_collecting_subscriber_on(node, ekv_name, prefix, target_pid, collect_timeout) do
-    :erpc.call(node, __MODULE__, :start_collecting_subscriber, [ekv_name, prefix, target_pid, collect_timeout])
+    :erpc.call(node, __MODULE__, :start_collecting_subscriber, [
+      ekv_name,
+      prefix,
+      target_pid,
+      collect_timeout
+    ])
   end
 
   @doc false

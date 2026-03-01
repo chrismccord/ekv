@@ -73,8 +73,18 @@ defmodule EKV.Supervisor do
     preserves the `kv_meta` `num_shards` row, so mismatches are caught.
   """
 
-  @valid_opts [:name, :data_dir, :shards, :log, :tombstone_ttl, :gc_interval, :blue_green,
-               :cluster_size, :node_id, :sync_chunk_size]
+  @valid_opts [
+    :name,
+    :data_dir,
+    :shards,
+    :log,
+    :tombstone_ttl,
+    :gc_interval,
+    :blue_green,
+    :cluster_size,
+    :node_id,
+    :sync_chunk_size
+  ]
 
   def start_link(opts) do
     opts = Keyword.validate!(opts, @valid_opts)

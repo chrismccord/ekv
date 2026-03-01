@@ -1078,12 +1078,36 @@ defmodule EKV.Replica do
   # Peer sync protocol
   # =====================================================================
 
-  def handle_info({:ekv_peer_connect, remote_pid, remote_shard, remote_num_shards, remote_seq, remote_node_id}, state) do
-    {:noreply, do_peer_connect(state, remote_pid, remote_shard, remote_num_shards, remote_seq, remote_node_id)}
+  def handle_info(
+        {:ekv_peer_connect, remote_pid, remote_shard, remote_num_shards, remote_seq,
+         remote_node_id},
+        state
+      ) do
+    {:noreply,
+     do_peer_connect(
+       state,
+       remote_pid,
+       remote_shard,
+       remote_num_shards,
+       remote_seq,
+       remote_node_id
+     )}
   end
 
-  def handle_info({:ekv_peer_connect_ack, remote_pid, remote_shard, remote_num_shards, remote_seq, remote_node_id}, state) do
-    {:noreply, do_peer_connect_ack(state, remote_pid, remote_shard, remote_num_shards, remote_seq, remote_node_id)}
+  def handle_info(
+        {:ekv_peer_connect_ack, remote_pid, remote_shard, remote_num_shards, remote_seq,
+         remote_node_id},
+        state
+      ) do
+    {:noreply,
+     do_peer_connect_ack(
+       state,
+       remote_pid,
+       remote_shard,
+       remote_num_shards,
+       remote_seq,
+       remote_node_id
+     )}
   end
 
   def handle_info({:ekv_sync, from_node, _shard, entries, their_seq}, state) do
@@ -1163,9 +1187,10 @@ defmodule EKV.Replica do
   def handle_info({:nodedown, dead_node}, state) do
     log_once(state, fn -> "#{log_prefix(state)} nodedown #{dead_node} (data preserved)" end)
 
-    state = %{state |
-      remote_shards: Map.delete(state.remote_shards, dead_node),
-      peer_node_ids: Map.delete(state.peer_node_ids, dead_node)
+    state = %{
+      state
+      | remote_shards: Map.delete(state.remote_shards, dead_node),
+        peer_node_ids: Map.delete(state.peer_node_ids, dead_node)
     }
 
     # Check if any pending CAS ops lost quorum
@@ -1186,9 +1211,10 @@ defmodule EKV.Replica do
         "#{log_prefix_shard(state)} remote_shard_down #{remote_node} (data preserved)"
       end)
 
-      state = %{state |
-        remote_shards: Map.delete(state.remote_shards, remote_node),
-        peer_node_ids: Map.delete(state.peer_node_ids, remote_node)
+      state = %{
+        state
+        | remote_shards: Map.delete(state.remote_shards, remote_node),
+          peer_node_ids: Map.delete(state.peer_node_ids, remote_node)
       }
 
       state = fail_pending_cas_if_no_quorum(state)
@@ -1216,7 +1242,10 @@ defmodule EKV.Replica do
     {:noreply, state}
   end
 
-  def handle_info({:ekv_accept, ref, proposer_pid, key, ballot_c, ballot_n, entry_tuple, _shard}, state) do
+  def handle_info(
+        {:ekv_accept, ref, proposer_pid, key, ballot_c, ballot_n, entry_tuple, _shard},
+        state
+      ) do
     %{db: db} = state
 
     {_key, value_binary, timestamp, origin_node_str, expires_at, deleted_at} = entry_tuple
@@ -1239,11 +1268,20 @@ defmodule EKV.Replica do
   def handle_info({:ekv_cas_committed, key, ballot_c, ballot_n, _shard}, state) do
     %{db: db, stmts: stmts} = state
 
-    case Store.paxos_promote(db, stmts.kv_force_upsert, stmts.oplog_insert, key, ballot_c, ballot_n) do
+    case Store.paxos_promote(
+           db,
+           stmts.kv_force_upsert,
+           stmts.oplog_insert,
+           key,
+           ballot_c,
+           ballot_n
+         ) do
       {:ok, value_binary, _ts, _origin, _expires, deleted_at, prev_value_binary} ->
-        if deleted_at != nil and deleted_at != :nil do
-          prev = if prev_value_binary != nil and prev_value_binary != :nil,
-            do: :erlang.binary_to_term(prev_value_binary)
+        if deleted_at != nil and deleted_at != nil do
+          prev =
+            if prev_value_binary != nil and prev_value_binary != nil,
+              do: :erlang.binary_to_term(prev_value_binary)
+
           dispatch_events(state, [%EKV.Event{type: :delete, key: key, value: prev}])
         else
           dispatch_events(state, [
@@ -1271,9 +1309,10 @@ defmodule EKV.Replica do
         if MapSet.member?(op.responded, remote_node_id) do
           {:noreply, state}
         else
-          op = %{op |
-            promises: [{remote_node_id, acc_c, acc_n, kv_row} | op.promises],
-            responded: MapSet.put(op.responded, remote_node_id)
+          op = %{
+            op
+            | promises: [{remote_node_id, acc_c, acc_n, kv_row} | op.promises],
+              responded: MapSet.put(op.responded, remote_node_id)
           }
 
           if length(op.promises) >= op.quorum do
@@ -1298,10 +1337,7 @@ defmodule EKV.Replica do
         if MapSet.member?(op.responded, remote_node_id) do
           {:noreply, state}
         else
-          op = %{op |
-            nacks: op.nacks + 1,
-            responded: MapSet.put(op.responded, remote_node_id)
-          }
+          op = %{op | nacks: op.nacks + 1, responded: MapSet.put(op.responded, remote_node_id)}
 
           max_possible_promises = count_alive_node_ids(state) - op.nacks
 
@@ -1354,9 +1390,10 @@ defmodule EKV.Replica do
         if MapSet.member?(op.responded, remote_node_id) do
           {:noreply, state}
         else
-          op = %{op |
-            accept_nacks: op.accept_nacks + 1,
-            responded: MapSet.put(op.responded, remote_node_id)
+          op = %{
+            op
+            | accept_nacks: op.accept_nacks + 1,
+              responded: MapSet.put(op.responded, remote_node_id)
           }
 
           max_possible = count_alive_node_ids(state) - op.accept_nacks
@@ -1460,17 +1497,30 @@ defmodule EKV.Replica do
   # Chunked sync continuations
   # =====================================================================
 
-  def handle_info({:continue_full_sync, remote_node, last_key, tombstone_cutoff,
-                   my_seq, remote_seq, chunk_size}, state) do
+  def handle_info(
+        {:continue_full_sync, remote_node, last_key, tombstone_cutoff, my_seq, remote_seq,
+         chunk_size},
+        state
+      ) do
     if Map.has_key?(state.remote_shards, remote_node) do
-      send_full_chunk(state, remote_node, last_key, tombstone_cutoff, my_seq, remote_seq, chunk_size)
+      send_full_chunk(
+        state,
+        remote_node,
+        last_key,
+        tombstone_cutoff,
+        my_seq,
+        remote_seq,
+        chunk_size
+      )
     end
 
     {:noreply, state}
   end
 
-  def handle_info({:continue_delta_sync, remote_node, last_seq,
-                   my_seq, remote_seq, chunk_size}, state) do
+  def handle_info(
+        {:continue_delta_sync, remote_node, last_seq, my_seq, remote_seq, chunk_size},
+        state
+      ) do
     if Map.has_key?(state.remote_shards, remote_node) do
       send_delta_chunk(state, remote_node, last_seq, my_seq, remote_seq, chunk_size)
     end
@@ -1486,7 +1536,14 @@ defmodule EKV.Replica do
   # Internal helpers
   # =====================================================================
 
-  defp do_peer_connect(state, remote_pid, remote_shard, remote_num_shards, remote_seq, remote_node_id)
+  defp do_peer_connect(
+         state,
+         remote_pid,
+         remote_shard,
+         remote_num_shards,
+         remote_seq,
+         remote_node_id
+       )
        when remote_shard == state.shard_index do
     if remote_num_shards != state.num_shards do
       Logger.error(
@@ -1506,7 +1563,8 @@ defmodule EKV.Replica do
       send_to_peer(
         state,
         remote_node,
-        {:ekv_peer_connect_ack, self(), state.shard_index, state.num_shards, my_seq, state.node_id}
+        {:ekv_peer_connect_ack, self(), state.shard_index, state.num_shards, my_seq,
+         state.node_id}
       )
 
       log_once(state, fn -> "#{log_prefix(state)} ekv_peer_connect from #{remote_node}" end)
@@ -1516,11 +1574,25 @@ defmodule EKV.Replica do
     end
   end
 
-  defp do_peer_connect(state, _remote_pid, _remote_shard, _remote_num_shards, _remote_seq, _remote_node_id) do
+  defp do_peer_connect(
+         state,
+         _remote_pid,
+         _remote_shard,
+         _remote_num_shards,
+         _remote_seq,
+         _remote_node_id
+       ) do
     state
   end
 
-  defp do_peer_connect_ack(state, remote_pid, remote_shard, remote_num_shards, remote_seq, remote_node_id)
+  defp do_peer_connect_ack(
+         state,
+         remote_pid,
+         remote_shard,
+         remote_num_shards,
+         remote_seq,
+         remote_node_id
+       )
        when remote_shard == state.shard_index do
     if remote_num_shards != state.num_shards do
       Logger.error(
@@ -1545,7 +1617,14 @@ defmodule EKV.Replica do
     end
   end
 
-  defp do_peer_connect_ack(state, _remote_pid, _remote_shard, _remote_num_shards, _remote_seq, _remote_node_id) do
+  defp do_peer_connect_ack(
+         state,
+         _remote_pid,
+         _remote_shard,
+         _remote_num_shards,
+         _remote_seq,
+         _remote_node_id
+       ) do
     state
   end
 
@@ -1593,7 +1672,15 @@ defmodule EKV.Replica do
     end
   end
 
-  defp send_full_chunk(state, remote_node, last_key, tombstone_cutoff, my_seq, remote_seq, chunk_size) do
+  defp send_full_chunk(
+         state,
+         remote_node,
+         last_key,
+         tombstone_cutoff,
+         my_seq,
+         remote_seq,
+         chunk_size
+       ) do
     entries = Store.full_state_chunk(state.db, tombstone_cutoff, last_key, chunk_size)
 
     case entries do
@@ -1605,15 +1692,22 @@ defmodule EKV.Replica do
         final? = length(entries) < chunk_size
         seq_to_send = if final?, do: my_seq, else: 0
 
-        send_to_peer(state, remote_node,
-          {:ekv_sync, node(), state.shard_index, entries, seq_to_send})
+        send_to_peer(
+          state,
+          remote_node,
+          {:ekv_sync, node(), state.shard_index, entries, seq_to_send}
+        )
 
         if final? do
           if remote_seq > 0, do: Store.set_hwm(state.db, remote_node, remote_seq)
         else
           next_key = elem(List.last(entries), 0)
-          send(self(), {:continue_full_sync, remote_node, next_key,
-                        tombstone_cutoff, my_seq, remote_seq, chunk_size})
+
+          send(
+            self(),
+            {:continue_full_sync, remote_node, next_key, tombstone_cutoff, my_seq, remote_seq,
+             chunk_size}
+          )
         end
     end
   end
@@ -1627,7 +1721,8 @@ defmodule EKV.Replica do
 
       _ ->
         entries =
-          Enum.map(oplog_entries, fn {_seq, key, value, timestamp, origin_node, expires_at, is_delete} ->
+          Enum.map(oplog_entries, fn {_seq, key, value, timestamp, origin_node, expires_at,
+                                      is_delete} ->
             deleted_at = if is_delete, do: timestamp, else: nil
             {key, value, timestamp, origin_node, expires_at, deleted_at}
           end)
@@ -1635,15 +1730,21 @@ defmodule EKV.Replica do
         final? = length(oplog_entries) < chunk_size
         seq_to_send = if final?, do: my_seq, else: 0
 
-        send_to_peer(state, remote_node,
-          {:ekv_sync, node(), state.shard_index, entries, seq_to_send})
+        send_to_peer(
+          state,
+          remote_node,
+          {:ekv_sync, node(), state.shard_index, entries, seq_to_send}
+        )
 
         if final? do
           if remote_seq > 0, do: Store.set_hwm(state.db, remote_node, remote_seq)
         else
           {max_chunk_seq, _, _, _, _, _, _} = List.last(oplog_entries)
-          send(self(), {:continue_delta_sync, remote_node, max_chunk_seq,
-                        my_seq, remote_seq, chunk_size})
+
+          send(
+            self(),
+            {:continue_delta_sync, remote_node, max_chunk_seq, my_seq, remote_seq, chunk_size}
+          )
         end
     end
   end
@@ -1687,8 +1788,10 @@ defmodule EKV.Replica do
 
     for {target_node, _pid} <- state.remote_shards do
       if MapSet.member?(accepted_node_ids, Map.get(state.peer_node_ids, target_node)) do
-        send({shard_name, target_node},
-          {:ekv_cas_committed, key, ballot_c, ballot_n, state.shard_index})
+        send(
+          {shard_name, target_node},
+          {:ekv_cas_committed, key, ballot_c, ballot_n, state.shard_index}
+        )
       else
         send({shard_name, target_node}, lww_msg)
       end
@@ -1728,8 +1831,11 @@ defmodule EKV.Replica do
 
       # Send prepare to all peers
       for {remote_node, _pid} <- state.remote_shards do
-        send_to_peer(state, remote_node,
-          {:ekv_prepare, ref, self(), key, ballot_c, ballot_n, state.shard_index})
+        send_to_peer(
+          state,
+          remote_node,
+          {:ekv_prepare, ref, self(), key, ballot_c, ballot_n, state.shard_index}
+        )
       end
 
       # Start timeout timer
@@ -1800,23 +1906,27 @@ defmodule EKV.Replica do
       {:ok, _new_value_binary, new_entry_tuple, reply_value, broadcast_msg, events} ->
         # Send accept to all peers (do NOT do local accept yet — deferred until quorum)
         for {remote_node, _pid} <- state.remote_shards do
-          send_to_peer(state, remote_node,
+          send_to_peer(
+            state,
+            remote_node,
             {:ekv_accept, ref, self(), op.key, elem(op.ballot, 0), elem(op.ballot, 1),
-             new_entry_tuple, state.shard_index})
+             new_entry_tuple, state.shard_index}
+          )
         end
 
         timer = Process.send_after(self(), {:cas_timeout, ref}, 5_000)
 
-        op = %{op |
-          phase: :accept,
-          accepts: MapSet.new(),
-          accept_nacks: 0,
-          responded: MapSet.new(),
-          timer: timer,
-          reply_value: reply_value,
-          broadcast_msg: broadcast_msg,
-          entry_tuple: new_entry_tuple,
-          events: events
+        op = %{
+          op
+          | phase: :accept,
+            accepts: MapSet.new(),
+            accept_nacks: 0,
+            responded: MapSet.new(),
+            timer: timer,
+            reply_value: reply_value,
+            broadcast_msg: broadcast_msg,
+            entry_tuple: new_entry_tuple,
+            events: events
         }
 
         # For cluster_size: 1 (no peers), commit immediately
@@ -1940,7 +2050,11 @@ defmodule EKV.Replica do
 
       # Live entry
       true ->
-        origin = if is_binary(origin_node_str), do: String.to_atom(origin_node_str), else: origin_node_str
+        origin =
+          if is_binary(origin_node_str),
+            do: String.to_atom(origin_node_str),
+            else: origin_node_str
+
         value = if value_binary, do: :erlang.binary_to_term(value_binary)
         {value, {timestamp, origin}}
     end
@@ -1955,7 +2069,13 @@ defmodule EKV.Replica do
         new_op = %{op | operation: {:update, fun, opts, retries - 1}}
         state = %{state | pending_cas: Map.put(state.pending_cas, ref, new_op)}
         delay = :rand.uniform(50) + 10
-        Process.send_after(self(), {:cas_retry, ref, op.key, {:update, fun, opts, retries - 1}}, delay)
+
+        Process.send_after(
+          self(),
+          {:cas_retry, ref, op.key, {:update, fun, opts, retries - 1}},
+          delay
+        )
+
         state
 
       _ ->
@@ -1967,7 +2087,8 @@ defmodule EKV.Replica do
   defp count_alive_node_ids(state) do
     if state.cluster_size do
       # Our own node_id + distinct peer node_ids
-      peer_ids = state.peer_node_ids
+      peer_ids =
+        state.peer_node_ids
         |> Map.values()
         |> Enum.reject(&is_nil/1)
         |> MapSet.new()

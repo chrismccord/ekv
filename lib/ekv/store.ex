@@ -541,12 +541,16 @@ defmodule EKV.Store do
   Pass `nil` as `last_key` for the first chunk.
   """
   def full_state_chunk(db, tombstone_cutoff, nil, limit) do
-    {:ok, rows} = EKV.Sqlite3.fetch_all(db, @full_state_first_chunk_sql, [tombstone_cutoff, limit])
+    {:ok, rows} =
+      EKV.Sqlite3.fetch_all(db, @full_state_first_chunk_sql, [tombstone_cutoff, limit])
+
     map_full_state_rows(rows)
   end
 
   def full_state_chunk(db, tombstone_cutoff, last_key, limit) do
-    {:ok, rows} = EKV.Sqlite3.fetch_all(db, @full_state_chunk_sql, [tombstone_cutoff, last_key, limit])
+    {:ok, rows} =
+      EKV.Sqlite3.fetch_all(db, @full_state_chunk_sql, [tombstone_cutoff, last_key, limit])
+
     map_full_state_rows(rows)
   end
 

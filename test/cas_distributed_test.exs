@@ -140,13 +140,15 @@ defmodule EKV.CASDistributedTest do
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
       Process.sleep(200)
 
-      {:ok, 1} = TestCluster.rpc!(node_a, EKV, :update, [ekv_name, "counter", &TestCluster.cas_increment/1])
+      {:ok, 1} =
+        TestCluster.rpc!(node_a, EKV, :update, [ekv_name, "counter", &TestCluster.cas_increment/1])
 
       TestCluster.assert_eventually(fn ->
         TestCluster.rpc!(node_b, EKV, :get, [ekv_name, "counter"]) == 1
       end)
 
-      {:ok, 2} = TestCluster.rpc!(node_b, EKV, :update, [ekv_name, "counter", &TestCluster.cas_increment/1])
+      {:ok, 2} =
+        TestCluster.rpc!(node_b, EKV, :update, [ekv_name, "counter", &TestCluster.cas_increment/1])
 
       TestCluster.assert_eventually(fn ->
         TestCluster.rpc!(node_a, EKV, :get, [ekv_name, "counter"]) == 2
@@ -240,7 +242,8 @@ defmodule EKV.CASDistributedTest do
       TestCluster.disconnect_nodes(node_b, node_c)
       Process.sleep(200)
 
-      {:ok, 1} = TestCluster.rpc!(node_a, EKV, :update, [ekv_name, "counter", &TestCluster.cas_increment/1])
+      {:ok, 1} =
+        TestCluster.rpc!(node_a, EKV, :update, [ekv_name, "counter", &TestCluster.cas_increment/1])
     end
   end
 
@@ -261,13 +264,15 @@ defmodule EKV.CASDistributedTest do
       Process.sleep(200)
 
       # Both try insert-if-absent concurrently
-      task_a = Task.async(fn ->
-        TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "race/1", "from_a", [if_vsn: nil]])
-      end)
+      task_a =
+        Task.async(fn ->
+          TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "race/1", "from_a", [if_vsn: nil]])
+        end)
 
-      task_b = Task.async(fn ->
-        TestCluster.rpc!(node_b, EKV, :put, [ekv_name, "race/1", "from_b", [if_vsn: nil]])
-      end)
+      task_b =
+        Task.async(fn ->
+          TestCluster.rpc!(node_b, EKV, :put, [ekv_name, "race/1", "from_b", [if_vsn: nil]])
+        end)
 
       results = Task.await_many([task_a, task_b], 10_000)
       successes = Enum.count(results, &(&1 == :ok))
@@ -300,20 +305,23 @@ defmodule EKV.CASDistributedTest do
         key = "phantom/#{round}"
 
         # All 3 nodes try insert-if-absent concurrently
-        task_a = Task.async(fn ->
-          result = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, key, "from_a", [if_vsn: nil]])
-          {node_a, result, "from_a"}
-        end)
+        task_a =
+          Task.async(fn ->
+            result = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, key, "from_a", [if_vsn: nil]])
+            {node_a, result, "from_a"}
+          end)
 
-        task_b = Task.async(fn ->
-          result = TestCluster.rpc!(node_b, EKV, :put, [ekv_name, key, "from_b", [if_vsn: nil]])
-          {node_b, result, "from_b"}
-        end)
+        task_b =
+          Task.async(fn ->
+            result = TestCluster.rpc!(node_b, EKV, :put, [ekv_name, key, "from_b", [if_vsn: nil]])
+            {node_b, result, "from_b"}
+          end)
 
-        task_c = Task.async(fn ->
-          result = TestCluster.rpc!(node_c, EKV, :put, [ekv_name, key, "from_c", [if_vsn: nil]])
-          {node_c, result, "from_c"}
-        end)
+        task_c =
+          Task.async(fn ->
+            result = TestCluster.rpc!(node_c, EKV, :put, [ekv_name, key, "from_c", [if_vsn: nil]])
+            {node_c, result, "from_c"}
+          end)
 
         results = Task.await_many([task_a, task_b, task_c], 10_000)
 
@@ -325,8 +333,8 @@ defmodule EKV.CASDistributedTest do
             local_value = TestCluster.rpc!(node, EKV, :get, [ekv_name, key])
 
             assert local_value != attempted_value,
-              "round #{round}: CAS returned #{inspect(result)} on #{inspect(node)} " <>
-              "but phantom write '#{attempted_value}' is visible locally"
+                   "round #{round}: CAS returned #{inspect(result)} on #{inspect(node)} " <>
+                     "but phantom write '#{attempted_value}' is visible locally"
           end
         end
       end
@@ -344,13 +352,15 @@ defmodule EKV.CASDistributedTest do
       Process.sleep(200)
 
       # Sequential updates from different nodes
-      {:ok, 1} = TestCluster.rpc!(node_a, EKV, :update, [ekv_name, "counter", &TestCluster.cas_increment/1])
+      {:ok, 1} =
+        TestCluster.rpc!(node_a, EKV, :update, [ekv_name, "counter", &TestCluster.cas_increment/1])
 
       TestCluster.assert_eventually(fn ->
         TestCluster.rpc!(node_b, EKV, :get, [ekv_name, "counter"]) == 1
       end)
 
-      {:ok, 2} = TestCluster.rpc!(node_b, EKV, :update, [ekv_name, "counter", &TestCluster.cas_increment/1])
+      {:ok, 2} =
+        TestCluster.rpc!(node_b, EKV, :update, [ekv_name, "counter", &TestCluster.cas_increment/1])
 
       TestCluster.assert_eventually(fn ->
         TestCluster.rpc!(node_a, EKV, :get, [ekv_name, "counter"]) == 2
@@ -373,9 +383,19 @@ defmodule EKV.CASDistributedTest do
       # Sequential updates from each node (interleaved)
       for i <- 1..n_per_node do
         if rem(i, 2) == 0 do
-          {:ok, _} = TestCluster.rpc!(node_a, EKV, :update, [ekv_name, "counter", &TestCluster.cas_increment/1])
+          {:ok, _} =
+            TestCluster.rpc!(node_a, EKV, :update, [
+              ekv_name,
+              "counter",
+              &TestCluster.cas_increment/1
+            ])
         else
-          {:ok, _} = TestCluster.rpc!(node_b, EKV, :update, [ekv_name, "counter", &TestCluster.cas_increment/1])
+          {:ok, _} =
+            TestCluster.rpc!(node_b, EKV, :update, [
+              ekv_name,
+              "counter",
+              &TestCluster.cas_increment/1
+            ])
         end
       end
 
@@ -396,17 +416,20 @@ defmodule EKV.CASDistributedTest do
       Process.sleep(300)
 
       # All three nodes try insert-if-absent concurrently
-      task_a = Task.async(fn ->
-        TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "tri/1", "from_a", [if_vsn: nil]])
-      end)
+      task_a =
+        Task.async(fn ->
+          TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "tri/1", "from_a", [if_vsn: nil]])
+        end)
 
-      task_b = Task.async(fn ->
-        TestCluster.rpc!(node_b, EKV, :put, [ekv_name, "tri/1", "from_b", [if_vsn: nil]])
-      end)
+      task_b =
+        Task.async(fn ->
+          TestCluster.rpc!(node_b, EKV, :put, [ekv_name, "tri/1", "from_b", [if_vsn: nil]])
+        end)
 
-      task_c = Task.async(fn ->
-        TestCluster.rpc!(node_c, EKV, :put, [ekv_name, "tri/1", "from_c", [if_vsn: nil]])
-      end)
+      task_c =
+        Task.async(fn ->
+          TestCluster.rpc!(node_c, EKV, :put, [ekv_name, "tri/1", "from_c", [if_vsn: nil]])
+        end)
 
       results = Task.await_many([task_a, task_b, task_c], 15_000)
       successes = Enum.count(results, &(&1 == :ok))
@@ -443,7 +466,8 @@ defmodule EKV.CASDistributedTest do
       end)
 
       # Node B updates
-      {:ok, "INITIAL"} = TestCluster.rpc!(node_b, EKV, :update, [ekv_name, "cas/1", &TestCluster.cas_upcase/1])
+      {:ok, "INITIAL"} =
+        TestCluster.rpc!(node_b, EKV, :update, [ekv_name, "cas/1", &TestCluster.cas_upcase/1])
 
       TestCluster.assert_eventually(fn ->
         TestCluster.rpc!(node_a, EKV, :get, [ekv_name, "cas/1"]) == "INITIAL"
@@ -560,7 +584,13 @@ defmodule EKV.CASDistributedTest do
         Process.sleep(100)
 
         # CAS write on majority during partition
-        :ok = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "flap/#{cycle}", "v#{cycle}", [if_vsn: nil]])
+        :ok =
+          TestCluster.rpc!(node_a, EKV, :put, [
+            ekv_name,
+            "flap/#{cycle}",
+            "v#{cycle}",
+            [if_vsn: nil]
+          ])
 
         # Heal
         TestCluster.reconnect_nodes(node_a, node_c)
@@ -678,6 +708,7 @@ defmodule EKV.CASDistributedTest do
       Process.sleep(200)
 
       data_dir = "/tmp/ekv_cas_test_#{node_a}_#{ekv_name}"
+
       TestCluster.start_ekv(
         node_a,
         name: ekv_name,
@@ -689,6 +720,7 @@ defmodule EKV.CASDistributedTest do
         cluster_size: 2,
         node_id: 1
       )
+
       Process.sleep(200)
 
       # CAS should work after restart
@@ -719,7 +751,12 @@ defmodule EKV.CASDistributedTest do
       :ok = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "kill_acc/1", "v2", [if_vsn: vsn]])
 
       # Update also works with reduced quorum
-      {:ok, 1} = TestCluster.rpc!(node_b, EKV, :update, [ekv_name, "kill_acc/cnt", &TestCluster.cas_increment/1])
+      {:ok, 1} =
+        TestCluster.rpc!(node_b, EKV, :update, [
+          ekv_name,
+          "kill_acc/cnt",
+          &TestCluster.cas_increment/1
+        ])
 
       # Verify values
       assert TestCluster.rpc!(node_a, EKV, :get, [ekv_name, "kill_acc/1"]) == "v2"
@@ -770,7 +807,9 @@ defmodule EKV.CASDistributedTest do
 
       for i <- 1..n do
         node = if rem(i, 2) == 0, do: node_a, else: node_b
-        {:ok, ^i} = TestCluster.rpc!(node, EKV, :update, [ekv_name, "counter", &TestCluster.cas_increment/1])
+
+        {:ok, ^i} =
+          TestCluster.rpc!(node, EKV, :update, [ekv_name, "counter", &TestCluster.cas_increment/1])
       end
 
       TestCluster.assert_eventually(fn ->
@@ -790,19 +829,22 @@ defmodule EKV.CASDistributedTest do
       Process.sleep(300)
 
       # Sequential updates from 3 different nodes
-      {:ok, 1} = TestCluster.rpc!(node_a, EKV, :update, [ekv_name, "tri_cnt", &TestCluster.cas_increment/1])
+      {:ok, 1} =
+        TestCluster.rpc!(node_a, EKV, :update, [ekv_name, "tri_cnt", &TestCluster.cas_increment/1])
 
       TestCluster.assert_eventually(fn ->
         TestCluster.rpc!(node_b, EKV, :get, [ekv_name, "tri_cnt"]) == 1
       end)
 
-      {:ok, 2} = TestCluster.rpc!(node_b, EKV, :update, [ekv_name, "tri_cnt", &TestCluster.cas_increment/1])
+      {:ok, 2} =
+        TestCluster.rpc!(node_b, EKV, :update, [ekv_name, "tri_cnt", &TestCluster.cas_increment/1])
 
       TestCluster.assert_eventually(fn ->
         TestCluster.rpc!(node_c, EKV, :get, [ekv_name, "tri_cnt"]) == 2
       end)
 
-      {:ok, 3} = TestCluster.rpc!(node_c, EKV, :update, [ekv_name, "tri_cnt", &TestCluster.cas_increment/1])
+      {:ok, 3} =
+        TestCluster.rpc!(node_c, EKV, :update, [ekv_name, "tri_cnt", &TestCluster.cas_increment/1])
 
       TestCluster.assert_eventually(fn ->
         TestCluster.rpc!(node_a, EKV, :get, [ekv_name, "tri_cnt"]) == 3
@@ -825,28 +867,44 @@ defmodule EKV.CASDistributedTest do
       Process.sleep(200)
 
       # Create initial key with integer value (cas_increment expects integers)
-      {:ok, 1} = TestCluster.rpc!(node_a, EKV, :update, [ekv_name, "exhaust/1", &TestCluster.cas_increment/1])
+      {:ok, 1} =
+        TestCluster.rpc!(node_a, EKV, :update, [
+          ekv_name,
+          "exhaust/1",
+          &TestCluster.cas_increment/1
+        ])
 
       # Rapid CAS puts from node B while node A tries to update
       # This creates contention that may exhaust retries
       # Even if update succeeds (retries work), the test validates the retry path
       results =
         for _ <- 1..20 do
-          task_a = Task.async(fn ->
-            TestCluster.rpc!(node_a, EKV, :update, [ekv_name, "exhaust/1", &TestCluster.cas_increment/1])
-          end)
+          task_a =
+            Task.async(fn ->
+              TestCluster.rpc!(node_a, EKV, :update, [
+                ekv_name,
+                "exhaust/1",
+                &TestCluster.cas_increment/1
+              ])
+            end)
 
-          task_b = Task.async(fn ->
-            {:ok, _, vsn} = TestCluster.rpc!(node_b, EKV, :fetch, [ekv_name, "exhaust/1"])
-            TestCluster.rpc!(node_b, EKV, :put, [ekv_name, "exhaust/1", 99999, [if_vsn: vsn]])
-          end)
+          task_b =
+            Task.async(fn ->
+              {:ok, _, vsn} = TestCluster.rpc!(node_b, EKV, :fetch, [ekv_name, "exhaust/1"])
+              TestCluster.rpc!(node_b, EKV, :put, [ekv_name, "exhaust/1", 99999, [if_vsn: vsn]])
+            end)
 
           [res_a, _res_b] = Task.await_many([task_a, task_b], 15_000)
           res_a
         end
 
       # At least some updates should succeed (via retry), some may fail with conflict
-      successes = Enum.count(results, fn {:ok, _} -> true; _ -> false end)
+      successes =
+        Enum.count(results, fn
+          {:ok, _} -> true
+          _ -> false
+        end)
+
       conflicts = Enum.count(results, &(&1 == {:error, :conflict}))
 
       # The key invariant: every result is either {:ok, _} or {:error, :conflict}
@@ -866,9 +924,14 @@ defmodule EKV.CASDistributedTest do
       Process.sleep(200)
 
       # Interleaved updates — one will be preempted and must retry
-      {:ok, 1} = TestCluster.rpc!(node_a, EKV, :update, [ekv_name, "preempt", &TestCluster.cas_increment/1])
-      {:ok, 2} = TestCluster.rpc!(node_b, EKV, :update, [ekv_name, "preempt", &TestCluster.cas_increment/1])
-      {:ok, 3} = TestCluster.rpc!(node_a, EKV, :update, [ekv_name, "preempt", &TestCluster.cas_increment/1])
+      {:ok, 1} =
+        TestCluster.rpc!(node_a, EKV, :update, [ekv_name, "preempt", &TestCluster.cas_increment/1])
+
+      {:ok, 2} =
+        TestCluster.rpc!(node_b, EKV, :update, [ekv_name, "preempt", &TestCluster.cas_increment/1])
+
+      {:ok, 3} =
+        TestCluster.rpc!(node_a, EKV, :update, [ekv_name, "preempt", &TestCluster.cas_increment/1])
 
       # All increments should be applied
       TestCluster.assert_eventually(fn ->
@@ -894,15 +957,19 @@ defmodule EKV.CASDistributedTest do
       # Sequential updates spread across keys and nodes
       for key_idx <- 1..n_keys do
         key = "bulk/#{key_idx}"
+
         for i <- 1..n_per_key do
           node = Enum.at(nodes, rem(i, length(nodes)))
-          {:ok, ^i} = TestCluster.rpc!(node, EKV, :update, [ekv_name, key, &TestCluster.cas_increment/1])
+
+          {:ok, ^i} =
+            TestCluster.rpc!(node, EKV, :update, [ekv_name, key, &TestCluster.cas_increment/1])
         end
       end
 
       # Verify all counters reached expected value
       for key_idx <- 1..n_keys do
         key = "bulk/#{key_idx}"
+
         TestCluster.assert_eventually(fn ->
           val_a = TestCluster.rpc!(node_a, EKV, :get, [ekv_name, key])
           val_b = TestCluster.rpc!(node_b, EKV, :get, [ekv_name, key])
@@ -952,7 +1019,8 @@ defmodule EKV.CASDistributedTest do
 
       # Write keys that hash to different shards
       for i <- 1..8 do
-        :ok = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "key/#{i}", "val#{i}", [if_vsn: nil]])
+        :ok =
+          TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "key/#{i}", "val#{i}", [if_vsn: nil]])
       end
 
       # All should be readable from node B
@@ -1013,7 +1081,8 @@ defmodule EKV.CASDistributedTest do
       :ok = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "dup/1", "v2", [if_vsn: vsn]])
 
       # Stale vsn gets conflict
-      assert {:error, :conflict} = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "dup/1", "v3", [if_vsn: vsn]])
+      assert {:error, :conflict} =
+               TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "dup/1", "v3", [if_vsn: vsn]])
     end
 
     test "subscriber on remote node receives event from CAS-triggered write" do
@@ -1055,7 +1124,8 @@ defmodule EKV.CASDistributedTest do
       Process.sleep(50)
 
       # CAS put on proposer node (A) — B acts as acceptor
-      :ok = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "asub/1", "accepted_val", [if_vsn: nil]])
+      :ok =
+        TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "asub/1", "accepted_val", [if_vsn: nil]])
 
       # Acceptor subscriber should get the event
       assert_receive {:remote_ekv_event, events, _}, 3000
@@ -1121,7 +1191,12 @@ defmodule EKV.CASDistributedTest do
 
       # Now try CAS with the stale vsn — should conflict
       assert {:error, :conflict} =
-        TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "nosub/1", "v3", [if_vsn: stale_vsn]])
+               TestCluster.rpc!(node_a, EKV, :put, [
+                 ekv_name,
+                 "nosub/1",
+                 "v3",
+                 [if_vsn: stale_vsn]
+               ])
 
       # No event should be dispatched for the conflict
       refute_receive {:remote_ekv_event, _, _}, 500
@@ -1174,13 +1249,15 @@ defmodule EKV.CASDistributedTest do
       for i <- 1..10 do
         key = "lin/#{i}"
 
-        task_a = Task.async(fn ->
-          TestCluster.rpc!(node_a, EKV, :put, [ekv_name, key, "a", [if_vsn: nil]])
-        end)
+        task_a =
+          Task.async(fn ->
+            TestCluster.rpc!(node_a, EKV, :put, [ekv_name, key, "a", [if_vsn: nil]])
+          end)
 
-        task_b = Task.async(fn ->
-          TestCluster.rpc!(node_b, EKV, :put, [ekv_name, key, "b", [if_vsn: nil]])
-        end)
+        task_b =
+          Task.async(fn ->
+            TestCluster.rpc!(node_b, EKV, :put, [ekv_name, key, "b", [if_vsn: nil]])
+          end)
 
         results = Task.await_many([task_a, task_b], 10_000)
         successes = Enum.count(results, &(&1 == :ok))
@@ -1205,7 +1282,8 @@ defmodule EKV.CASDistributedTest do
 
       # Write 20 keys via CAS from node A
       for i <- 1..20 do
-        :ok = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "dur/#{i}", "val#{i}", [if_vsn: nil]])
+        :ok =
+          TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "dur/#{i}", "val#{i}", [if_vsn: nil]])
       end
 
       # All should be readable from both nodes
@@ -1310,7 +1388,8 @@ defmodule EKV.CASDistributedTest do
       assert TestCluster.rpc!(n1, EKV, :get, [ekv_name, "survive/1"]) == "v2"
 
       # update also works
-      {:ok, 1} = TestCluster.rpc!(n2, EKV, :update, [ekv_name, "survive/cnt", &TestCluster.cas_increment/1])
+      {:ok, 1} =
+        TestCluster.rpc!(n2, EKV, :update, [ekv_name, "survive/cnt", &TestCluster.cas_increment/1])
     end
 
     test "kill 3 of 5 nodes: CAS fails (quorum=3, only 2 alive)" do
@@ -1349,6 +1428,7 @@ defmodule EKV.CASDistributedTest do
       for majority <- [n1, n2, n3], minority <- [n4, n5] do
         TestCluster.disconnect_nodes(majority, minority)
       end
+
       Process.sleep(300)
 
       # Majority side (3 nodes, quorum=3) can CAS
@@ -1419,9 +1499,12 @@ defmodule EKV.CASDistributedTest do
 
       # Round-robin updates across all 5 nodes
       n = 10
+
       for i <- 1..n do
         node = Enum.at(nodes, rem(i - 1, 5))
-        {:ok, ^i} = TestCluster.rpc!(node, EKV, :update, [ekv_name, "cnt5", &TestCluster.cas_increment/1])
+
+        {:ok, ^i} =
+          TestCluster.rpc!(node, EKV, :update, [ekv_name, "cnt5", &TestCluster.cas_increment/1])
       end
 
       # All nodes agree on final value
@@ -1454,6 +1537,7 @@ defmodule EKV.CASDistributedTest do
       for majority <- [n1, n2, n3], minority <- [n4, n5] do
         TestCluster.disconnect_nodes(majority, minority)
       end
+
       Process.sleep(300)
 
       # CAS update on majority
@@ -1535,9 +1619,10 @@ defmodule EKV.CASDistributedTest do
       TestCluster.suspend_shards(node_b, ekv_name)
 
       # Start CAS in background — will block waiting for B's promise
-      task = Task.async(fn ->
-        TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "slow/1", "val1", [if_vsn: nil]])
-      end)
+      task =
+        Task.async(fn ->
+          TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "slow/1", "val1", [if_vsn: nil]])
+        end)
 
       # Let the prepare message sit in B's queue
       Process.sleep(500)
@@ -1570,10 +1655,12 @@ defmodule EKV.CASDistributedTest do
 
       # CAS from A — needs quorum of 2. A+B available, C suspended.
       # Prepare: A local + B remote → quorum. Accept: B remote → quorum (A deferred + B).
-      assert :ok = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "slow/2", "val2", [if_vsn: nil]])
+      assert :ok =
+               TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "slow/2", "val2", [if_vsn: nil]])
 
       # Value readable on A and B immediately
       assert TestCluster.rpc!(node_a, EKV, :get, [ekv_name, "slow/2"]) == "val2"
+
       TestCluster.assert_eventually(fn ->
         TestCluster.rpc!(node_b, EKV, :get, [ekv_name, "slow/2"]) == "val2"
       end)
@@ -1633,7 +1720,8 @@ defmodule EKV.CASDistributedTest do
       elapsed = System.monotonic_time(:millisecond) - t1
 
       # Should complete in well under the 5s timeout
-      assert elapsed < 2000, "CAS took #{elapsed}ms, expected < 2000ms (slow minority should not block)"
+      assert elapsed < 2000,
+             "CAS took #{elapsed}ms, expected < 2000ms (slow minority should not block)"
 
       # Resume C — it catches up
       TestCluster.resume_shards(node_c, ekv_name)
@@ -1661,13 +1749,15 @@ defmodule EKV.CASDistributedTest do
       # Suspend B — forces A and C to compete for quorum via A↔C
       TestCluster.suspend_shards(node_b, ekv_name)
 
-      task_a = Task.async(fn ->
-        TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "asym/1", "from_a", [if_vsn: nil]])
-      end)
+      task_a =
+        Task.async(fn ->
+          TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "asym/1", "from_a", [if_vsn: nil]])
+        end)
 
-      task_c = Task.async(fn ->
-        TestCluster.rpc!(node_c, EKV, :put, [ekv_name, "asym/1", "from_c", [if_vsn: nil]])
-      end)
+      task_c =
+        Task.async(fn ->
+          TestCluster.rpc!(node_c, EKV, :put, [ekv_name, "asym/1", "from_c", [if_vsn: nil]])
+        end)
 
       results = Task.await_many([task_a, task_c], 15_000)
       successes = Enum.count(results, &(&1 == :ok))
@@ -1726,6 +1816,7 @@ defmodule EKV.CASDistributedTest do
       # All values should be readable everywhere after all resumes
       for i <- 1..5 do
         key = "cycle/#{i}"
+
         TestCluster.assert_eventually(fn ->
           val_a = TestCluster.rpc!(node_a, EKV, :get, [ekv_name, key])
           val_b = TestCluster.rpc!(node_b, EKV, :get, [ekv_name, key])
@@ -1765,6 +1856,7 @@ defmodule EKV.CASDistributedTest do
 
       # A has v2, C should have v2 (it was either acceptor or got LWW)
       assert TestCluster.rpc!(node_a, EKV, :get, [ekv_name, "delay/1"]) == "v2"
+
       TestCluster.assert_eventually(fn ->
         TestCluster.rpc!(node_c, EKV, :get, [ekv_name, "delay/1"]) == "v2"
       end)
@@ -1793,18 +1885,24 @@ defmodule EKV.CASDistributedTest do
       Process.sleep(300)
 
       # Background task that flaps C's shards
-      flapper = Task.async(fn ->
-        for _ <- 1..8 do
-          TestCluster.suspend_shards(node_c, ekv_name)
-          Process.sleep(50 + :rand.uniform(100))
-          TestCluster.resume_shards(node_c, ekv_name)
-          Process.sleep(50 + :rand.uniform(100))
-        end
-      end)
+      flapper =
+        Task.async(fn ->
+          for _ <- 1..8 do
+            TestCluster.suspend_shards(node_c, ekv_name)
+            Process.sleep(50 + :rand.uniform(100))
+            TestCluster.resume_shards(node_c, ekv_name)
+            Process.sleep(50 + :rand.uniform(100))
+          end
+        end)
 
       # Sequential updates while C is flapping
       for i <- 1..6 do
-        {:ok, ^i} = TestCluster.rpc!(node_a, EKV, :update, [ekv_name, "flap_counter", &TestCluster.cas_increment/1])
+        {:ok, ^i} =
+          TestCluster.rpc!(node_a, EKV, :update, [
+            ekv_name,
+            "flap_counter",
+            &TestCluster.cas_increment/1
+          ])
       end
 
       Task.await(flapper, 30_000)
@@ -1842,6 +1940,7 @@ defmodule EKV.CASDistributedTest do
 
       # Resume n4 first
       TestCluster.resume_shards(n4, ekv_name)
+
       TestCluster.assert_eventually(fn ->
         TestCluster.rpc!(n4, EKV, :get, [ekv_name, "stagger/1"]) == "val"
       end)
@@ -1879,6 +1978,7 @@ defmodule EKV.CASDistributedTest do
       TestCluster.assert_eventually(fn ->
         TestCluster.rpc!(node_b, EKV, :get, [ekv_name, "freeze/1"]) == "val"
       end)
+
       TestCluster.assert_eventually(fn ->
         TestCluster.rpc!(node_c, EKV, :get, [ekv_name, "freeze/1"]) == "val"
       end)
