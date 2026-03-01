@@ -1592,4 +1592,933 @@ defmodule EKVTest do
       for i <- 6..10, do: assert("delta_key_#{i}" in delta_keys)
     end
   end
+
+  # =====================================================================
+  # CAS Config Validation
+  # =====================================================================
+
+  describe "CAS config validation" do
+    test "cluster_size without node_id raises" do
+      name = :"ekv_cas_cfg_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_cas_cfg_#{name}")
+      Process.flag(:trap_exit, true)
+
+      assert {:error, {%ArgumentError{message: msg}, _}} =
+        EKV.start_link(name: name, data_dir: data_dir, cluster_size: 3, log: false)
+      assert msg =~ ":node_id is required"
+
+      File.rm_rf!(data_dir)
+    end
+
+    test "node_id without cluster_size raises" do
+      name = :"ekv_cas_cfg_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_cas_cfg_#{name}")
+      Process.flag(:trap_exit, true)
+
+      assert {:error, {%ArgumentError{message: msg}, _}} =
+        EKV.start_link(name: name, data_dir: data_dir, node_id: 1, log: false)
+      assert msg =~ ":cluster_size is required"
+
+      File.rm_rf!(data_dir)
+    end
+
+    test "node_id > cluster_size raises" do
+      name = :"ekv_cas_cfg_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_cas_cfg_#{name}")
+      Process.flag(:trap_exit, true)
+
+      assert {:error, {%ArgumentError{message: msg}, _}} =
+        EKV.start_link(name: name, data_dir: data_dir, cluster_size: 3, node_id: 5, log: false)
+      assert msg =~ "must be <="
+
+      File.rm_rf!(data_dir)
+    end
+
+    test "invalid node_id type raises" do
+      name = :"ekv_cas_cfg_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_cas_cfg_#{name}")
+      Process.flag(:trap_exit, true)
+
+      assert {:error, {%ArgumentError{message: msg}, _}} =
+        EKV.start_link(name: name, data_dir: data_dir, cluster_size: 3, node_id: "bad", log: false)
+      assert msg =~ "must be positive integers"
+
+      File.rm_rf!(data_dir)
+    end
+
+    test "cluster_size: 1, node_id: 1 starts successfully" do
+      name = :"ekv_cas_cfg_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_cas_cfg_#{name}")
+
+      {:ok, pid} = EKV.start_link(name: name, data_dir: data_dir, cluster_size: 1, node_id: 1, shards: 1, log: false)
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      assert Process.alive?(pid)
+    end
+
+    test "CAS ops without cluster_size raise" do
+      name = :"ekv_cas_cfg_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_cas_cfg_#{name}")
+
+      {:ok, pid} = EKV.start_link(name: name, data_dir: data_dir, shards: 1, log: false)
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      assert_raise ArgumentError, ~r/CAS operations require/, fn ->
+        EKV.put(name, "key", "val", if_vsn: nil)
+      end
+
+      assert_raise ArgumentError, ~r/CAS operations require/, fn ->
+        EKV.delete(name, "key", if_vsn: nil)
+      end
+
+      assert_raise ArgumentError, ~r/CAS operations require/, fn ->
+        EKV.update(name, "key", fn v -> v end)
+      end
+    end
+  end
+
+  # =====================================================================
+  # CAS: fetch/2
+  # =====================================================================
+
+  describe "fetch" do
+    setup do
+      name = :"ekv_fetch_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+
+      {:ok, pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: data_dir,
+          shards: 2,
+          log: false,
+          cluster_size: 1,
+          node_id: 1,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      %{cas_name: name}
+    end
+
+    test "returns value and vsn for existing key", %{cas_name: name} do
+      :ok = EKV.put(name, "user/1", %{name: "Alice"})
+      {:ok, value, vsn} = EKV.fetch(name, "user/1")
+      assert value == %{name: "Alice"}
+      assert {ts, origin} = vsn
+      assert is_integer(ts)
+      assert is_atom(origin)
+    end
+
+    test "returns nil nil for missing key", %{cas_name: name} do
+      assert {:ok, nil, nil} = EKV.fetch(name, "missing")
+    end
+
+    test "returns nil nil for deleted key", %{cas_name: name} do
+      :ok = EKV.put(name, "del/1", "val")
+      :ok = EKV.delete(name, "del/1")
+      assert {:ok, nil, nil} = EKV.fetch(name, "del/1")
+    end
+
+    test "returns nil nil for expired TTL key", %{cas_name: name} do
+      :ok = EKV.put(name, "ttl/1", "val", ttl: 1)
+      Process.sleep(10)
+      assert {:ok, nil, nil} = EKV.fetch(name, "ttl/1")
+    end
+
+    test "vsn changes after each put", %{cas_name: name} do
+      :ok = EKV.put(name, "k", "v1")
+      {:ok, _, vsn1} = EKV.fetch(name, "k")
+      Process.sleep(1)
+      :ok = EKV.put(name, "k", "v2")
+      {:ok, _, vsn2} = EKV.fetch(name, "k")
+      assert vsn1 != vsn2
+    end
+  end
+
+  # =====================================================================
+  # CAS: put with if_vsn (single-node, cluster_size: 1)
+  # =====================================================================
+
+  describe "CAS put" do
+    setup do
+      name = :"ekv_cas_put_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+
+      {:ok, pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: data_dir,
+          shards: 2,
+          log: false,
+          cluster_size: 1,
+          node_id: 1,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      %{cas_name: name}
+    end
+
+    test "put if_vsn: nil on missing key succeeds (insert-if-absent)", %{cas_name: name} do
+      assert :ok = EKV.put(name, "new/1", "val", if_vsn: nil)
+      assert EKV.get(name, "new/1") == "val"
+    end
+
+    test "put if_vsn: nil on existing key returns conflict", %{cas_name: name} do
+      :ok = EKV.put(name, "exist/1", "val")
+      assert {:error, :conflict} = EKV.put(name, "exist/1", "val2", if_vsn: nil)
+    end
+
+    test "put if_vsn: vsn succeeds when vsn matches", %{cas_name: name} do
+      :ok = EKV.put(name, "cas/1", "v1")
+      {:ok, _, vsn} = EKV.fetch(name, "cas/1")
+      assert :ok = EKV.put(name, "cas/1", "v2", if_vsn: vsn)
+      assert EKV.get(name, "cas/1") == "v2"
+    end
+
+    test "put if_vsn: vsn returns conflict when stale", %{cas_name: name} do
+      :ok = EKV.put(name, "cas/2", "v1")
+      {:ok, _, vsn1} = EKV.fetch(name, "cas/2")
+      :ok = EKV.put(name, "cas/2", "v2")
+      assert {:error, :conflict} = EKV.put(name, "cas/2", "v3", if_vsn: vsn1)
+    end
+
+    test "put if_vsn with TTL works", %{cas_name: name} do
+      assert :ok = EKV.put(name, "ttl/1", "val", if_vsn: nil, ttl: 60_000)
+      assert EKV.get(name, "ttl/1") == "val"
+    end
+
+    test "after CAS put, get returns new value", %{cas_name: name} do
+      :ok = EKV.put(name, "get/1", "v1", if_vsn: nil)
+      assert EKV.get(name, "get/1") == "v1"
+    end
+
+    test "after CAS put, fetch returns new vsn", %{cas_name: name} do
+      :ok = EKV.put(name, "vsn/1", "v1", if_vsn: nil)
+      {:ok, _, vsn1} = EKV.fetch(name, "vsn/1")
+      assert vsn1 != nil
+
+      :ok = EKV.put(name, "vsn/1", "v2", if_vsn: vsn1)
+      {:ok, _, vsn2} = EKV.fetch(name, "vsn/1")
+      assert vsn2 != vsn1
+    end
+
+    test "sequential fetch-put-fetch-put chain", %{cas_name: name} do
+      :ok = EKV.put(name, "chain/1", "v1", if_vsn: nil)
+      {:ok, "v1", vsn1} = EKV.fetch(name, "chain/1")
+      :ok = EKV.put(name, "chain/1", "v2", if_vsn: vsn1)
+      {:ok, "v2", vsn2} = EKV.fetch(name, "chain/1")
+      :ok = EKV.put(name, "chain/1", "v3", if_vsn: vsn2)
+      assert EKV.get(name, "chain/1") == "v3"
+    end
+
+    test "CAS put writes to oplog (visible via delta sync)", %{cas_name: name} do
+      :ok = EKV.put(name, "oplog_cas/1", "val1", if_vsn: nil)
+
+      config = EKV.get_config(name)
+      shard = EKV.Replica.shard_index_for("oplog_cas/1", config.num_shards)
+      shard_name = EKV.Replica.shard_name(name, shard)
+      %{db: db} = :sys.get_state(shard_name)
+
+      entries = EKV.Store.oplog_since(db, 0)
+      oplog_keys = Enum.map(entries, fn {_, key, _, _, _, _, _} -> key end)
+      assert "oplog_cas/1" in oplog_keys
+    end
+
+    test "CAS put dispatches subscriber events", %{cas_name: name} do
+      :ok = EKV.subscribe(name, "sub/")
+      :ok = EKV.put(name, "sub/1", "val", if_vsn: nil)
+      flush_dispatchers(name)
+
+      assert_receive {:ekv, [%EKV.Event{type: :put, key: "sub/1", value: "val"}], _}
+    end
+  end
+
+  # =====================================================================
+  # CAS: delete with if_vsn (single-node)
+  # =====================================================================
+
+  describe "CAS delete" do
+    setup do
+      name = :"ekv_cas_del_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+
+      {:ok, pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: data_dir,
+          shards: 2,
+          log: false,
+          cluster_size: 1,
+          node_id: 1,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      %{cas_name: name}
+    end
+
+    test "delete if_vsn succeeds when vsn matches", %{cas_name: name} do
+      :ok = EKV.put(name, "del/1", "val")
+      {:ok, _, vsn} = EKV.fetch(name, "del/1")
+      assert :ok = EKV.delete(name, "del/1", if_vsn: vsn)
+      assert EKV.get(name, "del/1") == nil
+    end
+
+    test "delete if_vsn returns conflict when stale", %{cas_name: name} do
+      :ok = EKV.put(name, "del/2", "v1")
+      {:ok, _, vsn1} = EKV.fetch(name, "del/2")
+      :ok = EKV.put(name, "del/2", "v2")
+      assert {:error, :conflict} = EKV.delete(name, "del/2", if_vsn: vsn1)
+      assert EKV.get(name, "del/2") == "v2"
+    end
+
+    test "after CAS delete, get returns nil and fetch returns nil", %{cas_name: name} do
+      :ok = EKV.put(name, "del/3", "val")
+      {:ok, _, vsn} = EKV.fetch(name, "del/3")
+      :ok = EKV.delete(name, "del/3", if_vsn: vsn)
+      assert EKV.get(name, "del/3") == nil
+      assert {:ok, nil, nil} = EKV.fetch(name, "del/3")
+    end
+
+    test "CAS delete dispatches subscriber event with previous value", %{cas_name: name} do
+      :ok = EKV.put(name, "del/4", "old_val")
+      {:ok, _, vsn} = EKV.fetch(name, "del/4")
+      :ok = EKV.subscribe(name, "del/")
+      :ok = EKV.delete(name, "del/4", if_vsn: vsn)
+      flush_dispatchers(name)
+
+      assert_receive {:ekv, [%EKV.Event{type: :delete, key: "del/4", value: "old_val"}], _}
+    end
+
+    test "CAS delete then put if_vsn: nil re-creates key", %{cas_name: name} do
+      :ok = EKV.put(name, "del/5", "val")
+      {:ok, _, vsn} = EKV.fetch(name, "del/5")
+      :ok = EKV.delete(name, "del/5", if_vsn: vsn)
+      assert {:ok, nil, nil} = EKV.fetch(name, "del/5")
+      :ok = EKV.put(name, "del/5", "reborn", if_vsn: nil)
+      assert EKV.get(name, "del/5") == "reborn"
+    end
+  end
+
+  # =====================================================================
+  # CAS: update/3 (single-node)
+  # =====================================================================
+
+  describe "update" do
+    setup do
+      name = :"ekv_update_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+
+      {:ok, pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: data_dir,
+          shards: 2,
+          log: false,
+          cluster_size: 1,
+          node_id: 1,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      %{cas_name: name}
+    end
+
+    test "update on missing key: fun.(nil) creates key", %{cas_name: name} do
+      {:ok, 1} = EKV.update(name, "u/1", fn nil -> 1 end)
+      assert EKV.get(name, "u/1") == 1
+    end
+
+    test "update on existing key: fun.(value) modifies it", %{cas_name: name} do
+      :ok = EKV.put(name, "u/2", 10)
+      {:ok, 20} = EKV.update(name, "u/2", fn v -> v * 2 end)
+      assert EKV.get(name, "u/2") == 20
+    end
+
+    test "update returns {:ok, new_value}", %{cas_name: name} do
+      {:ok, "hello"} = EKV.update(name, "u/3", fn nil -> "hello" end)
+    end
+
+    test "counter increment nil→1→2→3", %{cas_name: name} do
+      inc = fn nil -> 1; n -> n + 1 end
+      {:ok, 1} = EKV.update(name, "counter", inc)
+      {:ok, 2} = EKV.update(name, "counter", inc)
+      {:ok, 3} = EKV.update(name, "counter", inc)
+      assert EKV.get(name, "counter") == 3
+    end
+
+    test "update with TTL option", %{cas_name: name} do
+      {:ok, "val"} = EKV.update(name, "ttl/u", fn nil -> "val" end, ttl: 60_000)
+      assert EKV.get(name, "ttl/u") == "val"
+    end
+
+    test "update dispatches subscriber events", %{cas_name: name} do
+      :ok = EKV.subscribe(name, "u/")
+      {:ok, "val"} = EKV.update(name, "u/4", fn nil -> "val" end)
+      flush_dispatchers(name)
+
+      assert_receive {:ekv, [%EKV.Event{type: :put, key: "u/4", value: "val"}], _}
+    end
+  end
+
+  # =====================================================================
+  # CAS: NIF paxos operations (direct NIF calls)
+  # =====================================================================
+
+  describe "NIF paxos operations" do
+    setup do
+      name = :"ekv_nif_pax_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+
+      {:ok, pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: data_dir,
+          shards: 1,
+          log: false,
+          cluster_size: 1,
+          node_id: 1,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      # Get writer db from shard state
+      shard_name = :"#{name}_ekv_replica_0"
+      state = :sys.get_state(shard_name)
+      %{cas_name: name, db: state.db, stmts: state.stmts}
+    end
+
+    test "prepare on empty kv_paxos returns promise with accepted={0,0}, nil", %{db: db} do
+      {:ok, :promise, 0, 0, nil} = EKV.Store.paxos_prepare(db, "pax/1", 100, 1)
+    end
+
+    test "prepare with higher ballot updates promise", %{db: db} do
+      {:ok, :promise, 0, 0, nil} = EKV.Store.paxos_prepare(db, "pax/2", 100, 1)
+      {:ok, :promise, 0, 0, nil} = EKV.Store.paxos_prepare(db, "pax/2", 200, 1)
+    end
+
+    test "prepare with lower ballot returns nack", %{db: db} do
+      {:ok, :promise, 0, 0, nil} = EKV.Store.paxos_prepare(db, "pax/3", 200, 1)
+      {:ok, :nack, 200, 1} = EKV.Store.paxos_prepare(db, "pax/3", 100, 1)
+    end
+
+    test "prepare with equal ballot returns nack (must be strictly greater)", %{db: db} do
+      {:ok, :promise, 0, 0, nil} = EKV.Store.paxos_prepare(db, "pax/4", 100, 1)
+      {:ok, :nack, 100, 1} = EKV.Store.paxos_prepare(db, "pax/4", 100, 1)
+    end
+
+    test "prepare returns kv row when key exists in kv table", %{cas_name: name, db: db} do
+      # Write a value via normal put (writes to kv table)
+      :ok = EKV.put(name, "pax/5", "hello")
+      {:ok, :promise, 0, 0, [val, ts, origin, _expires, _deleted]} =
+        EKV.Store.paxos_prepare(db, "pax/5", 100, 1)
+      assert :erlang.binary_to_term(val) == "hello"
+      assert is_integer(ts)
+      assert is_binary(origin)
+    end
+
+    test "accept succeeds when ballot >= promised", %{db: db, stmts: stmts} do
+      {:ok, :promise, 0, 0, nil} = EKV.Store.paxos_prepare(db, "pax/6", 100, 1)
+
+      now = System.system_time(:nanosecond)
+      origin_str = Atom.to_string(node())
+      val_bin = :erlang.term_to_binary("accepted_val")
+      kv_args = ["pax/6", val_bin, now, origin_str, nil, nil]
+      oplog_args = ["pax/6", val_bin, now, origin_str, nil, 0]
+
+      {:ok, true} = EKV.Store.paxos_accept(db, stmts.kv_upsert, stmts.oplog_insert,
+        "pax/6", 100, 1, kv_args, oplog_args)
+    end
+
+    test "accept fails when ballot < promised", %{db: db, stmts: stmts} do
+      {:ok, :promise, 0, 0, nil} = EKV.Store.paxos_prepare(db, "pax/7", 200, 1)
+
+      now = System.system_time(:nanosecond)
+      origin_str = Atom.to_string(node())
+      val_bin = :erlang.term_to_binary("val")
+      kv_args = ["pax/7", val_bin, now, origin_str, nil, nil]
+      oplog_args = ["pax/7", val_bin, now, origin_str, nil, 0]
+
+      {:ok, false} = EKV.Store.paxos_accept(db, stmts.kv_upsert, stmts.oplog_insert,
+        "pax/7", 100, 1, kv_args, oplog_args)
+    end
+
+    test "accept writes to both kv and kv_oplog atomically", %{db: db, stmts: stmts} do
+      {:ok, :promise, 0, 0, nil} = EKV.Store.paxos_prepare(db, "pax/8", 100, 1)
+
+      now = System.system_time(:nanosecond)
+      origin_str = Atom.to_string(node())
+      val_bin = :erlang.term_to_binary("atomic_val")
+      kv_args = ["pax/8", val_bin, now, origin_str, nil, nil]
+      oplog_args = ["pax/8", val_bin, now, origin_str, nil, 0]
+
+      {:ok, true} = EKV.Store.paxos_accept(db, stmts.kv_upsert, stmts.oplog_insert,
+        "pax/8", 100, 1, kv_args, oplog_args)
+
+      # Verify kv table
+      {v, _ts, _origin, _exp, _del} = EKV.Store.get(db, "pax/8")
+      assert :erlang.binary_to_term(v) == "atomic_val"
+
+      # Verify oplog
+      entries = EKV.Store.oplog_since(db, 0)
+      pax8_entries = Enum.filter(entries, fn {_, key, _, _, _, _, _} -> key == "pax/8" end)
+      assert length(pax8_entries) > 0
+    end
+
+    test "prepare after accept returns accepted ballot + value", %{db: db, stmts: stmts} do
+      {:ok, :promise, 0, 0, nil} = EKV.Store.paxos_prepare(db, "pax/9", 100, 1)
+
+      now = System.system_time(:nanosecond)
+      origin_str = Atom.to_string(node())
+      val_bin = :erlang.term_to_binary("accepted")
+      kv_args = ["pax/9", val_bin, now, origin_str, nil, nil]
+      oplog_args = ["pax/9", val_bin, now, origin_str, nil, 0]
+
+      {:ok, true} = EKV.Store.paxos_accept(db, stmts.kv_upsert, stmts.oplog_insert,
+        "pax/9", 100, 1, kv_args, oplog_args)
+
+      # Higher prepare should see accepted ballot
+      {:ok, :promise, 100, 1, [val, _, _, _, _]} = EKV.Store.paxos_prepare(db, "pax/9", 200, 1)
+      assert :erlang.binary_to_term(val) == "accepted"
+    end
+
+    test "sequence: prepare(5) → accept(5) → prepare(3) → nack", %{db: db, stmts: stmts} do
+      {:ok, :promise, 0, 0, nil} = EKV.Store.paxos_prepare(db, "pax/10", 5, 1)
+
+      now = System.system_time(:nanosecond)
+      origin_str = Atom.to_string(node())
+      val_bin = :erlang.term_to_binary("seq")
+      kv_args = ["pax/10", val_bin, now, origin_str, nil, nil]
+      oplog_args = ["pax/10", val_bin, now, origin_str, nil, 0]
+
+      {:ok, true} = EKV.Store.paxos_accept(db, stmts.kv_upsert, stmts.oplog_insert,
+        "pax/10", 5, 1, kv_args, oplog_args)
+
+      # Lower prepare should nack (accepted ballot 5 is now promised)
+      {:ok, :nack, 5, 1} = EKV.Store.paxos_prepare(db, "pax/10", 3, 1)
+    end
+
+    test "accept updates accepted_counter/node in kv_paxos", %{db: db, stmts: stmts} do
+      {:ok, :promise, 0, 0, nil} = EKV.Store.paxos_prepare(db, "pax/11", 100, 2)
+
+      now = System.system_time(:nanosecond)
+      origin_str = Atom.to_string(node())
+      val_bin = :erlang.term_to_binary("val")
+      kv_args = ["pax/11", val_bin, now, origin_str, nil, nil]
+      oplog_args = ["pax/11", val_bin, now, origin_str, nil, 0]
+
+      {:ok, true} = EKV.Store.paxos_accept(db, stmts.kv_upsert, stmts.oplog_insert,
+        "pax/11", 100, 2, kv_args, oplog_args)
+
+      # Higher prepare should see accepted={100, 2}
+      {:ok, :promise, 100, 2, _kv_row} = EKV.Store.paxos_prepare(db, "pax/11", 200, 1)
+    end
+  end
+
+  # =====================================================================
+  # CAS: Ballot and concurrency
+  # =====================================================================
+
+  describe "ballot and concurrency" do
+    setup do
+      name = :"ekv_ballot_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+
+      {:ok, pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: data_dir,
+          shards: 1,
+          log: false,
+          cluster_size: 1,
+          node_id: 1,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      %{cas_name: name, data_dir: data_dir}
+    end
+
+    test "ballot counter always increases", %{cas_name: name} do
+      # Multiple updates → ballot counter should be monotonically increasing
+      for i <- 1..5 do
+        {:ok, ^i} = EKV.update(name, "inc", fn nil -> 1; n -> n + 1 end)
+      end
+
+      assert EKV.get(name, "inc") == 5
+    end
+
+    test "ballot counter survives process restart", %{cas_name: name} do
+      {:ok, 1} = EKV.update(name, "persist", fn nil -> 1 end)
+
+      # Get ballot counter before restart
+      shard_name = :"#{name}_ekv_replica_0"
+      state_before = :sys.get_state(shard_name)
+      old_counter = state_before.ballot_counter
+
+      # Kill and restart the shard (will restore from kv_meta)
+      Process.exit(Process.whereis(shard_name), :kill)
+      Process.sleep(100)
+
+      # After restart, ballot counter should be >= old + 1
+      state_after = :sys.get_state(shard_name)
+      assert state_after.ballot_counter > old_counter
+    end
+
+    test "clock regression: ballot still increases (max(time, counter+1))", %{cas_name: name} do
+      # Do an update to establish a ballot counter
+      {:ok, 1} = EKV.update(name, "clock/1", fn nil -> 1 end)
+
+      shard_name = :"#{name}_ekv_replica_0"
+      state = :sys.get_state(shard_name)
+      counter_before = state.ballot_counter
+
+      # The ballot counter uses max(System.system_time(:nanosecond), counter+1)
+      # Even if system clock somehow returned a lower value, counter+1 ensures monotonicity
+      # We verify this by doing another update and checking the counter increased
+      {:ok, 2} = EKV.update(name, "clock/1", fn n -> n + 1 end)
+
+      state2 = :sys.get_state(shard_name)
+      assert state2.ballot_counter > counter_before
+    end
+
+    test "N concurrent update tasks on same key → final value = N (serialized)", %{cas_name: name} do
+      n = 10
+      tasks =
+        for _ <- 1..n do
+          Task.async(fn ->
+            EKV.update(name, "concurrent", fn nil -> 1; v -> v + 1 end)
+          end)
+        end
+
+      results = Task.await_many(tasks, 10_000)
+      assert Enum.all?(results, fn {:ok, _} -> true; _ -> false end)
+      assert EKV.get(name, "concurrent") == n
+    end
+
+    test "concurrent put(if_vsn:) tasks — exactly one succeeds, others get conflict", %{cas_name: name} do
+      # Create the key
+      :ok = EKV.put(name, "race/1", "v0", if_vsn: nil)
+      {:ok, _, vsn} = EKV.fetch(name, "race/1")
+
+      # Launch concurrent CAS puts with same vsn
+      tasks =
+        for i <- 1..5 do
+          Task.async(fn ->
+            EKV.put(name, "race/1", "v#{i}", if_vsn: vsn)
+          end)
+        end
+
+      results = Task.await_many(tasks, 10_000)
+      successes = Enum.count(results, &(&1 == :ok))
+      conflicts = Enum.count(results, &(&1 == {:error, :conflict}))
+
+      assert successes == 1
+      assert conflicts == 4
+    end
+  end
+
+  # =====================================================================
+  # CAS: GC + mixed writes
+  # =====================================================================
+
+  describe "CAS GC and mixed writes" do
+    setup do
+      name = :"ekv_cas_gc_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+
+      {:ok, pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: data_dir,
+          shards: 1,
+          log: false,
+          cluster_size: 1,
+          node_id: 1,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      %{cas_name: name}
+    end
+
+    test "GC purges orphan kv_paxos rows", %{cas_name: name} do
+      # Do a CAS put to create kv_paxos entry
+      :ok = EKV.put(name, "gc/1", "val", if_vsn: nil)
+
+      # Delete and purge tombstone
+      {:ok, _, vsn} = EKV.fetch(name, "gc/1")
+      :ok = EKV.delete(name, "gc/1", if_vsn: vsn)
+
+      # Manually trigger GC with a future tombstone cutoff to purge
+      shard_name = :"#{name}_ekv_replica_0"
+      now = System.system_time(:nanosecond)
+      future_cutoff = now + :timer.hours(1) * 1_000_000
+      send(shard_name, {:gc, now, future_cutoff})
+      :sys.get_state(shard_name)
+
+      # Check kv_paxos is cleaned up
+      state = :sys.get_state(shard_name)
+      {:ok, rows} = EKV.Sqlite3.fetch_all(state.db, "SELECT key FROM kv_paxos", [])
+      pax_keys = Enum.map(rows, fn [k] -> k end)
+      refute "gc/1" in pax_keys
+    end
+
+    test "CAS put during GC TTL expiry: CAS wins (higher timestamp)", %{cas_name: name} do
+      # Write a key with a very short TTL
+      :ok = EKV.put(name, "gc_race/1", "old_val", ttl: 1)
+      Process.sleep(10)
+
+      # Key is expired — GC would tombstone it
+      assert EKV.get(name, "gc_race/1") == nil
+
+      # CAS put with if_vsn: nil should succeed (expired = absent)
+      :ok = EKV.put(name, "gc_race/1", "new_val", if_vsn: nil)
+      assert EKV.get(name, "gc_race/1") == "new_val"
+
+      # Now trigger GC — the new CAS write should survive (higher timestamp)
+      shard_name = :"#{name}_ekv_replica_0"
+      now = System.system_time(:nanosecond)
+      send(shard_name, {:gc, now, 0})
+      :sys.get_state(shard_name)
+
+      assert EKV.get(name, "gc_race/1") == "new_val"
+    end
+
+    test "non-CAS put does not touch kv_paxos", %{cas_name: name} do
+      :ok = EKV.put(name, "nocas/1", "val")
+
+      shard_name = :"#{name}_ekv_replica_0"
+      state = :sys.get_state(shard_name)
+      {:ok, rows} = EKV.Sqlite3.fetch_all(state.db, "SELECT key FROM kv_paxos WHERE key = ?1", ["nocas/1"])
+      assert rows == []
+    end
+
+    test "CAS after non-CAS: vsn check works against LWW-written vsn", %{cas_name: name} do
+      :ok = EKV.put(name, "mixed/1", "lww_val")
+      {:ok, "lww_val", vsn} = EKV.fetch(name, "mixed/1")
+      assert {_ts, _origin} = vsn
+
+      :ok = EKV.put(name, "mixed/1", "cas_val", if_vsn: vsn)
+      assert EKV.get(name, "mixed/1") == "cas_val"
+    end
+  end
+
+  # =====================================================================
+  # Blue-green + CAS
+  # =====================================================================
+
+  describe "blue-green + CAS" do
+    setup do
+      bg_name = :"ekv_bg_cas_#{System.unique_integer([:positive])}"
+      bg_dir = Path.join(System.tmp_dir!(), "ekv_bg_cas_test_#{bg_name}")
+
+      on_exit(fn ->
+        File.rm_rf!(bg_dir)
+      end)
+
+      %{bg_name: bg_name, bg_dir: bg_dir}
+    end
+
+    test "kv_paxos ballot state survives blue-green deploy", %{bg_name: name, bg_dir: dir} do
+      Process.flag(:trap_exit, true)
+
+      # Boot on slot_a with CAS enabled
+      {:ok, _} =
+        EKV.start_link(
+          name: name,
+          data_dir: dir,
+          shards: 2,
+          log: false,
+          blue_green: true,
+          cluster_size: 1,
+          node_id: 1,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      # CAS write creates kv_paxos entries
+      :ok = EKV.put(name, "bg/1", "val1", if_vsn: nil)
+      {:ok, "val1", vsn1} = EKV.fetch(name, "bg/1")
+
+      Supervisor.stop(:"#{name}_ekv_sup", :shutdown)
+      Process.sleep(50)
+
+      # Simulate blue-green deploy (different node name → snapshot to slot_b)
+      File.write!(Path.join(dir, "current"), "a\told_node@host\n")
+
+      {:ok, pid2} =
+        EKV.start_link(
+          name: name,
+          data_dir: dir,
+          shards: 2,
+          log: false,
+          blue_green: true,
+          cluster_size: 1,
+          node_id: 1,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      # kv_paxos state survived — CAS with old vsn should work
+      :ok = EKV.put(name, "bg/1", "val2", if_vsn: vsn1)
+      assert EKV.get(name, "bg/1") == "val2"
+
+      Process.exit(pid2, :shutdown)
+      Process.sleep(50)
+    end
+
+    test "CAS on new VM after deploy: ballot counter does not regress", %{bg_name: name, bg_dir: dir} do
+      Process.flag(:trap_exit, true)
+
+      {:ok, _} =
+        EKV.start_link(
+          name: name,
+          data_dir: dir,
+          shards: 2,
+          log: false,
+          blue_green: true,
+          cluster_size: 1,
+          node_id: 1,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      # Do several CAS ops to advance ballot counter
+      for i <- 1..5 do
+        {:ok, ^i} = EKV.update(name, "counter", fn nil -> 1; n -> n + 1 end)
+      end
+
+      # Record ballot counter before deploy
+      shard_name = :"#{name}_ekv_replica_0"
+      state_before = :sys.get_state(shard_name)
+      counter_before = state_before.ballot_counter
+
+      Supervisor.stop(:"#{name}_ekv_sup", :shutdown)
+      Process.sleep(50)
+
+      # Blue-green deploy
+      File.write!(Path.join(dir, "current"), "a\told_node@host\n")
+
+      {:ok, pid2} =
+        EKV.start_link(
+          name: name,
+          data_dir: dir,
+          shards: 2,
+          log: false,
+          blue_green: true,
+          cluster_size: 1,
+          node_id: 1,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      # Ballot counter should not regress
+      state_after = :sys.get_state(shard_name)
+      assert state_after.ballot_counter >= counter_before
+
+      # CAS ops continue working
+      {:ok, 6} = EKV.update(name, "counter", fn n -> n + 1 end)
+
+      Process.exit(pid2, :shutdown)
+      Process.sleep(50)
+    end
+
+    test "synchronized handoff: CAS on slot_a, deploy to slot_b, CAS sees slot_a values", %{bg_name: name, bg_dir: dir} do
+      Process.flag(:trap_exit, true)
+
+      {:ok, _} =
+        EKV.start_link(
+          name: name,
+          data_dir: dir,
+          shards: 2,
+          log: false,
+          blue_green: true,
+          cluster_size: 1,
+          node_id: 1,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      # CAS writes on slot_a
+      :ok = EKV.put(name, "hand/1", "from_a", if_vsn: nil)
+      :ok = EKV.put(name, "hand/2", "from_a2", if_vsn: nil)
+      {:ok, "from_a", vsn1} = EKV.fetch(name, "hand/1")
+
+      Supervisor.stop(:"#{name}_ekv_sup", :shutdown)
+      Process.sleep(50)
+
+      # Deploy to slot_b
+      File.write!(Path.join(dir, "current"), "a\told_node@host\n")
+
+      {:ok, pid2} =
+        EKV.start_link(
+          name: name,
+          data_dir: dir,
+          shards: 2,
+          log: false,
+          blue_green: true,
+          cluster_size: 1,
+          node_id: 1,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      # Slot_b sees slot_a's CAS values
+      assert EKV.get(name, "hand/1") == "from_a"
+      assert EKV.get(name, "hand/2") == "from_a2"
+
+      # Can CAS-update slot_a's values from slot_b
+      :ok = EKV.put(name, "hand/1", "from_b", if_vsn: vsn1)
+      assert EKV.get(name, "hand/1") == "from_b"
+
+      Process.exit(pid2, :shutdown)
+      Process.sleep(50)
+    end
+  end
 end

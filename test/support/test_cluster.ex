@@ -152,6 +152,20 @@ defmodule EKV.TestCluster do
     end
   end
 
+  # CAS helpers — named functions that can be called across nodes
+  def cas_increment(nil), do: 1
+  def cas_increment(n), do: n + 1
+
+  def cas_upcase(v), do: String.upcase(v)
+
+  @doc "Kill a process by registered name (for cross-node RPC)"
+  def kill_registered(name) do
+    case Process.whereis(name) do
+      nil -> :ok
+      pid -> Process.exit(pid, :kill)
+    end
+  end
+
   @doc "Flush all EKV shard GenServers on a remote node"
   def flush_shards(node, name) do
     num_shards = rpc!(node, EKV, :get_config, [name]).num_shards

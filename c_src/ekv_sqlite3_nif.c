@@ -28,6 +28,8 @@ static ERL_NIF_TERM atom_row;
 static ERL_NIF_TERM atom_done;
 static ERL_NIF_TERM atom_true;
 static ERL_NIF_TERM atom_false;
+static ERL_NIF_TERM atom_promise;
+static ERL_NIF_TERM atom_nack;
 
 static ERL_NIF_TERM make_atom(ErlNifEnv *env, const char *name)
 {
@@ -847,21 +849,358 @@ static ERL_NIF_TERM ekv_backup(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv
 }
 
 /* ------------------------------------------------------------------ */
+/* NIF: paxos_prepare(db, key, ballot_counter, ballot_node)            */
+/*   -> {:ok, :promise, acc_c, acc_n, kv_row | nil}                    */
+/*   -> {:ok, :nack, promised_c, promised_n}                           */
+/*   -> {:error, msg}                                                  */
+/*                                                                     */
+/* Single dirty IO bounce. Atomic CASPaxos prepare-phase acceptor op.  */
+/* ------------------------------------------------------------------ */
+
+static ERL_NIF_TERM ekv_paxos_prepare(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    (void)argc;
+    connection_t *conn;
+    if (!enif_get_resource(env, argv[0], connection_type, (void **)&conn))
+        return enif_make_badarg(env);
+
+    ErlNifBinary key_bin;
+    if (!enif_inspect_iolist_as_binary(env, argv[1], &key_bin))
+        return enif_make_badarg(env);
+
+    ErlNifSInt64 ballot_c, ballot_n;
+    if (!enif_get_int64(env, argv[2], &ballot_c))
+        return enif_make_badarg(env);
+    if (!enif_get_int64(env, argv[3], &ballot_n))
+        return enif_make_badarg(env);
+
+    enif_mutex_lock(conn->mutex);
+    if (!conn->db) {
+        enif_mutex_unlock(conn->mutex);
+        return make_error(env, "database closed");
+    }
+
+    /* BEGIN IMMEDIATE */
+    int rc = sqlite3_exec(conn->db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
+    if (rc != SQLITE_OK) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
+
+    /* SELECT from kv_paxos */
+    sqlite3_stmt *sel = NULL;
+    rc = sqlite3_prepare_v3(conn->db,
+        "SELECT promised_counter, promised_node, accepted_counter, accepted_node "
+        "FROM kv_paxos WHERE key = ?1", -1, 0, &sel, NULL);
+    if (rc != SQLITE_OK) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
+    sqlite3_bind_text(sel, 1, (const char *)key_bin.data, (int)key_bin.size, SQLITE_TRANSIENT);
+
+    rc = sqlite3_step(sel);
+
+    ErlNifSInt64 promised_c = 0, promised_n = 0, accepted_c = 0, accepted_n = 0;
+    int has_row = 0;
+
+    if (rc == SQLITE_ROW) {
+        has_row = 1;
+        promised_c = sqlite3_column_int64(sel, 0);
+        promised_n = sqlite3_column_int64(sel, 1);
+        accepted_c = sqlite3_column_int64(sel, 2);
+        accepted_n = sqlite3_column_int64(sel, 3);
+    }
+    sqlite3_finalize(sel);
+
+    /* Check ballot > promised (strictly greater) */
+    int ballot_wins = (ballot_c > promised_c) ||
+                      (ballot_c == promised_c && ballot_n > promised_n);
+
+    if (!ballot_wins) {
+        /* NACK */
+        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+        enif_mutex_unlock(conn->mutex);
+        return enif_make_tuple4(env, atom_ok, atom_nack,
+            enif_make_int64(env, promised_c),
+            enif_make_int64(env, promised_n));
+    }
+
+    /* Update or insert promise */
+    sqlite3_stmt *ups = NULL;
+    if (has_row) {
+        rc = sqlite3_prepare_v3(conn->db,
+            "UPDATE kv_paxos SET promised_counter = ?2, promised_node = ?3 WHERE key = ?1",
+            -1, 0, &ups, NULL);
+    } else {
+        rc = sqlite3_prepare_v3(conn->db,
+            "INSERT INTO kv_paxos (key, promised_counter, promised_node, accepted_counter, accepted_node) "
+            "VALUES (?1, ?2, ?3, 0, 0)",
+            -1, 0, &ups, NULL);
+    }
+    if (rc != SQLITE_OK) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
+    sqlite3_bind_text(ups, 1, (const char *)key_bin.data, (int)key_bin.size, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(ups, 2, ballot_c);
+    sqlite3_bind_int64(ups, 3, ballot_n);
+    rc = sqlite3_step(ups);
+    sqlite3_finalize(ups);
+    if (rc != SQLITE_DONE) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
+
+    /* SELECT from kv to get current value */
+    sqlite3_stmt *kv_sel = NULL;
+    rc = sqlite3_prepare_v3(conn->db,
+        "SELECT value, timestamp, origin_node, expires_at, deleted_at FROM kv WHERE key = ?1",
+        -1, 0, &kv_sel, NULL);
+    if (rc != SQLITE_OK) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
+    sqlite3_bind_text(kv_sel, 1, (const char *)key_bin.data, (int)key_bin.size, SQLITE_TRANSIENT);
+
+    rc = sqlite3_step(kv_sel);
+    ERL_NIF_TERM kv_row;
+    if (rc == SQLITE_ROW) {
+        int ncols = sqlite3_column_count(kv_sel);
+        ERL_NIF_TERM cols[5];
+        for (int i = 0; i < ncols && i < 5; i++)
+            cols[i] = make_column(env, kv_sel, i);
+        kv_row = enif_make_list_from_array(env, cols, (unsigned)ncols);
+    } else {
+        kv_row = atom_nil;
+    }
+    sqlite3_finalize(kv_sel);
+
+    /* COMMIT */
+    rc = sqlite3_exec(conn->db, "COMMIT", NULL, NULL, NULL);
+    if (rc != SQLITE_OK) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
+
+    enif_mutex_unlock(conn->mutex);
+
+    /* {:ok, :promise, accepted_c, accepted_n, kv_row_or_nil} */
+    return enif_make_tuple(env, 5, atom_ok, atom_promise,
+        enif_make_int64(env, accepted_c),
+        enif_make_int64(env, accepted_n),
+        kv_row);
+}
+
+/* ------------------------------------------------------------------ */
+/* NIF: paxos_accept(db, kv_stmt, oplog_stmt, key, ballot_c, ballot_n,*/
+/*                   kv_args, oplog_args)                              */
+/*   -> {:ok, true}   (accepted)                                       */
+/*   -> {:ok, false}  (rejected — ballot < promised)                   */
+/*   -> {:error, msg}                                                  */
+/*                                                                     */
+/* Single dirty IO bounce. Atomic CASPaxos accept-phase acceptor op.   */
+/* Reuses cached kv_upsert and oplog_insert prepared statements.       */
+/* ------------------------------------------------------------------ */
+
+static ERL_NIF_TERM ekv_paxos_accept(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    (void)argc;
+    connection_t *conn;
+    if (!enif_get_resource(env, argv[0], connection_type, (void **)&conn))
+        return enif_make_badarg(env);
+
+    statement_t *kv_s;
+    if (!enif_get_resource(env, argv[1], statement_type, (void **)&kv_s))
+        return enif_make_badarg(env);
+
+    statement_t *oplog_s;
+    if (!enif_get_resource(env, argv[2], statement_type, (void **)&oplog_s))
+        return enif_make_badarg(env);
+
+    if (kv_s->conn != conn || oplog_s->conn != conn)
+        return make_error(env, "statement does not belong to this connection");
+
+    ErlNifBinary key_bin;
+    if (!enif_inspect_iolist_as_binary(env, argv[3], &key_bin))
+        return enif_make_badarg(env);
+
+    ErlNifSInt64 ballot_c, ballot_n;
+    if (!enif_get_int64(env, argv[4], &ballot_c))
+        return enif_make_badarg(env);
+    if (!enif_get_int64(env, argv[5], &ballot_n))
+        return enif_make_badarg(env);
+
+    enif_mutex_lock(conn->mutex);
+    if (!conn->db) {
+        enif_mutex_unlock(conn->mutex);
+        return make_error(env, "database closed");
+    }
+    if (!kv_s->stmt || !oplog_s->stmt) {
+        enif_mutex_unlock(conn->mutex);
+        return make_error(env, "statement finalized");
+    }
+
+    /* 1. BEGIN IMMEDIATE */
+    int rc = sqlite3_exec(conn->db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
+    if (rc != SQLITE_OK) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
+
+    /* 2. Check promised ballot */
+    sqlite3_stmt *sel = NULL;
+    rc = sqlite3_prepare_v3(conn->db,
+        "SELECT promised_counter, promised_node FROM kv_paxos WHERE key = ?1",
+        -1, 0, &sel, NULL);
+    if (rc != SQLITE_OK) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
+    sqlite3_bind_text(sel, 1, (const char *)key_bin.data, (int)key_bin.size, SQLITE_TRANSIENT);
+
+    rc = sqlite3_step(sel);
+    ErlNifSInt64 promised_c = 0, promised_n = 0;
+    int has_paxos_row = 0;
+
+    if (rc == SQLITE_ROW) {
+        has_paxos_row = 1;
+        promised_c = sqlite3_column_int64(sel, 0);
+        promised_n = sqlite3_column_int64(sel, 1);
+    }
+    sqlite3_finalize(sel);
+
+    /* ballot >= promised? */
+    int ballot_ok = (ballot_c > promised_c) ||
+                    (ballot_c == promised_c && ballot_n >= promised_n);
+
+    if (!ballot_ok) {
+        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+        enif_mutex_unlock(conn->mutex);
+        return enif_make_tuple2(env, atom_ok, atom_false);
+    }
+
+    /* 3. Update kv_paxos (both promised and accepted) */
+    sqlite3_stmt *pax_ups = NULL;
+    if (has_paxos_row) {
+        rc = sqlite3_prepare_v3(conn->db,
+            "UPDATE kv_paxos SET promised_counter = ?2, promised_node = ?3, "
+            "accepted_counter = ?2, accepted_node = ?3 WHERE key = ?1",
+            -1, 0, &pax_ups, NULL);
+    } else {
+        rc = sqlite3_prepare_v3(conn->db,
+            "INSERT INTO kv_paxos (key, promised_counter, promised_node, accepted_counter, accepted_node) "
+            "VALUES (?1, ?2, ?3, ?2, ?3)",
+            -1, 0, &pax_ups, NULL);
+    }
+    if (rc != SQLITE_OK) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
+    sqlite3_bind_text(pax_ups, 1, (const char *)key_bin.data, (int)key_bin.size, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(pax_ups, 2, ballot_c);
+    sqlite3_bind_int64(pax_ups, 3, ballot_n);
+    rc = sqlite3_step(pax_ups);
+    sqlite3_finalize(pax_ups);
+    if (rc != SQLITE_DONE) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
+
+    /* 4. Bind + step kv upsert (LWW — CAS proposer uses fresh timestamp) */
+    int br = bind_args(env, kv_s->stmt, argv[6]);
+    if (br != 0) {
+        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+        enif_mutex_unlock(conn->mutex);
+        return (br == -1) ? enif_make_badarg(env)
+                          : make_sqlite_error(env, conn->db);
+    }
+
+    rc = sqlite3_step(kv_s->stmt);
+    if (rc != SQLITE_DONE) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        sqlite3_reset(kv_s->stmt);
+        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
+    sqlite3_reset(kv_s->stmt);
+
+    /* 5. Check LWW result */
+    int changes = sqlite3_changes(conn->db);
+    if (changes == 0) {
+        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+        enif_mutex_unlock(conn->mutex);
+        return enif_make_tuple2(env, atom_ok, atom_false);
+    }
+
+    /* 6. Bind + step oplog insert */
+    br = bind_args(env, oplog_s->stmt, argv[7]);
+    if (br != 0) {
+        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+        enif_mutex_unlock(conn->mutex);
+        return (br == -1) ? enif_make_badarg(env)
+                          : make_sqlite_error(env, conn->db);
+    }
+
+    rc = sqlite3_step(oplog_s->stmt);
+    if (rc != SQLITE_DONE) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        sqlite3_reset(oplog_s->stmt);
+        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
+    sqlite3_reset(oplog_s->stmt);
+
+    /* 7. COMMIT */
+    rc = sqlite3_exec(conn->db, "COMMIT", NULL, NULL, NULL);
+    if (rc != SQLITE_OK) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
+
+    enif_mutex_unlock(conn->mutex);
+    return enif_make_tuple2(env, atom_ok, atom_true);
+}
+
+/* ------------------------------------------------------------------ */
 /* NIF table & lifecycle                                               */
 /* ------------------------------------------------------------------ */
 
 static ErlNifFunc nif_funcs[] = {
-    {"ekv_open",        1, ekv_open,        ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"ekv_close",       1, ekv_close,       ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"ekv_execute",     2, ekv_execute,     ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"ekv_prepare",     2, ekv_prepare,     ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"ekv_bind",        2, ekv_bind,        ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"ekv_step",        2, ekv_step,        ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"ekv_release",     2, ekv_release,     ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"ekv_write_entry", 5, ekv_write_entry, ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"ekv_read_entry",  3, ekv_read_entry,  ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"ekv_fetch_all",   3, ekv_fetch_all,   ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"ekv_backup",      2, ekv_backup,      ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"ekv_open",          1, ekv_open,          ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"ekv_close",         1, ekv_close,         ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"ekv_execute",       2, ekv_execute,       ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"ekv_prepare",       2, ekv_prepare,       ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"ekv_bind",          2, ekv_bind,          ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"ekv_step",          2, ekv_step,          ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"ekv_release",       2, ekv_release,       ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"ekv_write_entry",   5, ekv_write_entry,   ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"ekv_read_entry",    3, ekv_read_entry,    ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"ekv_fetch_all",     3, ekv_fetch_all,     ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"ekv_backup",        2, ekv_backup,        ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"ekv_paxos_prepare", 4, ekv_paxos_prepare, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"ekv_paxos_accept",  8, ekv_paxos_accept,  ERL_NIF_DIRTY_JOB_IO_BOUND},
 };
 
 static int on_load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info)
@@ -877,13 +1216,15 @@ static int on_load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info)
         statement_dtor, ERL_NIF_RT_CREATE, NULL);
     if (!statement_type) return -1;
 
-    atom_ok    = make_atom(env, "ok");
-    atom_error = make_atom(env, "error");
-    atom_nil   = make_atom(env, "nil");
-    atom_row   = make_atom(env, "row");
-    atom_done  = make_atom(env, "done");
-    atom_true  = make_atom(env, "true");
-    atom_false = make_atom(env, "false");
+    atom_ok      = make_atom(env, "ok");
+    atom_error   = make_atom(env, "error");
+    atom_nil     = make_atom(env, "nil");
+    atom_row     = make_atom(env, "row");
+    atom_done    = make_atom(env, "done");
+    atom_true    = make_atom(env, "true");
+    atom_false   = make_atom(env, "false");
+    atom_promise = make_atom(env, "promise");
+    atom_nack    = make_atom(env, "nack");
 
     return 0;
 }

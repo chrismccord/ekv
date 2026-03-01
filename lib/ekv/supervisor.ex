@@ -73,7 +73,8 @@ defmodule EKV.Supervisor do
     preserves the `kv_meta` `num_shards` row, so mismatches are caught.
   """
 
-  @valid_opts [:name, :data_dir, :shards, :log, :tombstone_ttl, :gc_interval, :blue_green]
+  @valid_opts [:name, :data_dir, :shards, :log, :tombstone_ttl, :gc_interval, :blue_green,
+               :cluster_size, :node_id]
 
   def start_link(opts) do
     opts = Keyword.validate!(opts, @valid_opts)
@@ -90,6 +91,10 @@ defmodule EKV.Supervisor do
     log = Keyword.get(opts, :log, :info)
     tombstone_ttl = Keyword.get(opts, :tombstone_ttl, :timer.hours(24 * 7))
     gc_interval = Keyword.get(opts, :gc_interval, :timer.minutes(5))
+    cluster_size = Keyword.get(opts, :cluster_size)
+    node_id = Keyword.get(opts, :node_id)
+
+    validate_cas_config!(cluster_size, node_id)
 
     data_dir =
       if blue_green,
@@ -107,7 +112,9 @@ defmodule EKV.Supervisor do
       tombstone_ttl: tombstone_ttl,
       gc_interval: gc_interval,
       registry: registry_name,
-      sub_count: sub_count
+      sub_count: sub_count,
+      cluster_size: cluster_size,
+      node_id: node_id
     }
 
     :persistent_term.put({EKV, name}, config)
@@ -121,6 +128,40 @@ defmodule EKV.Supervisor do
     ]
 
     Supervisor.init(children, strategy: :rest_for_one)
+  end
+
+  # =====================================================================
+  # CAS config validation
+  # =====================================================================
+
+  defp validate_cas_config!(nil, nil), do: :ok
+
+  defp validate_cas_config!(cluster_size, nil) when is_integer(cluster_size) do
+    raise ArgumentError, "EKV: :node_id is required when :cluster_size is set"
+  end
+
+  defp validate_cas_config!(nil, node_id) when not is_nil(node_id) do
+    raise ArgumentError, "EKV: :cluster_size is required when :node_id is set"
+  end
+
+  defp validate_cas_config!(cluster_size, node_id)
+       when is_integer(cluster_size) and is_integer(node_id) do
+    if cluster_size < 1 do
+      raise ArgumentError, "EKV: :cluster_size must be a positive integer, got: #{cluster_size}"
+    end
+
+    if node_id < 1 do
+      raise ArgumentError, "EKV: :node_id must be a positive integer, got: #{node_id}"
+    end
+
+    if node_id > cluster_size do
+      raise ArgumentError,
+            "EKV: :node_id (#{node_id}) must be <= :cluster_size (#{cluster_size})"
+    end
+  end
+
+  defp validate_cas_config!(_cluster_size, _node_id) do
+    raise ArgumentError, "EKV: :cluster_size and :node_id must be positive integers"
   end
 
   # =====================================================================

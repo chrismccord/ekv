@@ -289,18 +289,69 @@ defmodule EKV do
   def start_link(opts), do: EKV.Supervisor.start_link(opts)
 
   @doc """
+  Fetch a key's value and version.
+
+  Returns `{:ok, value, vsn}` where `vsn` is `{timestamp, origin_node}`,
+  or `{:ok, nil, nil}` for missing, deleted, or expired keys.
+
+  The vsn can be passed to `put/4` with `if_vsn:` for compare-and-swap.
+  This is a local read (eventually consistent, no GenServer hop).
+  """
+  def fetch(name, key) do
+    config = get_config(name)
+    shard_index = Replica.shard_index_for(key, config.num_shards)
+    {db, get_stmt} = read_conn(name, shard_index)
+
+    case EKV.Store.get_cached(db, get_stmt, key) do
+      nil ->
+        {:ok, nil, nil}
+
+      {_value_binary, _ts, _origin, _expires_at, deleted_at} when is_integer(deleted_at) ->
+        {:ok, nil, nil}
+
+      {value_binary, ts, origin, expires_at, nil} when is_integer(expires_at) ->
+        now = System.system_time(:nanosecond)
+
+        if expires_at <= now do
+          {:ok, nil, nil}
+        else
+          {:ok, :erlang.binary_to_term(value_binary), {ts, origin}}
+        end
+
+      {value_binary, ts, origin, _expires_at, nil} ->
+        {:ok, :erlang.binary_to_term(value_binary), {ts, origin}}
+    end
+  end
+
+  @doc """
   Put a key-value pair.
 
   ## Options
 
   - `:ttl` — time-to-live in milliseconds. Entry expires after this duration.
+  - `:if_vsn` — compare-and-swap. Only succeeds if the key's current version
+    matches. Use `nil` for insert-if-absent. Returns `{:error, :conflict}` on
+    mismatch. Requires `cluster_size` and `node_id` config.
   """
   def put(name, key, value, opts \\ []) do
-    opts = Keyword.validate!(opts, [:ttl])
+    opts = Keyword.validate!(opts, [:ttl, :if_vsn])
     value_binary = :erlang.term_to_binary(value)
     config = get_config(name)
     shard_index = Replica.shard_index_for(key, config.num_shards)
-    GenServer.call(Replica.shard_name(name, shard_index), {:put, key, value_binary, opts})
+
+    case Keyword.fetch(opts, :if_vsn) do
+      {:ok, expected_vsn} ->
+        validate_cas_config!(config)
+
+        GenServer.call(
+          Replica.shard_name(name, shard_index),
+          {:cas_put, key, value_binary, expected_vsn, opts},
+          :infinity
+        )
+
+      :error ->
+        GenServer.call(Replica.shard_name(name, shard_index), {:put, key, value_binary, opts})
+    end
   end
 
   @doc """
@@ -338,11 +389,59 @@ defmodule EKV do
   Delete a key.
 
   Writes a tombstone that replicates to all peers.
+
+  ## Options
+
+  - `:if_vsn` — compare-and-swap delete. Only succeeds if the key's current
+    version matches. Returns `{:error, :conflict}` on mismatch. Requires
+    `cluster_size` and `node_id` config.
   """
-  def delete(name, key) do
+  def delete(name, key, opts \\ []) do
+    opts = Keyword.validate!(opts, [:if_vsn])
     config = get_config(name)
     shard_index = Replica.shard_index_for(key, config.num_shards)
-    GenServer.call(Replica.shard_name(name, shard_index), {:delete, key})
+
+    case Keyword.fetch(opts, :if_vsn) do
+      {:ok, expected_vsn} ->
+        validate_cas_config!(config)
+
+        GenServer.call(
+          Replica.shard_name(name, shard_index),
+          {:cas_delete, key, expected_vsn},
+          :infinity
+        )
+
+      :error ->
+        GenServer.call(Replica.shard_name(name, shard_index), {:delete, key})
+    end
+  end
+
+  @doc """
+  Atomic read-modify-write.
+
+  Reads the current value, applies `fun`, and writes the result using CASPaxos.
+  Auto-retries on conflict (up to 5 times with random backoff).
+
+  Returns `{:ok, new_value}` on success, or `{:error, :conflict}` if retries
+  are exhausted.
+
+  Requires `cluster_size` and `node_id` config.
+
+  ## Options
+
+  - `:ttl` — time-to-live in milliseconds for the new value.
+  """
+  def update(name, key, fun, opts \\ []) when is_function(fun, 1) do
+    opts = Keyword.validate!(opts, [:ttl])
+    config = get_config(name)
+    validate_cas_config!(config)
+    shard_index = Replica.shard_index_for(key, config.num_shards)
+
+    GenServer.call(
+      Replica.shard_name(name, shard_index),
+      {:update, key, fun, opts},
+      :infinity
+    )
   end
 
   @scan_sql """
@@ -463,6 +562,13 @@ defmodule EKV do
   def get_config(name) do
     :persistent_term.get({EKV, name})
   end
+
+  defp validate_cas_config!(%{cluster_size: nil}) do
+    raise ArgumentError,
+          "EKV: CAS operations require :cluster_size and :node_id to be configured"
+  end
+
+  defp validate_cas_config!(_config), do: :ok
 
   defp read_conn(name, shard_index) do
     readers = :persistent_term.get({EKV, name, :readers, shard_index})

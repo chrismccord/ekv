@@ -46,4 +46,10 @@ defmodule EKV.Sqlite3NIF do
   def ekv_read_entry(_db, _stmt, _args), do: :erlang.nif_error(:not_loaded)
   def ekv_fetch_all(_db, _sql, _args), do: :erlang.nif_error(:not_loaded)
   def ekv_backup(_source_path, _dest_path), do: :erlang.nif_error(:not_loaded)
+
+  def ekv_paxos_prepare(_db, _key, _ballot_counter, _ballot_node),
+    do: :erlang.nif_error(:not_loaded)
+
+  def ekv_paxos_accept(_db, _kv_stmt, _oplog_stmt, _key, _ballot_c, _ballot_n, _kv_args, _oplog_args),
+    do: :erlang.nif_error(:not_loaded)
 end

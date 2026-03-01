@@ -107,6 +107,17 @@ defmodule EKV.Store do
       """)
 
     :ok =
+      EKV.Sqlite3.execute(db, """
+      CREATE TABLE IF NOT EXISTS kv_paxos (
+        key TEXT NOT NULL PRIMARY KEY,
+        promised_counter INTEGER NOT NULL DEFAULT 0,
+        promised_node INTEGER NOT NULL DEFAULT 0,
+        accepted_counter INTEGER NOT NULL DEFAULT 0,
+        accepted_node INTEGER NOT NULL DEFAULT 0
+      )
+      """)
+
+    :ok =
       EKV.Sqlite3.execute(
         db,
         "CREATE INDEX IF NOT EXISTS idx_kv_deleted ON kv(deleted_at) WHERE deleted_at IS NOT NULL"
@@ -539,6 +550,61 @@ defmodule EKV.Store do
       {:error, _} ->
         nil
     end
+  end
+
+  # =====================================================================
+  # Shard count validation
+  # =====================================================================
+
+  # =====================================================================
+  # Metadata
+  # =====================================================================
+
+  def get_meta(db, key) do
+    {:ok, stmt} = EKV.Sqlite3.prepare(db, "SELECT value FROM kv_meta WHERE key = ?1")
+    :ok = EKV.Sqlite3.bind(stmt, [key])
+
+    result =
+      case EKV.Sqlite3.step(db, stmt) do
+        {:row, [val]} -> val
+        :done -> nil
+      end
+
+    :ok = EKV.Sqlite3.release(db, stmt)
+    result
+  end
+
+  def set_meta(db, key, value) do
+    {:ok, stmt} =
+      EKV.Sqlite3.prepare(db, """
+      INSERT INTO kv_meta (key, value) VALUES (?1, ?2)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      """)
+
+    :ok = EKV.Sqlite3.bind(stmt, [key, value])
+    :done = EKV.Sqlite3.step(db, stmt)
+    :ok = EKV.Sqlite3.release(db, stmt)
+    :ok
+  end
+
+  # =====================================================================
+  # Paxos
+  # =====================================================================
+
+  def paxos_prepare(db, key, ballot_counter, ballot_node) do
+    EKV.Sqlite3.paxos_prepare(db, key, ballot_counter, ballot_node)
+  end
+
+  def paxos_accept(db, kv_stmt, oplog_stmt, key, ballot_c, ballot_n, kv_args, oplog_args) do
+    EKV.Sqlite3.paxos_accept(db, kv_stmt, oplog_stmt, key, ballot_c, ballot_n, kv_args, oplog_args)
+  end
+
+  @doc """
+  Remove kv_paxos rows for keys that no longer exist in kv.
+  Called during GC to prevent unbounded growth.
+  """
+  def purge_orphan_paxos(db) do
+    :ok = EKV.Sqlite3.execute(db, "DELETE FROM kv_paxos WHERE key NOT IN (SELECT key FROM kv)")
   end
 
   # =====================================================================

@@ -112,6 +112,29 @@ defmodule Bench.Replica do
     :ok
   end
 
+  # ---------------------------------------------------------------------------
+  # CAS helpers
+  # ---------------------------------------------------------------------------
+
+  def cas_put(name, key, value, expected_vsn) do
+    EKV.put(name, key, value, if_vsn: expected_vsn)
+  end
+
+  def cas_delete(name, key, expected_vsn) do
+    EKV.delete(name, key, if_vsn: expected_vsn)
+  end
+
+  def cas_update(name, key, fun) do
+    EKV.update(name, key, fun)
+  end
+
+  def cas_fetch(name, key) do
+    EKV.fetch(name, key)
+  end
+
+  def cas_increment(nil), do: 1
+  def cas_increment(n), do: n + 1
+
   @doc "Start a subscriber that forwards event timestamps to a remote pid"
   def start_event_subscriber(name, prefix, notify_pid) do
     spawn(fn ->
