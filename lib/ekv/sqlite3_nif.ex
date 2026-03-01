@@ -50,6 +50,9 @@ defmodule EKV.Sqlite3NIF do
   def ekv_paxos_prepare(_db, _key, _ballot_counter, _ballot_node),
     do: :erlang.nif_error(:not_loaded)
 
-  def ekv_paxos_accept(_db, _kv_stmt, _oplog_stmt, _key, _ballot_c, _ballot_n, _kv_args, _oplog_args),
+  def ekv_paxos_accept(_db, _key, _ballot_c, _ballot_n, _value_args),
+    do: :erlang.nif_error(:not_loaded)
+
+  def ekv_paxos_promote(_db, _kv_force_stmt, _oplog_stmt, _key, _ballot_c, _ballot_n),
     do: :erlang.nif_error(:not_loaded)
 end

@@ -277,6 +277,61 @@ defmodule EKV.CASDistributedTest do
       assert conflicts == 1
     end
 
+    test "CAS conflict does not leave phantom write on proposer node" do
+      # This test targets a specific bug: the proposer does local paxos_accept
+      # BEFORE quorum is confirmed. If the accept phase fails (remote acceptors
+      # nack due to a higher-ballot prepare from a third proposer), the proposer
+      # returns {:error, :conflict} but the value is in local SQLite.
+      #
+      # Trigger: 3 concurrent proposers. The middle-ballot proposer (B) can get
+      # prepare quorum (own + A's promise), enter accept with local accept, but
+      # then get nacked in accept phase (C's higher prepare pre-empted A and C).
+      peers = TestCluster.start_peers(3)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
+      ekv_name = unique_name(:cas)
+
+      start_cas_cluster(peers, ekv_name, cluster_size: 3)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+      Process.sleep(500)
+
+      for round <- 1..20 do
+        key = "phantom/#{round}"
+
+        # All 3 nodes try insert-if-absent concurrently
+        task_a = Task.async(fn ->
+          result = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, key, "from_a", [if_vsn: nil]])
+          {node_a, result, "from_a"}
+        end)
+
+        task_b = Task.async(fn ->
+          result = TestCluster.rpc!(node_b, EKV, :put, [ekv_name, key, "from_b", [if_vsn: nil]])
+          {node_b, result, "from_b"}
+        end)
+
+        task_c = Task.async(fn ->
+          result = TestCluster.rpc!(node_c, EKV, :put, [ekv_name, key, "from_c", [if_vsn: nil]])
+          {node_c, result, "from_c"}
+        end)
+
+        results = Task.await_many([task_a, task_b, task_c], 10_000)
+
+        for {node, result, attempted_value} <- results do
+          if result != :ok do
+            # CAS failed — immediately check local value BEFORE LWW broadcast overwrites.
+            # If local accept was deferred until quorum, this value cannot be the
+            # attempted write. If it IS, the proposer wrote locally before quorum.
+            local_value = TestCluster.rpc!(node, EKV, :get, [ekv_name, key])
+
+            assert local_value != attempted_value,
+              "round #{round}: CAS returned #{inspect(result)} on #{inspect(node)} " <>
+              "but phantom write '#{attempted_value}' is visible locally"
+          end
+        end
+      end
+    end
+
     test "two nodes update same counter concurrently: both increments applied via retry" do
       peers = TestCluster.start_peers(2)
       on_exit(fn -> TestCluster.stop_peers(peers) end)
@@ -983,6 +1038,120 @@ defmodule EKV.CASDistributedTest do
       assert_receive {:remote_ekv_event, events, _}, 3000
       assert Enum.any?(events, fn e -> e.key == "sub/1" and e.type == :put end)
     end
+
+    test "acceptor node subscriber gets put event from CAS accept" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      ekv_name = unique_name(:cas)
+
+      start_cas_cluster(peers, ekv_name)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+      Process.sleep(200)
+
+      # Subscribe on acceptor node (B)
+      TestCluster.subscribe_on(node_b, ekv_name, "asub/", self())
+      Process.sleep(50)
+
+      # CAS put on proposer node (A) — B acts as acceptor
+      :ok = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "asub/1", "accepted_val", [if_vsn: nil]])
+
+      # Acceptor subscriber should get the event
+      assert_receive {:remote_ekv_event, events, _}, 3000
+      assert [%EKV.Event{type: :put, key: "asub/1", value: "accepted_val"}] = events
+    end
+
+    test "acceptor node subscriber gets delete event with previous value" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      ekv_name = unique_name(:cas)
+
+      start_cas_cluster(peers, ekv_name)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+      Process.sleep(200)
+
+      # Write initial value via CAS
+      :ok = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "dsub/1", "old_val", [if_vsn: nil]])
+
+      # Wait for replication so B has the value
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, EKV, :get, [ekv_name, "dsub/1"]) == "old_val"
+      end)
+
+      # Subscribe on acceptor node (B)
+      TestCluster.subscribe_on(node_b, ekv_name, "dsub/", self())
+      Process.sleep(50)
+
+      # CAS delete on proposer node (A)
+      {:ok, _, vsn} = TestCluster.rpc!(node_a, EKV, :fetch, [ekv_name, "dsub/1"])
+      :ok = TestCluster.rpc!(node_a, EKV, :delete, [ekv_name, "dsub/1", [if_vsn: vsn]])
+
+      # Acceptor subscriber gets delete event with the previous value
+      assert_receive {:remote_ekv_event, events, _}, 3000
+      assert [%EKV.Event{type: :delete, key: "dsub/1", value: "old_val"}] = events
+    end
+
+    test "proposer node subscriber does not get event on CAS conflict" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, _node_b}] = peers
+      ekv_name = unique_name(:cas)
+
+      start_cas_cluster(peers, ekv_name)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+      Process.sleep(200)
+
+      # Write initial value
+      :ok = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "nosub/1", "v1", [if_vsn: nil]])
+
+      # Subscribe on proposer node (A)
+      TestCluster.subscribe_on(node_a, ekv_name, "nosub/", self())
+      Process.sleep(50)
+
+      # Get current vsn, then write again to make it stale
+      {:ok, _, stale_vsn} = TestCluster.rpc!(node_a, EKV, :fetch, [ekv_name, "nosub/1"])
+      :ok = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "nosub/1", "v2", [if_vsn: stale_vsn]])
+
+      # Drain the put event from the v2 write
+      assert_receive {:remote_ekv_event, _, _}, 3000
+
+      # Now try CAS with the stale vsn — should conflict
+      assert {:error, :conflict} =
+        TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "nosub/1", "v3", [if_vsn: stale_vsn]])
+
+      # No event should be dispatched for the conflict
+      refute_receive {:remote_ekv_event, _, _}, 500
+    end
+
+    test "acceptor node does not get duplicate events from CAS accept + LWW broadcast" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      ekv_name = unique_name(:cas)
+
+      start_cas_cluster(peers, ekv_name)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+      Process.sleep(200)
+
+      # Use a collecting subscriber on B to capture all events over a window
+      TestCluster.start_collecting_subscriber_on(node_b, ekv_name, "nodup/", self(), 1000)
+      Process.sleep(50)
+
+      # CAS put on A — B will get accept event, then LWW broadcast
+      :ok = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "nodup/1", "val", [if_vsn: nil]])
+
+      # Wait for collection window
+      assert_receive {:collected_events, events}, 3000
+
+      # Should have exactly 1 put event, not 2 (no duplicate from LWW)
+      put_events = Enum.filter(events, fn e -> e.key == "nodup/1" and e.type == :put end)
+      assert length(put_events) == 1
+    end
   end
 
   # =====================================================================
@@ -1340,6 +1509,383 @@ defmodule EKV.CASDistributedTest do
 
       assert result_a in [{:error, :no_quorum}, {:error, :quorum_timeout}]
       assert result_b in [{:error, :no_quorum}, {:error, :quorum_timeout}]
+    end
+  end
+
+  # =====================================================================
+  # Latency scenarios — simulating slow nodes via :sys.suspend/:sys.resume
+  # =====================================================================
+
+  describe "latency scenarios" do
+    test "CAS succeeds after slow acceptor resumes (suspend during prepare)" do
+      # Suspend an acceptor BEFORE CAS starts. The proposer's prepare message
+      # queues in the suspended acceptor's mailbox. CAS blocks waiting for quorum.
+      # Resume the acceptor → queued prepare processes → quorum reached → CAS succeeds.
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      ekv_name = unique_name(:cas)
+
+      start_cas_cluster(peers, ekv_name)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+      Process.sleep(200)
+
+      # Suspend B (acceptor) — messages will queue
+      TestCluster.suspend_shards(node_b, ekv_name)
+
+      # Start CAS in background — will block waiting for B's promise
+      task = Task.async(fn ->
+        TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "slow/1", "val1", [if_vsn: nil]])
+      end)
+
+      # Let the prepare message sit in B's queue
+      Process.sleep(500)
+
+      # Resume B — it processes the queued prepare, sends promise
+      TestCluster.resume_shards(node_b, ekv_name)
+
+      # CAS should complete successfully
+      assert :ok = Task.await(task, 10_000)
+      assert TestCluster.rpc!(node_a, EKV, :get, [ekv_name, "slow/1"]) == "val1"
+    end
+
+    test "CAS succeeds after slow acceptor resumes (suspend during accept phase)" do
+      # 3-node cluster. Suspend C before CAS. A proposes, gets promises from A+B
+      # (quorum for prepare). Enters accept phase, sends accepts to B and C.
+      # B accepts → quorum for accept (A+B). CAS commits.
+      # Then resume C — C gets the queued accept + commit notification.
+      peers = TestCluster.start_peers(3)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
+      ekv_name = unique_name(:cas)
+
+      start_cas_cluster(peers, ekv_name)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+      Process.sleep(300)
+
+      # Suspend C — it won't process any messages
+      TestCluster.suspend_shards(node_c, ekv_name)
+
+      # CAS from A — needs quorum of 2. A+B available, C suspended.
+      # Prepare: A local + B remote → quorum. Accept: B remote → quorum (A deferred + B).
+      assert :ok = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "slow/2", "val2", [if_vsn: nil]])
+
+      # Value readable on A and B immediately
+      assert TestCluster.rpc!(node_a, EKV, :get, [ekv_name, "slow/2"]) == "val2"
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, EKV, :get, [ekv_name, "slow/2"]) == "val2"
+      end)
+
+      # C doesn't have it yet (still suspended)
+      # Resume C — it processes the queued messages
+      TestCluster.resume_shards(node_c, ekv_name)
+
+      # C should eventually get the value (via commit notification or LWW)
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_c, EKV, :get, [ekv_name, "slow/2"]) == "val2"
+      end)
+    end
+
+    test "CAS times out when all acceptors are suspended" do
+      # 2-node cluster. Suspend B. A's CAS can't get quorum → timeout.
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      ekv_name = unique_name(:cas)
+
+      start_cas_cluster(peers, ekv_name)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+      Process.sleep(200)
+
+      # Suspend B
+      TestCluster.suspend_shards(node_b, ekv_name)
+
+      # CAS from A — quorum requires both nodes, B is frozen
+      result = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "slow/3", "val3", [if_vsn: nil]])
+      assert result == {:error, :quorum_timeout}
+
+      # Resume B for cleanup
+      TestCluster.resume_shards(node_b, ekv_name)
+    end
+
+    test "slow minority does not block CAS when majority is fast (3-node)" do
+      # 3-node cluster (quorum=2). Suspend C. A proposes with quorum A+B.
+      # CAS should succeed quickly without waiting for C.
+      peers = TestCluster.start_peers(3)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, _node_b}, {_, node_c}] = peers
+      ekv_name = unique_name(:cas)
+
+      start_cas_cluster(peers, ekv_name)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+      Process.sleep(300)
+
+      # Suspend C (slow minority)
+      TestCluster.suspend_shards(node_c, ekv_name)
+
+      # CAS should succeed quickly with just A+B
+      t1 = System.monotonic_time(:millisecond)
+      assert :ok = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "fast/1", "val", [if_vsn: nil]])
+      elapsed = System.monotonic_time(:millisecond) - t1
+
+      # Should complete in well under the 5s timeout
+      assert elapsed < 2000, "CAS took #{elapsed}ms, expected < 2000ms (slow minority should not block)"
+
+      # Resume C — it catches up
+      TestCluster.resume_shards(node_c, ekv_name)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_c, EKV, :get, [ekv_name, "fast/1"]) == "val"
+      end)
+    end
+
+    test "concurrent CAS with asymmetric latency: one proposer's acceptor is slow" do
+      # 3 nodes. Suspend B briefly while A and C both try CAS on the same key.
+      # A can only reach quorum with A+C (B is frozen).
+      # C can only reach quorum with C+A (B is frozen).
+      # One should win, one should conflict.
+      peers = TestCluster.start_peers(3)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
+      ekv_name = unique_name(:cas)
+
+      start_cas_cluster(peers, ekv_name)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+      Process.sleep(300)
+
+      # Suspend B — forces A and C to compete for quorum via A↔C
+      TestCluster.suspend_shards(node_b, ekv_name)
+
+      task_a = Task.async(fn ->
+        TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "asym/1", "from_a", [if_vsn: nil]])
+      end)
+
+      task_c = Task.async(fn ->
+        TestCluster.rpc!(node_c, EKV, :put, [ekv_name, "asym/1", "from_c", [if_vsn: nil]])
+      end)
+
+      results = Task.await_many([task_a, task_c], 15_000)
+      successes = Enum.count(results, &(&1 == :ok))
+
+      # At most one wins (could be 0 if both nack each other)
+      assert successes <= 1
+
+      # Resume B
+      TestCluster.resume_shards(node_b, ekv_name)
+
+      # All nodes eventually agree
+      TestCluster.assert_eventually(fn ->
+        val_a = TestCluster.rpc!(node_a, EKV, :get, [ekv_name, "asym/1"])
+        val_b = TestCluster.rpc!(node_b, EKV, :get, [ekv_name, "asym/1"])
+        val_c = TestCluster.rpc!(node_c, EKV, :get, [ekv_name, "asym/1"])
+        val_a != nil and val_a == val_b and val_b == val_c
+      end)
+    end
+
+    test "suspend acceptor between prepare and accept: CAS still commits after resume" do
+      # 2-node cluster. Start CAS from A — prepare succeeds (both nodes respond).
+      # Then suspend B before accept phase messages arrive.
+      # A's accept to B queues. A waits. Resume B → accept processes → quorum.
+      #
+      # We can't precisely time the suspend between phases, so we use a 3-node
+      # cluster, suspend C before CAS (so C misses prepare), then CAS gets
+      # prepare quorum from A+B. A enters accept phase. Accept goes to B and C.
+      # B accepts (quorum reached). C gets accept after resume. This is covered
+      # by "suspend during accept phase" test above, so instead we test a
+      # different angle: suspend+resume cycles during a series of CAS operations.
+      peers = TestCluster.start_peers(3)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
+      ekv_name = unique_name(:cas)
+
+      start_cas_cluster(peers, ekv_name)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+      Process.sleep(300)
+
+      # Rapid suspend/resume cycles with CAS operations
+      for i <- 1..5 do
+        # Suspend a different node each cycle
+        slow_node = Enum.at([node_b, node_c, node_b, node_c, node_b], i - 1)
+        TestCluster.suspend_shards(slow_node, ekv_name)
+
+        # CAS should still work (quorum of 2 from remaining fast nodes)
+        key = "cycle/#{i}"
+        assert :ok = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, key, "v#{i}", [if_vsn: nil]])
+
+        # Resume before next cycle
+        TestCluster.resume_shards(slow_node, ekv_name)
+        Process.sleep(100)
+      end
+
+      # All values should be readable everywhere after all resumes
+      for i <- 1..5 do
+        key = "cycle/#{i}"
+        TestCluster.assert_eventually(fn ->
+          val_a = TestCluster.rpc!(node_a, EKV, :get, [ekv_name, key])
+          val_b = TestCluster.rpc!(node_b, EKV, :get, [ekv_name, key])
+          val_c = TestCluster.rpc!(node_c, EKV, :get, [ekv_name, key])
+          val_a == "v#{i}" and val_b == "v#{i}" and val_c == "v#{i}"
+        end)
+      end
+    end
+
+    test "slow commit notification: acceptor promotes value after delay" do
+      # 3-node cluster. CAS from A with quorum A+B. A commits locally.
+      # B is suspended when commit notification arrives — it queues.
+      # Resume B → promote fires → value appears on B.
+      peers = TestCluster.start_peers(3)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
+      ekv_name = unique_name(:cas)
+
+      start_cas_cluster(peers, ekv_name)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+      Process.sleep(300)
+
+      # First, do a CAS write normally to establish ballot state
+      :ok = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "delay/1", "v1", [if_vsn: nil]])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, EKV, :get, [ekv_name, "delay/1"]) == "v1"
+      end)
+
+      # Now suspend B, do a CAS update from A
+      TestCluster.suspend_shards(node_b, ekv_name)
+
+      # CAS update — A+C form quorum (B is suspended but still "alive" from dist POV)
+      {:ok, _, vsn} = TestCluster.rpc!(node_a, EKV, :fetch, [ekv_name, "delay/1"])
+      :ok = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "delay/1", "v2", [if_vsn: vsn]])
+
+      # A has v2, C should have v2 (it was either acceptor or got LWW)
+      assert TestCluster.rpc!(node_a, EKV, :get, [ekv_name, "delay/1"]) == "v2"
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_c, EKV, :get, [ekv_name, "delay/1"]) == "v2"
+      end)
+
+      # B still has v1 (suspended, hasn't processed commit notification)
+      # Resume B — it processes the queued commit/LWW message
+      TestCluster.resume_shards(node_b, ekv_name)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, EKV, :get, [ekv_name, "delay/1"]) == "v2"
+      end)
+    end
+
+    test "update retries succeed despite intermittent acceptor suspension" do
+      # 3-node cluster. While node A does update operations, periodically
+      # suspend/resume node C. The update retry mechanism should handle
+      # the intermittent failures from C being slow.
+      peers = TestCluster.start_peers(3)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
+      ekv_name = unique_name(:cas)
+
+      start_cas_cluster(peers, ekv_name)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+      Process.sleep(300)
+
+      # Background task that flaps C's shards
+      flapper = Task.async(fn ->
+        for _ <- 1..8 do
+          TestCluster.suspend_shards(node_c, ekv_name)
+          Process.sleep(50 + :rand.uniform(100))
+          TestCluster.resume_shards(node_c, ekv_name)
+          Process.sleep(50 + :rand.uniform(100))
+        end
+      end)
+
+      # Sequential updates while C is flapping
+      for i <- 1..6 do
+        {:ok, ^i} = TestCluster.rpc!(node_a, EKV, :update, [ekv_name, "flap_counter", &TestCluster.cas_increment/1])
+      end
+
+      Task.await(flapper, 30_000)
+
+      # Final value should be correct everywhere
+      TestCluster.assert_eventually(fn ->
+        val_a = TestCluster.rpc!(node_a, EKV, :get, [ekv_name, "flap_counter"])
+        val_b = TestCluster.rpc!(node_b, EKV, :get, [ekv_name, "flap_counter"])
+        val_c = TestCluster.rpc!(node_c, EKV, :get, [ekv_name, "flap_counter"])
+        val_a == 6 and val_b == 6 and val_c == 6
+      end)
+    end
+
+    test "staggered resume: two suspended acceptors resume at different times" do
+      # 5-node cluster (quorum=3). Suspend nodes 4 and 5.
+      # CAS from node 1 — gets quorum from 1+2+3. Nodes 4,5 have queued messages.
+      # Resume node 4 first, then node 5 later.
+      # Both should eventually get the value.
+      peers = TestCluster.start_peers(5)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, n1}, {_, _n2}, {_, _n3}, {_, n4}, {_, n5}] = peers
+      ekv_name = unique_name(:cas5)
+
+      start_cas_cluster(peers, ekv_name)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+      Process.sleep(500)
+
+      # Suspend n4 and n5
+      TestCluster.suspend_shards(n4, ekv_name)
+      TestCluster.suspend_shards(n5, ekv_name)
+
+      # CAS — quorum from n1+n2+n3
+      :ok = TestCluster.rpc!(n1, EKV, :put, [ekv_name, "stagger/1", "val", [if_vsn: nil]])
+
+      # Resume n4 first
+      TestCluster.resume_shards(n4, ekv_name)
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(n4, EKV, :get, [ekv_name, "stagger/1"]) == "val"
+      end)
+
+      # n5 still suspended — resume it after a delay
+      Process.sleep(300)
+      TestCluster.resume_shards(n5, ekv_name)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(n5, EKV, :get, [ekv_name, "stagger/1"]) == "val"
+      end)
+    end
+
+    test "CAS put then immediate suspend: value survives on remaining nodes" do
+      # 3-node cluster. CAS from A (quorum A+B). Immediately suspend A.
+      # B should have the value (via commit notification). C should get it via LWW.
+      # Then resume A — it should still have the value (it committed locally).
+      peers = TestCluster.start_peers(3)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
+      ekv_name = unique_name(:cas)
+
+      start_cas_cluster(peers, ekv_name)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+      Process.sleep(300)
+
+      # CAS from A
+      :ok = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "freeze/1", "val", [if_vsn: nil]])
+
+      # Immediately suspend A (simulating proposer going slow right after commit)
+      TestCluster.suspend_shards(node_a, ekv_name)
+
+      # B and C should still have or get the value
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, EKV, :get, [ekv_name, "freeze/1"]) == "val"
+      end)
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_c, EKV, :get, [ekv_name, "freeze/1"]) == "val"
+      end)
+
+      # Resume A — value should still be there
+      TestCluster.resume_shards(node_a, ekv_name)
+      assert TestCluster.rpc!(node_a, EKV, :get, [ekv_name, "freeze/1"]) == "val"
     end
   end
 end

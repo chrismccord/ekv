@@ -21,6 +21,9 @@ defmodule EKV.Sqlite3 do
   def paxos_prepare(db, key, ballot_counter, ballot_node),
     do: Sqlite3NIF.ekv_paxos_prepare(db, key, ballot_counter, ballot_node)
 
-  def paxos_accept(db, kv_stmt, oplog_stmt, key, ballot_c, ballot_n, kv_args, oplog_args),
-    do: Sqlite3NIF.ekv_paxos_accept(db, kv_stmt, oplog_stmt, key, ballot_c, ballot_n, kv_args, oplog_args)
+  def paxos_accept(db, key, ballot_c, ballot_n, value_args),
+    do: Sqlite3NIF.ekv_paxos_accept(db, key, ballot_c, ballot_n, value_args)
+
+  def paxos_promote(db, kv_force_stmt, oplog_stmt, key, ballot_c, ballot_n),
+    do: Sqlite3NIF.ekv_paxos_promote(db, kv_force_stmt, oplog_stmt, key, ballot_c, ballot_n)
 end

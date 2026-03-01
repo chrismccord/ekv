@@ -2052,101 +2052,151 @@ defmodule EKVTest do
       assert is_binary(origin)
     end
 
-    test "accept succeeds when ballot >= promised", %{db: db, stmts: stmts} do
+    test "accept succeeds when ballot >= promised", %{db: db} do
       {:ok, :promise, 0, 0, nil} = EKV.Store.paxos_prepare(db, "pax/6", 100, 1)
 
       now = System.system_time(:nanosecond)
       origin_str = Atom.to_string(node())
       val_bin = :erlang.term_to_binary("accepted_val")
-      kv_args = ["pax/6", val_bin, now, origin_str, nil, nil]
-      oplog_args = ["pax/6", val_bin, now, origin_str, nil, 0]
+      value_args = [val_bin, now, origin_str, nil, nil]
 
-      {:ok, true} = EKV.Store.paxos_accept(db, stmts.kv_upsert, stmts.oplog_insert,
-        "pax/6", 100, 1, kv_args, oplog_args)
+      {:ok, true} = EKV.Store.paxos_accept(db, "pax/6", 100, 1, value_args)
     end
 
-    test "accept fails when ballot < promised", %{db: db, stmts: stmts} do
+    test "accept fails when ballot < promised", %{db: db} do
       {:ok, :promise, 0, 0, nil} = EKV.Store.paxos_prepare(db, "pax/7", 200, 1)
 
       now = System.system_time(:nanosecond)
       origin_str = Atom.to_string(node())
       val_bin = :erlang.term_to_binary("val")
-      kv_args = ["pax/7", val_bin, now, origin_str, nil, nil]
-      oplog_args = ["pax/7", val_bin, now, origin_str, nil, 0]
+      value_args = [val_bin, now, origin_str, nil, nil]
 
-      {:ok, false} = EKV.Store.paxos_accept(db, stmts.kv_upsert, stmts.oplog_insert,
-        "pax/7", 100, 1, kv_args, oplog_args)
+      {:ok, false} = EKV.Store.paxos_accept(db, "pax/7", 100, 1, value_args)
     end
 
-    test "accept writes to both kv and kv_oplog atomically", %{db: db, stmts: stmts} do
+    test "accept writes to kv_paxos only (not kv or oplog)", %{db: db} do
       {:ok, :promise, 0, 0, nil} = EKV.Store.paxos_prepare(db, "pax/8", 100, 1)
 
       now = System.system_time(:nanosecond)
       origin_str = Atom.to_string(node())
       val_bin = :erlang.term_to_binary("atomic_val")
-      kv_args = ["pax/8", val_bin, now, origin_str, nil, nil]
-      oplog_args = ["pax/8", val_bin, now, origin_str, nil, 0]
+      value_args = [val_bin, now, origin_str, nil, nil]
 
-      {:ok, true} = EKV.Store.paxos_accept(db, stmts.kv_upsert, stmts.oplog_insert,
-        "pax/8", 100, 1, kv_args, oplog_args)
+      {:ok, true} = EKV.Store.paxos_accept(db, "pax/8", 100, 1, value_args)
 
-      # Verify kv table
-      {v, _ts, _origin, _exp, _del} = EKV.Store.get(db, "pax/8")
-      assert :erlang.binary_to_term(v) == "atomic_val"
+      # kv table should NOT have the value (accept writes kv_paxos only)
+      assert EKV.Store.get(db, "pax/8") == nil
 
-      # Verify oplog
+      # oplog should NOT have the value
       entries = EKV.Store.oplog_since(db, 0)
       pax8_entries = Enum.filter(entries, fn {_, key, _, _, _, _, _} -> key == "pax/8" end)
-      assert length(pax8_entries) > 0
+      assert length(pax8_entries) == 0
     end
 
-    test "prepare after accept returns accepted ballot + value", %{db: db, stmts: stmts} do
+    test "prepare after accept returns accepted ballot + value from kv_paxos", %{db: db} do
       {:ok, :promise, 0, 0, nil} = EKV.Store.paxos_prepare(db, "pax/9", 100, 1)
 
       now = System.system_time(:nanosecond)
       origin_str = Atom.to_string(node())
       val_bin = :erlang.term_to_binary("accepted")
-      kv_args = ["pax/9", val_bin, now, origin_str, nil, nil]
-      oplog_args = ["pax/9", val_bin, now, origin_str, nil, 0]
+      value_args = [val_bin, now, origin_str, nil, nil]
 
-      {:ok, true} = EKV.Store.paxos_accept(db, stmts.kv_upsert, stmts.oplog_insert,
-        "pax/9", 100, 1, kv_args, oplog_args)
+      {:ok, true} = EKV.Store.paxos_accept(db, "pax/9", 100, 1, value_args)
 
-      # Higher prepare should see accepted ballot
+      # Higher prepare should see accepted ballot + value from kv_paxos
       {:ok, :promise, 100, 1, [val, _, _, _, _]} = EKV.Store.paxos_prepare(db, "pax/9", 200, 1)
       assert :erlang.binary_to_term(val) == "accepted"
     end
 
-    test "sequence: prepare(5) → accept(5) → prepare(3) → nack", %{db: db, stmts: stmts} do
+    test "sequence: prepare(5) → accept(5) → prepare(3) → nack", %{db: db} do
       {:ok, :promise, 0, 0, nil} = EKV.Store.paxos_prepare(db, "pax/10", 5, 1)
 
       now = System.system_time(:nanosecond)
       origin_str = Atom.to_string(node())
       val_bin = :erlang.term_to_binary("seq")
-      kv_args = ["pax/10", val_bin, now, origin_str, nil, nil]
-      oplog_args = ["pax/10", val_bin, now, origin_str, nil, 0]
+      value_args = [val_bin, now, origin_str, nil, nil]
 
-      {:ok, true} = EKV.Store.paxos_accept(db, stmts.kv_upsert, stmts.oplog_insert,
-        "pax/10", 5, 1, kv_args, oplog_args)
+      {:ok, true} = EKV.Store.paxos_accept(db, "pax/10", 5, 1, value_args)
 
       # Lower prepare should nack (accepted ballot 5 is now promised)
       {:ok, :nack, 5, 1} = EKV.Store.paxos_prepare(db, "pax/10", 3, 1)
     end
 
-    test "accept updates accepted_counter/node in kv_paxos", %{db: db, stmts: stmts} do
+    test "accept updates accepted_counter/node in kv_paxos", %{db: db} do
       {:ok, :promise, 0, 0, nil} = EKV.Store.paxos_prepare(db, "pax/11", 100, 2)
 
       now = System.system_time(:nanosecond)
       origin_str = Atom.to_string(node())
       val_bin = :erlang.term_to_binary("val")
-      kv_args = ["pax/11", val_bin, now, origin_str, nil, nil]
-      oplog_args = ["pax/11", val_bin, now, origin_str, nil, 0]
+      value_args = [val_bin, now, origin_str, nil, nil]
 
-      {:ok, true} = EKV.Store.paxos_accept(db, stmts.kv_upsert, stmts.oplog_insert,
-        "pax/11", 100, 2, kv_args, oplog_args)
+      {:ok, true} = EKV.Store.paxos_accept(db, "pax/11", 100, 2, value_args)
 
       # Higher prepare should see accepted={100, 2}
       {:ok, :promise, 100, 2, _kv_row} = EKV.Store.paxos_prepare(db, "pax/11", 200, 1)
+    end
+
+    test "promote after accept writes to kv + oplog", %{db: db, stmts: stmts} do
+      {:ok, :promise, 0, 0, nil} = EKV.Store.paxos_prepare(db, "pax/12", 100, 1)
+
+      now = System.system_time(:nanosecond)
+      origin_str = Atom.to_string(node())
+      val_bin = :erlang.term_to_binary("promoted_val")
+      value_args = [val_bin, now, origin_str, nil, nil]
+
+      {:ok, true} = EKV.Store.paxos_accept(db, "pax/12", 100, 1, value_args)
+
+      # Not in kv yet
+      assert EKV.Store.get(db, "pax/12") == nil
+
+      # Promote
+      {:ok, ^val_bin, ^now, ^origin_str, nil, nil, nil} =
+        EKV.Store.paxos_promote(db, stmts.kv_force_upsert, stmts.oplog_insert, "pax/12", 100, 1)
+
+      # Now in kv
+      {v, _ts, _origin, _exp, _del} = EKV.Store.get(db, "pax/12")
+      assert :erlang.binary_to_term(v) == "promoted_val"
+
+      # And in oplog
+      entries = EKV.Store.oplog_since(db, 0)
+      assert Enum.any?(entries, fn {_, key, _, _, _, _, _} -> key == "pax/12" end)
+    end
+
+    test "promote with stale ballot returns :stale", %{db: db, stmts: stmts} do
+      {:ok, :promise, 0, 0, nil} = EKV.Store.paxos_prepare(db, "pax/13", 100, 1)
+
+      now = System.system_time(:nanosecond)
+      origin_str = Atom.to_string(node())
+      val_bin = :erlang.term_to_binary("v1")
+      value_args = [val_bin, now, origin_str, nil, nil]
+
+      {:ok, true} = EKV.Store.paxos_accept(db, "pax/13", 100, 1, value_args)
+
+      # Higher accept overwrites
+      {:ok, :promise, 100, 1, _} = EKV.Store.paxos_prepare(db, "pax/13", 200, 2)
+      val_bin2 = :erlang.term_to_binary("v2")
+      {:ok, true} = EKV.Store.paxos_accept(db, "pax/13", 200, 2, [val_bin2, now, origin_str, nil, nil])
+
+      # Stale promote for ballot {100, 1}
+      {:ok, :stale} =
+        EKV.Store.paxos_promote(db, stmts.kv_force_upsert, stmts.oplog_insert, "pax/13", 100, 1)
+    end
+
+    test "promote clears kv_paxos accepted columns", %{db: db, stmts: stmts} do
+      {:ok, :promise, 0, 0, nil} = EKV.Store.paxos_prepare(db, "pax/14", 100, 1)
+
+      now = System.system_time(:nanosecond)
+      origin_str = Atom.to_string(node())
+      val_bin = :erlang.term_to_binary("cleared")
+      {:ok, true} = EKV.Store.paxos_accept(db, "pax/14", 100, 1, [val_bin, now, origin_str, nil, nil])
+
+      # Promote
+      {:ok, _, _, _, _, _, _} =
+        EKV.Store.paxos_promote(db, stmts.kv_force_upsert, stmts.oplog_insert, "pax/14", 100, 1)
+
+      # After promote, higher prepare should read from kv (kv_paxos accepted cleared)
+      {:ok, :promise, 0, 0, [v, _, _, _, _]} = EKV.Store.paxos_prepare(db, "pax/14", 300, 1)
+      assert :erlang.binary_to_term(v) == "cleared"
     end
   end
 
@@ -2255,6 +2305,137 @@ defmodule EKVTest do
 
       assert successes == 1
       assert conflicts == 4
+    end
+  end
+
+  # =====================================================================
+  # CAS: deferred local accept (no phantom writes)
+  # =====================================================================
+
+  describe "deferred local accept" do
+    test "CAS failure does not leave phantom write in local SQLite" do
+      # Setup: single node with cluster_size: 3, inject fake peers
+      # so the shard THINKS it has quorum. Then control the Paxos
+      # messages to force: prepare succeeds → accept fails.
+      # With the bug (local accept before quorum), the value is in
+      # SQLite even though CAS returned conflict.
+      name = :"ekv_phantom_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+
+      {:ok, pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: data_dir,
+          shards: 1,
+          log: false,
+          cluster_size: 3,
+          node_id: 1,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      shard_name = :"#{name}_ekv_replica_0"
+
+      # Inject fake peers so the shard thinks alive_count = 3 (quorum = 2)
+      :sys.replace_state(shard_name, fn state ->
+        %{state |
+          peer_node_ids: %{:fake_b@localhost => 2, :fake_c@localhost => 3},
+          remote_shards: %{:fake_b@localhost => self(), :fake_c@localhost => self()}
+        }
+      end)
+
+      # Start CAS in a task (will hang waiting for remote promises)
+      task = Task.async(fn ->
+        EKV.put(name, "phantom_key", "phantom_value", if_vsn: nil)
+      end)
+
+      # Let the CAS call enter the shard and send prepare messages
+      Process.sleep(50)
+
+      # Get the pending CAS ref
+      shard_state = :sys.get_state(shard_name)
+      assert map_size(shard_state.pending_cas) == 1
+      [{ref, _op}] = Map.to_list(shard_state.pending_cas)
+
+      # Send a fake promise from node_id 2 — shard now has 2 promises
+      # (own + fake_b) which meets quorum=2. It enters accept phase.
+      # BUG: local paxos_accept writes to SQLite before quorum is confirmed.
+      send(shard_name, {:ekv_promise, ref, self(), 2, 0, 0, nil})
+      Process.sleep(50)
+
+      # Send accept nacks from both fake peers — quorum can't be reached
+      send(shard_name, {:ekv_accept_nack, ref, self(), 2})
+      send(shard_name, {:ekv_accept_nack, ref, self(), 3})
+
+      # CAS should fail
+      result = Task.await(task, 10_000)
+      assert result == {:error, :conflict}
+
+      # THE KEY ASSERTION: CAS failed, so the value must NOT be in local SQLite.
+      # If local accept was deferred until quorum, this passes.
+      # If local accept happened eagerly (the bug), this fails.
+      assert EKV.get(name, "phantom_key") == nil,
+        "CAS returned {:error, :conflict} but phantom write is visible via EKV.get"
+    end
+
+    test "CAS success still works with deferred local accept" do
+      name = :"ekv_deferred_ok_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+
+      {:ok, pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: data_dir,
+          shards: 1,
+          log: false,
+          cluster_size: 3,
+          node_id: 1,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      shard_name = :"#{name}_ekv_replica_0"
+
+      # Inject fake peers
+      :sys.replace_state(shard_name, fn state ->
+        %{state |
+          peer_node_ids: %{:fake_b@localhost => 2, :fake_c@localhost => 3},
+          remote_shards: %{:fake_b@localhost => self(), :fake_c@localhost => self()}
+        }
+      end)
+
+      # Start CAS
+      task = Task.async(fn ->
+        EKV.put(name, "real_key", "real_value", if_vsn: nil)
+      end)
+
+      Process.sleep(50)
+
+      shard_state = :sys.get_state(shard_name)
+      [{ref, _op}] = Map.to_list(shard_state.pending_cas)
+
+      # Send promise → quorum → accept phase
+      send(shard_name, {:ekv_promise, ref, self(), 2, 0, 0, nil})
+      Process.sleep(50)
+
+      # Send accepted from node_id 2 → quorum of accepts reached
+      send(shard_name, {:ekv_accepted, ref, self(), 2})
+
+      result = Task.await(task, 10_000)
+      assert result == :ok
+
+      # Value should be visible
+      assert EKV.get(name, "real_key") == "real_value"
     end
   end
 
@@ -2519,6 +2700,264 @@ defmodule EKVTest do
 
       Process.exit(pid2, :shutdown)
       Process.sleep(50)
+    end
+  end
+
+  # =====================================================================
+  # CAS: Phantom prevention — acceptor isolation tests
+  # =====================================================================
+
+  describe "phantom prevention" do
+    setup do
+      name = :"ekv_phantom_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+
+      {:ok, pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: data_dir,
+          shards: 1,
+          log: false,
+          cluster_size: 3,
+          node_id: 1,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      shard_name = :"#{name}_ekv_replica_0"
+
+      # Inject fake peers via :sys.replace_state so the shard thinks it has remote nodes.
+      # We use self() as a fake pid — messages come back to the test process.
+      fake_node_a = :"fake_a@127.0.0.1"
+      fake_node_b = :"fake_b@127.0.0.1"
+
+      :sys.replace_state(shard_name, fn state ->
+        %{state |
+          remote_shards: %{fake_node_a => self(), fake_node_b => self()},
+          peer_node_ids: %{fake_node_a => 2, fake_node_b => 3}
+        }
+      end)
+
+      %{name: name, shard_name: shard_name}
+    end
+
+    test "acceptor accept does NOT write to kv", %{name: name, shard_name: shard_name} do
+      key = "phantom/1"
+      ref = make_ref()
+      now = System.system_time(:nanosecond)
+      origin_str = Atom.to_string(node())
+      val_bin = :erlang.term_to_binary("phantom_val")
+      entry_tuple = {key, val_bin, now, origin_str, nil, nil}
+
+      send(shard_name, {:ekv_accept, ref, self(), key, 100, 2, entry_tuple, 0})
+
+      # Should get accepted back
+      assert_receive {:ekv_accepted, ^ref, _, _}, 1000
+
+      # Value should NOT be in kv (only in kv_paxos)
+      assert EKV.get(name, key) == nil
+    end
+
+    test "acceptor accept does NOT dispatch subscriber events", %{name: name, shard_name: shard_name} do
+      :ok = EKV.subscribe(name, "phantom/")
+      Process.sleep(50)
+
+      key = "phantom/2"
+      ref = make_ref()
+      now = System.system_time(:nanosecond)
+      origin_str = Atom.to_string(node())
+      val_bin = :erlang.term_to_binary("no_event")
+      entry_tuple = {key, val_bin, now, origin_str, nil, nil}
+
+      send(shard_name, {:ekv_accept, ref, self(), key, 100, 2, entry_tuple, 0})
+      assert_receive {:ekv_accepted, ^ref, _, _}, 1000
+
+      flush_dispatchers(name)
+      refute_receive {:ekv, _, _}, 200
+    end
+
+    test "promote after commit writes to kv", %{name: name, shard_name: shard_name} do
+      key = "phantom/3"
+      ref = make_ref()
+      now = System.system_time(:nanosecond)
+      origin_str = Atom.to_string(node())
+      val_bin = :erlang.term_to_binary("promoted")
+      entry_tuple = {key, val_bin, now, origin_str, nil, nil}
+
+      # Accept
+      send(shard_name, {:ekv_accept, ref, self(), key, 100, 2, entry_tuple, 0})
+      assert_receive {:ekv_accepted, ^ref, _, _}, 1000
+      assert EKV.get(name, key) == nil
+
+      # Commit notification → promote
+      send(shard_name, {:ekv_cas_committed, key, 100, 2, 0})
+      :sys.get_state(shard_name)
+
+      assert EKV.get(name, key) == "promoted"
+    end
+
+    test "promote dispatches subscriber events", %{name: name, shard_name: shard_name} do
+      :ok = EKV.subscribe(name, "phantom/")
+      Process.sleep(50)
+
+      key = "phantom/4"
+      ref = make_ref()
+      now = System.system_time(:nanosecond)
+      origin_str = Atom.to_string(node())
+      val_bin = :erlang.term_to_binary("event_val")
+      entry_tuple = {key, val_bin, now, origin_str, nil, nil}
+
+      # Accept — no event
+      send(shard_name, {:ekv_accept, ref, self(), key, 100, 2, entry_tuple, 0})
+      assert_receive {:ekv_accepted, ^ref, _, _}, 1000
+      flush_dispatchers(name)
+      refute_receive {:ekv, _, _}, 100
+
+      # Commit — event dispatched
+      send(shard_name, {:ekv_cas_committed, key, 100, 2, 0})
+      :sys.get_state(shard_name)
+      flush_dispatchers(name)
+
+      assert_receive {:ekv, [%EKV.Event{type: :put, key: ^key, value: "event_val"}], _}, 1000
+    end
+
+    test "promote with stale ballot is ignored", %{name: name, shard_name: shard_name} do
+      key = "phantom/5"
+      now = System.system_time(:nanosecond)
+      origin_str = Atom.to_string(node())
+
+      # Accept with ballot {100, 2}
+      ref1 = make_ref()
+      val1 = :erlang.term_to_binary("v1")
+      entry1 = {key, val1, now, origin_str, nil, nil}
+      send(shard_name, {:ekv_accept, ref1, self(), key, 100, 2, entry1, 0})
+      assert_receive {:ekv_accepted, ^ref1, _, _}, 1000
+
+      # Accept with higher ballot {200, 3} — overwrites kv_paxos
+      ref2 = make_ref()
+      val2 = :erlang.term_to_binary("v2")
+      entry2 = {key, val2, now + 1, origin_str, nil, nil}
+      send(shard_name, {:ekv_accept, ref2, self(), key, 200, 3, entry2, 0})
+      assert_receive {:ekv_accepted, ^ref2, _, _}, 1000
+
+      # Stale commit for ballot {100, 2} — should be ignored
+      send(shard_name, {:ekv_cas_committed, key, 100, 2, 0})
+      :sys.get_state(shard_name)
+
+      # Neither value promoted to kv
+      assert EKV.get(name, key) == nil
+    end
+
+    test "promote clears kv_paxos value columns (no storage doubling)", %{name: name, shard_name: shard_name} do
+      key = "phantom/6"
+      now = System.system_time(:nanosecond)
+      origin_str = Atom.to_string(node())
+      val_bin = :erlang.term_to_binary("clear_test")
+      entry = {key, val_bin, now, origin_str, nil, nil}
+
+      # Accept
+      ref = make_ref()
+      send(shard_name, {:ekv_accept, ref, self(), key, 100, 2, entry, 0})
+      assert_receive {:ekv_accepted, ^ref, _, _}, 1000
+
+      # Commit → promote
+      send(shard_name, {:ekv_cas_committed, key, 100, 2, 0})
+      :sys.get_state(shard_name)
+
+      assert EKV.get(name, key) == "clear_test"
+
+      # After promote, a new CAS operation should see the value via kv (not kv_paxos)
+      # Verify by doing a fetch — the vsn should match the committed value
+      {:ok, "clear_test", vsn} = EKV.fetch(name, key)
+      assert is_tuple(vsn)
+    end
+
+    test "prepare reads from kv_paxos when accepted (tentative value)", %{name: name, shard_name: shard_name} do
+      key = "phantom/7"
+
+      # Write "v1" via regular LWW put (goes to kv)
+      :ok = EKV.put(name, key, "v1")
+      assert EKV.get(name, key) == "v1"
+
+      # Send paxos_accept with ballot {100, 2} and value "v2"
+      # kv_paxos has "v2", kv has "v1"
+      now = System.system_time(:nanosecond)
+      origin_str = Atom.to_string(node())
+      val_bin = :erlang.term_to_binary("v2")
+      entry = {key, val_bin, now, origin_str, nil, nil}
+
+      ref = make_ref()
+      send(shard_name, {:ekv_accept, ref, self(), key, 100, 2, entry, 0})
+      assert_receive {:ekv_accepted, ^ref, _, _}, 1000
+
+      # kv still has "v1"
+      assert EKV.get(name, key) == "v1"
+
+      # But paxos_prepare should see "v2" (from kv_paxos)
+      state = :sys.get_state(shard_name)
+      {:ok, :promise, 100, 2, [val, _, _, _, _]} =
+        EKV.Store.paxos_prepare(state.db, key, 300, 1)
+      assert :erlang.binary_to_term(val) == "v2"
+    end
+
+    test "prepare falls back to kv when kv_paxos has no accepted value", %{name: name, shard_name: shard_name} do
+      key = "phantom/8"
+
+      # Write "v1" via regular LWW put
+      :ok = EKV.put(name, key, "v1")
+
+      # No accept on this key — paxos_prepare should read from kv
+      state = :sys.get_state(shard_name)
+      {:ok, :promise, 0, 0, [val, _, _, _, _]} =
+        EKV.Store.paxos_prepare(state.db, key, 100, 1)
+      assert :erlang.binary_to_term(val) == "v1"
+    end
+
+    test "CAS delete promote delivers previous value in event", %{name: name, shard_name: shard_name} do
+      key = "phantom/10"
+
+      # Put "v1" via regular LWW put (committed to kv)
+      :ok = EKV.put(name, key, "v1")
+      assert EKV.get(name, key) == "v1"
+
+      # Subscribe
+      :ok = EKV.subscribe(name, "phantom/")
+      Process.sleep(50)
+      # Drain the put event
+      flush_dispatchers(name)
+      receive do
+        {:ekv, _, _} -> :ok
+      after
+        100 -> :ok
+      end
+
+      # Accept a delete (tombstone)
+      now = System.system_time(:nanosecond)
+      origin_str = Atom.to_string(node())
+      entry = {key, nil, now, origin_str, nil, now}
+
+      ref = make_ref()
+      send(shard_name, {:ekv_accept, ref, self(), key, 200, 2, entry, 0})
+      assert_receive {:ekv_accepted, ^ref, _, _}, 1000
+
+      # kv still has "v1" (delete not committed yet)
+      assert EKV.get(name, key) == "v1"
+
+      # Commit → promote writes tombstone to kv
+      send(shard_name, {:ekv_cas_committed, key, 200, 2, 0})
+      :sys.get_state(shard_name)
+      flush_dispatchers(name)
+
+      # Subscriber event has previous value
+      assert_receive {:ekv, [%EKV.Event{type: :delete, key: ^key, value: "v1"}], _}, 1000
+
+      # Key is now deleted
+      assert EKV.get(name, key) == nil
     end
   end
 end

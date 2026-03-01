@@ -31,6 +31,17 @@ defmodule EKV.Store do
     OR (excluded.timestamp = kv.timestamp AND excluded.origin_node > kv.origin_node)
   """
 
+  # Unconditional upsert — no LWW WHERE clause. Used by paxos_accept where
+  # Paxos ballots determine ordering, not timestamps.
+  @kv_force_upsert_sql """
+  INSERT INTO kv (key, value, timestamp, origin_node, expires_at, deleted_at)
+  VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+  ON CONFLICT(key) DO UPDATE SET
+    value = excluded.value, timestamp = excluded.timestamp,
+    origin_node = excluded.origin_node, expires_at = excluded.expires_at,
+    deleted_at = excluded.deleted_at
+  """
+
   @oplog_insert_sql """
   INSERT INTO kv_oplog (key, value, timestamp, origin_node, expires_at, is_delete)
   VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -113,9 +124,28 @@ defmodule EKV.Store do
         promised_counter INTEGER NOT NULL DEFAULT 0,
         promised_node INTEGER NOT NULL DEFAULT 0,
         accepted_counter INTEGER NOT NULL DEFAULT 0,
-        accepted_node INTEGER NOT NULL DEFAULT 0
+        accepted_node INTEGER NOT NULL DEFAULT 0,
+        accepted_value BLOB,
+        accepted_timestamp INTEGER,
+        accepted_origin TEXT,
+        accepted_expires_at INTEGER,
+        accepted_deleted_at INTEGER
       )
       """)
+
+    # Migration for existing dev databases — add value columns if missing
+    for {col, type} <- [
+          {"accepted_value", "BLOB"},
+          {"accepted_timestamp", "INTEGER"},
+          {"accepted_origin", "TEXT"},
+          {"accepted_expires_at", "INTEGER"},
+          {"accepted_deleted_at", "INTEGER"}
+        ] do
+      case EKV.Sqlite3.execute(db, "ALTER TABLE kv_paxos ADD COLUMN #{col} #{type}") do
+        :ok -> :ok
+        {:error, _} -> :ok
+      end
+    end
 
     :ok =
       EKV.Sqlite3.execute(
@@ -166,8 +196,9 @@ defmodule EKV.Store do
   """
   def prepare_cached_stmts(db) do
     {:ok, kv_stmt} = EKV.Sqlite3.prepare(db, @kv_upsert_sql)
+    {:ok, kv_force_stmt} = EKV.Sqlite3.prepare(db, @kv_force_upsert_sql)
     {:ok, oplog_stmt} = EKV.Sqlite3.prepare(db, @oplog_insert_sql)
-    %{kv_upsert: kv_stmt, oplog_insert: oplog_stmt}
+    %{kv_upsert: kv_stmt, kv_force_upsert: kv_force_stmt, oplog_insert: oplog_stmt}
   end
 
   @doc """
@@ -595,8 +626,32 @@ defmodule EKV.Store do
     EKV.Sqlite3.paxos_prepare(db, key, ballot_counter, ballot_node)
   end
 
-  def paxos_accept(db, kv_stmt, oplog_stmt, key, ballot_c, ballot_n, kv_args, oplog_args) do
-    EKV.Sqlite3.paxos_accept(db, kv_stmt, oplog_stmt, key, ballot_c, ballot_n, kv_args, oplog_args)
+  def paxos_accept(db, key, ballot_c, ballot_n, value_args) do
+    EKV.Sqlite3.paxos_accept(db, key, ballot_c, ballot_n, value_args)
+  end
+
+  def paxos_promote(db, kv_force_stmt, oplog_stmt, key, ballot_c, ballot_n) do
+    EKV.Sqlite3.paxos_promote(db, kv_force_stmt, oplog_stmt, key, ballot_c, ballot_n)
+  end
+
+  @clear_paxos_accepted_sql """
+  UPDATE kv_paxos SET accepted_counter = 0, accepted_node = 0,
+    accepted_value = NULL, accepted_timestamp = NULL, accepted_origin = NULL,
+    accepted_expires_at = NULL, accepted_deleted_at = NULL
+  WHERE key = ?1
+  """
+
+  @doc """
+  Clear accepted value columns in kv_paxos after a commit.
+  Called by the proposer after write_entry succeeds, so future prepares
+  read from kv (committed state) and GC can purge the row.
+  """
+  def clear_paxos_accepted(db, key) do
+    {:ok, stmt} = EKV.Sqlite3.prepare(db, @clear_paxos_accepted_sql)
+    :ok = EKV.Sqlite3.bind(stmt, [key])
+    :done = EKV.Sqlite3.step(db, stmt)
+    :ok = EKV.Sqlite3.release(db, stmt)
+    :ok
   end
 
   @doc """
@@ -604,7 +659,11 @@ defmodule EKV.Store do
   Called during GC to prevent unbounded growth.
   """
   def purge_orphan_paxos(db) do
-    :ok = EKV.Sqlite3.execute(db, "DELETE FROM kv_paxos WHERE key NOT IN (SELECT key FROM kv)")
+    :ok =
+      EKV.Sqlite3.execute(
+        db,
+        "DELETE FROM kv_paxos WHERE key NOT IN (SELECT key FROM kv) AND accepted_counter = 0"
+      )
   end
 
   # =====================================================================

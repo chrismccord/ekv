@@ -124,6 +124,10 @@ defmodule EKV.TestCluster do
     end)
   end
 
+  def start_collecting_subscriber_on(node, ekv_name, prefix, target_pid, collect_timeout) do
+    :erpc.call(node, __MODULE__, :start_collecting_subscriber, [ekv_name, prefix, target_pid, collect_timeout])
+  end
+
   @doc false
   def start_collecting_subscriber(ekv_name, prefix, target_pid, collect_timeout) do
     spawn(fn ->
@@ -172,6 +176,28 @@ defmodule EKV.TestCluster do
 
     for shard <- 0..(num_shards - 1) do
       rpc!(node, :sys, :get_state, [:"#{name}_ekv_replica_#{shard}"])
+    end
+
+    :ok
+  end
+
+  @doc "Suspend all EKV shard GenServers on a remote node (simulates latency/freeze)"
+  def suspend_shards(node, name) do
+    num_shards = rpc!(node, EKV, :get_config, [name]).num_shards
+
+    for shard <- 0..(num_shards - 1) do
+      rpc!(node, :sys, :suspend, [:"#{name}_ekv_replica_#{shard}"])
+    end
+
+    :ok
+  end
+
+  @doc "Resume all EKV shard GenServers on a remote node"
+  def resume_shards(node, name) do
+    num_shards = rpc!(node, EKV, :get_config, [name]).num_shards
+
+    for shard <- 0..(num_shards - 1) do
+      rpc!(node, :sys, :resume, [:"#{name}_ekv_replica_#{shard}"])
     end
 
     :ok

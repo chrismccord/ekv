@@ -354,8 +354,8 @@ defmodule EKV.Replica do
     {:ekv_delete, key, timestamp, origin_node}
 
   Peer handshake (on nodeup / init):
-    {:ekv_peer_connect, pid, shard_index, num_shards, my_max_seq}
-    {:ekv_peer_connect_ack, pid, shard_index, num_shards, my_max_seq}
+    {:ekv_peer_connect, pid, shard_index, num_shards, my_max_seq, node_id}
+    {:ekv_peer_connect_ack, pid, shard_index, num_shards, my_max_seq, node_id}
 
   Bulk sync (after handshake):
     {:ekv_sync, from_node, shard_index, entries, sender_max_seq}
@@ -578,17 +578,17 @@ defmodule EKV.Replica do
 
   def handle_call({:cas_put, key, value_binary, expected_vsn, opts}, from, state) do
     operation = {:cas_put, expected_vsn, value_binary, opts}
-    start_cas(key, operation, from, state)
+    {:noreply, start_cas(state, key, operation, from)}
   end
 
   def handle_call({:cas_delete, key, expected_vsn}, from, state) do
     operation = {:cas_delete, expected_vsn}
-    start_cas(key, operation, from, state)
+    {:noreply, start_cas(state, key, operation, from)}
   end
 
   def handle_call({:update, key, fun, opts}, from, state) do
     operation = {:update, fun, opts, 5}
-    start_cas(key, operation, from, state)
+    {:noreply, start_cas(state, key, operation, from)}
   end
 
   # =====================================================================
@@ -626,22 +626,12 @@ defmodule EKV.Replica do
   # Peer sync protocol
   # =====================================================================
 
-  # Handle both old (5-tuple) and new (6-tuple with node_id) peer_connect
-  def handle_info({:ekv_peer_connect, remote_pid, remote_shard, remote_num_shards, remote_seq}, state) do
-    do_peer_connect(remote_pid, remote_shard, remote_num_shards, remote_seq, nil, state)
-  end
-
   def handle_info({:ekv_peer_connect, remote_pid, remote_shard, remote_num_shards, remote_seq, remote_node_id}, state) do
-    do_peer_connect(remote_pid, remote_shard, remote_num_shards, remote_seq, remote_node_id, state)
-  end
-
-  # Handle both old (5-tuple) and new (6-tuple with node_id) peer_connect_ack
-  def handle_info({:ekv_peer_connect_ack, remote_pid, remote_shard, remote_num_shards, remote_seq}, state) do
-    do_peer_connect_ack(remote_pid, remote_shard, remote_num_shards, remote_seq, nil, state)
+    {:noreply, do_peer_connect(state, remote_pid, remote_shard, remote_num_shards, remote_seq, remote_node_id)}
   end
 
   def handle_info({:ekv_peer_connect_ack, remote_pid, remote_shard, remote_num_shards, remote_seq, remote_node_id}, state) do
-    do_peer_connect_ack(remote_pid, remote_shard, remote_num_shards, remote_seq, remote_node_id, state)
+    {:noreply, do_peer_connect_ack(state, remote_pid, remote_shard, remote_num_shards, remote_seq, remote_node_id)}
   end
 
   def handle_info({:ekv_sync, from_node, _shard, entries, their_seq}, state) do
@@ -775,29 +765,42 @@ defmodule EKV.Replica do
   end
 
   def handle_info({:ekv_accept, ref, proposer_pid, key, ballot_c, ballot_n, entry_tuple, _shard}, state) do
-    %{db: db, stmts: stmts} = state
+    %{db: db} = state
 
     {_key, value_binary, timestamp, origin_node_str, expires_at, deleted_at} = entry_tuple
-    is_delete = if deleted_at, do: 1, else: 0
-    kv_args = [key, value_binary, timestamp, origin_node_str, expires_at, deleted_at]
-    oplog_args = [key, value_binary, timestamp, origin_node_str, expires_at, is_delete]
+    value_args = [value_binary, timestamp, origin_node_str, expires_at, deleted_at]
 
-    case Store.paxos_accept(db, stmts.kv_upsert, stmts.oplog_insert, key, ballot_c, ballot_n, kv_args, oplog_args) do
+    # Write to kv_paxos only — no kv write, no oplog, no events.
+    # The proposer will send {:ekv_cas_committed} after quorum, which triggers promote.
+    case Store.paxos_accept(db, key, ballot_c, ballot_n, value_args) do
       {:ok, true} ->
         send(proposer_pid, {:ekv_accepted, ref, self(), state.node_id})
 
-        # Dispatch subscriber events for accepted writes
-        if deleted_at do
-          prev_value = if has_subscribers?(state), do: read_previous_value(state, key)
-          dispatch_events(state, [%EKV.Event{type: :delete, key: key, value: prev_value}])
+      {:ok, false} ->
+        send(proposer_pid, {:ekv_accept_nack, ref, self(), state.node_id})
+    end
+
+    {:noreply, state}
+  end
+
+  # CAS commit notification — acceptor promotes kv_paxos → kv + oplog
+  def handle_info({:ekv_cas_committed, key, ballot_c, ballot_n, _shard}, state) do
+    %{db: db, stmts: stmts} = state
+
+    case Store.paxos_promote(db, stmts.kv_force_upsert, stmts.oplog_insert, key, ballot_c, ballot_n) do
+      {:ok, value_binary, _ts, _origin, _expires, deleted_at, prev_value_binary} ->
+        if deleted_at != nil and deleted_at != :nil do
+          prev = if prev_value_binary != nil and prev_value_binary != :nil,
+            do: :erlang.binary_to_term(prev_value_binary)
+          dispatch_events(state, [%EKV.Event{type: :delete, key: key, value: prev}])
         else
           dispatch_events(state, [
             %EKV.Event{type: :put, key: key, value: :erlang.binary_to_term(value_binary)}
           ])
         end
 
-      {:ok, false} ->
-        send(proposer_pid, {:ekv_accept_nack, ref, self(), state.node_id})
+      {:ok, :stale} ->
+        :ok
     end
 
     {:noreply, state}
@@ -877,15 +880,9 @@ defmodule EKV.Replica do
           responded = MapSet.put(op.responded, remote_node_id)
           op = %{op | accepts: accepts, responded: responded}
 
-          if MapSet.size(accepts) >= op.quorum do
-            # Quorum reached — success!
-            cancel_timer(op.timer)
-            GenServer.reply(op.from, op.reply_value)
-
-            # Broadcast to all peers for LWW replication
-            if op.broadcast_msg, do: broadcast_to_peers(state, op.broadcast_msg)
-
-            {:noreply, %{state | pending_cas: Map.delete(state.pending_cas, ref)}}
+          if MapSet.size(accepts) + 1 >= op.quorum do
+            # Remote quorum reached — do local accept and commit
+            {:noreply, commit_cas(ref, op, state)}
           else
             {:noreply, %{state | pending_cas: Map.put(state.pending_cas, ref, op)}}
           end
@@ -946,9 +943,7 @@ defmodule EKV.Replica do
 
       {old_op, pending_cas} ->
         state = %{state | pending_cas: pending_cas}
-        # Start a new CAS round
-        {:noreply, state} = start_cas_internal(key, operation, old_op.from, state)
-        {:noreply, state}
+        {:noreply, start_cas(state, key, operation, old_op.from)}
     end
   end
 
@@ -1017,7 +1012,7 @@ defmodule EKV.Replica do
   # Internal helpers
   # =====================================================================
 
-  defp do_peer_connect(remote_pid, remote_shard, remote_num_shards, remote_seq, remote_node_id, state)
+  defp do_peer_connect(state, remote_pid, remote_shard, remote_num_shards, remote_seq, remote_node_id)
        when remote_shard == state.shard_index do
     if remote_num_shards != state.num_shards do
       Logger.error(
@@ -1025,7 +1020,7 @@ defmodule EKV.Replica do
           "shard count mismatch (local=#{state.num_shards}, remote=#{remote_num_shards})"
       )
 
-      {:noreply, state}
+      state
     else
       %{db: db} = state
       remote_node = node(remote_pid)
@@ -1043,15 +1038,15 @@ defmodule EKV.Replica do
       log_once(state, fn -> "#{log_prefix(state)} ekv_peer_connect from #{remote_node}" end)
       send_sync_data(state, remote_node, remote_seq)
 
-      {:noreply, state}
+      state
     end
   end
 
-  defp do_peer_connect(_remote_pid, _remote_shard, _remote_num_shards, _remote_seq, _remote_node_id, state) do
-    {:noreply, state}
+  defp do_peer_connect(state, _remote_pid, _remote_shard, _remote_num_shards, _remote_seq, _remote_node_id) do
+    state
   end
 
-  defp do_peer_connect_ack(remote_pid, remote_shard, remote_num_shards, remote_seq, remote_node_id, state)
+  defp do_peer_connect_ack(state, remote_pid, remote_shard, remote_num_shards, remote_seq, remote_node_id)
        when remote_shard == state.shard_index do
     if remote_num_shards != state.num_shards do
       Logger.error(
@@ -1059,7 +1054,7 @@ defmodule EKV.Replica do
           "shard count mismatch (local=#{state.num_shards}, remote=#{remote_num_shards})"
       )
 
-      {:noreply, state}
+      state
     else
       remote_node = node(remote_pid)
 
@@ -1072,12 +1067,12 @@ defmodule EKV.Replica do
 
       send_sync_data(state, remote_node, remote_seq)
 
-      {:noreply, state}
+      state
     end
   end
 
-  defp do_peer_connect_ack(_remote_pid, _remote_shard, _remote_num_shards, _remote_seq, _remote_node_id, state) do
-    {:noreply, state}
+  defp do_peer_connect_ack(state, _remote_pid, _remote_shard, _remote_num_shards, _remote_seq, _remote_node_id) do
+    state
   end
 
   defp merge_remote_entry(
@@ -1184,16 +1179,26 @@ defmodule EKV.Replica do
     end
   end
 
+  # Send commit notification to acceptors (they promote kv_paxos → kv),
+  # send LWW broadcast to non-acceptors (they don't have kv_paxos state).
+  defp broadcast_commit_and_lww(state, key, ballot_c, ballot_n, lww_msg, accepted_node_ids) do
+    shard_name = shard_name(state.name, state.shard_index)
+
+    for {target_node, _pid} <- state.remote_shards do
+      if MapSet.member?(accepted_node_ids, Map.get(state.peer_node_ids, target_node)) do
+        send({shard_name, target_node},
+          {:ekv_cas_committed, key, ballot_c, ballot_n, state.shard_index})
+      else
+        send({shard_name, target_node}, lww_msg)
+      end
+    end
+  end
+
   # =====================================================================
   # CAS helpers
   # =====================================================================
 
-  defp start_cas(key, operation, from, state) do
-    {:noreply, state} = start_cas_internal(key, operation, from, state)
-    {:noreply, state}
-  end
-
-  defp start_cas_internal(key, operation, from, state) do
+  defp start_cas(state, key, operation, from) do
     %{db: db, cluster_size: cluster_size, node_id: node_id} = state
     quorum = div(cluster_size, 2) + 1
 
@@ -1202,7 +1207,7 @@ defmodule EKV.Replica do
 
     if alive_count < quorum do
       GenServer.reply(from, {:error, :no_quorum})
-      {:noreply, state}
+      state
     else
       # Generate ballot
       {ballot_c, ballot_n, state} = next_ballot(state)
@@ -1244,22 +1249,24 @@ defmodule EKV.Replica do
         quorum: quorum,
         timer: timer,
         reply_value: nil,
-        broadcast_msg: nil
+        broadcast_msg: nil,
+        entry_tuple: nil,
+        events: []
       }
 
       # Check if local promise already gave us quorum (cluster_size: 1)
-      if length(op.promises) >= quorum do
-        state = %{state | pending_cas: Map.put(state.pending_cas, ref, op)}
-        state = enter_accept_phase(ref, op, state)
-        {:noreply, state}
-      else if local_nack > 0 and alive_count - local_nack < quorum do
-        # Can't reach quorum
-        cancel_timer(timer)
-        state = handle_cas_failure(ref, op, %{state | pending_cas: Map.put(state.pending_cas, ref, op)})
-        {:noreply, state}
-      else
-        {:noreply, %{state | pending_cas: Map.put(state.pending_cas, ref, op)}}
-      end
+      cond do
+        length(op.promises) >= quorum ->
+          state = %{state | pending_cas: Map.put(state.pending_cas, ref, op)}
+          enter_accept_phase(ref, op, state)
+
+        local_nack > 0 and alive_count - local_nack < quorum ->
+          # Can't reach quorum
+          cancel_timer(timer)
+          handle_cas_failure(ref, op, %{state | pending_cas: Map.put(state.pending_cas, ref, op)})
+
+        true ->
+          %{state | pending_cas: Map.put(state.pending_cas, ref, op)}
       end
     end
   end
@@ -1290,57 +1297,81 @@ defmodule EKV.Replica do
     # Apply operation
     case apply_operation(op.operation, op.key, current_value, current_vsn) do
       {:ok, _new_value_binary, new_entry_tuple, reply_value, broadcast_msg, events} ->
-        %{db: db, stmts: stmts} = state
-        {key, value_binary, timestamp, origin_str, expires_at, deleted_at} = new_entry_tuple
-        is_delete = if deleted_at, do: 1, else: 0
-        kv_args = [key, value_binary, timestamp, origin_str, expires_at, deleted_at]
-        oplog_args = [key, value_binary, timestamp, origin_str, expires_at, is_delete]
+        # Send accept to all peers (do NOT do local accept yet — deferred until quorum)
+        for {remote_node, _pid} <- state.remote_shards do
+          send_to_peer(state, remote_node,
+            {:ekv_accept, ref, self(), op.key, elem(op.ballot, 0), elem(op.ballot, 1),
+             new_entry_tuple, state.shard_index})
+        end
 
-        {ballot_c, ballot_n} = op.ballot
+        timer = Process.send_after(self(), {:cas_timeout, ref}, 5_000)
 
-        # Local accept
-        case Store.paxos_accept(db, stmts.kv_upsert, stmts.oplog_insert, op.key, ballot_c, ballot_n, kv_args, oplog_args) do
-          {:ok, true} ->
-            # Dispatch local events
-            dispatch_events(state, events)
+        op = %{op |
+          phase: :accept,
+          accepts: MapSet.new(),
+          accept_nacks: 0,
+          responded: MapSet.new(),
+          timer: timer,
+          reply_value: reply_value,
+          broadcast_msg: broadcast_msg,
+          entry_tuple: new_entry_tuple,
+          events: events
+        }
 
-            # Send accept to all peers
-            for {remote_node, _pid} <- state.remote_shards do
-              send_to_peer(state, remote_node,
-                {:ekv_accept, ref, self(), op.key, ballot_c, ballot_n, new_entry_tuple, state.shard_index})
-            end
-
-            timer = Process.send_after(self(), {:cas_timeout, ref}, 5_000)
-
-            op = %{op |
-              phase: :accept,
-              accepts: MapSet.new([state.node_id]),
-              accept_nacks: 0,
-              responded: MapSet.new([state.node_id]),
-              timer: timer,
-              reply_value: reply_value,
-              broadcast_msg: broadcast_msg
-            }
-
-            # Check if local accept already gave us quorum (cluster_size: 1)
-            if MapSet.size(op.accepts) >= op.quorum do
-              cancel_timer(timer)
-              GenServer.reply(op.from, reply_value)
-              if broadcast_msg, do: broadcast_to_peers(state, broadcast_msg)
-              %{state | pending_cas: Map.delete(state.pending_cas, ref)}
-            else
-              %{state | pending_cas: Map.put(state.pending_cas, ref, op)}
-            end
-
-          {:ok, false} ->
-            # LWW lost — should not happen since CAS uses fresh timestamps
-            # but handle gracefully
-            handle_cas_failure(ref, op, state)
+        # For cluster_size: 1 (no peers), commit immediately
+        if MapSet.size(op.accepts) + 1 >= op.quorum do
+          commit_cas(ref, op, state)
+        else
+          %{state | pending_cas: Map.put(state.pending_cas, ref, op)}
         end
 
       {:error, :conflict} ->
         GenServer.reply(op.from, {:error, :conflict})
         %{state | pending_cas: Map.delete(state.pending_cas, ref)}
+    end
+  end
+
+  # Commit CAS: do local paxos_accept (kv_paxos), then write to kv + oplog.
+  # Called only when remote accepts + self >= quorum.
+  defp commit_cas(ref, op, state) do
+    %{db: db, stmts: stmts} = state
+    {key, value_binary, timestamp, origin_str, expires_at, deleted_at} = op.entry_tuple
+    {ballot_c, ballot_n} = op.ballot
+    value_args = [value_binary, timestamp, origin_str, expires_at, deleted_at]
+
+    case Store.paxos_accept(db, key, ballot_c, ballot_n, value_args) do
+      {:ok, true} ->
+        # Write committed value to kv + oplog
+        is_delete = if deleted_at, do: 1, else: 0
+        kv_args = [key, value_binary, timestamp, origin_str, expires_at, deleted_at]
+        oplog_args = [key, value_binary, timestamp, origin_str, expires_at, is_delete]
+
+        {:ok, true} =
+          EKV.Sqlite3.write_entry(
+            db,
+            stmts.kv_force_upsert,
+            stmts.oplog_insert,
+            kv_args,
+            oplog_args
+          )
+
+        # Clear kv_paxos accepted columns so future prepares read from kv
+        # and GC can purge the row when the kv entry is tombstone-purged
+        Store.clear_paxos_accepted(db, key)
+
+        cancel_timer(op.timer)
+        dispatch_events(state, op.events)
+        GenServer.reply(op.from, op.reply_value)
+
+        if op.broadcast_msg do
+          broadcast_commit_and_lww(state, key, ballot_c, ballot_n, op.broadcast_msg, op.accepts)
+        end
+
+        %{state | pending_cas: Map.delete(state.pending_cas, ref)}
+
+      {:ok, false} ->
+        # Local accept rejected (pre-empted between send and commit)
+        handle_cas_failure(ref, op, state)
     end
   end
 
