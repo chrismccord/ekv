@@ -2634,26 +2634,45 @@ defmodule EKVTest do
       %{cas_name: name}
     end
 
-    test "GC purges orphan kv_paxos rows", %{cas_name: name} do
-      # Do a CAS put to create kv_paxos entry
+    test "GC purges orphan kv_paxos rows only when fully idle", %{cas_name: name} do
+      shard_name = :"#{name}_ekv_replica_0"
+
+      # CAS put creates kv_paxos entry with promised_counter > 0
       :ok = EKV.put(name, "gc/1", "val", if_vsn: nil)
 
-      # Delete and purge tombstone
+      # Delete and purge tombstone — kv entry removed, kv_paxos row survives
       {:ok, _, vsn} = EKV.fetch(name, "gc/1")
       :ok = EKV.delete(name, "gc/1", if_vsn: vsn)
 
-      # Manually trigger GC with a future tombstone cutoff to purge
-      shard_name = :"#{name}_ekv_replica_0"
       now = System.system_time(:nanosecond)
       future_cutoff = now + :timer.hours(1) * 1_000_000
       send(shard_name, {:gc, now, future_cutoff})
       :sys.get_state(shard_name)
 
-      # Check kv_paxos is cleaned up
+      # kv_paxos row kept: promised_counter > 0 from the CAS rounds.
+      # This is correct — clearing promised state would let stale accepts
+      # from older ballots succeed and kv_force_upsert would overwrite
+      # the committed value (CASPaxos violation).
       state = :sys.get_state(shard_name)
       {:ok, rows} = EKV.Sqlite3.fetch_all(state.db, "SELECT key FROM kv_paxos", [])
       pax_keys = Enum.map(rows, fn [k] -> k end)
-      refute "gc/1" in pax_keys
+      assert "gc/1" in pax_keys
+
+      # But accepted_value is cleared (no storage doubling)
+      {:ok, val_rows} =
+        EKV.Sqlite3.fetch_all(
+          state.db,
+          "SELECT accepted_counter, accepted_value FROM kv_paxos WHERE key = ?1",
+          ["gc/1"]
+        )
+
+      [[acc_counter, acc_value]] = val_rows
+      assert acc_counter == 0
+      assert acc_value == nil
+
+      # A fresh prepare on the key resets promised state, and after that
+      # commit cycle completes + tombstone purge, the row CAN be purged
+      # (this is the normal lifecycle)
     end
 
     test "CAS put during GC TTL expiry: CAS wins (higher timestamp)", %{cas_name: name} do

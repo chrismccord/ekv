@@ -777,7 +777,11 @@ defmodule EKV.Store do
   @doc """
   Clear accepted value columns in kv_paxos after a commit.
   Called by the proposer after write_entry succeeds, so future prepares
-  read from kv (committed state) and GC can purge the row.
+  read from kv (committed state) rather than stale accepted values.
+
+  Note: promised_counter is intentionally preserved — clearing it would allow
+  stale accepts from older ballots to succeed, and kv_force_upsert would then
+  unconditionally overwrite the committed value (CASPaxos violation).
   """
   def clear_paxos_accepted(db, key) do
     {:ok, stmt} = EKV.Sqlite3.prepare(db, @clear_paxos_accepted_sql)
@@ -795,7 +799,7 @@ defmodule EKV.Store do
     :ok =
       EKV.Sqlite3.execute(
         db,
-        "DELETE FROM kv_paxos WHERE key NOT IN (SELECT key FROM kv) AND accepted_counter = 0"
+        "DELETE FROM kv_paxos WHERE key NOT IN (SELECT key FROM kv) AND accepted_counter = 0 AND promised_counter = 0"
       )
   end
 

@@ -1532,7 +1532,10 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
     }
     sqlite3_reset(oplog_s->stmt);
 
-    /* 7. Clear accepted columns in kv_paxos (no storage doubling) */
+    /* 7. Clear accepted columns in kv_paxos (no storage doubling).
+     * Keep promised_counter/promised_node — clearing them would allow stale
+     * accepts from older ballots, and kv_force_upsert would unconditionally
+     * overwrite the committed value (CASPaxos violation). */
     sqlite3_stmt *clr = NULL;
     rc = sqlite3_prepare_v3(conn->db,
         "UPDATE kv_paxos SET accepted_counter = 0, accepted_node = '', "

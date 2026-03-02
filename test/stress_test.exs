@@ -1067,6 +1067,468 @@ defmodule EKV.StressTest do
   end
 
   # =====================================================================
+  # 7. Fault Injection (local single-shard with injected fake peers)
+  # =====================================================================
+
+  describe "fault injection" do
+    setup do
+      name = :"ekv_fi_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_fi_test_#{name}")
+
+      {:ok, pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: data_dir,
+          shards: 1,
+          log: false,
+          cluster_size: 5,
+          node_id: "1",
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      shard_name = :"#{name}_ekv_replica_0"
+
+      # Inject 4 fake peers — all pointing to self() so we receive their messages
+      fake_nodes = [
+        :"fi_peer2@127.0.0.1",
+        :"fi_peer3@127.0.0.1",
+        :"fi_peer4@127.0.0.1",
+        :"fi_peer5@127.0.0.1"
+      ]
+
+      :sys.replace_state(shard_name, fn state ->
+        %{
+          state
+          | remote_shards:
+              Map.new(fake_nodes, fn n -> {n, self()} end),
+            peer_node_ids: %{
+              :"fi_peer2@127.0.0.1" => "2",
+              :"fi_peer3@127.0.0.1" => "3",
+              :"fi_peer4@127.0.0.1" => "4",
+              :"fi_peer5@127.0.0.1" => "5"
+            }
+        }
+      end)
+
+      %{name: name, data_dir: data_dir, shard_name: shard_name}
+    end
+
+    # Helper: start a CAS GenServer.call in a task, wait for it to be pending,
+    # then extract the ref from pending_cas via :sys.get_state.
+    # Returns {task, ref, shard_pid} — shard_pid is needed to send responses.
+    defp start_cas_and_get_ref(shard_name, call_args) do
+      task = Task.async(fn -> GenServer.call(shard_name, call_args, 10_000) end)
+
+      # Wait for the CAS to appear in pending_cas
+      {ref, _op} =
+        poll_pending_cas(shard_name, fn pending_cas ->
+          case Map.to_list(pending_cas) do
+            [{ref, op}] -> {ref, op}
+            _ -> nil
+          end
+        end)
+
+      shard_pid = Process.whereis(shard_name)
+      {task, ref, shard_pid}
+    end
+
+    defp poll_pending_cas(shard_name, extract_fn, attempts \\ 50) do
+      state = :sys.get_state(shard_name)
+      result = extract_fn.(state.pending_cas)
+
+      if result != nil do
+        result
+      else
+        if attempts <= 0, do: raise("pending_cas never populated")
+        Process.sleep(10)
+        poll_pending_cas(shard_name, extract_fn, attempts - 1)
+      end
+    end
+
+    # ----- Timing & Race Conditions (4) -----
+
+    test "GC purge_orphan_paxos preserves promised-but-not-accepted rows", %{
+      name: name,
+      shard_name: shard_name
+    } do
+      key = "fi/gc_purge_during_cas"
+
+      # Send a prepare to the shard (as if we're a remote proposer)
+      # This creates a kv_paxos row with promised_counter > 0, accepted_counter = 0
+      ref = make_ref()
+      send(shard_name, {:ekv_prepare, ref, self(), key, 100, "2", 0})
+      assert_receive {:ekv_promise, ^ref, _, _, _, _, _}, 2000
+
+      # Verify: key NOT in kv, but kv_paxos has a promised row
+      assert EKV.get(name, key) == nil
+
+      # Trigger GC — purge_orphan_paxos must NOT delete this row because
+      # promised_counter > 0 (active Paxos round in progress)
+      now_ms = System.system_time(:millisecond)
+      send(shard_name, {:gc, now_ms, 0})
+      :sys.get_state(shard_name)
+
+      # Accept with the original ballot — should succeed because
+      # the promised row survived GC
+      now = System.system_time(:nanosecond)
+      origin_str = Atom.to_string(node())
+      val = :erlang.term_to_binary("gc_survivor")
+      entry = {key, val, now, origin_str, nil, nil}
+
+      ref2 = make_ref()
+      send(shard_name, {:ekv_accept, ref2, self(), key, 100, "2", entry, 0})
+      assert_receive {:ekv_accepted, ^ref2, _, _}, 2000
+
+      # Commit and verify the value
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", 0})
+      :sys.get_state(shard_name)
+      assert EKV.get(name, key) == "gc_survivor"
+    end
+
+    test "GC purge_orphan_paxos preserves rows with stale promises after commit", %{
+      name: name,
+      shard_name: shard_name
+    } do
+      key = "fi/gc_stale_promise"
+
+      # Accept with ballot {100, "2"} — creates row with promised + accepted state
+      now = System.system_time(:nanosecond)
+      origin_str = Atom.to_string(node())
+      val = :erlang.term_to_binary("accepted")
+      entry = {key, val, now, origin_str, nil, nil}
+
+      ref = make_ref()
+      send(shard_name, {:ekv_accept, ref, self(), key, 100, "2", entry, 0})
+      assert_receive {:ekv_accepted, ^ref, _, _}, 2000
+
+      # Commit — promotes to kv, clears accepted columns, keeps promised_counter
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", 0})
+      :sys.get_state(shard_name)
+      assert EKV.get(name, key) == "accepted"
+
+      # Delete the key so kv row goes away (tombstone)
+      :ok = EKV.delete(name, key)
+
+      # Trigger GC with future cutoff to purge the tombstone
+      future_ms = System.system_time(:millisecond) + 1_000_000
+      send(shard_name, {:gc, future_ms, future_ms})
+      :sys.get_state(shard_name)
+
+      # kv_paxos row survives: promised_counter > 0 (from the accept's implicit
+      # prepare). This is necessary — clearing it would allow stale accepts from
+      # older ballots, and kv_force_upsert would overwrite committed values.
+      state = :sys.get_state(shard_name)
+
+      {:ok, rows} =
+        EKV.Sqlite3.fetch_all(
+          state.db,
+          "SELECT promised_counter, accepted_counter FROM kv_paxos WHERE key = ?1",
+          [key]
+        )
+
+      assert length(rows) == 1
+      [[prom_c, acc_c]] = rows
+      assert prom_c > 0, "promised_counter should be preserved"
+      assert acc_c == 0, "accepted_counter should be cleared"
+
+      # A fresh prepare still works — accepted state is clean
+      ref2 = make_ref()
+      send(shard_name, {:ekv_prepare, ref2, self(), key, 200, "3", 0})
+
+      assert_receive {:ekv_promise, ^ref2, _, _, acc_c2, acc_n2, _kv_row}, 2000
+      assert acc_c2 == 0
+      assert acc_n2 in ["", nil]
+    end
+
+    test "commit to non-acceptor: no kv_paxos row exists", %{
+      name: name,
+      shard_name: shard_name
+    } do
+      key = "fi/commit_no_row"
+
+      # Send a commit for a key that was never prepared/accepted on this shard
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", 0})
+      :sys.get_state(shard_name)
+
+      # paxos_promote looks up kv_paxos row → no row → should return :stale
+      # No crash, no phantom value
+      assert EKV.get(name, key) == nil
+      assert Process.alive?(Process.whereis(shard_name))
+
+      # Shard still functional — can do normal operations
+      :ok = EKV.put(name, "fi/after_phantom", "still_works")
+      assert EKV.get(name, "fi/after_phantom") == "still_works"
+    end
+
+    test "concurrent CAS on different keys, same shard: no interference", %{
+      name: name,
+      shard_name: shard_name
+    } do
+      key_a = "fi/concurrent_a"
+      key_b = "fi/concurrent_b"
+
+      # Start 2 CAS ops simultaneously via tasks
+      task_a =
+        Task.async(fn ->
+          GenServer.call(
+            shard_name,
+            {:cas_put, key_a, :erlang.term_to_binary("val_a"), nil, []},
+            10_000
+          )
+        end)
+
+      task_b =
+        Task.async(fn ->
+          GenServer.call(
+            shard_name,
+            {:cas_put, key_b, :erlang.term_to_binary("val_b"), nil, []},
+            10_000
+          )
+        end)
+
+      # Wait for both CAS ops to appear in pending_cas
+      {refs, _ops} =
+        poll_pending_cas(shard_name, fn pending ->
+          if map_size(pending) == 2 do
+            {Map.keys(pending), Map.values(pending)}
+          else
+            nil
+          end
+        end)
+
+      shard_pid = Process.whereis(shard_name)
+
+      # Send 2 promises for each ref (from "2" and "3")
+      for ref <- refs do
+        send(shard_pid, {:ekv_promise, ref, self(), "2", 0, "", nil})
+        send(shard_pid, {:ekv_promise, ref, self(), "3", 0, "", nil})
+      end
+
+      Process.sleep(50)
+
+      # Wait for both to enter accept phase (or be completed)
+      poll_pending_cas(shard_name, fn pending ->
+        if Enum.all?(refs, fn r ->
+             case Map.get(pending, r) do
+               %{phase: :accept} -> true
+               nil -> true
+               _ -> false
+             end
+           end) do
+          true
+        else
+          nil
+        end
+      end)
+
+      # Send 2 accepts for each ref
+      for ref <- refs do
+        send(shard_pid, {:ekv_accepted, ref, self(), "2"})
+        send(shard_pid, {:ekv_accepted, ref, self(), "3"})
+      end
+
+      # Both should commit
+      assert Task.await(task_a, 5000) == :ok
+      assert Task.await(task_b, 5000) == :ok
+
+      # No cross-contamination
+      assert EKV.get(name, key_a) == "val_a"
+      assert EKV.get(name, key_b) == "val_b"
+    end
+
+    test "late accept arriving after proposer already committed", %{
+      name: name,
+      shard_name: shard_name
+    } do
+      key = "fi/late_accept"
+
+      {task, ref, shard_pid} =
+        start_cas_and_get_ref(
+          shard_name,
+          {:cas_put, key, :erlang.term_to_binary("committed_val"), nil, []}
+        )
+
+      # 2 promises → quorum
+      send(shard_pid, {:ekv_promise, ref, self(), "2", 0, "", nil})
+      send(shard_pid, {:ekv_promise, ref, self(), "3", 0, "", nil})
+      Process.sleep(50)
+
+      # Wait for accept phase
+      poll_pending_cas(shard_name, fn pending ->
+        case Map.get(pending, ref) do
+          %{phase: :accept} -> true
+          nil -> true
+          _ -> nil
+        end
+      end)
+
+      # Save the ref before it gets removed
+      old_ref = ref
+
+      # 2 accepts → quorum → commit
+      send(shard_pid, {:ekv_accepted, ref, self(), "2"})
+      send(shard_pid, {:ekv_accepted, ref, self(), "3"})
+
+      assert Task.await(task, 5000) == :ok
+      assert EKV.get(name, key) == "committed_val"
+
+      # Now send late accepts with the old ref — ref already removed from pending_cas
+      send(shard_name, {:ekv_accepted, old_ref, self(), "4"})
+      send(shard_name, {:ekv_accepted, old_ref, self(), "5"})
+      :sys.get_state(shard_name)
+
+      # No crash, value unchanged
+      assert EKV.get(name, key) == "committed_val"
+      assert Process.alive?(Process.whereis(shard_name))
+    end
+
+    # ----- Value Corruption Attempts (3) -----
+
+    test "promises with conflicting kv_rows from different nodes", %{
+      name: name,
+      shard_name: shard_name
+    } do
+      key = "fi/conflicting_kv_rows"
+
+      # Write val_A via LWW
+      :ok = EKV.put(name, key, "val_A")
+
+      {task, ref, shard_pid} =
+        start_cas_and_get_ref(
+          shard_name,
+          {:update, key, fn val -> String.upcase(val) end, []}
+        )
+
+      # Forge promises with different kv_rows (different values, different timestamps)
+      now = System.system_time(:nanosecond)
+      origin = Atom.to_string(node())
+
+      # Promise from "2": kv_row with "val_B" at ts=now+100
+      kv_row_b = [:erlang.term_to_binary("val_B"), now + 100, origin, nil, nil]
+      send(shard_pid, {:ekv_promise, ref, self(), "2", 0, "", kv_row_b})
+
+      # Promise from "3": kv_row with "val_C" at ts=now+200
+      kv_row_c = [:erlang.term_to_binary("val_C"), now + 200, origin, nil, nil]
+      send(shard_pid, {:ekv_promise, ref, self(), "3", 0, "", kv_row_c})
+
+      Process.sleep(50)
+
+      # Wait for accept phase (or done)
+      poll_pending_cas(shard_name, fn pending ->
+        case Map.get(pending, ref) do
+          %{phase: :accept} -> true
+          nil -> true
+          _ -> nil
+        end
+      end)
+
+      # Respond with 2 accepts
+      send(shard_pid, {:ekv_accepted, ref, self(), "2"})
+      send(shard_pid, {:ekv_accepted, ref, self(), "3"})
+
+      {:ok, result} = Task.await(task, 5000)
+
+      # The update function uppercased whatever value was picked from promises
+      # Local promise has "val_A". All have accepted_counter=0.
+      # enter_accept_phase: Enum.find_value picks first non-nil kv_row
+      assert is_binary(result)
+      assert result == String.upcase(result)
+      assert result in ["VAL_A", "VAL_B", "VAL_C"]
+
+      # Value is committed and readable
+      assert EKV.get(name, key) == result
+    end
+
+    test "commit notification with wrong ballot: paxos_promote rejects", %{
+      name: name,
+      shard_name: shard_name
+    } do
+      key = "fi/wrong_ballot_commit"
+
+      # Accept with ballot {100, "2"}
+      now = System.system_time(:nanosecond)
+      origin_str = Atom.to_string(node())
+      val = :erlang.term_to_binary("accepted_val")
+      entry = {key, val, now, origin_str, nil, nil}
+
+      ref = make_ref()
+      send(shard_name, {:ekv_accept, ref, self(), key, 100, "2", entry, 0})
+      assert_receive {:ekv_accepted, ^ref, _, _}, 2000
+
+      # Value NOT in kv yet (only in kv_paxos)
+      assert EKV.get(name, key) == nil
+
+      # Send commit with WRONG ballot {101, "2"} (doesn't match accepted {100, "2"})
+      send(shard_name, {:ekv_cas_committed, key, 101, "2", 0})
+      :sys.get_state(shard_name)
+
+      # paxos_promote checks ballot matches → :stale
+      assert EKV.get(name, key) == nil
+      assert Process.alive?(Process.whereis(shard_name))
+
+      # Correct ballot commit should still work
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", 0})
+      :sys.get_state(shard_name)
+      assert EKV.get(name, key) == "accepted_val"
+    end
+
+    test "triple prepare: middle ballot wins, lowest and highest stale", %{
+      name: name,
+      shard_name: shard_name
+    } do
+      key = "fi/triple_prepare"
+
+      # Prepare ballot=100 → promise
+      ref1 = make_ref()
+      send(shard_name, {:ekv_prepare, ref1, self(), key, 100, "2", 0})
+      assert_receive {:ekv_promise, ^ref1, _, _, _, _, _}, 2000
+
+      # Prepare ballot=200 → promise (supersedes 100)
+      ref2 = make_ref()
+      send(shard_name, {:ekv_prepare, ref2, self(), key, 200, "3", 0})
+      assert_receive {:ekv_promise, ^ref2, _, _, _, _, _}, 2000
+
+      # Prepare ballot=150 → nack (lower than 200)
+      ref3 = make_ref()
+      send(shard_name, {:ekv_prepare, ref3, self(), key, 150, "4", 0})
+      assert_receive {:ekv_nack, ^ref3, _, _, 200, "3"}, 2000
+
+      # Accept ballot=200 → accepted
+      now = System.system_time(:nanosecond)
+      origin_str = Atom.to_string(node())
+      val200 = :erlang.term_to_binary("ballot_200_val")
+      entry200 = {key, val200, now, origin_str, nil, nil}
+
+      ref4 = make_ref()
+      send(shard_name, {:ekv_accept, ref4, self(), key, 200, "3", entry200, 0})
+      assert_receive {:ekv_accepted, ^ref4, _, _}, 2000
+
+      # Commit ballot=200 → value in kv
+      send(shard_name, {:ekv_cas_committed, key, 200, "3", 0})
+      :sys.get_state(shard_name)
+      assert EKV.get(name, key) == "ballot_200_val"
+
+      # Late accept for ballot=100 → rejected (promised/accepted 200)
+      val100 = :erlang.term_to_binary("ballot_100_val")
+      entry100 = {key, val100, now + 1, origin_str, nil, nil}
+
+      ref5 = make_ref()
+      send(shard_name, {:ekv_accept, ref5, self(), key, 100, "2", entry100, 0})
+      assert_receive {:ekv_accept_nack, ^ref5, _, _}, 2000
+
+      # Only ballot 200's value in kv
+      assert EKV.get(name, key) == "ballot_200_val"
+      assert Process.alive?(Process.whereis(shard_name))
+    end
+  end
+
+  # =====================================================================
   # Helpers
   # =====================================================================
 
