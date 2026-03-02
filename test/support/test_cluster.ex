@@ -186,7 +186,9 @@ defmodule EKV.TestCluster do
   def do_keys_sorted(name, prefix), do: EKV.keys(name, prefix) |> Enum.sort()
   def do_keys_count(name, prefix), do: EKV.keys(name, prefix) |> Enum.count()
   def do_scan_count(name, prefix), do: EKV.scan(name, prefix) |> Enum.count()
-  def do_scan_to_map(name, prefix), do: EKV.scan(name, prefix) |> Map.new(fn {k, v, _vsn} -> {k, v} end)
+
+  def do_scan_to_map(name, prefix),
+    do: EKV.scan(name, prefix) |> Map.new(fn {k, v, _vsn} -> {k, v} end)
 
   # CAS helpers — named functions that can be called across nodes
   def cas_increment(nil), do: 1

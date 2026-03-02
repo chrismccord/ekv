@@ -1619,7 +1619,7 @@ defmodule EKVTest do
       # Handoff with a fake unreachable node
       shard_name = :"#{name}_ekv_replica_0"
       ref = make_ref()
-      send(shard_name, {:ekv_handoff_request, ref, :"nonexistent@node", self()})
+      send(shard_name, {:ekv_handoff_request, ref, :nonexistent@node, self()})
       assert_receive {:ekv_handoff_ack, ^ref}, 2000
 
       # Write call should fail with :shutting_down (proxy can't reach fake node)
@@ -2366,7 +2366,9 @@ defmodule EKVTest do
       {:ok, true} = EKV.Store.paxos_accept(db, "pax/9", 100, "1", value_args)
 
       # Higher prepare should see accepted ballot + value from kv_paxos
-      {:ok, :promise, 100, "1", [val, _, _, _, _]} = EKV.Store.paxos_prepare(db, "pax/9", 200, "1")
+      {:ok, :promise, 100, "1", [val, _, _, _, _]} =
+        EKV.Store.paxos_prepare(db, "pax/9", 200, "1")
+
       assert :erlang.binary_to_term(val) == "accepted"
     end
 

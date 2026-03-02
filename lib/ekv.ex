@@ -313,7 +313,6 @@ defmodule EKV do
     end
   end
 
-
   @doc """
   Put a key-value pair.
 
@@ -565,8 +564,7 @@ defmodule EKV do
               else
                 items =
                   Enum.map(rows, fn [key, value_binary, ts, origin_str] ->
-                    {key, :erlang.binary_to_term(value_binary),
-                     {ts, String.to_atom(origin_str)}}
+                    {key, :erlang.binary_to_term(value_binary), {ts, String.to_atom(origin_str)}}
                   end)
 
                 if length(rows) < @scan_chunk_size do

@@ -109,8 +109,10 @@ defmodule EKV.CASDistributedTest do
       {_, vsn_a} = TestCluster.rpc!(node_a, EKV, :lookup, [ekv_name, "key1"])
 
       TestCluster.assert_eventually(fn ->
-        {_, vsn_b} = TestCluster.rpc!(node_b, EKV, :lookup, [ekv_name, "key1"])
-        vsn_b == vsn_a
+        case TestCluster.rpc!(node_b, EKV, :lookup, [ekv_name, "key1"]) do
+          {_, ^vsn_a} -> true
+          _ -> false
+        end
       end)
     end
 
@@ -890,7 +892,12 @@ defmodule EKV.CASDistributedTest do
 
           task_b =
             Task.async(fn ->
-              {_, vsn} = TestCluster.rpc!(node_b, EKV, :lookup, [ekv_name, "exhaust/1"])
+              vsn =
+                case TestCluster.rpc!(node_b, EKV, :lookup, [ekv_name, "exhaust/1"]) do
+                  {_, v} -> v
+                  nil -> nil
+                end
+
               TestCluster.rpc!(node_b, EKV, :put, [ekv_name, "exhaust/1", 99999, [if_vsn: vsn]])
             end)
 

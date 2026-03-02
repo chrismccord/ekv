@@ -1986,7 +1986,11 @@ defmodule EKV.Replica do
           local_nack > 0 and alive_count - local_nack < quorum ->
             # Can't reach quorum
             cancel_timer(timer)
-            handle_cas_failure(ref, op, %{state | pending_cas: Map.put(state.pending_cas, ref, op)})
+
+            handle_cas_failure(ref, op, %{
+              state
+              | pending_cas: Map.put(state.pending_cas, ref, op)
+            })
 
           true ->
             %{state | pending_cas: Map.put(state.pending_cas, ref, op)}
@@ -2033,8 +2037,18 @@ defmodule EKV.Replica do
         %{state | pending_cas: Map.delete(state.pending_cas, ref)}
 
       _ ->
-        # Apply operation
-        case apply_operation(op.operation, op.key, current_value, current_vsn) do
+        # Apply operation. For :cas_read recovery (best_acc_c > 0), pass
+        # the raw kv_row so metadata (expires_at, deleted_at) is preserved.
+        apply_result =
+          case op.operation do
+            {:cas_read, _, _} ->
+              apply_cas_read_recovery(op.key, best_kv_row, current_value)
+
+            _ ->
+              apply_operation(op.operation, op.key, current_value, current_vsn)
+          end
+
+        case apply_result do
           {:ok, _new_value_binary, new_entry_tuple, reply_value, broadcast_msg, events} ->
             # Send accept to all peers (do NOT do local accept yet — deferred until quorum)
             for {remote_node, _pid} <- state.remote_shards do
@@ -2166,28 +2180,9 @@ defmodule EKV.Replica do
         {:ok, new_value_binary, entry_tuple, {:ok, new_value}, broadcast_msg, events}
 
       {:cas_read, _opts, _retries} ->
-        # Re-proposing a pending accepted value (best_acc_c > 0 case).
-        # We must complete the stalled CAS by committing the accepted value.
-        # Build entry_tuple from the accepted kv_row columns.
-        # current_value was decoded from the accepted row — re-encode it.
-        if current_value != nil do
-          value_binary = :erlang.term_to_binary(current_value)
-          {ts, origin} = current_vsn
-          origin_str = if is_atom(origin), do: Atom.to_string(origin), else: origin
-          entry_tuple = {key, value_binary, ts, origin_str, nil, nil}
-          broadcast_msg = {:ekv_put, key, value_binary, ts, origin, nil}
-          events = []
-          {:ok, value_binary, entry_tuple, {:ok, current_value}, broadcast_msg, events}
-        else
-          # The accepted value was a delete/nil — re-propose as nil
-          now = System.system_time(:nanosecond)
-          origin = node()
-          origin_str = Atom.to_string(origin)
-          entry_tuple = {key, nil, now, origin_str, nil, now}
-          broadcast_msg = {:ekv_delete, key, now, origin}
-          events = []
-          {:ok, nil, entry_tuple, {:ok, nil}, broadcast_msg, events}
-        end
+        # Unreachable: cas_read recovery is handled via apply_cas_read_recovery
+        # in enter_accept_phase. This clause exists only for completeness.
+        {:error, :conflict}
     end
   end
 
@@ -2214,6 +2209,28 @@ defmodule EKV.Replica do
 
         value = if value_binary, do: :erlang.binary_to_term(value_binary)
         {value, {timestamp, origin}}
+    end
+  end
+
+  # Build entry_tuple for cas_read recovery directly from the raw accepted
+  # kv_row columns, preserving expires_at and deleted_at exactly as accepted.
+  defp apply_cas_read_recovery(
+         key,
+         [value_binary, ts, origin_str, expires_at, deleted_at],
+         current_value
+       ) do
+    origin = if is_binary(origin_str), do: String.to_atom(origin_str), else: origin_str
+
+    if is_integer(deleted_at) do
+      # Tombstone — re-propose as delete with original metadata
+      entry_tuple = {key, nil, ts, to_string(origin), nil, deleted_at}
+      broadcast_msg = {:ekv_delete, key, ts, origin}
+      {:ok, nil, entry_tuple, {:ok, nil}, broadcast_msg, []}
+    else
+      # Live value — re-propose with original expires_at
+      entry_tuple = {key, value_binary, ts, to_string(origin), expires_at, nil}
+      broadcast_msg = {:ekv_put, key, value_binary, ts, origin, expires_at}
+      {:ok, value_binary, entry_tuple, {:ok, current_value}, broadcast_msg, []}
     end
   end
 

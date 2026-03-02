@@ -77,7 +77,6 @@ defmodule EKV.StressTest do
     )
   end
 
-
   # =====================================================================
   # 1. Split-Brain Prevention
   # =====================================================================
@@ -130,7 +129,9 @@ defmodule EKV.StressTest do
 
       TestCluster.assert_eventually(
         fn ->
-          vals = Enum.map(all_nodes, fn n -> TestCluster.rpc!(n, EKV, :get, [ekv_name, "brain/1"]) end)
+          vals =
+            Enum.map(all_nodes, fn n -> TestCluster.rpc!(n, EKV, :get, [ekv_name, "brain/1"]) end)
+
           Enum.all?(vals, &(&1 == "majority_val"))
         end,
         timeout: 5000
@@ -193,7 +194,9 @@ defmodule EKV.StressTest do
 
       TestCluster.assert_eventually(
         fn ->
-          vals = Enum.map(all_nodes, fn n -> TestCluster.rpc!(n, EKV, :get, [ekv_name, "three/1"]) end)
+          vals =
+            Enum.map(all_nodes, fn n -> TestCluster.rpc!(n, EKV, :get, [ekv_name, "three/1"]) end)
+
           Enum.all?(vals, &is_nil/1)
         end,
         timeout: 3000
@@ -205,7 +208,9 @@ defmodule EKV.StressTest do
 
       TestCluster.assert_eventually(
         fn ->
-          vals = Enum.map(all_nodes, fn n -> TestCluster.rpc!(n, EKV, :get, [ekv_name, "three/1"]) end)
+          vals =
+            Enum.map(all_nodes, fn n -> TestCluster.rpc!(n, EKV, :get, [ekv_name, "three/1"]) end)
+
           Enum.all?(vals, &(&1 == "after_heal"))
         end,
         timeout: 5000
@@ -395,7 +400,14 @@ defmodule EKV.StressTest do
 
       # CAS update on one key succeeds (ballot counter restored)
       {_, vsn} = TestCluster.rpc!(hd(nodes), EKV, :lookup, [ekv_name, "restart/1"])
-      assert :ok = TestCluster.rpc!(hd(nodes), EKV, :put, [ekv_name, "restart/1", "updated", [if_vsn: vsn]])
+
+      assert :ok =
+               TestCluster.rpc!(hd(nodes), EKV, :put, [
+                 ekv_name,
+                 "restart/1",
+                 "updated",
+                 [if_vsn: vsn]
+               ])
     end
 
     test "50 concurrent increments from 5 nodes: counter exact" do
@@ -428,7 +440,10 @@ defmodule EKV.StressTest do
       total_successes =
         all_results
         |> List.flatten()
-        |> Enum.count(fn {:ok, _} -> true; _ -> false end)
+        |> Enum.count(fn
+          {:ok, _} -> true
+          _ -> false
+        end)
 
       assert total_successes == 50,
              "Expected all 50 updates to succeed, got #{total_successes}"
@@ -520,7 +535,9 @@ defmodule EKV.StressTest do
 
           Task.async(fn ->
             val = "committed_#{i}"
-            result = TestCluster.rpc!(node, EKV, :put, [ekv_name, "pscan/#{i}", val, [if_vsn: nil]])
+
+            result =
+              TestCluster.rpc!(node, EKV, :put, [ekv_name, "pscan/#{i}", val, [if_vsn: nil]])
 
             if result == :ok do
               :atomics.put(committed_ref, i, 1)
@@ -897,6 +914,7 @@ defmodule EKV.StressTest do
 
       # All 5 agree on CAS value + LWW values
       keys = ["chaos/cas", "chaos/lww_left", "chaos/lww_right"]
+
       expected = %{
         "chaos/cas" => "cas_val",
         "chaos/lww_left" => "from_left",
@@ -906,7 +924,9 @@ defmodule EKV.StressTest do
       TestCluster.assert_eventually(
         fn ->
           Enum.all?(keys, fn key ->
-            vals = Enum.map(all_nodes, fn n -> TestCluster.rpc!(n, EKV, :get, [ekv_name, key]) end)
+            vals =
+              Enum.map(all_nodes, fn n -> TestCluster.rpc!(n, EKV, :get, [ekv_name, key]) end)
+
             Enum.all?(vals, &(&1 == expected[key]))
           end)
         end,
@@ -937,7 +957,9 @@ defmodule EKV.StressTest do
       :ok = TestCluster.rpc!(n1, EKV, :put, [ekv_name, key, "original", [if_vsn: nil]])
 
       TestCluster.assert_eventually(fn ->
-        Enum.all?(all_nodes, fn n -> TestCluster.rpc!(n, EKV, :get, [ekv_name, key]) == "original" end)
+        Enum.all?(all_nodes, fn n ->
+          TestCluster.rpc!(n, EKV, :get, [ekv_name, key]) == "original"
+        end)
       end)
 
       # CAS delete
@@ -1105,8 +1127,7 @@ defmodule EKV.StressTest do
       :sys.replace_state(shard_name, fn state ->
         %{
           state
-          | remote_shards:
-              Map.new(fake_nodes, fn n -> {n, self()} end),
+          | remote_shards: Map.new(fake_nodes, fn n -> {n, self()} end),
             peer_node_ids: %{
               :"fi_peer2@127.0.0.1" => "2",
               :"fi_peer3@127.0.0.1" => "3",
@@ -1757,7 +1778,93 @@ defmodule EKV.StressTest do
       refute_receive {:DOWN, ^mref, :process, _, _}
     end
 
-    # ----- CASPaxos Correctness (2) -----
+    # ----- CASPaxos Correctness (3) -----
+
+    # Intention: verify that `EKV.get(..., consistent: true)` acts as a recovery read
+    # and does not rewrite accepted metadata (expires_at/deleted_at) when committing
+    # a pending accepted value.
+    test "consistent read recovery preserves accepted TTL and tombstone metadata", %{
+      name: name,
+      shard_name: shard_name
+    } do
+      state = :sys.get_state(shard_name)
+      db = state.db
+      shard_pid = Process.whereis(shard_name)
+      origin = Atom.to_string(node())
+
+      run_consistent_read = fn key ->
+        task = Task.async(fn -> EKV.get(name, key, consistent: true) end)
+
+        ref =
+          poll_pending_cas(shard_name, fn pending_cas ->
+            Enum.find_value(pending_cas, fn {ref, op} ->
+              if op.key == key, do: ref
+            end)
+          end)
+
+        send(shard_pid, {:ekv_promise, ref, self(), "2", 0, "", nil})
+        send(shard_pid, {:ekv_promise, ref, self(), "3", 0, "", nil})
+
+        poll_pending_cas(shard_name, fn pending ->
+          case Map.get(pending, ref) do
+            %{phase: :accept} -> true
+            nil -> true
+            _ -> nil
+          end
+        end)
+
+        send(shard_pid, {:ekv_accepted, ref, self(), "2"})
+        send(shard_pid, {:ekv_accepted, ref, self(), "3"})
+
+        Task.await(task, 5_000)
+      end
+
+      key_ttl = "fi/cas_read_preserve_ttl"
+      value_ttl = :erlang.term_to_binary("ttl_val")
+      ts_ttl = System.system_time(:nanosecond) - 2_000_000_000
+      expires_at = ts_ttl + 60_000_000_000
+
+      {:ok, :promise, 0, "", _} = EKV.Store.paxos_prepare(db, key_ttl, 100, "n1")
+
+      {:ok, true} =
+        EKV.Store.paxos_accept(db, key_ttl, 100, "n1", [
+          value_ttl,
+          ts_ttl,
+          origin,
+          expires_at,
+          nil
+        ])
+
+      assert run_consistent_read.(key_ttl) == "ttl_val"
+
+      {stored_ttl_val, stored_ttl_ts, stored_ttl_origin, stored_ttl_exp, stored_ttl_del} =
+        EKV.Store.get(db, key_ttl)
+
+      assert stored_ttl_val == value_ttl
+      assert stored_ttl_ts == ts_ttl
+      assert stored_ttl_origin == String.to_atom(origin)
+      assert stored_ttl_exp == expires_at
+      assert stored_ttl_del == nil
+
+      key_del = "fi/cas_read_preserve_delete"
+      ts_del = System.system_time(:nanosecond) - 1_000_000_000
+
+      {:ok, :promise, 0, "", _} = EKV.Store.paxos_prepare(db, key_del, 200, "n1")
+
+      {:ok, true} =
+        EKV.Store.paxos_accept(db, key_del, 200, "n1", [nil, ts_del, origin, nil, ts_del])
+
+      assert run_consistent_read.(key_del) == nil
+
+      {stored_del_val, stored_del_ts, stored_del_origin, stored_del_exp, stored_del_deleted_at} =
+        EKV.Store.get(db, key_del)
+
+      assert stored_del_val == nil
+      assert stored_del_ts == ts_del
+      assert stored_del_origin == String.to_atom(origin)
+      assert stored_del_exp == nil
+      assert stored_del_deleted_at == ts_del
+    end
 
     test "prepare returns accepted tombstone (not stale kv row) after accepted delete", %{
       name: name,
@@ -1798,12 +1905,13 @@ defmodule EKV.StressTest do
           EKV.put(name, key, "v_new", if_vsn: stale_vsn)
         end)
 
-      ref = poll_pending_cas(shard_name, fn pending_cas ->
-        case Map.to_list(pending_cas) do
-          [{ref, _op}] -> ref
-          _ -> nil
-        end
-      end)
+      ref =
+        poll_pending_cas(shard_name, fn pending_cas ->
+          case Map.to_list(pending_cas) do
+            [{ref, _op}] -> ref
+            _ -> nil
+          end
+        end)
 
       stale_value_bin = :erlang.term_to_binary("v1")
       {stale_ts, stale_origin} = stale_vsn

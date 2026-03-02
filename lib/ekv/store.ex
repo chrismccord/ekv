@@ -626,7 +626,10 @@ defmodule EKV.Store do
       {:ok, db} ->
         result =
           try do
-            case EKV.Sqlite3.prepare(db, "SELECT value_int FROM kv_meta WHERE key = 'last_active_at'") do
+            case EKV.Sqlite3.prepare(
+                   db,
+                   "SELECT value_int FROM kv_meta WHERE key = 'last_active_at'"
+                 ) do
               {:ok, stmt} ->
                 val =
                   case EKV.Sqlite3.step(db, stmt) do
