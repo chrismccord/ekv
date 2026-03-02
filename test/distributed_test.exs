@@ -571,9 +571,9 @@ defmodule EKV.DistributedTest do
       TestCluster.assert_eventually(
         fn ->
           for node <- [node_a, node_b, node_c] do
-            a_keys = TestCluster.rpc!(node, EKV, :keys, [ekv_name, "batch_a/"])
-            c_keys = TestCluster.rpc!(node, EKV, :keys, [ekv_name, "batch_c/"])
-            length(a_keys) == 50 and length(c_keys) == 50
+            a_count = TestCluster.keys_count(node, ekv_name, "batch_a/")
+            c_count = TestCluster.keys_count(node, ekv_name, "batch_c/")
+            a_count == 50 and c_count == 50
           end
           |> Enum.all?()
         end,
@@ -738,7 +738,7 @@ defmodule EKV.DistributedTest do
       TestCluster.assert_eventually(
         fn ->
           for node <- [node_a, node_b, node_c] do
-            keys = TestCluster.rpc!(node, EKV, :keys, [ekv_name, "user/"])
+            keys = TestCluster.keys_sorted(node, ekv_name, "user/")
             # user/1 was deleted (by A, which is the latest write)
             # user/2, user/3 from A; user/4, user/5, user/6 from C
             keys == ["user/2", "user/3", "user/4", "user/5", "user/6"]
@@ -1022,13 +1022,13 @@ defmodule EKV.DistributedTest do
       TestCluster.assert_eventually(
         fn ->
           for node <- [node_a, node_b] do
-            pre_a = TestCluster.rpc!(node, EKV, :keys, [ekv_name, "pre_heal/a/"])
-            pre_b = TestCluster.rpc!(node, EKV, :keys, [ekv_name, "pre_heal/b/"])
-            post_a = TestCluster.rpc!(node, EKV, :keys, [ekv_name, "post_heal/a/"])
-            post_b = TestCluster.rpc!(node, EKV, :keys, [ekv_name, "post_heal/b/"])
+            pre_a = TestCluster.keys_count(node, ekv_name, "pre_heal/a/")
+            pre_b = TestCluster.keys_count(node, ekv_name, "pre_heal/b/")
+            post_a = TestCluster.keys_count(node, ekv_name, "post_heal/a/")
+            post_b = TestCluster.keys_count(node, ekv_name, "post_heal/b/")
 
-            length(pre_a) == 10 and length(pre_b) == 10 and
-              length(post_a) == 10 and length(post_b) == 10
+            pre_a == 10 and pre_b == 10 and
+              post_a == 10 and post_b == 10
           end
           |> Enum.all?()
         end,
@@ -1148,9 +1148,9 @@ defmodule EKV.DistributedTest do
       TestCluster.assert_eventually(
         fn ->
           for node <- [node_a, node_b] do
-            a_keys = TestCluster.rpc!(node, EKV, :keys, [ekv_name, "sync_a/"])
-            b_keys = TestCluster.rpc!(node, EKV, :keys, [ekv_name, "sync_b/"])
-            length(a_keys) == 150 and length(b_keys) == 150
+            a_count = TestCluster.keys_count(node, ekv_name, "sync_a/")
+            b_count = TestCluster.keys_count(node, ekv_name, "sync_b/")
+            a_count == 150 and b_count == 150
           end
           |> Enum.all?()
         end,
@@ -1498,9 +1498,9 @@ defmodule EKV.DistributedTest do
       TestCluster.assert_eventually(
         fn ->
           for node <- [node_a, node_b, node_c] do
-            ab_keys = TestCluster.rpc!(node, EKV, :keys, [ekv_name, "flap/ab/"])
-            c_keys = TestCluster.rpc!(node, EKV, :keys, [ekv_name, "flap/c/"])
-            length(ab_keys) == 25 and length(c_keys) == 25
+            ab_count = TestCluster.keys_count(node, ekv_name, "flap/ab/")
+            c_count = TestCluster.keys_count(node, ekv_name, "flap/c/")
+            ab_count == 25 and c_count == 25
           end
           |> Enum.all?()
         end,
@@ -1707,8 +1707,8 @@ defmodule EKV.DistributedTest do
       TestCluster.assert_eventually(
         fn ->
           for node <- [node_a, node_b, node_c] do
-            keys = TestCluster.rpc!(node, EKV, :keys, [ekv_name, "multi_shard/"])
-            length(keys) == 40
+            count = TestCluster.keys_count(node, ekv_name, "multi_shard/")
+            count == 40
           end
           |> Enum.all?()
         end,
@@ -1717,8 +1717,8 @@ defmodule EKV.DistributedTest do
 
       # Verify prefix scan returns correct union
       for node <- [node_a, node_b, node_c] do
-        result = TestCluster.rpc!(node, EKV, :scan, [ekv_name, "multi_shard/"])
-        assert map_size(result) == 40
+        count = TestCluster.scan_count(node, ekv_name, "multi_shard/")
+        assert count == 40
       end
     end
   end
@@ -1896,8 +1896,8 @@ defmodule EKV.DistributedTest do
       # B should get all 5000 keys
       TestCluster.assert_eventually(
         fn ->
-          keys = TestCluster.rpc!(node_b, EKV, :keys, [ekv_name, "large/"])
-          length(keys) == 5000
+          count = TestCluster.keys_count(node_b, ekv_name, "large/")
+          count == 5000
         end,
         timeout: 60_000
       )
@@ -1908,7 +1908,7 @@ defmodule EKV.DistributedTest do
       end
 
       # Verify no duplicate keys
-      keys = TestCluster.rpc!(node_b, EKV, :keys, [ekv_name, "large/"])
+      keys = TestCluster.keys_sorted(node_b, ekv_name, "large/")
       assert length(keys) == length(Enum.uniq(keys))
     end
   end

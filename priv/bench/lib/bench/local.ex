@@ -156,14 +156,14 @@ defmodule Bench.Local do
 
         scan_samples =
           collect_samples(1_000, fn ->
-            EKV.scan(@name, "scan#{size}/")
+            EKV.scan(@name, "scan#{size}/") |> Stream.run()
           end)
 
         report_latency("scan/2", scan_samples)
 
         keys_samples =
           collect_samples(1_000, fn ->
-            EKV.keys(@name, "scan#{size}/")
+            EKV.keys(@name, "scan#{size}/") |> Stream.run()
           end)
 
         report_latency("keys/2", keys_samples)

@@ -51,7 +51,7 @@ defmodule Bench.CAS do
           key = "cas_insert/#{i}"
           {us, _} =
             time_us(fn ->
-              {:ok, nil, nil} = :erpc.call(@replica1, Bench.Replica, :cas_fetch, [@name, key])
+              nil = :erpc.call(@replica1, Bench.Replica, :cas_lookup, [@name, key])
               :ok = :erpc.call(@replica1, Bench.Replica, :cas_put, [@name, key, %{i: i}, nil])
             end)
           us
@@ -66,7 +66,7 @@ defmodule Bench.CAS do
           key = "cas_insert/#{i}"
           {us, _} =
             time_us(fn ->
-              {:ok, _val, vsn} = :erpc.call(@replica1, Bench.Replica, :cas_fetch, [@name, key])
+              {_val, vsn} = :erpc.call(@replica1, Bench.Replica, :cas_lookup, [@name, key])
               :ok = :erpc.call(@replica1, Bench.Replica, :cas_put, [@name, key, %{i: i, v: 2}, vsn])
             end)
           us
@@ -175,8 +175,8 @@ defmodule Bench.CAS do
           {us, {r1, r2}} =
             time_us(fn ->
               # Fetch from both sides
-              {:ok, _v1, vsn1} = :erpc.call(@replica1, Bench.Replica, :cas_fetch, [@name, key])
-              {:ok, _v2, vsn2} = :erpc.call(@replica2, Bench.Replica, :cas_fetch, [@name, key])
+              {_v1, vsn1} = :erpc.call(@replica1, Bench.Replica, :cas_lookup, [@name, key])
+              {_v2, vsn2} = :erpc.call(@replica2, Bench.Replica, :cas_lookup, [@name, key])
 
               t1 = Task.async(fn ->
                 :erpc.call(@replica1, Bench.Replica, :cas_put, [@name, key, %{winner: :r1, i: i}, vsn1])
@@ -252,7 +252,7 @@ defmodule Bench.CAS do
             IO.puts("    conflicts : #{conflicts} (retries exhausted)")
           end)
 
-        {:ok, final_val, _vsn} = :erpc.call(@replica1, Bench.Replica, :cas_fetch, [@name, key])
+        {final_val, _vsn} = :erpc.call(@replica1, Bench.Replica, :cas_lookup, [@name, key])
         report_throughput("contested counter increments", n, wall_us)
         IO.puts("    final value : #{inspect(final_val)} (expected: sum of successes)")
       end

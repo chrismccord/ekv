@@ -279,39 +279,40 @@ defmodule EKV do
   def start_link(opts), do: EKV.Supervisor.start_link(opts)
 
   @doc """
-  Fetch a key's value and version.
+  Look up a key's value and version.
 
-  Returns `{:ok, value, vsn}` where `vsn` is `{timestamp, origin_node}`,
-  or `{:ok, nil, nil}` for missing, deleted, or expired keys.
+  Returns `{value, vsn}` where `vsn` is `{timestamp, origin_node}`,
+  or `nil` for missing, deleted, or expired keys.
 
   The vsn can be passed to `put/4` with `if_vsn:` for compare-and-swap.
   This is a local read (eventually consistent, no GenServer hop).
   """
-  def fetch(name, key) do
+  def lookup(name, key) do
     config = get_config(name)
     shard_index = Replica.shard_index_for(key, config.num_shards)
     {db, get_stmt} = read_conn(name, shard_index)
 
     case EKV.Store.get_cached(db, get_stmt, key) do
       nil ->
-        {:ok, nil, nil}
+        nil
 
       {_value_binary, _ts, _origin, _expires_at, deleted_at} when is_integer(deleted_at) ->
-        {:ok, nil, nil}
+        nil
 
       {value_binary, ts, origin, expires_at, nil} when is_integer(expires_at) ->
         now = System.system_time(:nanosecond)
 
         if expires_at <= now do
-          {:ok, nil, nil}
+          nil
         else
-          {:ok, :erlang.binary_to_term(value_binary), {ts, origin}}
+          {:erlang.binary_to_term(value_binary), {ts, origin}}
         end
 
       {value_binary, ts, origin, _expires_at, nil} ->
-        {:ok, :erlang.binary_to_term(value_binary), {ts, origin}}
+        {:erlang.binary_to_term(value_binary), {ts, origin}}
     end
   end
+
 
   @doc """
   Put a key-value pair.
@@ -322,24 +323,46 @@ defmodule EKV do
   - `:if_vsn` — compare-and-swap. Only succeeds if the key's current version
     matches. Use `nil` for insert-if-absent. Returns `{:error, :conflict}` on
     mismatch. Requires `cluster_size` and `node_id` config.
+  - `:consistent` — when `true`, uses CASPaxos consensus for the write
+    (unconditional, overwrites any current value). Mutually exclusive with
+    `:if_vsn`. Requires `cluster_size` and `node_id` config.
+  - `:retries` — max CAS retries on conflict (default 5). Only for
+    `:consistent` and `:if_vsn` paths.
+  - `:backoff` — `{min_ms, max_ms}` random backoff range (default `{10, 60}`).
+  - `:timeout` — GenServer call timeout in ms (default 10_000).
   """
   def put(name, key, value, opts \\ []) do
-    opts = Keyword.validate!(opts, [:ttl, :if_vsn])
-    value_binary = :erlang.term_to_binary(value)
+    opts = Keyword.validate!(opts, [:ttl, :if_vsn, :consistent, :retries, :backoff, :timeout])
     config = get_config(name)
     shard_index = Replica.shard_index_for(key, config.num_shards)
+    timeout = Keyword.get(opts, :timeout, 10_000)
 
-    case Keyword.fetch(opts, :if_vsn) do
-      {:ok, expected_vsn} ->
+    case {Keyword.fetch(opts, :if_vsn), Keyword.get(opts, :consistent, false)} do
+      {_, true} ->
+        if Keyword.has_key?(opts, :if_vsn) do
+          raise ArgumentError, "EKV: :consistent and :if_vsn are mutually exclusive"
+        end
+
         validate_cas_config!(config)
+        update_opts = Keyword.take(opts, [:ttl, :retries, :backoff, :timeout])
+
+        case update(name, key, fn _ -> value end, update_opts) do
+          {:ok, _} -> :ok
+          error -> error
+        end
+
+      {{:ok, expected_vsn}, false} ->
+        validate_cas_config!(config)
+        value_binary = :erlang.term_to_binary(value)
 
         GenServer.call(
           Replica.shard_name(name, shard_index),
           {:cas_put, key, value_binary, expected_vsn, opts},
-          :infinity
+          timeout
         )
 
-      :error ->
+      {:error, false} ->
+        value_binary = :erlang.term_to_binary(value)
         GenServer.call(Replica.shard_name(name, shard_index), {:put, key, value_binary, opts})
     end
   end
@@ -347,31 +370,59 @@ defmodule EKV do
   @doc """
   Get a value by key. Returns `nil` for missing, expired, or deleted entries.
 
-  Reads directly from SQLite shard via per-scheduler read connection.
+  By default, reads directly from SQLite via per-scheduler read connection
+  (eventually consistent, no GenServer hop).
+
+  ## Options
+
+  - `:consistent` — when `true`, performs a CASPaxos consensus read
+    (linearizable). Requires `cluster_size` and `node_id` config.
+  - `:retries` — max CAS retries (default 5). Only for `consistent: true`.
+  - `:backoff` — `{min_ms, max_ms}` random backoff range (default `{10, 60}`).
+  - `:timeout` — GenServer call timeout in ms (default 10_000).
   """
-  def get(name, key) do
-    config = get_config(name)
-    shard_index = Replica.shard_index_for(key, config.num_shards)
-    {db, get_stmt} = read_conn(name, shard_index)
+  def get(name, key, opts \\ []) do
+    opts = Keyword.validate!(opts, [:consistent, :retries, :backoff, :timeout])
 
-    case EKV.Store.get_cached(db, get_stmt, key) do
-      nil ->
-        nil
+    if Keyword.get(opts, :consistent, false) do
+      config = get_config(name)
+      validate_cas_config!(config)
+      shard_index = Replica.shard_index_for(key, config.num_shards)
+      timeout = Keyword.get(opts, :timeout, 10_000)
+      cas_opts = Keyword.take(opts, [:retries, :backoff])
 
-      {_value_binary, _ts, _origin, _expires_at, deleted_at} when is_integer(deleted_at) ->
-        nil
+      case GenServer.call(
+             Replica.shard_name(name, shard_index),
+             {:cas_read, key, cas_opts},
+             timeout
+           ) do
+        {:ok, value} -> value
+        {:error, reason} -> raise "EKV: consistent read failed: #{inspect(reason)}"
+      end
+    else
+      config = get_config(name)
+      shard_index = Replica.shard_index_for(key, config.num_shards)
+      {db, get_stmt} = read_conn(name, shard_index)
 
-      {value_binary, _ts, _origin, expires_at, nil} when is_integer(expires_at) ->
-        now = System.system_time(:nanosecond)
-
-        if expires_at <= now do
+      case EKV.Store.get_cached(db, get_stmt, key) do
+        nil ->
           nil
-        else
-          :erlang.binary_to_term(value_binary)
-        end
 
-      {value_binary, _ts, _origin, _expires_at, nil} ->
-        :erlang.binary_to_term(value_binary)
+        {_value_binary, _ts, _origin, _expires_at, deleted_at} when is_integer(deleted_at) ->
+          nil
+
+        {value_binary, _ts, _origin, expires_at, nil} when is_integer(expires_at) ->
+          now = System.system_time(:nanosecond)
+
+          if expires_at <= now do
+            nil
+          else
+            :erlang.binary_to_term(value_binary)
+          end
+
+        {value_binary, _ts, _origin, _expires_at, nil} ->
+          :erlang.binary_to_term(value_binary)
+      end
     end
   end
 
@@ -387,9 +438,10 @@ defmodule EKV do
     `cluster_size` and `node_id` config.
   """
   def delete(name, key, opts \\ []) do
-    opts = Keyword.validate!(opts, [:if_vsn])
+    opts = Keyword.validate!(opts, [:if_vsn, :timeout])
     config = get_config(name)
     shard_index = Replica.shard_index_for(key, config.num_shards)
+    timeout = Keyword.get(opts, :timeout, 10_000)
 
     case Keyword.fetch(opts, :if_vsn) do
       {:ok, expected_vsn} ->
@@ -398,7 +450,7 @@ defmodule EKV do
         GenServer.call(
           Replica.shard_name(name, shard_index),
           {:cas_delete, key, expected_vsn},
-          :infinity
+          timeout
         )
 
       :error ->
@@ -420,74 +472,169 @@ defmodule EKV do
   ## Options
 
   - `:ttl` — time-to-live in milliseconds for the new value.
+  - `:retries` — max CAS retries on conflict (default 5).
+  - `:backoff` — `{min_ms, max_ms}` random backoff range (default `{10, 60}`).
+  - `:timeout` — GenServer call timeout in ms (default 10_000).
   """
   def update(name, key, fun, opts \\ []) when is_function(fun, 1) do
-    opts = Keyword.validate!(opts, [:ttl])
+    opts = Keyword.validate!(opts, [:ttl, :retries, :backoff, :timeout])
     config = get_config(name)
     validate_cas_config!(config)
     shard_index = Replica.shard_index_for(key, config.num_shards)
+    timeout = Keyword.get(opts, :timeout, 10_000)
 
     GenServer.call(
       Replica.shard_name(name, shard_index),
       {:update, key, fun, opts},
-      :infinity
+      timeout
     )
   end
 
-  @scan_sql """
-  SELECT key, value FROM kv
+  @scan_chunk_size 500
+
+  @scan_first_chunk_sql """
+  SELECT key, value, timestamp, origin_node FROM kv
   WHERE key >= ?1 AND key < ?2
     AND (deleted_at IS NULL OR deleted_at > ?3)
     AND (expires_at IS NULL OR expires_at > ?3)
+  ORDER BY key LIMIT ?4
   """
 
-  @keys_sql """
+  @scan_next_chunk_sql """
+  SELECT key, value, timestamp, origin_node FROM kv
+  WHERE key > ?1 AND key < ?2
+    AND (deleted_at IS NULL OR deleted_at > ?3)
+    AND (expires_at IS NULL OR expires_at > ?3)
+  ORDER BY key LIMIT ?4
+  """
+
+  @keys_first_chunk_sql """
   SELECT key FROM kv
   WHERE key >= ?1 AND key < ?2
     AND (deleted_at IS NULL OR deleted_at > ?3)
     AND (expires_at IS NULL OR expires_at > ?3)
-  ORDER BY key
+  ORDER BY key LIMIT ?4
+  """
+
+  @keys_next_chunk_sql """
+  SELECT key FROM kv
+  WHERE key > ?1 AND key < ?2
+    AND (deleted_at IS NULL OR deleted_at > ?3)
+    AND (expires_at IS NULL OR expires_at > ?3)
+  ORDER BY key LIMIT ?4
   """
 
   @doc """
   Scan key-value pairs matching a prefix.
 
-  Scans all shards.
+  Scans all shards using cursor-based streaming. Returns a `Stream` of
+  `{key, value, vsn}` tuples where `vsn` is `{timestamp, origin_node}`.
 
-  Returns `%{key => value}`.
+  Results are sorted by key within each shard but not globally sorted
+  across shards.
   """
   def scan(name, prefix) do
     config = get_config(name)
-    now = System.system_time(:nanosecond)
     prefix_end = EKV.Store.next_binary_prefix(prefix)
 
-    Enum.reduce(0..(config.num_shards - 1), %{}, fn shard, acc ->
-      {db, _} = read_conn(name, shard)
-      {:ok, rows} = EKV.Sqlite3.fetch_all(db, @scan_sql, [prefix, prefix_end, now])
+    shard_streams =
+      for shard <- 0..(config.num_shards - 1) do
+        Stream.resource(
+          fn -> {prefix, :first} end,
+          fn
+            :done ->
+              {:halt, :done}
 
-      Enum.reduce(rows, acc, fn [key, value_binary], map ->
-        Map.put(map, key, :erlang.binary_to_term(value_binary))
-      end)
-    end)
+            {cursor, phase} ->
+              now = System.system_time(:nanosecond)
+              {db, _} = read_conn(name, shard)
+
+              {sql, args} =
+                case phase do
+                  :first ->
+                    {@scan_first_chunk_sql, [cursor, prefix_end, now, @scan_chunk_size]}
+
+                  :next ->
+                    {@scan_next_chunk_sql, [cursor, prefix_end, now, @scan_chunk_size]}
+                end
+
+              {:ok, rows} = EKV.Sqlite3.fetch_all(db, sql, args)
+
+              if rows == [] do
+                {:halt, :done}
+              else
+                items =
+                  Enum.map(rows, fn [key, value_binary, ts, origin_str] ->
+                    {key, :erlang.binary_to_term(value_binary),
+                     {ts, String.to_atom(origin_str)}}
+                  end)
+
+                if length(rows) < @scan_chunk_size do
+                  {items, :done}
+                else
+                  [last_key | _] = List.last(rows)
+                  {items, {last_key, :next}}
+                end
+              end
+          end,
+          fn _ -> :ok end
+        )
+      end
+
+    Stream.concat(shard_streams)
   end
 
   @doc """
-  List keys matching a prefix. Scans all shards.
+  List keys matching a prefix. Scans all shards using cursor-based streaming.
 
-  Returns `[key]` sorted.
+  Returns a `Stream` of key strings. Results are sorted by key within each
+  shard but not globally sorted across shards.
   """
   def keys(name, prefix) do
     config = get_config(name)
-    now = System.system_time(:nanosecond)
     prefix_end = EKV.Store.next_binary_prefix(prefix)
 
-    for shard <- 0..(config.num_shards - 1),
-        {db, _} = read_conn(name, shard),
-        {:ok, rows} = EKV.Sqlite3.fetch_all(db, @keys_sql, [prefix, prefix_end, now]),
-        [key] <- rows do
-      key
-    end
-    |> Enum.sort()
+    shard_streams =
+      for shard <- 0..(config.num_shards - 1) do
+        Stream.resource(
+          fn -> {prefix, :first} end,
+          fn
+            :done ->
+              {:halt, :done}
+
+            {cursor, phase} ->
+              now = System.system_time(:nanosecond)
+              {db, _} = read_conn(name, shard)
+
+              {sql, args} =
+                case phase do
+                  :first ->
+                    {@keys_first_chunk_sql, [cursor, prefix_end, now, @scan_chunk_size]}
+
+                  :next ->
+                    {@keys_next_chunk_sql, [cursor, prefix_end, now, @scan_chunk_size]}
+                end
+
+              {:ok, rows} = EKV.Sqlite3.fetch_all(db, sql, args)
+
+              if rows == [] do
+                {:halt, :done}
+              else
+                items = Enum.map(rows, fn [key] -> key end)
+
+                if length(rows) < @scan_chunk_size do
+                  {items, :done}
+                else
+                  last_key = rows |> List.last() |> hd()
+                  {items, {last_key, :next}}
+                end
+              end
+          end,
+          fn _ -> :ok end
+        )
+      end
+
+    Stream.concat(shard_streams)
   end
 
   # ===========================================================================

@@ -79,22 +79,45 @@ defmodule EKVTest do
   end
 
   describe "scan/keys (prefix scan)" do
-    test "scan returns matching entries as a map", %{name: name} do
+    test "scan returns matching entries as stream of {key, value, vsn}", %{name: name} do
       :ok = EKV.put(name, "user/1", %{name: "Alice"})
       :ok = EKV.put(name, "user/2", %{name: "Bob"})
       :ok = EKV.put(name, "post/1", %{title: "Hello"})
 
-      result = EKV.scan(name, "user/")
+      result = EKV.scan(name, "user/") |> Map.new(fn {k, v, _vsn} -> {k, v} end)
       assert result == %{"user/1" => %{name: "Alice"}, "user/2" => %{name: "Bob"}}
     end
 
-    test "keys returns matching keys only", %{name: name} do
+    test "scan includes vsn in results", %{name: name} do
+      :ok = EKV.put(name, "user/1", "alice")
+
+      [{key, value, vsn}] = EKV.scan(name, "user/") |> Enum.to_list()
+      assert key == "user/1"
+      assert value == "alice"
+      assert {ts, origin} = vsn
+      assert is_integer(ts)
+      assert is_atom(origin)
+    end
+
+    test "scan is a Stream (lazy)", %{name: name} do
+      :ok = EKV.put(name, "user/1", "a")
+      stream = EKV.scan(name, "user/")
+      assert is_function(stream) or match?(%Stream{}, stream)
+    end
+
+    test "keys returns matching keys as stream", %{name: name} do
       :ok = EKV.put(name, "user/1", "a")
       :ok = EKV.put(name, "user/2", "b")
       :ok = EKV.put(name, "post/1", "c")
 
-      result = EKV.keys(name, "user/")
+      result = EKV.keys(name, "user/") |> Enum.sort()
       assert result == ["user/1", "user/2"]
+    end
+
+    test "keys is a Stream (lazy)", %{name: name} do
+      :ok = EKV.put(name, "user/1", "a")
+      stream = EKV.keys(name, "user/")
+      assert is_function(stream) or match?(%Stream{}, stream)
     end
 
     test "scan excludes deleted entries", %{name: name} do
@@ -102,7 +125,7 @@ defmodule EKVTest do
       :ok = EKV.put(name, "user/2", "b")
       :ok = EKV.delete(name, "user/1")
 
-      result = EKV.scan(name, "user/")
+      result = EKV.scan(name, "user/") |> Map.new(fn {k, v, _vsn} -> {k, v} end)
       assert result == %{"user/2" => "b"}
     end
 
@@ -111,7 +134,7 @@ defmodule EKVTest do
       :ok = EKV.put(name, "user/2", "b")
       Process.sleep(10)
 
-      result = EKV.scan(name, "user/")
+      result = EKV.scan(name, "user/") |> Map.new(fn {k, v, _vsn} -> {k, v} end)
       assert result == %{"user/2" => "b"}
     end
   end
@@ -1490,7 +1513,7 @@ defmodule EKVTest do
         )
 
       :ok = EKV.put(name, "cas/1", "val1", if_vsn: nil)
-      {:ok, "val1", vsn} = EKV.fetch(name, "cas/1")
+      {"val1", vsn} = EKV.lookup(name, "cas/1")
 
       # Handoff + restart
       for i <- 0..1 do
@@ -1823,12 +1846,12 @@ defmodule EKVTest do
   end
 
   # =====================================================================
-  # CAS: fetch/2
+  # CAS: lookup/2
   # =====================================================================
 
-  describe "fetch" do
+  describe "lookup" do
     setup do
-      name = :"ekv_fetch_#{System.unique_integer([:positive])}"
+      name = :"ekv_lookup_#{System.unique_integer([:positive])}"
       data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
 
       {:ok, pid} =
@@ -1851,37 +1874,37 @@ defmodule EKVTest do
       %{cas_name: name}
     end
 
-    test "returns value and vsn for existing key", %{cas_name: name} do
+    test "returns {value, vsn} for existing key", %{cas_name: name} do
       :ok = EKV.put(name, "user/1", %{name: "Alice"})
-      {:ok, value, vsn} = EKV.fetch(name, "user/1")
+      {value, vsn} = EKV.lookup(name, "user/1")
       assert value == %{name: "Alice"}
       assert {ts, origin} = vsn
       assert is_integer(ts)
       assert is_atom(origin)
     end
 
-    test "returns nil nil for missing key", %{cas_name: name} do
-      assert {:ok, nil, nil} = EKV.fetch(name, "missing")
+    test "returns nil for missing key", %{cas_name: name} do
+      assert nil == EKV.lookup(name, "missing")
     end
 
-    test "returns nil nil for deleted key", %{cas_name: name} do
+    test "returns nil for deleted key", %{cas_name: name} do
       :ok = EKV.put(name, "del/1", "val")
       :ok = EKV.delete(name, "del/1")
-      assert {:ok, nil, nil} = EKV.fetch(name, "del/1")
+      assert nil == EKV.lookup(name, "del/1")
     end
 
-    test "returns nil nil for expired TTL key", %{cas_name: name} do
+    test "returns nil for expired TTL key", %{cas_name: name} do
       :ok = EKV.put(name, "ttl/1", "val", ttl: 1)
       Process.sleep(10)
-      assert {:ok, nil, nil} = EKV.fetch(name, "ttl/1")
+      assert nil == EKV.lookup(name, "ttl/1")
     end
 
     test "vsn changes after each put", %{cas_name: name} do
       :ok = EKV.put(name, "k", "v1")
-      {:ok, _, vsn1} = EKV.fetch(name, "k")
+      {_, vsn1} = EKV.lookup(name, "k")
       Process.sleep(1)
       :ok = EKV.put(name, "k", "v2")
-      {:ok, _, vsn2} = EKV.fetch(name, "k")
+      {_, vsn2} = EKV.lookup(name, "k")
       assert vsn1 != vsn2
     end
   end
@@ -1927,14 +1950,14 @@ defmodule EKVTest do
 
     test "put if_vsn: vsn succeeds when vsn matches", %{cas_name: name} do
       :ok = EKV.put(name, "cas/1", "v1")
-      {:ok, _, vsn} = EKV.fetch(name, "cas/1")
+      {_, vsn} = EKV.lookup(name, "cas/1")
       assert :ok = EKV.put(name, "cas/1", "v2", if_vsn: vsn)
       assert EKV.get(name, "cas/1") == "v2"
     end
 
     test "put if_vsn: vsn returns conflict when stale", %{cas_name: name} do
       :ok = EKV.put(name, "cas/2", "v1")
-      {:ok, _, vsn1} = EKV.fetch(name, "cas/2")
+      {_, vsn1} = EKV.lookup(name, "cas/2")
       :ok = EKV.put(name, "cas/2", "v2")
       assert {:error, :conflict} = EKV.put(name, "cas/2", "v3", if_vsn: vsn1)
     end
@@ -1949,21 +1972,21 @@ defmodule EKVTest do
       assert EKV.get(name, "get/1") == "v1"
     end
 
-    test "after CAS put, fetch returns new vsn", %{cas_name: name} do
+    test "after CAS put, lookup returns new vsn", %{cas_name: name} do
       :ok = EKV.put(name, "vsn/1", "v1", if_vsn: nil)
-      {:ok, _, vsn1} = EKV.fetch(name, "vsn/1")
-      assert vsn1 != nil
+      {_, vsn1} = EKV.lookup(name, "vsn/1")
+      assert is_tuple(vsn1)
 
       :ok = EKV.put(name, "vsn/1", "v2", if_vsn: vsn1)
-      {:ok, _, vsn2} = EKV.fetch(name, "vsn/1")
+      {_, vsn2} = EKV.lookup(name, "vsn/1")
       assert vsn2 != vsn1
     end
 
-    test "sequential fetch-put-fetch-put chain", %{cas_name: name} do
+    test "sequential lookup-put-lookup-put chain", %{cas_name: name} do
       :ok = EKV.put(name, "chain/1", "v1", if_vsn: nil)
-      {:ok, "v1", vsn1} = EKV.fetch(name, "chain/1")
+      {"v1", vsn1} = EKV.lookup(name, "chain/1")
       :ok = EKV.put(name, "chain/1", "v2", if_vsn: vsn1)
-      {:ok, "v2", vsn2} = EKV.fetch(name, "chain/1")
+      {"v2", vsn2} = EKV.lookup(name, "chain/1")
       :ok = EKV.put(name, "chain/1", "v3", if_vsn: vsn2)
       assert EKV.get(name, "chain/1") == "v3"
     end
@@ -2021,30 +2044,30 @@ defmodule EKVTest do
 
     test "delete if_vsn succeeds when vsn matches", %{cas_name: name} do
       :ok = EKV.put(name, "del/1", "val")
-      {:ok, _, vsn} = EKV.fetch(name, "del/1")
+      {_, vsn} = EKV.lookup(name, "del/1")
       assert :ok = EKV.delete(name, "del/1", if_vsn: vsn)
       assert EKV.get(name, "del/1") == nil
     end
 
     test "delete if_vsn returns conflict when stale", %{cas_name: name} do
       :ok = EKV.put(name, "del/2", "v1")
-      {:ok, _, vsn1} = EKV.fetch(name, "del/2")
+      {_, vsn1} = EKV.lookup(name, "del/2")
       :ok = EKV.put(name, "del/2", "v2")
       assert {:error, :conflict} = EKV.delete(name, "del/2", if_vsn: vsn1)
       assert EKV.get(name, "del/2") == "v2"
     end
 
-    test "after CAS delete, get returns nil and fetch returns nil", %{cas_name: name} do
+    test "after CAS delete, get returns nil and lookup returns nil", %{cas_name: name} do
       :ok = EKV.put(name, "del/3", "val")
-      {:ok, _, vsn} = EKV.fetch(name, "del/3")
+      {_, vsn} = EKV.lookup(name, "del/3")
       :ok = EKV.delete(name, "del/3", if_vsn: vsn)
       assert EKV.get(name, "del/3") == nil
-      assert {:ok, nil, nil} = EKV.fetch(name, "del/3")
+      assert nil == EKV.lookup(name, "del/3")
     end
 
     test "CAS delete dispatches subscriber event with previous value", %{cas_name: name} do
       :ok = EKV.put(name, "del/4", "old_val")
-      {:ok, _, vsn} = EKV.fetch(name, "del/4")
+      {_, vsn} = EKV.lookup(name, "del/4")
       :ok = EKV.subscribe(name, "del/")
       :ok = EKV.delete(name, "del/4", if_vsn: vsn)
       flush_dispatchers(name)
@@ -2054,9 +2077,9 @@ defmodule EKVTest do
 
     test "CAS delete then put if_vsn: nil re-creates key", %{cas_name: name} do
       :ok = EKV.put(name, "del/5", "val")
-      {:ok, _, vsn} = EKV.fetch(name, "del/5")
+      {_, vsn} = EKV.lookup(name, "del/5")
       :ok = EKV.delete(name, "del/5", if_vsn: vsn)
-      assert {:ok, nil, nil} = EKV.fetch(name, "del/5")
+      assert nil == EKV.lookup(name, "del/5")
       :ok = EKV.put(name, "del/5", "reborn", if_vsn: nil)
       assert EKV.get(name, "del/5") == "reborn"
     end
@@ -2129,6 +2152,102 @@ defmodule EKVTest do
       flush_dispatchers(name)
 
       assert_receive {:ekv, [%EKV.Event{type: :put, key: "u/4", value: "val"}], _}
+    end
+  end
+
+  # =====================================================================
+  # CAS: get/3 with consistent: true
+  # =====================================================================
+
+  describe "consistent get" do
+    setup do
+      name = :"ekv_cget_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+
+      {:ok, pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: data_dir,
+          shards: 2,
+          log: false,
+          cluster_size: 1,
+          node_id: 1,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      %{cas_name: name}
+    end
+
+    test "returns nil for missing key", %{cas_name: name} do
+      assert nil == EKV.get(name, "missing", consistent: true)
+    end
+
+    test "returns value for existing key", %{cas_name: name} do
+      :ok = EKV.put(name, "cg/1", "val")
+      assert "val" == EKV.get(name, "cg/1", consistent: true)
+    end
+
+    test "accepts retries and backoff opts", %{cas_name: name} do
+      :ok = EKV.put(name, "cg/2", "val")
+      assert "val" == EKV.get(name, "cg/2", consistent: true, retries: 3, backoff: {5, 20})
+    end
+  end
+
+  # =====================================================================
+  # CAS: put/4 with consistent: true
+  # =====================================================================
+
+  describe "consistent put" do
+    setup do
+      name = :"ekv_cput_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+
+      {:ok, pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: data_dir,
+          shards: 2,
+          log: false,
+          cluster_size: 1,
+          node_id: 1,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      %{cas_name: name}
+    end
+
+    test "creates new key", %{cas_name: name} do
+      assert :ok = EKV.put(name, "cp/1", "val", consistent: true)
+      assert EKV.get(name, "cp/1") == "val"
+    end
+
+    test "overwrites existing key", %{cas_name: name} do
+      :ok = EKV.put(name, "cp/2", "v1")
+      assert :ok = EKV.put(name, "cp/2", "v2", consistent: true)
+      assert EKV.get(name, "cp/2") == "v2"
+    end
+
+    test "with TTL", %{cas_name: name} do
+      assert :ok = EKV.put(name, "cp/3", "val", consistent: true, ttl: 60_000)
+      assert EKV.get(name, "cp/3") == "val"
+    end
+
+    test "consistent and if_vsn are mutually exclusive", %{cas_name: name} do
+      assert_raise ArgumentError, ~r/mutually exclusive/, fn ->
+        EKV.put(name, "cp/4", "val", consistent: true, if_vsn: nil)
+      end
     end
   end
 
@@ -2451,7 +2570,7 @@ defmodule EKVTest do
     } do
       # Create the key
       :ok = EKV.put(name, "race/1", "v0", if_vsn: nil)
-      {:ok, _, vsn} = EKV.fetch(name, "race/1")
+      {_, vsn} = EKV.lookup(name, "race/1")
 
       # Launch concurrent CAS puts with same vsn
       tasks =
@@ -2641,7 +2760,7 @@ defmodule EKVTest do
       :ok = EKV.put(name, "gc/1", "val", if_vsn: nil)
 
       # Delete and purge tombstone — kv entry removed, kv_paxos row survives
-      {:ok, _, vsn} = EKV.fetch(name, "gc/1")
+      {_, vsn} = EKV.lookup(name, "gc/1")
       :ok = EKV.delete(name, "gc/1", if_vsn: vsn)
 
       now = System.system_time(:nanosecond)
@@ -2710,7 +2829,7 @@ defmodule EKVTest do
 
     test "CAS after non-CAS: vsn check works against LWW-written vsn", %{cas_name: name} do
       :ok = EKV.put(name, "mixed/1", "lww_val")
-      {:ok, "lww_val", vsn} = EKV.fetch(name, "mixed/1")
+      {"lww_val", vsn} = EKV.lookup(name, "mixed/1")
       assert {_ts, _origin} = vsn
 
       :ok = EKV.put(name, "mixed/1", "cas_val", if_vsn: vsn)
@@ -2814,7 +2933,7 @@ defmodule EKVTest do
 
       :ok = EKV.put(name, "hand/1", "from_a", if_vsn: nil)
       :ok = EKV.put(name, "hand/2", "from_a2", if_vsn: nil)
-      {:ok, "from_a", vsn1} = EKV.fetch(name, "hand/1")
+      {"from_a", vsn1} = EKV.lookup(name, "hand/1")
 
       # Handoff + stop
       for i <- 0..1 do
@@ -3029,7 +3148,7 @@ defmodule EKVTest do
 
       # After promote, a new CAS operation should see the value via kv (not kv_paxos)
       # Verify by doing a fetch — the vsn should match the committed value
-      {:ok, "clear_test", vsn} = EKV.fetch(name, key)
+      {"clear_test", vsn} = EKV.lookup(name, key)
       assert is_tuple(vsn)
     end
 

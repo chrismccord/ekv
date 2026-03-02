@@ -1062,7 +1062,15 @@ defmodule EKV.Replica do
   end
 
   def handle_call({:update, key, fun, opts}, from, state) do
-    operation = {:update, fun, opts, 5}
+    retries = Keyword.get(opts, :retries, 5)
+    operation = {:update, fun, opts, retries}
+    {:noreply, start_cas(state, key, operation, from)}
+  end
+
+  def handle_call({:cas_read, key, opts}, from, state) do
+    retries = Keyword.get(opts, :retries, 5)
+    backoff = Keyword.get(opts, :backoff, {10, 60})
+    operation = {:cas_read, [backoff: backoff], retries}
     {:noreply, start_cas(state, key, operation, from)}
   end
 
@@ -2009,44 +2017,54 @@ defmodule EKV.Replica do
         decode_kv_row(best_kv_row)
       end
 
-    # Apply operation
-    case apply_operation(op.operation, op.key, current_value, current_vsn) do
-      {:ok, _new_value_binary, new_entry_tuple, reply_value, broadcast_msg, events} ->
-        # Send accept to all peers (do NOT do local accept yet — deferred until quorum)
-        for {remote_node, _pid} <- state.remote_shards do
-          send_to_peer(
-            state,
-            remote_node,
-            {:ekv_accept, ref, self(), op.key, elem(op.ballot, 0), elem(op.ballot, 1),
-             new_entry_tuple, state.shard_index}
-          )
-        end
-
-        timer = Process.send_after(self(), {:cas_timeout, ref}, 5_000)
-
-        op = %{
-          op
-          | phase: :accept,
-            accepts: MapSet.new(),
-            accept_nacks: 0,
-            responded: MapSet.new(),
-            timer: timer,
-            reply_value: reply_value,
-            broadcast_msg: broadcast_msg,
-            entry_tuple: new_entry_tuple,
-            events: events
-        }
-
-        # For cluster_size: 1 (no peers), commit immediately
-        if MapSet.size(op.accepts) + 1 >= op.quorum do
-          commit_cas(ref, op, state)
-        else
-          %{state | pending_cas: Map.put(state.pending_cas, ref, op)}
-        end
-
-      {:error, :conflict} ->
-        GenServer.reply(op.from, {:error, :conflict})
+    # Read-only CAS: if operation is :cas_read and no pending accepted value,
+    # reply immediately without accept/commit phases.
+    case op.operation do
+      {:cas_read, _, _} when best_acc_c == 0 ->
+        cancel_timer(op.timer)
+        GenServer.reply(op.from, {:ok, current_value})
         %{state | pending_cas: Map.delete(state.pending_cas, ref)}
+
+      _ ->
+        # Apply operation
+        case apply_operation(op.operation, op.key, current_value, current_vsn) do
+          {:ok, _new_value_binary, new_entry_tuple, reply_value, broadcast_msg, events} ->
+            # Send accept to all peers (do NOT do local accept yet — deferred until quorum)
+            for {remote_node, _pid} <- state.remote_shards do
+              send_to_peer(
+                state,
+                remote_node,
+                {:ekv_accept, ref, self(), op.key, elem(op.ballot, 0), elem(op.ballot, 1),
+                 new_entry_tuple, state.shard_index}
+              )
+            end
+
+            timer = Process.send_after(self(), {:cas_timeout, ref}, 5_000)
+
+            op = %{
+              op
+              | phase: :accept,
+                accepts: MapSet.new(),
+                accept_nacks: 0,
+                responded: MapSet.new(),
+                timer: timer,
+                reply_value: reply_value,
+                broadcast_msg: broadcast_msg,
+                entry_tuple: new_entry_tuple,
+                events: events
+            }
+
+            # For cluster_size: 1 (no peers), commit immediately
+            if MapSet.size(op.accepts) + 1 >= op.quorum do
+              commit_cas(ref, op, state)
+            else
+              %{state | pending_cas: Map.put(state.pending_cas, ref, op)}
+            end
+
+          {:error, :conflict} ->
+            GenServer.reply(op.from, {:error, :conflict})
+            %{state | pending_cas: Map.delete(state.pending_cas, ref)}
+        end
     end
   end
 
@@ -2139,6 +2157,30 @@ defmodule EKV.Replica do
         broadcast_msg = {:ekv_put, key, new_value_binary, now, origin, expires_at}
         events = [%EKV.Event{type: :put, key: key, value: new_value}]
         {:ok, new_value_binary, entry_tuple, {:ok, new_value}, broadcast_msg, events}
+
+      {:cas_read, _opts, _retries} ->
+        # Re-proposing a pending accepted value (best_acc_c > 0 case).
+        # We must complete the stalled CAS by committing the accepted value.
+        # Build entry_tuple from the accepted kv_row columns.
+        # current_value was decoded from the accepted row — re-encode it.
+        if current_value != nil do
+          value_binary = :erlang.term_to_binary(current_value)
+          {ts, origin} = current_vsn
+          origin_str = if is_atom(origin), do: Atom.to_string(origin), else: origin
+          entry_tuple = {key, value_binary, ts, origin_str, nil, nil}
+          broadcast_msg = {:ekv_put, key, value_binary, ts, origin, nil}
+          events = []
+          {:ok, value_binary, entry_tuple, {:ok, current_value}, broadcast_msg, events}
+        else
+          # The accepted value was a delete/nil — re-propose as nil
+          now = System.system_time(:nanosecond)
+          origin = node()
+          origin_str = Atom.to_string(origin)
+          entry_tuple = {key, nil, now, origin_str, nil, now}
+          broadcast_msg = {:ekv_delete, key, now, origin}
+          events = []
+          {:ok, nil, entry_tuple, {:ok, nil}, broadcast_msg, events}
+        end
     end
   end
 
@@ -2176,11 +2218,26 @@ defmodule EKV.Replica do
         # Retry with new ballot after random backoff
         new_op = %{op | operation: {:update, fun, opts, retries - 1}}
         state = %{state | pending_cas: Map.put(state.pending_cas, ref, new_op)}
-        delay = :rand.uniform(50) + 10
+        {min_ms, max_ms} = Keyword.get(opts, :backoff, {10, 60})
+        delay = Enum.random(min_ms..max_ms)
 
         Process.send_after(
           self(),
           {:cas_retry, ref, op.key, {:update, fun, opts, retries - 1}},
+          delay
+        )
+
+        state
+
+      {:cas_read, opts, retries} when retries > 0 ->
+        new_op = %{op | operation: {:cas_read, opts, retries - 1}}
+        state = %{state | pending_cas: Map.put(state.pending_cas, ref, new_op)}
+        {min_ms, max_ms} = Keyword.get(opts, :backoff, {10, 60})
+        delay = Enum.random(min_ms..max_ms)
+
+        Process.send_after(
+          self(),
+          {:cas_retry, ref, op.key, {:cas_read, opts, retries - 1}},
           delay
         )
 

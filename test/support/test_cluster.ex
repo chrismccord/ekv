@@ -162,6 +162,26 @@ defmodule EKV.TestCluster do
     end
   end
 
+  @doc "Materialize keys stream on remote node, return sorted list"
+  def keys_sorted(node, name, prefix) do
+    rpc!(node, __MODULE__, :do_keys_sorted, [name, prefix])
+  end
+
+  @doc "Count keys on remote node"
+  def keys_count(node, name, prefix) do
+    rpc!(node, __MODULE__, :do_keys_count, [name, prefix])
+  end
+
+  @doc "Count scan results on remote node"
+  def scan_count(node, name, prefix) do
+    rpc!(node, __MODULE__, :do_scan_count, [name, prefix])
+  end
+
+  @doc false
+  def do_keys_sorted(name, prefix), do: EKV.keys(name, prefix) |> Enum.sort()
+  def do_keys_count(name, prefix), do: EKV.keys(name, prefix) |> Enum.count()
+  def do_scan_count(name, prefix), do: EKV.scan(name, prefix) |> Enum.count()
+
   # CAS helpers — named functions that can be called across nodes
   def cas_increment(nil), do: 1
   def cas_increment(n), do: n + 1

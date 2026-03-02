@@ -58,7 +58,7 @@ defmodule Bench.Replica do
   end
 
   def count_keys(name, prefix) when prefix != "" do
-    length(EKV.keys(name, prefix))
+    EKV.keys(name, prefix) |> Enum.count()
   end
 
   def count_all_keys(name) do
@@ -74,7 +74,7 @@ defmodule Bench.Replica do
   end
 
   def list_keys(name, prefix) do
-    EKV.keys(name, prefix)
+    EKV.keys(name, prefix) |> Enum.sort()
   end
 
   def start_watcher(name, notify_pid) do
@@ -128,8 +128,8 @@ defmodule Bench.Replica do
     EKV.update(name, key, fun)
   end
 
-  def cas_fetch(name, key) do
-    EKV.fetch(name, key)
+  def cas_lookup(name, key) do
+    EKV.lookup(name, key)
   end
 
   def cas_increment(nil), do: 1
