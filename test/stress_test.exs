@@ -249,7 +249,7 @@ defmodule EKV.StressTest do
             ])
 
           # Record the version
-          {:ok, _val, vsn} = TestCluster.rpc!(proposer, EKV, :fetch, [ekv_name, key])
+          {_val, vsn} = TestCluster.rpc!(proposer, EKV, :lookup, [ekv_name, key])
 
           # Heal before next round
           heal(majority, minority)
@@ -319,7 +319,7 @@ defmodule EKV.StressTest do
       end
 
       # CAS update from n3 with quorum n3+n4+n5 succeeds and sees previous value
-      {:ok, _, vsn} = TestCluster.rpc!(n3, EKV, :fetch, [ekv_name, "crash/1"])
+      {_, vsn} = TestCluster.rpc!(n3, EKV, :lookup, [ekv_name, "crash/1"])
       assert vsn != nil, "Version should exist for committed value"
       :ok = TestCluster.rpc!(n3, EKV, :put, [ekv_name, "crash/1", "updated", [if_vsn: vsn]])
 
@@ -394,7 +394,7 @@ defmodule EKV.StressTest do
       end
 
       # CAS update on one key succeeds (ballot counter restored)
-      {:ok, _, vsn} = TestCluster.rpc!(hd(nodes), EKV, :fetch, [ekv_name, "restart/1"])
+      {_, vsn} = TestCluster.rpc!(hd(nodes), EKV, :lookup, [ekv_name, "restart/1"])
       assert :ok = TestCluster.rpc!(hd(nodes), EKV, :put, [ekv_name, "restart/1", "updated", [if_vsn: vsn]])
     end
 
@@ -538,7 +538,7 @@ defmodule EKV.StressTest do
 
           for _ <- 1..20 do
             for node <- nodes do
-              result = TestCluster.rpc!(node, EKV, :scan, [ekv_name, "pscan/"])
+              result = TestCluster.scan_to_map(node, ekv_name, "pscan/")
               [{node, result} | scan_results]
             end
 
@@ -559,7 +559,7 @@ defmodule EKV.StressTest do
 
       # Verify: every value in final scan matches a committed value
       for node <- nodes do
-        final_scan = TestCluster.rpc!(node, EKV, :scan, [ekv_name, "pscan/"])
+        final_scan = TestCluster.scan_to_map(node, ekv_name, "pscan/")
 
         for {key, val} <- final_scan do
           assert Map.has_key?(committed_vals, key),
@@ -746,7 +746,7 @@ defmodule EKV.StressTest do
               &TestCluster.cas_increment/1
             ])
 
-          {:ok, _val, vsn} = TestCluster.rpc!(proposer, EKV, :fetch, [ekv_name, key])
+          {_val, vsn} = TestCluster.rpc!(proposer, EKV, :lookup, [ekv_name, key])
           vsns ++ [vsn]
         end)
 
@@ -775,7 +775,7 @@ defmodule EKV.StressTest do
 
       # CAS put "v1", record vsn1
       :ok = TestCluster.rpc!(n1, EKV, :put, [ekv_name, key, "v1", [if_vsn: nil]])
-      {:ok, "v1", vsn1} = TestCluster.rpc!(n1, EKV, :fetch, [ekv_name, key])
+      {"v1", vsn1} = TestCluster.rpc!(n1, EKV, :lookup, [ekv_name, key])
       assert vsn1 != nil
 
       # Wait for replication
@@ -790,9 +790,9 @@ defmodule EKV.StressTest do
       Process.sleep(300)
 
       # CAS update to "v2" on majority, record vsn2
-      {:ok, _, vsn_before} = TestCluster.rpc!(n1, EKV, :fetch, [ekv_name, key])
+      {_, vsn_before} = TestCluster.rpc!(n1, EKV, :lookup, [ekv_name, key])
       :ok = TestCluster.rpc!(n1, EKV, :put, [ekv_name, key, "v2", [if_vsn: vsn_before]])
-      {:ok, "v2", vsn2} = TestCluster.rpc!(n1, EKV, :fetch, [ekv_name, key])
+      {"v2", vsn2} = TestCluster.rpc!(n1, EKV, :lookup, [ekv_name, key])
       assert vsn2 > vsn1, "vsn2 should be greater than vsn1"
 
       # Heal
@@ -802,7 +802,7 @@ defmodule EKV.StressTest do
       # Fetch from n4, n5 — version must be >= vsn2, never vsn1
       for node <- [n4, n5] do
         TestCluster.assert_eventually(fn ->
-          {:ok, val, vsn_node} = TestCluster.rpc!(node, EKV, :fetch, [ekv_name, key])
+          {val, vsn_node} = TestCluster.rpc!(node, EKV, :lookup, [ekv_name, key])
           val == "v2" and vsn_node >= vsn2
         end)
       end
@@ -824,7 +824,7 @@ defmodule EKV.StressTest do
 
       # CAS put from n1, record vsn_before
       :ok = TestCluster.rpc!(n1, EKV, :put, [ekv_name, key, "before_crash", [if_vsn: nil]])
-      {:ok, "before_crash", vsn_before} = TestCluster.rpc!(n1, EKV, :fetch, [ekv_name, key])
+      {"before_crash", vsn_before} = TestCluster.rpc!(n1, EKV, :lookup, [ekv_name, key])
 
       # Kill shard 0 on n1 via Process.exit(:kill) (supervisor restarts it)
       TestCluster.rpc!(n1, TestCluster, :kill_registered, [:"#{ekv_name}_ekv_replica_0"])
@@ -843,9 +843,9 @@ defmodule EKV.StressTest do
       )
 
       # CAS put from n1 again, record vsn_after
-      {:ok, _, vsn_current} = TestCluster.rpc!(n1, EKV, :fetch, [ekv_name, key])
+      {_, vsn_current} = TestCluster.rpc!(n1, EKV, :lookup, [ekv_name, key])
       :ok = TestCluster.rpc!(n1, EKV, :put, [ekv_name, key, "after_crash", [if_vsn: vsn_current]])
-      {:ok, "after_crash", vsn_after} = TestCluster.rpc!(n1, EKV, :fetch, [ekv_name, key])
+      {"after_crash", vsn_after} = TestCluster.rpc!(n1, EKV, :lookup, [ekv_name, key])
 
       # Version after crash must be strictly higher
       assert vsn_after > vsn_before,
@@ -941,7 +941,7 @@ defmodule EKV.StressTest do
       end)
 
       # CAS delete
-      {:ok, _, vsn} = TestCluster.rpc!(n1, EKV, :fetch, [ekv_name, key])
+      {_, vsn} = TestCluster.rpc!(n1, EKV, :lookup, [ekv_name, key])
       :ok = TestCluster.rpc!(n1, EKV, :delete, [ekv_name, key, [if_vsn: vsn]])
 
       TestCluster.assert_eventually(fn ->
@@ -1018,7 +1018,7 @@ defmodule EKV.StressTest do
       # not have received the commit notification (partition could interrupt it).
       # Those acceptors still have accepted_value="cas_v1" with a different
       # version, causing the if_vsn check to fail during the accept phase.
-      {:ok, _converged_val, stale_vsn} = TestCluster.rpc!(n2, EKV, :fetch, [ekv_name, key])
+      {_converged_val, stale_vsn} = TestCluster.rpc!(n2, EKV, :lookup, [ekv_name, key])
       result = TestCluster.rpc!(n2, EKV, :put, [ekv_name, key, "cas_v2", [if_vsn: stale_vsn]])
 
       # If commit broadcast was interrupted by partition → :conflict
@@ -1052,7 +1052,7 @@ defmodule EKV.StressTest do
 
       # Verify the system isn't stuck: a fresh fetch + if_vsn CAS must work
       # (proves kv_paxos is clean after update resolved the divergence)
-      {:ok, ^new_val, fresh_vsn} = TestCluster.rpc!(n2, EKV, :fetch, [ekv_name, key])
+      {^new_val, fresh_vsn} = TestCluster.rpc!(n2, EKV, :lookup, [ekv_name, key])
       assert fresh_vsn != nil
       :ok = TestCluster.rpc!(n2, EKV, :put, [ekv_name, key, "final", [if_vsn: fresh_vsn]])
 
@@ -1390,7 +1390,7 @@ defmodule EKV.StressTest do
 
     # ----- Value Corruption Attempts (3) -----
 
-    test "promises with conflicting kv_rows from different nodes", %{
+    test "promises with conflicting kv_rows: picks highest {ts, origin}", %{
       name: name,
       shard_name: shard_name
     } do
@@ -1434,12 +1434,9 @@ defmodule EKV.StressTest do
 
       {:ok, result} = Task.await(task, 5000)
 
-      # The update function uppercased whatever value was picked from promises
-      # Local promise has "val_A". All have accepted_counter=0.
-      # enter_accept_phase: Enum.find_value picks first non-nil kv_row
-      assert is_binary(result)
-      assert result == String.upcase(result)
-      assert result in ["VAL_A", "VAL_B", "VAL_C"]
+      # The update function uppercased the value with the highest {ts, origin}.
+      # "val_C" has ts=now+200 (highest), so it always wins deterministically.
+      assert result == "VAL_C"
 
       # Value is committed and readable
       assert EKV.get(name, key) == result
@@ -1758,6 +1755,82 @@ defmodule EKV.StressTest do
       assert EKV.get(name, key_a) == "val_a"
       assert EKV.get(name, key_b) == "val_b"
       refute_receive {:DOWN, ^mref, :process, _, _}
+    end
+
+    # ----- CASPaxos Correctness (2) -----
+
+    test "prepare returns accepted tombstone (not stale kv row) after accepted delete", %{
+      name: name,
+      shard_name: shard_name
+    } do
+      key = "fi/delete_pending"
+      :ok = EKV.put(name, key, "v1")
+
+      state = :sys.get_state(shard_name)
+      db = state.db
+
+      {:ok, :promise, 0, "", _} = EKV.Store.paxos_prepare(db, key, 100, "n1")
+
+      now = System.system_time(:nanosecond)
+      origin = Atom.to_string(node())
+
+      # Accepted-but-not-committed delete (tombstone) in kv_paxos.
+      {:ok, true} = EKV.Store.paxos_accept(db, key, 100, "n1", [nil, now, origin, nil, now])
+
+      # Correct CASPaxos behavior: a higher prepare must observe that accepted tombstone.
+      {:ok, :promise, 100, "n1", [_val, _ts, _origin, _exp, deleted_at]} =
+        EKV.Store.paxos_prepare(db, key, 200, "n2")
+
+      assert is_integer(deleted_at),
+             "prepare should return accepted tombstone from kv_paxos, not old committed kv value"
+    end
+
+    test "if_vsn CAS rejects stale vsn when quorum promises include fresher state", %{
+      name: name,
+      shard_name: shard_name
+    } do
+      key = "fi/quorum_select"
+      :ok = EKV.put(name, key, "v1")
+      {"v1", stale_vsn} = EKV.lookup(name, key)
+
+      task =
+        Task.async(fn ->
+          EKV.put(name, key, "v_new", if_vsn: stale_vsn)
+        end)
+
+      ref = poll_pending_cas(shard_name, fn pending_cas ->
+        case Map.to_list(pending_cas) do
+          [{ref, _op}] -> ref
+          _ -> nil
+        end
+      end)
+
+      stale_value_bin = :erlang.term_to_binary("v1")
+      {stale_ts, stale_origin} = stale_vsn
+      stale_origin_str = Atom.to_string(stale_origin)
+      stale_row = [stale_value_bin, stale_ts, stale_origin_str, nil, nil]
+
+      fresh_row = [
+        :erlang.term_to_binary("v2"),
+        stale_ts + 1_000,
+        stale_origin_str,
+        nil,
+        nil
+      ]
+
+      shard_pid = Process.whereis(shard_name)
+
+      # Quorum has conflicting committed states with accepted_counter=0.
+      # Proposer must pick highest {ts, origin} — fresh_row wins, stale if_vsn must conflict.
+      send(shard_pid, {:ekv_promise, ref, self(), "2", 0, "", fresh_row})
+      send(shard_pid, {:ekv_promise, ref, self(), "3", 0, "", stale_row})
+
+      Process.sleep(20)
+      send(shard_pid, {:ekv_accepted, ref, self(), "2"})
+      send(shard_pid, {:ekv_accepted, ref, self(), "3"})
+
+      assert Task.await(task, 5_000) == {:error, :conflict},
+             "stale if_vsn should conflict when quorum already contains fresher state"
     end
   end
 

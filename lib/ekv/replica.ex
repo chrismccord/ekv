@@ -2006,12 +2006,19 @@ defmodule EKV.Replica do
     {_best_node_id, best_acc_c, best_acc_n, best_kv_row} =
       Enum.max_by(op.promises, fn {_nid, acc_c, acc_n, _row} -> {acc_c, acc_n} end)
 
-    # The value with the highest accepted ballot is the current state
-    # If all accepted ballots are {0, 0}, no value was ever accepted
+    # The value with the highest accepted ballot is the current state.
+    # If all accepted ballots are {0, 0}, no value was ever accepted —
+    # pick the kv_row with the highest {timestamp, origin} to match LWW
+    # ordering. This ensures deterministic selection regardless of message
+    # arrival order.
     {current_value, current_vsn} =
       if best_acc_c == 0 and best_acc_n in ["", nil] do
-        # Use any non-nil kv_row from promises (there might be LWW-written data)
-        best_kv_row_any = Enum.find_value(op.promises, fn {_, _, _, row} -> row end)
+        best_kv_row_any =
+          op.promises
+          |> Enum.map(fn {_, _, _, row} -> row end)
+          |> Enum.reject(&is_nil/1)
+          |> Enum.max_by(fn [_val, ts, origin | _] -> {ts, origin} end, fn -> nil end)
+
         decode_kv_row(best_kv_row_any)
       else
         decode_kv_row(best_kv_row)

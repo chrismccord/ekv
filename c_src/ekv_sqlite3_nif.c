@@ -940,8 +940,10 @@ static ERL_NIF_TERM ekv_paxos_prepare(ErlNifEnv *env, int argc, const ERL_NIF_TE
             accepted_n_len = sqlite3_column_bytes(sel, 3);
         }
 
-        /* Check if there's a pending accepted value (acc_c > 0 AND value NOT NULL) */
-        if (accepted_c > 0 && sqlite3_column_type(sel, 4) != SQLITE_NULL) {
+        /* Check if there's a pending accepted state (acc_c > 0).
+         * Accepted deletes have value=NULL but deleted_at!=NULL,
+         * so we must not require value to be non-NULL. */
+        if (accepted_c > 0) {
             has_accepted_value = 1;
             for (int i = 0; i < 5; i++)
                 paxos_value_cols[i] = make_column(env, sel, 4 + i);

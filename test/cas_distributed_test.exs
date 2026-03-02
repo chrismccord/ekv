@@ -86,7 +86,7 @@ defmodule EKV.CASDistributedTest do
         TestCluster.rpc!(node_b, EKV, :get, [ekv_name, "key1"]) == "val1"
       end)
 
-      {:ok, _, vsn} = TestCluster.rpc!(node_a, EKV, :fetch, [ekv_name, "key1"])
+      {_, vsn} = TestCluster.rpc!(node_a, EKV, :lookup, [ekv_name, "key1"])
       :ok = TestCluster.rpc!(node_a, EKV, :delete, [ekv_name, "key1", [if_vsn: vsn]])
 
       TestCluster.assert_eventually(fn ->
@@ -106,10 +106,10 @@ defmodule EKV.CASDistributedTest do
       Process.sleep(200)
 
       :ok = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "key1", "val1", [if_vsn: nil]])
-      {:ok, _, vsn_a} = TestCluster.rpc!(node_a, EKV, :fetch, [ekv_name, "key1"])
+      {_, vsn_a} = TestCluster.rpc!(node_a, EKV, :lookup, [ekv_name, "key1"])
 
       TestCluster.assert_eventually(fn ->
-        {:ok, _, vsn_b} = TestCluster.rpc!(node_b, EKV, :fetch, [ekv_name, "key1"])
+        {_, vsn_b} = TestCluster.rpc!(node_b, EKV, :lookup, [ekv_name, "key1"])
         vsn_b == vsn_a
       end)
     end
@@ -215,7 +215,7 @@ defmodule EKV.CASDistributedTest do
 
       # Write via CAS
       :ok = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "key1", "val1", [if_vsn: nil]])
-      {:ok, _, vsn} = TestCluster.rpc!(node_a, EKV, :fetch, [ekv_name, "key1"])
+      {_, vsn} = TestCluster.rpc!(node_a, EKV, :lookup, [ekv_name, "key1"])
 
       # Disconnect one node (still have quorum)
       TestCluster.disconnect_nodes(node_a, node_c)
@@ -544,7 +544,7 @@ defmodule EKV.CASDistributedTest do
       Process.sleep(200)
 
       # Majority side: CAS update
-      {:ok, _, vsn} = TestCluster.rpc!(node_a, EKV, :fetch, [ekv_name, "mix/1"])
+      {_, vsn} = TestCluster.rpc!(node_a, EKV, :lookup, [ekv_name, "mix/1"])
       :ok = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "mix/1", "cas_updated", [if_vsn: vsn]])
 
       # Majority side: regular LWW put on a different key
@@ -724,7 +724,7 @@ defmodule EKV.CASDistributedTest do
       Process.sleep(200)
 
       # CAS should work after restart
-      {:ok, "v1", vsn} = TestCluster.rpc!(node_a, EKV, :fetch, [ekv_name, "key1"])
+      {"v1", vsn} = TestCluster.rpc!(node_a, EKV, :lookup, [ekv_name, "key1"])
       :ok = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "key1", "v2", [if_vsn: vsn]])
       assert TestCluster.rpc!(node_a, EKV, :get, [ekv_name, "key1"]) == "v2"
     end
@@ -747,7 +747,7 @@ defmodule EKV.CASDistributedTest do
       Process.sleep(200)
 
       # Proposer (node A) should still succeed with remaining quorum (A+B = 2 of 3)
-      {:ok, _, vsn} = TestCluster.rpc!(node_a, EKV, :fetch, [ekv_name, "kill_acc/1"])
+      {_, vsn} = TestCluster.rpc!(node_a, EKV, :lookup, [ekv_name, "kill_acc/1"])
       :ok = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "kill_acc/1", "v2", [if_vsn: vsn]])
 
       # Update also works with reduced quorum
@@ -782,7 +782,7 @@ defmodule EKV.CASDistributedTest do
       Process.sleep(200)
 
       # CAS should still work (kv_paxos survived in SQLite)
-      {:ok, _, vsn} = TestCluster.rpc!(node_a, EKV, :fetch, [ekv_name, "key1"])
+      {_, vsn} = TestCluster.rpc!(node_a, EKV, :lookup, [ekv_name, "key1"])
       :ok = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "key1", "v2", [if_vsn: vsn]])
     end
   end
@@ -890,7 +890,7 @@ defmodule EKV.CASDistributedTest do
 
           task_b =
             Task.async(fn ->
-              {:ok, _, vsn} = TestCluster.rpc!(node_b, EKV, :fetch, [ekv_name, "exhaust/1"])
+              {_, vsn} = TestCluster.rpc!(node_b, EKV, :lookup, [ekv_name, "exhaust/1"])
               TestCluster.rpc!(node_b, EKV, :put, [ekv_name, "exhaust/1", 99999, [if_vsn: vsn]])
             end)
 
@@ -999,7 +999,7 @@ defmodule EKV.CASDistributedTest do
       Process.sleep(10)
 
       # Key expired — fetch returns nil
-      {:ok, nil, nil} = TestCluster.rpc!(node_a, EKV, :fetch, [ekv_name, "ttl/1"])
+      nil = TestCluster.rpc!(node_a, EKV, :lookup, [ekv_name, "ttl/1"])
 
       # insert-if-absent should work (expired key is treated as absent)
       :ok = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "ttl/1", "reborn", [if_vsn: nil]])
@@ -1044,11 +1044,11 @@ defmodule EKV.CASDistributedTest do
 
       # Create and then delete (creating a tombstone)
       :ok = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "tomb/1", "val", [if_vsn: nil]])
-      {:ok, _, vsn} = TestCluster.rpc!(node_a, EKV, :fetch, [ekv_name, "tomb/1"])
+      {_, vsn} = TestCluster.rpc!(node_a, EKV, :lookup, [ekv_name, "tomb/1"])
       :ok = TestCluster.rpc!(node_a, EKV, :delete, [ekv_name, "tomb/1", [if_vsn: vsn]])
 
       # Key is now a tombstone — fetch returns nil
-      {:ok, nil, nil} = TestCluster.rpc!(node_a, EKV, :fetch, [ekv_name, "tomb/1"])
+      nil = TestCluster.rpc!(node_a, EKV, :lookup, [ekv_name, "tomb/1"])
 
       # insert-if-absent should succeed (tombstone treated as absent)
       :ok = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "tomb/1", "reborn", [if_vsn: nil]])
@@ -1077,7 +1077,7 @@ defmodule EKV.CASDistributedTest do
       # Second CAS with the same stale vsn should get conflict
       # (the ballot from the first CAS is now the promised ballot,
       #  a new CAS must generate a strictly higher ballot)
-      {:ok, _, vsn} = TestCluster.rpc!(node_a, EKV, :fetch, [ekv_name, "dup/1"])
+      {_, vsn} = TestCluster.rpc!(node_a, EKV, :lookup, [ekv_name, "dup/1"])
       :ok = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "dup/1", "v2", [if_vsn: vsn]])
 
       # Stale vsn gets conflict
@@ -1156,7 +1156,7 @@ defmodule EKV.CASDistributedTest do
       Process.sleep(50)
 
       # CAS delete on proposer node (A)
-      {:ok, _, vsn} = TestCluster.rpc!(node_a, EKV, :fetch, [ekv_name, "dsub/1"])
+      {_, vsn} = TestCluster.rpc!(node_a, EKV, :lookup, [ekv_name, "dsub/1"])
       :ok = TestCluster.rpc!(node_a, EKV, :delete, [ekv_name, "dsub/1", [if_vsn: vsn]])
 
       # Acceptor subscriber gets delete event with the previous value
@@ -1183,7 +1183,7 @@ defmodule EKV.CASDistributedTest do
       Process.sleep(50)
 
       # Get current vsn, then write again to make it stale
-      {:ok, _, stale_vsn} = TestCluster.rpc!(node_a, EKV, :fetch, [ekv_name, "nosub/1"])
+      {_, stale_vsn} = TestCluster.rpc!(node_a, EKV, :lookup, [ekv_name, "nosub/1"])
       :ok = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "nosub/1", "v2", [if_vsn: stale_vsn]])
 
       # Drain the put event from the v2 write
@@ -1319,7 +1319,7 @@ defmodule EKV.CASDistributedTest do
       Process.sleep(200)
 
       # Write on majority
-      {:ok, _, vsn1} = TestCluster.rpc!(node_a, EKV, :fetch, [ekv_name, "k/1"])
+      {_, vsn1} = TestCluster.rpc!(node_a, EKV, :lookup, [ekv_name, "k/1"])
       :ok = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "k/1", "v1_updated", [if_vsn: vsn1]])
 
       # Heal
@@ -1383,7 +1383,7 @@ defmodule EKV.CASDistributedTest do
       Process.sleep(300)
 
       # CAS should still work with 3 of 5 (quorum = 3)
-      {:ok, _, vsn} = TestCluster.rpc!(n1, EKV, :fetch, [ekv_name, "survive/1"])
+      {_, vsn} = TestCluster.rpc!(n1, EKV, :lookup, [ekv_name, "survive/1"])
       :ok = TestCluster.rpc!(n1, EKV, :put, [ekv_name, "survive/1", "v2", [if_vsn: vsn]])
       assert TestCluster.rpc!(n1, EKV, :get, [ekv_name, "survive/1"]) == "v2"
 
@@ -1541,7 +1541,7 @@ defmodule EKV.CASDistributedTest do
       Process.sleep(300)
 
       # CAS update on majority
-      {:ok, _, vsn} = TestCluster.rpc!(n1, EKV, :fetch, [ekv_name, "heal5/1"])
+      {_, vsn} = TestCluster.rpc!(n1, EKV, :lookup, [ekv_name, "heal5/1"])
       :ok = TestCluster.rpc!(n1, EKV, :put, [ekv_name, "heal5/1", "updated", [if_vsn: vsn]])
 
       # Regular LWW write on majority (different key)
@@ -1851,7 +1851,7 @@ defmodule EKV.CASDistributedTest do
       TestCluster.suspend_shards(node_b, ekv_name)
 
       # CAS update — A+C form quorum (B is suspended but still "alive" from dist POV)
-      {:ok, _, vsn} = TestCluster.rpc!(node_a, EKV, :fetch, [ekv_name, "delay/1"])
+      {_, vsn} = TestCluster.rpc!(node_a, EKV, :lookup, [ekv_name, "delay/1"])
       :ok = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "delay/1", "v2", [if_vsn: vsn]])
 
       # A has v2, C should have v2 (it was either acceptor or got LWW)
@@ -2148,7 +2148,7 @@ defmodule EKV.CASDistributedTest do
       Process.sleep(200)
 
       # CAS update on n1b with old version
-      {:ok, "v1", vsn} = TestCluster.rpc!(n1b, EKV, :fetch, [ekv_name, "cas/1"])
+      {"v1", vsn} = TestCluster.rpc!(n1b, EKV, :lookup, [ekv_name, "cas/1"])
       :ok = TestCluster.rpc!(n1b, EKV, :put, [ekv_name, "cas/1", "v2", [if_vsn: vsn]])
       assert TestCluster.rpc!(n1b, EKV, :get, [ekv_name, "cas/1"]) == "v2"
 
@@ -2157,7 +2157,7 @@ defmodule EKV.CASDistributedTest do
         TestCluster.rpc!(n2, EKV, :get, [ekv_name, "cas/1"]) == "v2"
       end)
 
-      {:ok, "v2", vsn2} = TestCluster.rpc!(n2, EKV, :fetch, [ekv_name, "cas/1"])
+      {"v2", vsn2} = TestCluster.rpc!(n2, EKV, :lookup, [ekv_name, "cas/1"])
       :ok = TestCluster.rpc!(n2, EKV, :put, [ekv_name, "cas/1", "v3", [if_vsn: vsn2]])
       assert TestCluster.rpc!(n2, EKV, :get, [ekv_name, "cas/1"]) == "v3"
     end
@@ -2563,12 +2563,12 @@ defmodule EKV.CASDistributedTest do
       assert TestCluster.rpc!(n1b, EKV, :get, [ekv_name, "cas_proxy/1"]) == "via_proxy"
 
       # CAS update via proxy
-      {:ok, "via_proxy", vsn} = TestCluster.rpc!(n1, EKV, :fetch, [ekv_name, "cas_proxy/1"])
+      {"via_proxy", vsn} = TestCluster.rpc!(n1, EKV, :lookup, [ekv_name, "cas_proxy/1"])
       :ok = TestCluster.rpc!(n1, EKV, :put, [ekv_name, "cas_proxy/1", "updated", [if_vsn: vsn]])
       assert TestCluster.rpc!(n1b, EKV, :get, [ekv_name, "cas_proxy/1"]) == "updated"
 
       # CAS delete via proxy
-      {:ok, "updated", vsn2} = TestCluster.rpc!(n1, EKV, :fetch, [ekv_name, "cas_proxy/1"])
+      {"updated", vsn2} = TestCluster.rpc!(n1, EKV, :lookup, [ekv_name, "cas_proxy/1"])
       :ok = TestCluster.rpc!(n1, EKV, :delete, [ekv_name, "cas_proxy/1", [if_vsn: vsn2]])
       assert TestCluster.rpc!(n1b, EKV, :get, [ekv_name, "cas_proxy/1"]) == nil
 

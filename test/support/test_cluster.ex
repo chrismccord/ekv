@@ -177,10 +177,16 @@ defmodule EKV.TestCluster do
     rpc!(node, __MODULE__, :do_scan_count, [name, prefix])
   end
 
+  @doc "Materialize scan stream on remote node, return %{key => value} map"
+  def scan_to_map(node, name, prefix) do
+    rpc!(node, __MODULE__, :do_scan_to_map, [name, prefix])
+  end
+
   @doc false
   def do_keys_sorted(name, prefix), do: EKV.keys(name, prefix) |> Enum.sort()
   def do_keys_count(name, prefix), do: EKV.keys(name, prefix) |> Enum.count()
   def do_scan_count(name, prefix), do: EKV.scan(name, prefix) |> Enum.count()
+  def do_scan_to_map(name, prefix), do: EKV.scan(name, prefix) |> Map.new(fn {k, v, _vsn} -> {k, v} end)
 
   # CAS helpers — named functions that can be called across nodes
   def cas_increment(nil), do: 1
