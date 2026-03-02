@@ -391,20 +391,18 @@ defmodule EKV.Replica do
   For EKV.update (read-modify-write), failures auto-retry up to 5 times
   with random backoff (10-60ms). Each retry generates a new ballot.
 
-  ### CAS + LWW Coexistence
+  ### CAS + LWW Interaction
 
-  CAS and LWW operate on the same kv table and oplog. They coexist
-  safely because:
+  CAS and LWW share the same kv/oplog storage and replication paths, but
+  ordering models are different (ballot order for CAS vs timestamp order for
+  LWW). The supported model is key-level ownership:
 
-    - CAS commit uses kv_force_upsert (no LWW WHERE clause) — Paxos
-      ballots, not timestamps, determine ordering for CAS keys.
-    - LWW broadcast after CAS commit ensures non-CAS-aware peers (or
-      peers that joined after the CAS round) still get the value via
-      normal replication.
-    - kv_paxos state is per-key. A key can switch between LWW puts and
-      CAS operations freely — the last committed value wins.
+    - Different keys may use different modes in the same EKV instance.
+    - A key managed via CAS should continue to use CAS write APIs.
+      Reads may still choose eventual or consistent paths based on needs.
+    - Mixed-mode writes on the same key (eventual + CAS) are unsupported.
     - Sync sends entries from kv (committed state). kv_paxos tentative
-      values are NOT included in sync — they only exist locally until
+      values are not included in sync — they only exist locally until
       committed.
 
   CAS operations are serialized per-shard through the GenServer. Two
@@ -2137,7 +2135,7 @@ defmodule EKV.Replica do
     case operation do
       {:cas_put, expected_vsn, value_binary, opts} ->
         if current_vsn == expected_vsn do
-          now = System.system_time(:nanosecond)
+          now = monotonic_cas_ts(current_vsn)
           origin = node()
           origin_str = Atom.to_string(origin)
           ttl = Keyword.get(opts, :ttl)
@@ -2153,7 +2151,7 @@ defmodule EKV.Replica do
 
       {:cas_delete, expected_vsn} ->
         if current_vsn == expected_vsn do
-          now = System.system_time(:nanosecond)
+          now = monotonic_cas_ts(current_vsn)
           origin = node()
           origin_str = Atom.to_string(origin)
 
@@ -2168,7 +2166,7 @@ defmodule EKV.Replica do
       {:update, fun, opts, _retries} ->
         new_value = fun.(current_value)
         new_value_binary = :erlang.term_to_binary(new_value)
-        now = System.system_time(:nanosecond)
+        now = monotonic_cas_ts(current_vsn)
         origin = node()
         origin_str = Atom.to_string(origin)
         ttl = Keyword.get(opts, :ttl)
@@ -2185,6 +2183,12 @@ defmodule EKV.Replica do
         {:error, :conflict}
     end
   end
+
+  # Ensure CAS commit timestamps are strictly greater than the current value's
+  # timestamp. This prevents LWW merge from overwriting the CAS-committed value
+  # with a prior high-timestamp value after partition heal.
+  defp monotonic_cas_ts(nil), do: System.system_time(:nanosecond)
+  defp monotonic_cas_ts({current_ts, _origin}), do: max(System.system_time(:nanosecond), current_ts + 1)
 
   defp decode_kv_row(nil), do: {nil, nil}
 

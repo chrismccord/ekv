@@ -83,6 +83,25 @@ defmodule EKV do
   sync and converge using LWW. Data is never lost — the "losing" write is
   simply overwritten by the "winning" one.
 
+  ### Consistency Modes Per Key (Important)
+
+  EKV supports two write modes:
+
+  - **Eventual/LWW mode** — default `put/4` and `delete/3` without CAS options.
+  - **CAS mode** — `put/4` with `if_vsn:` or `consistent: true`, `delete/3`
+    with `if_vsn:`, and `update/4`.
+
+  For predictable semantics, treat mode as **key ownership**:
+
+  - Keys managed via CAS should continue to use CAS **write** APIs.
+  - Reads for CAS-managed keys may be eventual (`get/2`, `lookup/2`) when
+    staleness is acceptable, or consistent (`get/3, consistent: true`) when
+    fresh linearizable reads are required.
+  - Do not mix eventual writes and CAS writes on the same key.
+
+  Mixed-mode writes on a single key are unsupported and can produce surprising
+  ordering/convergence outcomes under clock skew or partitions.
+
   ## Configuration
 
   All options are passed when starting EKV:
@@ -323,8 +342,10 @@ defmodule EKV do
     matches. Use `nil` for insert-if-absent. Returns `{:error, :conflict}` on
     mismatch. Requires `cluster_size` and `node_id` config.
   - `:consistent` — when `true`, uses CASPaxos consensus for the write
-    (unconditional, overwrites any current value). Mutually exclusive with
-    `:if_vsn`. Requires `cluster_size` and `node_id` config.
+    (quorum-backed CAS write). Mutually exclusive with `:if_vsn`. Requires
+    `cluster_size` and `node_id` config.
+    For strict behavior, keep the key in CAS mode and do not mix with eventual
+    `put`/`delete` on the same key.
   - `:retries` — max CAS retries on conflict (default 5). Only for
     `:consistent` and `:if_vsn` paths.
   - `:backoff` — `{min_ms, max_ms}` random backoff range (default `{10, 60}`).
@@ -375,7 +396,8 @@ defmodule EKV do
   ## Options
 
   - `:consistent` — when `true`, performs a CASPaxos consensus read
-    (linearizable). Requires `cluster_size` and `node_id` config.
+    (linearizable for CAS-managed keys). Requires `cluster_size` and `node_id`
+    config.
   - `:retries` — max CAS retries (default 5). Only for `consistent: true`.
   - `:backoff` — `{min_ms, max_ms}` random backoff range (default `{10, 60}`).
   - `:timeout` — GenServer call timeout in ms (default 10_000).
@@ -435,6 +457,8 @@ defmodule EKV do
   - `:if_vsn` — compare-and-swap delete. Only succeeds if the key's current
     version matches. Returns `{:error, :conflict}` on mismatch. Requires
     `cluster_size` and `node_id` config.
+    For strict behavior, keep the key in CAS mode and do not mix with eventual
+    `put`/`delete` on the same key.
   """
   def delete(name, key, opts \\ []) do
     opts = Keyword.validate!(opts, [:if_vsn, :timeout])
@@ -467,6 +491,8 @@ defmodule EKV do
   are exhausted.
 
   Requires `cluster_size` and `node_id` config.
+  Intended for keys managed in CAS mode (do not mix with eventual writes on
+  the same key).
 
   ## Options
 

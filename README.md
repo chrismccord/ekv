@@ -108,6 +108,27 @@ Last-Writer-Wins with nanosecond timestamps. Ties are broken deterministically b
 
 A delete is just an entry with `deleted_at` set. Same LWW rules apply -- a put with a higher timestamp beats a delete, and vice versa.
 
+### Consistency Modes (Important)
+
+EKV supports two write modes:
+
+- **Eventual/LWW mode**: default `EKV.put/4` and `EKV.delete/3` without CAS options.
+- **CAS mode**: `EKV.put/4` with `if_vsn:` or `consistent: true`, `EKV.delete/3` with `if_vsn:`, and `EKV.update/4`.
+
+Use mode as **key ownership**:
+
+- Keys managed via CAS should keep using CAS **write** APIs.
+- Reads for CAS-managed keys can be eventual (`EKV.get/2`, `EKV.lookup/2`) for
+  lower latency, or consistent (`EKV.get/3, consistent: true`) when freshness
+  matters.
+- Do not mix eventual writes and CAS writes on the same key.
+
+### Known limitation: mixed-mode single-key writes
+
+Mixing eventual and CAS writes on the same key is unsupported. Under clock skew and/or partitions, mixed-mode writes can produce surprising ordering or convergence outcomes.
+
+If you need strong per-key behavior, keep that keyspace CAS-only (for example, reserve a prefix like `cas/*` and route all writes for those keys through CAS APIs).
+
 ### Garbage collection
 
 A periodic GC timer runs three phases per tick:
