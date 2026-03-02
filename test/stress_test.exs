@@ -1526,6 +1526,239 @@ defmodule EKV.StressTest do
       assert EKV.get(name, key) == "ballot_200_val"
       assert Process.alive?(Process.whereis(shard_name))
     end
+
+    # ----- Real-World Latency & Reordering (4) -----
+
+    test "message reordering: accept arrives before prepare at acceptor", %{
+      name: name,
+      shard_name: shard_name
+    } do
+      mref = Process.monitor(Process.whereis(shard_name))
+      key = "fi/reorder_accept_before_prepare"
+      now = System.system_time(:nanosecond)
+      origin_str = Atom.to_string(node())
+      val = :erlang.term_to_binary("reordered_val")
+      entry = {key, val, now, origin_str, nil, nil}
+
+      # Send accept WITHOUT any prior prepare — TCP reordering scenario
+      # No kv_paxos row exists, so promised_counter defaults to 0.
+      # paxos_accept checks ballot_c >= promised_c → 100 >= 0 → succeeds (inserts new row)
+      ref1 = make_ref()
+      send(shard_name, {:ekv_accept, ref1, self(), key, 100, "2", entry, 0})
+      assert_receive {:ekv_accepted, ^ref1, _, _}, 2000
+
+      # Now send prepare with SAME ballot — arrives late due to reordering
+      # paxos_prepare checks ballot_c > promised_c (strictly greater)
+      # After accept, promised_counter=100 → 100 is NOT > 100 → nack
+      ref2 = make_ref()
+      send(shard_name, {:ekv_prepare, ref2, self(), key, 100, "2", 0})
+      assert_receive {:ekv_nack, ^ref2, _, _, 100, "2"}, 2000
+
+      # Higher ballot can still recover — prepare with ballot 200
+      ref3 = make_ref()
+      send(shard_name, {:ekv_prepare, ref3, self(), key, 200, "3", 0})
+      assert_receive {:ekv_promise, ^ref3, _, _, acc_c, acc_n, _kv_row}, 2000
+
+      # Promise carries the accepted value from the out-of-order accept
+      assert acc_c == 100
+      assert acc_n == "2"
+
+      # Value not in kv yet (no commit), shard healthy
+      assert EKV.get(name, key) == nil
+      refute_receive {:DOWN, ^mref, :process, _, _}
+    end
+
+    test "delayed commit: new round completes before old commit arrives", %{
+      name: name,
+      shard_name: shard_name
+    } do
+      mref = Process.monitor(Process.whereis(shard_name))
+      key = "fi/delayed_commit"
+      now = System.system_time(:nanosecond)
+      origin_str = Atom.to_string(node())
+
+      # Round 1: ballot {100, "2"} — prepare + accept
+      ref1 = make_ref()
+      send(shard_name, {:ekv_prepare, ref1, self(), key, 100, "2", 0})
+      assert_receive {:ekv_promise, ^ref1, _, _, _, _, _}, 2000
+
+      val_old = :erlang.term_to_binary("old_val")
+      entry_100 = {key, val_old, now, origin_str, nil, nil}
+      ref2 = make_ref()
+      send(shard_name, {:ekv_accept, ref2, self(), key, 100, "2", entry_100, 0})
+      assert_receive {:ekv_accepted, ^ref2, _, _}, 2000
+
+      # Round 2: ballot {200, "3"} — supersedes round 1
+      ref3 = make_ref()
+      send(shard_name, {:ekv_prepare, ref3, self(), key, 200, "3", 0})
+      assert_receive {:ekv_promise, ^ref3, _, _, acc_c, acc_n, _kv_row}, 2000
+      # Promise carries round 1's accepted value
+      assert acc_c == 100
+      assert acc_n == "2"
+
+      val_new = :erlang.term_to_binary("new_val")
+      entry_200 = {key, val_new, now + 1, origin_str, nil, nil}
+      ref4 = make_ref()
+      send(shard_name, {:ekv_accept, ref4, self(), key, 200, "3", entry_200, 0})
+      assert_receive {:ekv_accepted, ^ref4, _, _}, 2000
+
+      # Commit round 2 — value promoted to kv
+      send(shard_name, {:ekv_cas_committed, key, 200, "3", 0})
+      :sys.get_state(shard_name)
+      assert EKV.get(name, key) == "new_val"
+
+      # Delayed commit for round 1 arrives — stale because accepted columns
+      # were cleared after round 2's commit (ballot {100,"2"} doesn't match)
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", 0})
+      :sys.get_state(shard_name)
+
+      # Value unchanged — stale commit rejected
+      assert EKV.get(name, key) == "new_val"
+      refute_receive {:DOWN, ^mref, :process, _, _}
+    end
+
+    test "GC between prepare and accept: concurrent proposer does not corrupt", %{
+      name: name,
+      shard_name: shard_name
+    } do
+      mref = Process.monitor(Process.whereis(shard_name))
+      key = "fi/gc_between_prepare_accept"
+
+      # Proposer A: prepare ballot {100, "2"}
+      ref1 = make_ref()
+      send(shard_name, {:ekv_prepare, ref1, self(), key, 100, "2", 0})
+      assert_receive {:ekv_promise, ^ref1, _, _, _, _, _}, 2000
+
+      # Trigger GC — purge_orphan_paxos must NOT delete the promised row
+      # (our fix: AND promised_counter = 0 in purge SQL)
+      now_ms = System.system_time(:millisecond)
+      send(shard_name, {:gc, now_ms, 0})
+      :sys.get_state(shard_name)
+
+      # Verify kv_paxos row survived GC
+      state = :sys.get_state(shard_name)
+
+      {:ok, rows} =
+        EKV.Sqlite3.fetch_all(
+          state.db,
+          "SELECT promised_counter, promised_node FROM kv_paxos WHERE key = ?1",
+          [key]
+        )
+
+      assert length(rows) == 1
+      [[prom_c, _prom_n]] = rows
+      assert prom_c == 100
+
+      # Concurrent proposer B: prepare ballot {200, "3"} — supersedes A
+      ref2 = make_ref()
+      send(shard_name, {:ekv_prepare, ref2, self(), key, 200, "3", 0})
+      assert_receive {:ekv_promise, ^ref2, _, _, _, _, _}, 2000
+
+      # Late accept from proposer A (ballot 100) — must be rejected
+      # because promised_counter is now 200
+      now = System.system_time(:nanosecond)
+      origin_str = Atom.to_string(node())
+      val_a = :erlang.term_to_binary("val_a")
+      entry_a = {key, val_a, now, origin_str, nil, nil}
+
+      ref3 = make_ref()
+      send(shard_name, {:ekv_accept, ref3, self(), key, 100, "2", entry_a, 0})
+      assert_receive {:ekv_accept_nack, ^ref3, _, _}, 2000
+
+      # Accept from proposer B (ballot 200) — succeeds
+      val_b = :erlang.term_to_binary("val_b")
+      entry_b = {key, val_b, now + 1, origin_str, nil, nil}
+
+      ref4 = make_ref()
+      send(shard_name, {:ekv_accept, ref4, self(), key, 200, "3", entry_b, 0})
+      assert_receive {:ekv_accepted, ^ref4, _, _}, 2000
+
+      # Commit ballot 200 — only B's value committed
+      send(shard_name, {:ekv_cas_committed, key, 200, "3", 0})
+      :sys.get_state(shard_name)
+      assert EKV.get(name, key) == "val_b"
+      refute_receive {:DOWN, ^mref, :process, _, _}
+    end
+
+    test "proposer crash mid-broadcast: partial commit notification", %{
+      name: name,
+      shard_name: shard_name
+    } do
+      mref = Process.monitor(Process.whereis(shard_name))
+      key_a = "fi/partial_commit_a"
+      key_b = "fi/partial_commit_b"
+      now = System.system_time(:nanosecond)
+      origin_str = Atom.to_string(node())
+
+      # Prepare both keys with ballot {100, "2"}
+      ref_a1 = make_ref()
+      send(shard_name, {:ekv_prepare, ref_a1, self(), key_a, 100, "2", 0})
+      assert_receive {:ekv_promise, ^ref_a1, _, _, _, _, _}, 2000
+
+      ref_b1 = make_ref()
+      send(shard_name, {:ekv_prepare, ref_b1, self(), key_b, 100, "2", 0})
+      assert_receive {:ekv_promise, ^ref_b1, _, _, _, _, _}, 2000
+
+      # Accept both keys
+      val_a = :erlang.term_to_binary("val_a")
+      entry_a = {key_a, val_a, now, origin_str, nil, nil}
+      ref_a2 = make_ref()
+      send(shard_name, {:ekv_accept, ref_a2, self(), key_a, 100, "2", entry_a, 0})
+      assert_receive {:ekv_accepted, ^ref_a2, _, _}, 2000
+
+      val_b = :erlang.term_to_binary("val_b")
+      entry_b = {key_b, val_b, now + 1, origin_str, nil, nil}
+      ref_b2 = make_ref()
+      send(shard_name, {:ekv_accept, ref_b2, self(), key_b, 100, "2", entry_b, 0})
+      assert_receive {:ekv_accepted, ^ref_b2, _, _}, 2000
+
+      # Partial commit: proposer crashes after sending commit for key_a only
+      send(shard_name, {:ekv_cas_committed, key_a, 100, "2", 0})
+      :sys.get_state(shard_name)
+
+      # key_a committed, key_b NOT committed
+      assert EKV.get(name, key_a) == "val_a"
+      assert EKV.get(name, key_b) == nil
+
+      # Verify key_b's accepted state is preserved in kv_paxos
+      state = :sys.get_state(shard_name)
+
+      {:ok, rows} =
+        EKV.Sqlite3.fetch_all(
+          state.db,
+          "SELECT accepted_counter, accepted_node, accepted_value FROM kv_paxos WHERE key = ?1",
+          [key_b]
+        )
+
+      assert length(rows) == 1
+      [[acc_c, acc_n, acc_val]] = rows
+      assert acc_c == 100
+      assert acc_n == "2"
+      assert acc_val != nil
+
+      # New proposer (ballot {200, "3"}) recovers key_b
+      ref_b3 = make_ref()
+      send(shard_name, {:ekv_prepare, ref_b3, self(), key_b, 200, "3", 0})
+      assert_receive {:ekv_promise, ^ref_b3, _, _, rec_acc_c, rec_acc_n, _kv_row}, 2000
+
+      # Promise carries the accepted value from the crashed proposer
+      assert rec_acc_c == 100
+      assert rec_acc_n == "2"
+
+      # Accept with the recovered value (re-propose it at higher ballot)
+      ref_b4 = make_ref()
+      send(shard_name, {:ekv_accept, ref_b4, self(), key_b, 200, "3", entry_b, 0})
+      assert_receive {:ekv_accepted, ^ref_b4, _, _}, 2000
+
+      # Commit ballot 200 — key_b now in kv
+      send(shard_name, {:ekv_cas_committed, key_b, 200, "3", 0})
+      :sys.get_state(shard_name)
+
+      # Both keys readable and correct
+      assert EKV.get(name, key_a) == "val_a"
+      assert EKV.get(name, key_b) == "val_b"
+      refute_receive {:DOWN, ^mref, :process, _, _}
+    end
   end
 
   # =====================================================================
