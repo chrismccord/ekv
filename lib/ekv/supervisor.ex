@@ -70,7 +70,8 @@ defmodule EKV.Supervisor do
     :cluster_size,
     :node_id,
     :sync_chunk_size,
-    :skip_stale_check
+    :skip_stale_check,
+    :partition_ttl_policy
   ]
 
   def start_link(opts) do
@@ -92,8 +93,10 @@ defmodule EKV.Supervisor do
     node_id = Keyword.get(opts, :node_id)
     sync_chunk_size = Keyword.get(opts, :sync_chunk_size, 500)
     skip_stale_check = Keyword.get(opts, :skip_stale_check, false)
+    partition_ttl_policy = Keyword.get(opts, :partition_ttl_policy, :quarantine)
 
     validate_cas_config!(cluster_size, node_id)
+    validate_partition_ttl_policy!(partition_ttl_policy)
 
     # Normalize node_id to string early
     node_id =
@@ -153,7 +156,8 @@ defmodule EKV.Supervisor do
       cluster_size: cluster_size,
       node_id: effective_node_id,
       sync_chunk_size: sync_chunk_size,
-      skip_stale_check: skip_stale_check
+      skip_stale_check: skip_stale_check,
+      partition_ttl_policy: partition_ttl_policy
     }
 
     :persistent_term.put({EKV, name}, config)
@@ -197,6 +201,15 @@ defmodule EKV.Supervisor do
         raise ArgumentError,
               "EKV: :node_id must be a non-empty string or positive integer, got: #{inspect(node_id)}"
     end
+  end
+
+  defp validate_partition_ttl_policy!(policy)
+       when policy in [:quarantine, :ignore],
+       do: :ok
+
+  defp validate_partition_ttl_policy!(policy) do
+    raise ArgumentError,
+          "EKV: :partition_ttl_policy must be :quarantine or :ignore, got: #{inspect(policy)}"
   end
 
   # =====================================================================

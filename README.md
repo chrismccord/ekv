@@ -82,6 +82,7 @@ Values can be any Erlang term (stored via `:erlang.term_to_binary/1`). Keys are 
 | `:tombstone_ttl` | `604_800_000` (7 days) | How long tombstones are retained in milliseconds |
 | `:gc_interval` | `300_000` (5 min) | GC tick interval in milliseconds |
 | `:log` | `:info` | `:info`, `false` (silent), or `:verbose` |
+| `:partition_ttl_policy` | `:quarantine` | Policy when a peer identity reconnects after being disconnected longer than `tombstone_ttl`. `:quarantine` blocks replication with that peer until operator intervention. `:ignore` keeps legacy behavior. |
 
 ## How It Works
 
@@ -140,6 +141,25 @@ A periodic GC timer runs three phases per tick:
 ### Stale database protection
 
 If a node goes away longer than `tombstone_ttl` and comes back with an old database on disk, peers will have already GC'd the tombstones for entries deleted during the absence. EKV detects this by checking a `last_active_at` timestamp stored in the database. If the database is staler than `tombstone_ttl`, it's wiped on startup and rebuilt from scratch via full sync.
+
+### Long live-partition protection
+
+A different edge case is when nodes stay up but are partitioned longer than
+`tombstone_ttl`. In that window, one side can purge delete tombstones before
+reconnect.
+
+With the default `partition_ttl_policy: :quarantine`, EKV detects reconnects
+after a downtime longer than `tombstone_ttl` and quarantines that peer pair
+instead of syncing potentially unsafe state. Replication stays blocked for
+that peer until an operator rebuilds one side.
+
+Down-since markers are persisted in `kv_meta`, keyed by `node_id` when
+available (fallback: node name), so restart does not clear quarantine history.
+This also means node-name churn does not bypass quarantine when `node_id` is
+stable.
+
+Fallback name-based markers are bounded: EKV prunes very old entries and caps
+the retained set per shard to avoid unbounded growth over long periods.
 
 ## Multiple instances
 

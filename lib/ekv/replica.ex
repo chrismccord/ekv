@@ -51,7 +51,7 @@ defmodule EKV.Replica do
       │   kv          — current state, PK (key)                      │
       │   kv_oplog    — append-only mutation log, AUTOINCREMENT seq  │
       │   kv_peer_hwm — per-peer high-water marks for delta sync     │
-      │   kv_meta     — liveness tracking + ballot counter           │
+      │   kv_meta     — liveness + ballot counter + down markers     │
       │   kv_paxos    — CAS consensus state per key (opt-in)         │
       │                                                              │
       │ Indexes:                                                     │
@@ -420,23 +420,33 @@ defmodule EKV.Replica do
         for node <- Node.list(), send ekv_peer_connect
 
       nodeup:
-        send ekv_peer_connect to the new node's counterpart shard
+        attempt ekv_peer_connect (gated by long-partition quarantine)
 
       nodedown:
         remove from remote_shards + peer_node_ids
+        persist peer down marker (node_id key if known, fallback name key)
         fail any pending CAS ops that lost quorum
 
       DOWN (monitored remote shard pid):
         remove from remote_shards + peer_node_ids
+        persist peer down marker (node_id key if known, fallback name key)
         fail any pending CAS ops that lost quorum
 
   remote_shards :: %{node() => pid()} tracks confirmed live counterpart
   shard processes. A node enters this map only after a successful
   peer_connect / peer_connect_ack handshake where its pid is monitored.
 
-  peer_node_ids :: %{node() => integer()} maps Erlang nodes to their
+  peer_node_ids :: %{node() => string()} maps Erlang nodes to their
   configured node_id. Used for CAS quorum counting (distinct node_ids,
   not Erlang nodes, determine quorum).
+
+  Long-partition tracking is persisted in kv_meta:
+    - peer_down_at:id:<node_id>    (preferred, stable identity)
+    - peer_down_at:name:<node>     (fallback when node_id unknown)
+
+  On reconnect handshake, if downtime > tombstone_ttl and policy is
+  :quarantine, replication is blocked for that peer. Down markers are
+  cleared only after a successful non-quarantined reconnect.
 
 
   ## Peer Sync Protocol
@@ -448,7 +458,7 @@ defmodule EKV.Replica do
       Node A (shard i)                        Node B (shard i)
         │                                         │
         │  {:ekv_peer_connect,                    │
-        │   pid_a, i, num_shards, seq_a, nid_a}  │
+        │   pid_a, i, num_shards, hwm_a, nid_a}  │
         │────────────────────────────────────────>│
         │                                         │
         │                          validate num_shards match
@@ -457,12 +467,11 @@ defmodule EKV.Replica do
         │                          track A's node_id
         │                                         │
         │  {:ekv_peer_connect_ack,                │
-        │   pid_b, i, num_shards, seq_b, nid_b}  │
+        │   pid_b, i, num_shards, hwm_b, nid_b}  │
         │<────────────────────────────────────────│
         │                                         │
-        │                          send_sync_data(A, seq_a):
-        │                            look up hwm for A
-        │                            if hwm exists & oplog not truncated:
+        │                          send_sync_data(A, hwm_a):
+        │                            if hwm_a exists & oplog not truncated:
         │                              delta sync (chunked)
         │                            else:
         │                              full sync (chunked)
@@ -486,8 +495,7 @@ defmodule EKV.Replica do
 
       ┌─────────────────────────────────────────────────────────────┐
       │ Delta Sync                                                  │
-      │ Condition: we have a HWM for this peer AND our oplog still  │
-      │            contains entries back to that HWM                │
+      │ Condition: remote_hwm is within [local_min_seq, local_max_seq] │
       │                                                             │
       │ Query: SELECT * FROM kv_oplog WHERE seq > peer_hwm          │
       │        ORDER BY seq LIMIT chunk_size                        │
@@ -499,7 +507,8 @@ defmodule EKV.Replica do
       ┌─────────────────────────────────────────────────────────────┐
       │ Full Sync                                                   │
       │ Condition: no HWM for this peer, OR oplog truncated past    │
-      │            the peer's HWM (min_seq > peer_hwm)              │
+      │            the peer's HWM (min_seq > peer_hwm), OR          │
+      │            peer_hwm > local_max_seq                         │
       │                                                             │
       │ Query: SELECT * FROM kv WHERE (deleted_at IS NULL           │
       │          OR deleted_at > cutoff) AND key > cursor            │
@@ -512,7 +521,7 @@ defmodule EKV.Replica do
 
   After receiving sync data, the receiver applies each entry through
   merge_remote_entry (LWW check), then records the sender's advertised
-  max_seq as the new HWM for that peer.
+  max_seq as the new inbound HWM for that peer.
 
 
   ## Chunked Sync
@@ -548,14 +557,12 @@ defmodule EKV.Replica do
         │ handle_info(:continue_full_sync)
         │   query chunk 3 (< 500 entries = final)
         │   send {:ekv_sync, entries, seq=my_seq}  ──> peer
-        │   set_hwm(peer, remote_seq)
         │
 
   HWM safety: intermediate chunks send seq=0 in the sync message.
-  Only the final chunk carries the real my_seq. The receiver's
-  set_hwm uses MAX(current, new), so seq=0 is harmless. If the sender
-  crashes mid-sync, the HWM was never updated — reconnect triggers
-  a fresh sync from the old HWM.
+  Only the final chunk carries the real my_seq. The receiver updates
+  inbound HWM from that final seq; MAX(current, new) makes seq=0
+  harmless and prevents regression on out-of-order arrival.
 
   Continuation handlers check remote_shards before each chunk. If the
   peer disconnected mid-sync, the continuation silently stops.
@@ -573,13 +580,12 @@ defmodule EKV.Replica do
 
       peer_node TEXT PRIMARY KEY  →  last_seq INTEGER
 
-  This records: "the last oplog seq I know peer X has seen". When peer X
-  reconnects, I query oplog entries with seq > hwm[X] and send them.
+  This records: "the last oplog seq from peer X that I have applied."
+  During handshake, each side advertises this inbound HWM so the sender
+  can delta-sync from the receiver's cursor in sender sequence space.
 
-  HWMs are updated in two places:
-    1. In send_sync_data: after the final chunk, record their advertised
-       seq as our HWM for them.
-    2. In ekv_sync handler: after applying received data, record the
+  HWMs are updated in one place:
+    1. In ekv_sync handler: after applying received data, record the
        sender's seq from the sync message.
 
   HWM monotonicity: set_hwm uses MAX(current, new) in SQL so HWMs
@@ -645,15 +651,19 @@ defmodule EKV.Replica do
       Heal:
         - nodeup fires on both sides
         - ekv_peer_connect / ekv_peer_connect_ack exchanged
-        - send_sync_data: if HWMs still valid → delta sync (chunked)
-                          if oplog truncated  → full sync (chunked)
-        - Both sides send their missed mutations
-        - LWW resolves any conflicts deterministically:
-            * Disjoint keys: union of both sides
-            * Same key both sides: higher timestamp wins
-            * Put vs delete: whichever has higher timestamp wins
-        - CAS-written keys: already committed to kv via normal sync.
-          kv_paxos state is local only — sync uses kv (committed values).
+        - Reconnect gate checks persisted down marker age:
+            * age <= tombstone_ttl: proceed to sync
+            * age > tombstone_ttl: quarantine peer pair (no sync)
+        - If sync proceeds:
+            * send_sync_data: if HWMs still valid → delta sync (chunked)
+                             if oplog truncated  → full sync (chunked)
+            * Both sides send their missed mutations
+            * LWW resolves any conflicts deterministically:
+                - Disjoint keys: union of both sides
+                - Same key both sides: higher timestamp wins
+                - Put vs delete: whichever has higher timestamp wins
+            * CAS-written keys: already committed to kv via normal sync.
+              kv_paxos state is local only — sync uses kv (committed values).
 
 
   ## Subscription System
@@ -709,7 +719,7 @@ defmodule EKV.Replica do
   Periodic timer sends {:gc, now, tombstone_cutoff} to each shard.
   The shard handles GC inside its own process (serialized with writes).
 
-  Each tick, five phases:
+  Each tick, six phases:
 
       Phase 1: Expire TTL entries
         expired entries → set deleted_at, write oplog, broadcast delete
@@ -740,6 +750,12 @@ defmodule EKV.Replica do
         touch_last_active updates kv_meta.last_active_at.
         Used by stale DB detection on restart.
 
+      Phase 6: Prune fallback name-based down markers
+        Delete old / over-cap kv_meta keys:
+          peer_down_at:name:*
+        (bounds marker growth under node-name churn; primary id-based
+         markers remain until successful reconnect or operator action)
+
 
   ## Stale DB Protection
 
@@ -764,12 +780,16 @@ defmodule EKV.Replica do
           oplog_insert:    reference    #   oplog append
         },
         readers:        [{db, stmt}],   # per-scheduler read connections
+        tombstone_ttl:  integer,        # ms
+        partition_ttl_policy: :quarantine | :ignore,
         remote_shards:  %{node => pid}, # confirmed live peer shards
+        peer_down_at:   %{marker_key => down_since_ms}, # cached kv_meta markers
+        quarantined_peers: MapSet.t(node()),            # blocked peers
         # CAS fields (nil if CAS not configured):
         node_id:        string | nil,   # this node's CAS identity
         cluster_size:   integer | nil,  # total CAS participants
         ballot_counter: integer,        # monotonic, persisted in kv_meta
-        peer_node_ids:  %{node => id},  # Erlang node → CAS node_id
+        peer_node_ids:  %{node => string},  # Erlang node → CAS node_id
         pending_cas:    %{ref => op}    # in-flight CAS operations
       }
 
@@ -781,8 +801,8 @@ defmodule EKV.Replica do
     {:ekv_delete, key, timestamp, origin_node}
 
   Peer handshake (on nodeup / init):
-    {:ekv_peer_connect, pid, shard_index, num_shards, my_max_seq, node_id}
-    {:ekv_peer_connect_ack, pid, shard_index, num_shards, my_max_seq, node_id}
+    {:ekv_peer_connect, pid, shard_index, num_shards, my_hwm_for_remote, node_id}
+    {:ekv_peer_connect_ack, pid, shard_index, num_shards, my_hwm_for_remote, node_id}
 
   Chunked sync (after handshake, multiple messages per sync):
     {:ekv_sync, from_node, shard_index, entries, sender_seq}
@@ -791,8 +811,8 @@ defmodule EKV.Replica do
       sender_seq: 0 for intermediate chunks, real seq for final chunk
 
   Sync continuations (self-messages for chunking):
-    {:continue_full_sync, node, last_key, cutoff, my_seq, remote_seq, chunk_size}
-    {:continue_delta_sync, node, last_seq, my_seq, remote_seq, chunk_size}
+    {:continue_full_sync, node, last_key, cutoff, my_seq, chunk_size}
+    {:continue_delta_sync, node, last_seq, my_seq, chunk_size}
 
   CAS proposer → acceptors:
     {:ekv_prepare, ref, proposer_pid, key, ballot_c, ballot_n, shard}
@@ -828,6 +848,11 @@ defmodule EKV.Replica do
 
   alias EKV.Store
 
+  @peer_down_id_prefix "peer_down_at:id:"
+  @peer_down_name_prefix "peer_down_at:name:"
+  @peer_down_name_min_retention_ms :timer.hours(24 * 30)
+  @peer_down_name_max_entries 4096
+
   defstruct [
     :name,
     :shard_index,
@@ -835,8 +860,13 @@ defmodule EKV.Replica do
     :db,
     :data_dir,
     :stmts,
+    :tombstone_ttl,
+    partition_ttl_policy: :quarantine,
     readers: [],
     remote_shards: %{},
+    # Marker key -> down_since_ms (wall clock cache for kv_meta)
+    peer_down_at: %{},
+    quarantined_peers: MapSet.new(),
     # CAS fields
     node_id: nil,
     cluster_size: nil,
@@ -915,6 +945,8 @@ defmodule EKV.Replica do
       data_dir: data_dir,
       stmts: stmts,
       readers: readers,
+      tombstone_ttl: config.tombstone_ttl,
+      partition_ttl_policy: config.partition_ttl_policy,
       node_id: config.node_id,
       cluster_size: config.cluster_size,
       ballot_counter: ballot_counter
@@ -926,12 +958,13 @@ defmodule EKV.Replica do
 
     # Discover peers on all known nodes
     registered_name = shard_name(name, shard_index)
-    my_seq = Store.max_seq(db)
 
     for remote_node <- Node.list() do
+      remote_hwm = Store.get_hwm(db, remote_node) || 0
+
       send(
         {registered_name, remote_node},
-        {:ekv_peer_connect, self(), shard_index, num_shards, my_seq, config.node_id}
+        {:ekv_peer_connect, self(), shard_index, num_shards, remote_hwm, config.node_id}
       )
     end
 
@@ -1149,7 +1182,7 @@ defmodule EKV.Replica do
   # =====================================================================
 
   def handle_info(
-        {:ekv_peer_connect, remote_pid, remote_shard, remote_num_shards, remote_seq,
+        {:ekv_peer_connect, remote_pid, remote_shard, remote_num_shards, remote_hwm,
          remote_node_id},
         state
       ) do
@@ -1159,13 +1192,13 @@ defmodule EKV.Replica do
        remote_pid,
        remote_shard,
        remote_num_shards,
-       remote_seq,
+       remote_hwm,
        remote_node_id
      )}
   end
 
   def handle_info(
-        {:ekv_peer_connect_ack, remote_pid, remote_shard, remote_num_shards, remote_seq,
+        {:ekv_peer_connect_ack, remote_pid, remote_shard, remote_num_shards, remote_hwm,
          remote_node_id},
         state
       ) do
@@ -1175,7 +1208,7 @@ defmodule EKV.Replica do
        remote_pid,
        remote_shard,
        remote_num_shards,
-       remote_seq,
+       remote_hwm,
        remote_node_id
      )}
   end
@@ -1243,25 +1276,35 @@ defmodule EKV.Replica do
   # =====================================================================
 
   def handle_info({:nodeup, remote_node}, state) do
-    %{shard_index: shard, name: name, db: db} = state
-    my_seq = Store.max_seq(db)
+    case maybe_allow_peer_reconnect(state, remote_node) do
+      {:quarantine, state} ->
+        {:noreply, state}
 
-    send(
-      {shard_name(name, shard), remote_node},
-      {:ekv_peer_connect, self(), shard, state.num_shards, my_seq, state.node_id}
-    )
+      {:ok, state} ->
+        %{shard_index: shard, name: name, db: db} = state
+        remote_hwm = Store.get_hwm(db, remote_node) || 0
 
-    {:noreply, state}
+        send(
+          {shard_name(name, shard), remote_node},
+          {:ekv_peer_connect, self(), shard, state.num_shards, remote_hwm, state.node_id}
+        )
+
+        {:noreply, state}
+    end
   end
 
   def handle_info({:nodedown, dead_node}, state) do
     log_once(state, fn -> "#{log_prefix(state)} nodedown #{dead_node} (data preserved)" end)
+
+    dead_node_id = Map.get(state.peer_node_ids, dead_node)
 
     state = %{
       state
       | remote_shards: Map.delete(state.remote_shards, dead_node),
         peer_node_ids: Map.delete(state.peer_node_ids, dead_node)
     }
+
+    state = mark_peer_down(state, dead_node, dead_node_id)
 
     # Check if any pending CAS ops lost quorum
     state = fail_pending_cas_if_no_quorum(state)
@@ -1281,12 +1324,15 @@ defmodule EKV.Replica do
         "#{log_prefix_shard(state)} remote_shard_down #{remote_node} (data preserved)"
       end)
 
+      remote_node_id = Map.get(state.peer_node_ids, remote_node)
+
       state = %{
         state
         | remote_shards: Map.delete(state.remote_shards, remote_node),
           peer_node_ids: Map.delete(state.peer_node_ids, remote_node)
       }
 
+      state = mark_peer_down(state, remote_node, remote_node_id)
       state = fail_pending_cas_if_no_quorum(state)
       {:noreply, state}
     else
@@ -1560,6 +1606,9 @@ defmodule EKV.Replica do
     # 5. Bump liveness timestamp
     Store.touch_last_active(db)
 
+    # 6. Bounded cleanup for fallback name-based down markers.
+    prune_stale_peer_down_name_markers(state)
+
     {:noreply, state}
   end
 
@@ -1567,9 +1616,21 @@ defmodule EKV.Replica do
   # Chunked sync continuations
   # =====================================================================
 
+  # Backward-compat continuation shape (includes obsolete remote_hwm field).
+  # Keep handling this shape so tests/older internal senders still work.
   def handle_info(
-        {:continue_full_sync, remote_node, last_key, tombstone_cutoff, my_seq, remote_seq,
+        {:continue_full_sync, remote_node, last_key, tombstone_cutoff, my_seq, _remote_hwm,
          chunk_size},
+        state
+      ) do
+    handle_info(
+      {:continue_full_sync, remote_node, last_key, tombstone_cutoff, my_seq, chunk_size},
+      state
+    )
+  end
+
+  def handle_info(
+        {:continue_full_sync, remote_node, last_key, tombstone_cutoff, my_seq, chunk_size},
         state
       ) do
     if Map.has_key?(state.remote_shards, remote_node) do
@@ -1579,7 +1640,6 @@ defmodule EKV.Replica do
         last_key,
         tombstone_cutoff,
         my_seq,
-        remote_seq,
         chunk_size
       )
     end
@@ -1587,12 +1647,20 @@ defmodule EKV.Replica do
     {:noreply, state}
   end
 
+  # Backward-compat continuation shape (includes obsolete remote_hwm field).
   def handle_info(
-        {:continue_delta_sync, remote_node, last_seq, my_seq, remote_seq, chunk_size},
+        {:continue_delta_sync, remote_node, last_seq, my_seq, _remote_hwm, chunk_size},
+        state
+      ) do
+    handle_info({:continue_delta_sync, remote_node, last_seq, my_seq, chunk_size}, state)
+  end
+
+  def handle_info(
+        {:continue_delta_sync, remote_node, last_seq, my_seq, chunk_size},
         state
       ) do
     if Map.has_key?(state.remote_shards, remote_node) do
-      send_delta_chunk(state, remote_node, last_seq, my_seq, remote_seq, chunk_size)
+      send_delta_chunk(state, remote_node, last_seq, my_seq, chunk_size)
     end
 
     {:noreply, state}
@@ -1611,7 +1679,7 @@ defmodule EKV.Replica do
          remote_pid,
          remote_shard,
          remote_num_shards,
-         remote_seq,
+         remote_hwm,
          remote_node_id
        )
        when remote_shard == state.shard_index do
@@ -1625,34 +1693,41 @@ defmodule EKV.Replica do
     else
       %{db: db} = state
       remote_node = node(remote_pid)
-      my_seq = Store.max_seq(db)
 
-      state = track_remote_shard(state, remote_node, remote_pid)
-      state = track_peer_node_id(state, remote_node, remote_node_id)
+      case maybe_allow_peer_reconnect(state, remote_node, remote_node_id) do
+        {:quarantine, state} ->
+          state
 
-      if state.cluster_size do
-        alive = count_alive_node_ids(state)
+        {:ok, state} ->
+          my_hwm_for_remote = Store.get_hwm(db, remote_node) || 0
 
-        if alive > state.cluster_size do
-          Logger.error(
-            "#{log_prefix(state)} cluster overflow: #{alive} distinct node_ids, " <>
-              "cluster_size=#{state.cluster_size}. New peer #{remote_node} " <>
-              "has node_id=#{inspect(remote_node_id)}"
+          state = track_remote_shard(state, remote_node, remote_pid)
+          state = track_peer_node_id(state, remote_node, remote_node_id)
+
+          if state.cluster_size do
+            alive = count_alive_node_ids(state)
+
+            if alive > state.cluster_size do
+              Logger.error(
+                "#{log_prefix(state)} cluster overflow: #{alive} distinct node_ids, " <>
+                  "cluster_size=#{state.cluster_size}. New peer #{remote_node} " <>
+                  "has node_id=#{inspect(remote_node_id)}"
+              )
+            end
+          end
+
+          send_to_peer(
+            state,
+            remote_node,
+            {:ekv_peer_connect_ack, self(), state.shard_index, state.num_shards,
+             my_hwm_for_remote, state.node_id}
           )
-        end
+
+          log_once(state, fn -> "#{log_prefix(state)} ekv_peer_connect from #{remote_node}" end)
+          send_sync_data(state, remote_node, remote_hwm)
+
+          state
       end
-
-      send_to_peer(
-        state,
-        remote_node,
-        {:ekv_peer_connect_ack, self(), state.shard_index, state.num_shards, my_seq,
-         state.node_id}
-      )
-
-      log_once(state, fn -> "#{log_prefix(state)} ekv_peer_connect from #{remote_node}" end)
-      send_sync_data(state, remote_node, remote_seq)
-
-      state
     end
   end
 
@@ -1661,7 +1736,7 @@ defmodule EKV.Replica do
          _remote_pid,
          _remote_shard,
          _remote_num_shards,
-         _remote_seq,
+         _remote_hwm,
          _remote_node_id
        ) do
     state
@@ -1672,7 +1747,7 @@ defmodule EKV.Replica do
          remote_pid,
          remote_shard,
          remote_num_shards,
-         remote_seq,
+         remote_hwm,
          remote_node_id
        )
        when remote_shard == state.shard_index do
@@ -1686,28 +1761,34 @@ defmodule EKV.Replica do
     else
       remote_node = node(remote_pid)
 
-      state = track_remote_shard(state, remote_node, remote_pid)
-      state = track_peer_node_id(state, remote_node, remote_node_id)
+      case maybe_allow_peer_reconnect(state, remote_node, remote_node_id) do
+        {:quarantine, state} ->
+          state
 
-      if state.cluster_size do
-        alive = count_alive_node_ids(state)
+        {:ok, state} ->
+          state = track_remote_shard(state, remote_node, remote_pid)
+          state = track_peer_node_id(state, remote_node, remote_node_id)
 
-        if alive > state.cluster_size do
-          Logger.error(
-            "#{log_prefix(state)} cluster overflow: #{alive} distinct node_ids, " <>
-              "cluster_size=#{state.cluster_size}. New peer #{remote_node} " <>
-              "has node_id=#{inspect(remote_node_id)}"
-          )
-        end
+          if state.cluster_size do
+            alive = count_alive_node_ids(state)
+
+            if alive > state.cluster_size do
+              Logger.error(
+                "#{log_prefix(state)} cluster overflow: #{alive} distinct node_ids, " <>
+                  "cluster_size=#{state.cluster_size}. New peer #{remote_node} " <>
+                  "has node_id=#{inspect(remote_node_id)}"
+              )
+            end
+          end
+
+          log_once(state, fn ->
+            "#{log_prefix(state)} ekv_peer_connect_ack from #{remote_node}"
+          end)
+
+          send_sync_data(state, remote_node, remote_hwm)
+
+          state
       end
-
-      log_once(state, fn ->
-        "#{log_prefix(state)} ekv_peer_connect_ack from #{remote_node}"
-      end)
-
-      send_sync_data(state, remote_node, remote_seq)
-
-      state
     end
   end
 
@@ -1716,7 +1797,7 @@ defmodule EKV.Replica do
          _remote_pid,
          _remote_shard,
          _remote_num_shards,
-         _remote_seq,
+         _remote_hwm,
          _remote_node_id
        ) do
     state
@@ -1746,23 +1827,31 @@ defmodule EKV.Replica do
     )
   end
 
-  defp send_sync_data(state, remote_node, remote_seq) do
+  defp send_sync_data(state, remote_node, remote_hwm) do
     %{db: db} = state
     config = EKV.get_config(state.name)
     tombstone_cutoff = System.system_time(:nanosecond) - config.tombstone_ttl * 1_000_000
     chunk_size = config.sync_chunk_size
 
-    # Check if we have a HWM for this peer and can do delta sync
-    peer_hwm = Store.get_hwm(db, remote_node)
+    # remote_hwm is what the remote side reports having already applied from us.
+    # Use it as the delta cursor into our local oplog sequence space.
     my_min_seq = Store.min_seq(db)
     my_seq = Store.max_seq(db)
 
     cond do
-      peer_hwm && peer_hwm >= my_min_seq ->
-        send_delta_chunk(state, remote_node, peer_hwm, my_seq, remote_seq, chunk_size)
+      is_integer(remote_hwm) and remote_hwm >= my_min_seq and remote_hwm <= my_seq ->
+        send_delta_chunk(state, remote_node, remote_hwm, my_seq, chunk_size)
+
+      is_integer(remote_hwm) and remote_hwm > my_seq ->
+        log(state, fn ->
+          "#{log_prefix_shard(state)} remote_hwm #{remote_hwm} > local_max_seq #{my_seq} " <>
+            "for #{remote_node}; forcing full sync"
+        end)
+
+        send_full_chunk(state, remote_node, nil, tombstone_cutoff, my_seq, chunk_size)
 
       true ->
-        send_full_chunk(state, remote_node, nil, tombstone_cutoff, my_seq, remote_seq, chunk_size)
+        send_full_chunk(state, remote_node, nil, tombstone_cutoff, my_seq, chunk_size)
     end
   end
 
@@ -1772,18 +1861,18 @@ defmodule EKV.Replica do
          last_key,
          tombstone_cutoff,
          my_seq,
-         remote_seq,
          chunk_size
        ) do
-    entries = Store.full_state_chunk(state.db, tombstone_cutoff, last_key, chunk_size)
+    fetched = Store.full_state_chunk(state.db, tombstone_cutoff, last_key, chunk_size + 1)
 
-    case entries do
+    case fetched do
       [] ->
-        # Done — record their advertised seq as our HWM for them
-        if remote_seq > 0, do: Store.set_hwm(state.db, remote_node, remote_seq)
+        :ok
 
       _ ->
-        final? = length(entries) < chunk_size
+        has_more? = length(fetched) > chunk_size
+        entries = if has_more?, do: Enum.take(fetched, chunk_size), else: fetched
+        final? = not has_more?
         seq_to_send = if final?, do: my_seq, else: 0
 
         send_to_peer(
@@ -1793,27 +1882,29 @@ defmodule EKV.Replica do
         )
 
         if final? do
-          if remote_seq > 0, do: Store.set_hwm(state.db, remote_node, remote_seq)
+          :ok
         else
           next_key = elem(List.last(entries), 0)
 
           send(
             self(),
-            {:continue_full_sync, remote_node, next_key, tombstone_cutoff, my_seq, remote_seq,
-             chunk_size}
+            {:continue_full_sync, remote_node, next_key, tombstone_cutoff, my_seq, chunk_size}
           )
         end
     end
   end
 
-  defp send_delta_chunk(state, remote_node, last_seq, my_seq, remote_seq, chunk_size) do
-    oplog_entries = Store.oplog_since_chunk(state.db, last_seq, chunk_size)
+  defp send_delta_chunk(state, remote_node, last_seq, my_seq, chunk_size) do
+    fetched = Store.oplog_since_chunk(state.db, last_seq, chunk_size + 1)
 
-    case oplog_entries do
+    case fetched do
       [] ->
-        if remote_seq > 0, do: Store.set_hwm(state.db, remote_node, remote_seq)
+        :ok
 
       _ ->
+        has_more? = length(fetched) > chunk_size
+        oplog_entries = if has_more?, do: Enum.take(fetched, chunk_size), else: fetched
+
         entries =
           Enum.map(oplog_entries, fn {_seq, key, value, timestamp, origin_node, expires_at,
                                       is_delete} ->
@@ -1821,7 +1912,7 @@ defmodule EKV.Replica do
             {key, value, timestamp, origin_node, expires_at, deleted_at}
           end)
 
-        final? = length(oplog_entries) < chunk_size
+        final? = not has_more?
         seq_to_send = if final?, do: my_seq, else: 0
 
         send_to_peer(
@@ -1831,13 +1922,13 @@ defmodule EKV.Replica do
         )
 
         if final? do
-          if remote_seq > 0, do: Store.set_hwm(state.db, remote_node, remote_seq)
+          :ok
         else
           {max_chunk_seq, _, _, _, _, _, _} = List.last(oplog_entries)
 
           send(
             self(),
-            {:continue_delta_sync, remote_node, max_chunk_seq, my_seq, remote_seq, chunk_size}
+            {:continue_delta_sync, remote_node, max_chunk_seq, my_seq, chunk_size}
           )
         end
     end
@@ -2188,7 +2279,9 @@ defmodule EKV.Replica do
   # timestamp. This prevents LWW merge from overwriting the CAS-committed value
   # with a prior high-timestamp value after partition heal.
   defp monotonic_cas_ts(nil), do: System.system_time(:nanosecond)
-  defp monotonic_cas_ts({current_ts, _origin}), do: max(System.system_time(:nanosecond), current_ts + 1)
+
+  defp monotonic_cas_ts({current_ts, _origin}),
+    do: max(System.system_time(:nanosecond), current_ts + 1)
 
   defp decode_kv_row(nil), do: {nil, nil}
 
@@ -2316,6 +2409,178 @@ defmodule EKV.Replica do
 
   defp track_peer_node_id(state, remote_node, remote_node_id) do
     %{state | peer_node_ids: Map.put(state.peer_node_ids, remote_node, remote_node_id)}
+  end
+
+  defp mark_peer_down(state, remote_node, nil) do
+    remember_peer_down_marker(state, peer_down_name_key(remote_node))
+  end
+
+  defp mark_peer_down(state, remote_node, remote_node_id) do
+    if node_id_connected?(state, remote_node_id) do
+      # Blue/green overlap: same cluster member identity is still connected.
+      clear_peer_down_marker(state, peer_down_name_key(remote_node))
+    else
+      state
+      |> clear_peer_down_marker(peer_down_name_key(remote_node))
+      |> remember_peer_down_marker(peer_down_id_key(remote_node_id))
+    end
+  end
+
+  defp maybe_allow_peer_reconnect(state, remote_node, remote_node_id \\ nil)
+
+  defp maybe_allow_peer_reconnect(
+         %{partition_ttl_policy: :ignore} = state,
+         remote_node,
+         remote_node_id
+       ) do
+    state = clear_peer_down_markers(state, remote_node, remote_node_id)
+
+    state = %{
+      state
+      | quarantined_peers: MapSet.delete(state.quarantined_peers, remote_node)
+    }
+
+    {:ok, state}
+  end
+
+  defp maybe_allow_peer_reconnect(state, remote_node, remote_node_id) do
+    {state, down_since_ms} = resolve_peer_down_since(state, remote_node, remote_node_id)
+
+    age_ms =
+      if is_integer(down_since_ms), do: max(0, System.system_time(:millisecond) - down_since_ms)
+
+    cond do
+      is_nil(down_since_ms) ->
+        state = %{state | quarantined_peers: MapSet.delete(state.quarantined_peers, remote_node)}
+        {:ok, state}
+
+      is_integer(down_since_ms) and age_ms > state.tombstone_ttl ->
+        state = %{
+          state
+          | quarantined_peers: MapSet.put(state.quarantined_peers, remote_node),
+            remote_shards: Map.delete(state.remote_shards, remote_node),
+            peer_node_ids: Map.delete(state.peer_node_ids, remote_node)
+        }
+
+        log_once(state, fn ->
+          "#{log_prefix(state)} quarantining #{remote_node}: reconnect downtime exceeded " <>
+            "tombstone_ttl (#{state.tombstone_ttl}ms). " <>
+            "Replication is blocked until operator rebuilds one side."
+        end)
+
+        {:quarantine, state}
+
+      true ->
+        state = clear_peer_down_markers(state, remote_node, remote_node_id)
+
+        state = %{
+          state
+          | quarantined_peers: MapSet.delete(state.quarantined_peers, remote_node)
+        }
+
+        {:ok, state}
+    end
+  end
+
+  defp resolve_peer_down_since(state, remote_node, nil) do
+    read_peer_down_marker(state, peer_down_name_key(remote_node))
+  end
+
+  defp resolve_peer_down_since(state, remote_node, remote_node_id) do
+    id_key = peer_down_id_key(remote_node_id)
+    name_key = peer_down_name_key(remote_node)
+
+    {state, id_down_since} = read_peer_down_marker(state, id_key)
+    {state, name_down_since} = read_peer_down_marker(state, name_key)
+
+    if is_integer(name_down_since) do
+      merged_down_since =
+        if is_integer(id_down_since),
+          do: min(id_down_since, name_down_since),
+          else: name_down_since
+
+      state =
+        if id_down_since == merged_down_since,
+          do: state,
+          else: put_peer_down_marker(state, id_key, merged_down_since)
+
+      state = clear_peer_down_marker(state, name_key)
+      {state, merged_down_since}
+    else
+      {state, id_down_since}
+    end
+  end
+
+  defp remember_peer_down_marker(state, marker_key) do
+    {state, existing_down_since} = read_peer_down_marker(state, marker_key)
+
+    if is_integer(existing_down_since) do
+      state
+    else
+      put_peer_down_marker(state, marker_key, System.system_time(:millisecond))
+    end
+  end
+
+  defp read_peer_down_marker(state, marker_key) do
+    case Map.fetch(state.peer_down_at, marker_key) do
+      {:ok, down_since} ->
+        {state, down_since}
+
+      :error ->
+        down_since = Store.peer_down_marker_get(state.db, marker_key)
+
+        state =
+          if is_integer(down_since),
+            do: %{state | peer_down_at: Map.put(state.peer_down_at, marker_key, down_since)},
+            else: state
+
+        {state, down_since}
+    end
+  end
+
+  defp put_peer_down_marker(state, marker_key, down_since) do
+    Store.peer_down_marker_put(state.db, marker_key, down_since)
+    %{state | peer_down_at: Map.put(state.peer_down_at, marker_key, down_since)}
+  end
+
+  defp clear_peer_down_marker(state, marker_key) do
+    Store.peer_down_marker_clear(state.db, marker_key)
+    %{state | peer_down_at: Map.delete(state.peer_down_at, marker_key)}
+  end
+
+  defp clear_peer_down_markers(state, remote_node, remote_node_id) do
+    remote_node
+    |> peer_down_marker_keys(remote_node_id)
+    |> Enum.uniq()
+    |> Enum.reduce(state, fn marker_key, acc ->
+      clear_peer_down_marker(acc, marker_key)
+    end)
+  end
+
+  defp peer_down_marker_keys(remote_node, nil), do: [peer_down_name_key(remote_node)]
+
+  defp peer_down_marker_keys(remote_node, remote_node_id) do
+    [peer_down_id_key(remote_node_id), peer_down_name_key(remote_node)]
+  end
+
+  defp peer_down_id_key(remote_node_id), do: @peer_down_id_prefix <> to_string(remote_node_id)
+  defp peer_down_name_key(remote_node), do: @peer_down_name_prefix <> Atom.to_string(remote_node)
+
+  defp node_id_connected?(state, remote_node_id) do
+    Enum.any?(state.peer_node_ids, fn {peer_node, peer_node_id} ->
+      peer_node_id == remote_node_id and Map.has_key?(state.remote_shards, peer_node)
+    end)
+  end
+
+  defp prune_stale_peer_down_name_markers(state) do
+    retention_ms = max(@peer_down_name_min_retention_ms, state.tombstone_ttl * 4)
+    stale_before_ms = System.system_time(:millisecond) - retention_ms
+
+    Store.prune_peer_down_name_markers(
+      state.db,
+      stale_before_ms,
+      @peer_down_name_max_entries
+    )
   end
 
   defp cancel_timer(nil), do: :ok

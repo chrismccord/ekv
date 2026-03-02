@@ -698,6 +698,17 @@ defmodule EKV.Store do
     :ok
   end
 
+  def set_meta_int_if_absent(db, key, value) do
+    case get_meta_int(db, key) do
+      nil ->
+        set_meta_int(db, key, value)
+        :inserted
+
+      _existing ->
+        :exists
+    end
+  end
+
   def get_meta_text(db, key) do
     {:ok, stmt} = EKV.Sqlite3.prepare(db, "SELECT value_text FROM kv_meta WHERE key = ?1")
     :ok = EKV.Sqlite3.bind(stmt, [key])
@@ -723,6 +734,43 @@ defmodule EKV.Store do
     :done = EKV.Sqlite3.step(db, stmt)
     :ok = EKV.Sqlite3.release(db, stmt)
     :ok
+  end
+
+  def delete_meta_key(db, key) do
+    {:ok, stmt} = EKV.Sqlite3.prepare(db, "DELETE FROM kv_meta WHERE key = ?1")
+    :ok = EKV.Sqlite3.bind(stmt, [key])
+    :done = EKV.Sqlite3.step(db, stmt)
+    :ok = EKV.Sqlite3.release(db, stmt)
+    :ok
+  end
+
+  def peer_down_marker_get(db, key), do: get_meta_int(db, key)
+  def peer_down_marker_put(db, key, down_since_ms), do: set_meta_int(db, key, down_since_ms)
+
+  def peer_down_marker_set_if_absent(db, key, down_since_ms),
+    do: set_meta_int_if_absent(db, key, down_since_ms)
+
+  def peer_down_marker_clear(db, key), do: delete_meta_key(db, key)
+
+  def prune_peer_down_name_markers(db, stale_before_ms, max_entries) do
+    {:ok, rows} =
+      EKV.Sqlite3.fetch_all(
+        db,
+        "SELECT key, value_int FROM kv_meta WHERE key LIKE 'peer_down_at:name:%' ORDER BY value_int DESC",
+        []
+      )
+
+    keys_to_delete =
+      rows
+      |> Enum.with_index()
+      |> Enum.reduce([], fn {[key, down_since], idx}, acc ->
+        stale? = not is_integer(down_since) or down_since < stale_before_ms
+        over_cap? = idx >= max_entries
+        if stale? or over_cap?, do: [key | acc], else: acc
+      end)
+
+    Enum.each(keys_to_delete, &delete_meta_key(db, &1))
+    length(keys_to_delete)
   end
 
   def read_node_id(data_dir) do

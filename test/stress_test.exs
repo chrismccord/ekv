@@ -82,6 +82,184 @@ defmodule EKV.StressTest do
   # =====================================================================
 
   describe "split-brain prevention" do
+    # Intention: verify an acknowledged CAS write still converges cluster-wide
+    # after a partition heal, even when its timestamp is lower than an existing
+    # LWW timestamp (clock-skew scenario).
+    test "3-node heal: committed CAS write converges despite lower timestamp than prior LWW value" do
+      peers = TestCluster.start_peers(3)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, n1}, {_, n2}, {_, n3}] = peers
+      ekv_name = unique_name(:cas_lww_skew)
+
+      start_stress_cluster(peers, ekv_name, shards: 1)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+      Process.sleep(500)
+
+      key = "skew/cas_lww"
+      shard_name = :"#{ekv_name}_ekv_replica_0"
+
+      # Seed all nodes with the same value at an artificially high timestamp
+      # (simulates a prior write from a clock-ahead node).
+      old_value_bin = :erlang.term_to_binary("old")
+      old_ts = System.system_time(:nanosecond) + 1_000_000_000_000
+      old_origin = :"ahead_clock@127.0.0.1"
+
+      for {_pid, node} <- peers do
+        TestCluster.rpc!(node, Kernel, :send, [
+          shard_name,
+          {:ekv_put, key, old_value_bin, old_ts, old_origin, nil}
+        ])
+
+        # Drain shard mailbox so the synthetic write is definitely applied.
+        TestCluster.rpc!(node, :sys, :get_state, [shard_name])
+      end
+
+      TestCluster.assert_eventually(fn ->
+        Enum.all?([n1, n2, n3], fn node ->
+          TestCluster.rpc!(node, EKV, :get, [ekv_name, key]) == "old"
+        end)
+      end)
+
+      majority = [n1, n2]
+      minority = [n3]
+
+      partition(majority, minority)
+      Process.sleep(300)
+
+      # Commit CAS from majority with proposer timestamp likely lower than old_ts.
+      assert :ok = TestCluster.rpc!(n1, EKV, :put, [ekv_name, key, "new", [consistent: true]])
+
+      TestCluster.assert_eventually(fn ->
+        Enum.all?(majority, fn node ->
+          TestCluster.rpc!(node, EKV, :get, [ekv_name, key]) == "new"
+        end)
+      end)
+
+      heal(majority, minority)
+      Process.sleep(700)
+
+      # Expected correctness property: cluster converges to the acknowledged CAS value.
+      deadline = System.monotonic_time(:millisecond) + 5000
+
+      {converged?, last_vals} =
+        Enum.reduce_while(1..120, {false, []}, fn _, _acc ->
+          vals =
+            Enum.map([n1, n2, n3], fn node ->
+              TestCluster.rpc!(node, EKV, :get, [ekv_name, key])
+            end)
+
+          if Enum.all?(vals, &(&1 == "new")) do
+            {:halt, {true, vals}}
+          else
+            if System.monotonic_time(:millisecond) >= deadline do
+              {:halt, {false, vals}}
+            else
+              Process.sleep(50)
+              {:cont, {false, vals}}
+            end
+          end
+        end)
+
+      assert converged?,
+             "expected convergence to CAS value, got values=#{inspect(last_vals)}"
+    end
+
+    # Intention: verify repeated partition/heal cycles do not miss writes due to
+    # incorrect delta-sync cursor bookkeeping across peers.
+    test "second heal still replicates writes after prior conflicting skewed merge" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, n1}, {_, n2}] = peers
+      ekv_name = unique_name(:hwm_seq_space)
+
+      start_stress_cluster(peers, ekv_name, shards: 1)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+      Process.sleep(500)
+
+      shard_name = :"#{ekv_name}_ekv_replica_0"
+      conflict_key = "hwm/conflict"
+
+      partition([n1], [n2])
+      Process.sleep(300)
+
+      TestCluster.assert_eventually(fn ->
+        n2 not in TestCluster.rpc!(n1, Node, :list, []) and
+          n1 not in TestCluster.rpc!(n2, Node, :list, [])
+      end)
+
+      # Inject a far-future timestamp on n1 so n2's normal writes lose on heal.
+      ahead_bin = :erlang.term_to_binary("ahead")
+      ahead_ts = System.system_time(:nanosecond) + 1_000_000_000_000
+      ahead_origin = :"ahead_clock@127.0.0.1"
+
+      TestCluster.rpc!(n1, Kernel, :send, [
+        shard_name,
+        {:ekv_put, conflict_key, ahead_bin, ahead_ts, ahead_origin, nil}
+      ])
+
+      TestCluster.rpc!(n1, :sys, :get_state, [shard_name])
+
+      for i <- 1..120 do
+        TestCluster.rpc!(n2, EKV, :put, [ekv_name, conflict_key, "behind_#{i}"])
+      end
+
+      assert TestCluster.rpc!(n2, EKV, :get, [ekv_name, conflict_key]) == "behind_120"
+
+      # First heal: both nodes converge to the ahead-clock value.
+      heal([n1], [n2])
+      Process.sleep(700)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(n1, EKV, :get, [ekv_name, conflict_key]) == "ahead" and
+          TestCluster.rpc!(n2, EKV, :get, [ekv_name, conflict_key]) == "ahead"
+      end)
+
+      # Second partition and a fresh write only on n1.
+      partition([n1], [n2])
+      Process.sleep(300)
+
+      TestCluster.assert_eventually(fn ->
+        n2 not in TestCluster.rpc!(n1, Node, :list, []) and
+          n1 not in TestCluster.rpc!(n2, Node, :list, [])
+      end)
+
+      TestCluster.assert_eventually(fn ->
+        state = TestCluster.rpc!(n1, :sys, :get_state, [shard_name])
+        not Map.has_key?(state.remote_shards, n2)
+      end)
+
+      second_key = "hwm/second_heal"
+      second_value = "from_n1_after_second_partition"
+      :ok = TestCluster.rpc!(n1, EKV, :put, [ekv_name, second_key, second_value])
+
+      # Second heal must still deliver n1's write to n2.
+      heal([n1], [n2])
+      Process.sleep(700)
+
+      deadline = System.monotonic_time(:millisecond) + 5000
+
+      {converged?, last_seen} =
+        Enum.reduce_while(1..120, {false, nil}, fn _, _acc ->
+          val = TestCluster.rpc!(n2, EKV, :get, [ekv_name, second_key])
+
+          if val == second_value do
+            {:halt, {true, val}}
+          else
+            if System.monotonic_time(:millisecond) >= deadline do
+              {:halt, {false, val}}
+            else
+              Process.sleep(50)
+              {:cont, {false, val}}
+            end
+          end
+        end)
+
+      assert converged?,
+             "expected second-heal replication to deliver #{inspect(second_value)} to n2, got #{inspect(last_seen)}"
+    end
+
     test "3+2 partition: concurrent CAS on SAME key — only majority commits" do
       peers = TestCluster.start_peers(5)
       on_exit(fn -> TestCluster.stop_peers(peers) end)

@@ -122,6 +122,7 @@ defmodule EKV do
   | `:tombstone_ttl` | `604_800_000` (7 days) | How long tombstones (deleted entries) are kept before being permanently purged, in milliseconds. See "Tombstone Lifetime" below. |
   | `:gc_interval` | `300_000` (5 min) | How often garbage collection runs, in milliseconds. GC expires TTL entries, purges old tombstones, and truncates the replication oplog. |
   | `:log` | `:info` | Logging level. `:info` logs cluster events (connects, syncs). `false` disables logging. `:verbose` logs per-shard detail. |
+  | `:partition_ttl_policy` | `:quarantine` | Policy for reconnects after downtime longer than `tombstone_ttl`. `:quarantine` blocks replication with that peer identity until operator rebuild. `:ignore` keeps legacy behavior. |
   | `:blue_green` | `false` | Enable blue-green deployment mode. See "Blue-Green Deployment" below. |
 
   ### Choosing a Shard Count
@@ -168,6 +169,25 @@ defmodule EKV do
   Reduce `tombstone_ttl` if storage is tight and your nodes are rarely offline
   for long. Increase it if nodes may be offline for extended maintenance
   windows.
+
+  ### Long Live-Partition Protection
+
+  Startup stale-db detection covers nodes that were down and restarted. A
+  separate edge case is a very long network partition where nodes stay up past
+  `tombstone_ttl`.
+
+  By default (`partition_ttl_policy: :quarantine`), EKV detects reconnects
+  after downtime longer than `tombstone_ttl` and quarantines that peer pair
+  instead of syncing potentially unsafe state. Replication remains blocked for
+  that peer until an operator rebuilds one side.
+
+  Down-since markers are persisted in `kv_meta`, keyed by `node_id` when
+  available (fallback: node name). This preserves quarantine history across
+  restarts and prevents node-name churn from bypassing quarantine when
+  `node_id` is stable.
+
+  Fallback name-based markers are bounded: EKV periodically prunes very old
+  entries and caps retained fallback markers per shard.
 
   ## Blue-Green Deployment
 

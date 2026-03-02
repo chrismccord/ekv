@@ -24,6 +24,9 @@ Verify:
 - Each peer has a non-nil `node_id`
 - `node_id` values are distinct
 
+If a partition or maintenance event is active, `connected_peers` may be lower
+temporarily. Treat this as healthy only if it matches an expected outage.
+
 ## Backups
 
 ### Taking a Backup
@@ -179,13 +182,19 @@ minority side returns `{:error, :no_quorum}` for CAS but LWW still works.
 
 Nodes automatically reconnect and sync:
 
-- **Short partition** (oplog intact): Delta sync — only mutations since
-  the last known sequence are exchanged
-- **Long partition** (oplog truncated): Full sync — the entire live dataset
-  is transferred. This happens when `gc_interval` ticks have truncated the
-  oplog past the peer's last known position
+- **Short partition** (downtime <= `tombstone_ttl`): automatic sync.
+  - Oplog intact: Delta sync — only mutations since the last known sequence
+    are exchanged
+  - Oplog truncated: Full sync — the entire live dataset is transferred
 
-No operator action needed. Monitor convergence:
+- **Very long live partition** (downtime > `tombstone_ttl`):
+  - Default (`partition_ttl_policy: :quarantine`): EKV blocks replication for
+    that peer identity to prevent zombie resurrection. This is intentional.
+    Operator action is required (rebuild one side, then reconnect).
+  - Legacy mode (`partition_ttl_policy: :ignore`): EKV allows reconnect/sync
+    without quarantine.
+
+For automatic-sync cases, no operator action is needed. Monitor convergence:
 
 ```elixir
 # On node A — write a canary
@@ -194,6 +203,12 @@ EKV.put(:my_kv, "canary/heal", System.system_time())
 # On node B — check it appears
 EKV.get(:my_kv, "canary/heal")  # should be non-nil within seconds
 ```
+
+### Long Live-Partition Notes
+
+Quarantine downtime tracking survives restarts. EKV persists down markers in
+`kv_meta` keyed by `node_id` when known (fallback: node name), so a restart
+does not clear long-partition history.
 
 ## Stale Database Protection
 
