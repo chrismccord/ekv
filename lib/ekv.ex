@@ -154,50 +154,40 @@ defmodule EKV do
 
   When deploying with a blue-green strategy on a single machine, two BEAM VMs
   run side by side briefly — the old release and the new one. If both VMs open
-  the same SQLite files, the result is corruption and incoherent oplogs. The
-  `:blue_green` option solves this by giving each VM its own isolated copy of
-  the data.
+  the same SQLite files simultaneously, the result is corruption. The
+  `:blue_green` option solves this with a synchronized handoff — the new VM
+  coordinates with the old VM to drain operations, flush WAL, and close the
+  writer before opening the same database files.
 
       {EKV, name: :my_kv, data_dir: "/var/data/ekv", blue_green: true}
 
-  With `blue_green: true`, EKV manages two fixed slot directories (`slot_a/`
-  and `slot_b/`) under `data_dir` and ping-pongs between them across deploys.
-  A marker file (`data_dir/current`) tracks which slot is active and which
-  node owns it.
-
   **Startup behavior:**
 
-  - **First boot** (no marker file) — creates `slot_a/`, writes the marker,
-    and operates normally.
+  - **First boot** (no marker file) — writes the marker and operates normally.
 
-  - **Same node restart** (marker node matches `node()`) — reopens the same
-    slot. This is a normal EKV restart within the same VM (e.g. supervisor
-    restart, application reload). Data is preserved in place.
+  - **Same node restart** (marker node matches `node()`) — no handoff needed.
+    This is a normal EKV restart within the same VM.
 
-  - **Different node** (marker node does not match `node()`) — this is a
-    blue-green deploy. EKV snapshots every shard from the current slot to the
-    other slot using SQLite's backup API, flips the marker, and opens the new
-    slot. The old VM's files are untouched.
+  - **Different node** (marker node does not match `node()`) — synchronized
+    handoff. The new VM sends a handoff request to each shard on the old VM.
+    The old VM drains pending CAS operations, persists its ballot counter,
+    checkpoints the WAL, and closes its writer connection. Only then does the
+    new VM open the database files. The old VM enters proxy mode, forwarding
+    any remaining write requests to the new VM.
 
-  After the snapshot, the new VM's database is a consistent point-in-time copy
-  of the old VM's data. Any writes the old VM made between the snapshot and
-  shutdown are caught up via normal delta sync (HWM/oplog) when the old VM's
-  node connects to the new one during the handoff window, or via full sync if
-  the old VM has already shut down.
+  If the old VM is dead when the new VM starts, the handoff requests time out
+  after 5 seconds and the new VM opens the files directly. SQLite's WAL
+  recovery handles any incomplete writes.
 
   **Requirements:**
 
   - Each deploy must use a **different node name** (e.g. include a timestamp
-    or release version in the name). If the node name is the same, EKV treats
-    it as a same-node restart and reopens the existing slot without
-    snapshotting.
+    or release version in the name). Both VMs must share the same `node_id`.
 
-  - The `data_dir` must be on a **shared filesystem** accessible to both the
-    old and new VMs.
+  - The `data_dir` must be on a **shared filesystem** accessible to both VMs.
 
-  **Disk space:** Blue-green mode uses approximately 2x the storage of normal
-  mode since both `slot_a/` and `slot_b/` contain full copies of the data.
-  Old slot files are overwritten on the next deploy cycle.
+  **Disk space:** No additional storage — both VMs use the same database files
+  (sequentially, never simultaneously).
 
   ## Multiple Instances
 
@@ -557,6 +547,52 @@ defmodule EKV do
     config = get_config(name)
     Registry.unregister(config.registry, prefix)
     :ok
+  end
+
+  @doc """
+  Create a backup of all shards to `dest_dir`.
+
+  Uses SQLite's online backup API — safe to call while EKV is running.
+  Returns `:ok` on success or `{:error, reason}` on failure.
+  """
+  def backup(name, dest_dir) do
+    config = get_config(name)
+    File.mkdir_p!(dest_dir)
+
+    0..(config.num_shards - 1)
+    |> Task.async_stream(
+      fn shard -> EKV.Store.backup_shard(config.data_dir, dest_dir, shard) end,
+      ordered: false
+    )
+    |> Enum.reduce(:ok, fn
+      {:ok, :ok}, :ok -> :ok
+      {:ok, {:error, _} = err}, _ -> err
+      _, acc -> acc
+    end)
+  end
+
+  @doc """
+  Return cluster status information.
+
+  Returns a map with node_id, cluster_size, shards, data_dir, and connected peers.
+  """
+  def info(name) do
+    config = get_config(name)
+    shard_state = :sys.get_state(Replica.shard_name(name, 0))
+
+    peers =
+      for {node, _pid} <- shard_state.remote_shards do
+        %{node: node, node_id: Map.get(shard_state.peer_node_ids, node)}
+      end
+
+    %{
+      name: name,
+      node_id: config.node_id,
+      cluster_size: config.cluster_size,
+      shards: config.num_shards,
+      data_dir: config.data_dir,
+      connected_peers: peers
+    }
   end
 
   def get_config(name) do

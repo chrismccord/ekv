@@ -5,72 +5,58 @@ defmodule EKV.Supervisor do
   _archdoc = ~S"""
   Top-level supervisor. Builds config map and stores it in `persistent_term`.
 
-  ## Blue-Green Deployment
+  ## Blue-Green Deployment (Synchronized Handoff)
 
-  When `blue_green: true`, the supervisor resolves the effective `data_dir`
-  to a slot subdirectory before building config or starting children. All
-  downstream modules (Replica, GC, read connections) see the resolved
-  slot-specific path transparently.
+  When `blue_green: true`, the supervisor performs a synchronized handoff
+  with the old VM before starting children. Both VMs share the same
+  `data_dir` and `node_id` — from the cluster's perspective, it's a single
+  member that briefly restarted.
 
-  ### Slot Layout
+  ### Handoff Protocol
 
-      data_dir/
-      ├── current           # marker file: "a\tnode_name@host\n"
-      ├── slot_a/
-      │   ├── shard_0.db
-      │   ├── shard_1.db
-      │   └── ...
-      └── slot_b/
-          ├── shard_0.db
-          ├── shard_1.db
-          └── ...
+      New VM (m1b)                          Old VM (m1a)
+      ────────────                          ────────────
+      Supervisor.init
+        read_marker(data_dir)
+        => discovers m1a has running EKV
+
+        perform_handoff (parallel per shard):
+          send {:ekv_handoff_request}  ──>  Replica receives request
+                                              1. Fail all pending_cas
+                                              2. Persist ballot_counter
+                                              3. PRAGMA wal_checkpoint(TRUNCATE)
+                                              4. Close writer db
+          receive {:ekv_handoff_ack}   <──  5. Send ack
+                                              6. Enter proxy mode
+
+        Start children:
+          Replica.init opens SAME db files
+          Peers discover via nodeup            Proxy calls to m1b
+          CAS works immediately                Readers alive until shutdown
 
   ### Marker File
 
-  The `current` marker is a single line: `"slot\tnode_name\n"` (tab-separated).
-  Written atomically via write-to-tmp + `File.rename!/2` (POSIX rename is
-  atomic on the same filesystem). Read on every startup to decide which slot
-  to use.
+  The `current` marker is a single line: `"node_name\n"`. Written atomically
+  via write-to-tmp + `File.rename!/2`. Read on every startup to discover the
+  old node for handoff.
 
-  ### Slot Resolution (`resolve_blue_green_slot/2`)
+  ### Handoff Resolution (`perform_handoff/3`)
 
-  1. **No marker** → first boot. Create `slot_a/`, write marker, return
-     `slot_a` path.
+  1. **No marker** → first boot. Write marker, proceed normally.
 
-  2. **Marker node == `node()`** → same-VM restart (supervisor restart,
-     application reload). Reopen the same slot. No snapshot needed.
+  2. **Marker node == `node()`** → same-VM restart. No handoff needed.
 
-  3. **Marker node != `node()`** → blue-green deploy. Snapshot current slot
-     to the other slot, flip marker, return new slot path.
+  3. **Marker node != `node()`** → blue-green deploy. Send handoff request
+     to old VM's shards in parallel (5s timeout per shard). If old VM is
+     dead, requests timeout and new VM opens files directly (WAL recovery).
 
-  ### Snapshot (`snapshot_shards/3`)
+  ### Key Invariants
 
-  Uses `Task.async_stream` to backup all shards in parallel. For each shard:
-
-  1. Remove any stale WAL/SHM files at the destination (leftover from a
-     previous slot occupant).
-  2. Remove the destination `.db` file.
-  3. Call `Store.backup_shard/3` which invokes the `ekv_backup` NIF.
-
-  The NIF uses SQLite's online backup API (`sqlite3_backup_init/step/finish`).
-  The source is opened `SQLITE_OPEN_READONLY` — safe to run while the old
-  VM's WAL writer is active. `sqlite3_backup_step(backup, -1)` copies all
-  pages in a single pass.
-
-  ### Interaction with Other Features
-
-  - **Stale DB detection**: The snapshotted database inherits the source's
-    `last_active_at` timestamp. A fresh source produces a non-stale copy;
-    a genuinely stale source is correctly wiped by `Store.open/3`.
-
-  - **HWMs preserved**: The snapshot includes `kv_peer_hwm` rows, so the
-    new VM can delta-sync from peers instead of requiring full sync.
-
-  - **Oplog preserved**: The snapshot includes the full oplog, so the new
-    VM advertises a meaningful `max_seq` in its peer handshake.
-
-  - **Shard count**: Validated by `Store.open/3` as usual. The snapshot
-    preserves the `kv_meta` `num_shards` row, so mismatches are caught.
+  - Single writer: old writer closed before new writer opens
+  - Ballot monotonicity: persisted before close, max(now, persisted+1) on init
+  - Quorum safety: same node_id → count_alive_node_ids counts as 1
+  - kv_paxos durable: promise/accept state survives in SQLite
+  - No data loss: WAL checkpoint flushes everything before close
   """
 
   @valid_opts [
@@ -83,7 +69,8 @@ defmodule EKV.Supervisor do
     :blue_green,
     :cluster_size,
     :node_id,
-    :sync_chunk_size
+    :sync_chunk_size,
+    :skip_stale_check
   ]
 
   def start_link(opts) do
@@ -104,13 +91,52 @@ defmodule EKV.Supervisor do
     cluster_size = Keyword.get(opts, :cluster_size)
     node_id = Keyword.get(opts, :node_id)
     sync_chunk_size = Keyword.get(opts, :sync_chunk_size, 500)
+    skip_stale_check = Keyword.get(opts, :skip_stale_check, false)
 
     validate_cas_config!(cluster_size, node_id)
 
-    data_dir =
-      if blue_green,
-        do: resolve_blue_green_slot(data_dir, num_shards),
-        else: data_dir
+    # Normalize node_id to string early
+    node_id =
+      case node_id do
+        nil -> nil
+        id when is_integer(id) -> Integer.to_string(id)
+        id when is_binary(id) -> id
+      end
+
+    if blue_green, do: perform_handoff(name, data_dir, num_shards)
+
+    # Auto-persist node_id resolution
+    effective_node_id =
+      if cluster_size do
+        persisted = EKV.Store.read_node_id(data_dir)
+
+        cond do
+          persisted != nil and node_id != nil and persisted != node_id ->
+            require Logger
+
+            Logger.warning(
+              "[EKV #{name}] configured node_id #{inspect(node_id)} differs from " <>
+                "persisted #{inspect(persisted)} (volume identity) — using persisted"
+            )
+
+            persisted
+
+          persisted != nil ->
+            persisted
+
+          node_id != nil ->
+            node_id
+
+          true ->
+            generated = :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
+
+            require Logger
+            Logger.info("[EKV #{name}] generated node_id: #{generated}")
+            generated
+        end
+      else
+        nil
+      end
 
     registry_name = :"#{name}_ekv_registry"
     sub_tracker_name = :"#{name}_ekv_sub_tracker"
@@ -125,8 +151,9 @@ defmodule EKV.Supervisor do
       registry: registry_name,
       sub_count: sub_count,
       cluster_size: cluster_size,
-      node_id: node_id,
-      sync_chunk_size: sync_chunk_size
+      node_id: effective_node_id,
+      sync_chunk_size: sync_chunk_size,
+      skip_stale_check: skip_stale_check
     }
 
     :persistent_term.put({EKV, name}, config)
@@ -146,103 +173,94 @@ defmodule EKV.Supervisor do
   # CAS config validation
   # =====================================================================
 
-  defp validate_cas_config!(nil, nil), do: :ok
+  defp validate_cas_config!(nil, _node_id), do: :ok
 
-  defp validate_cas_config!(cluster_size, nil) when is_integer(cluster_size) do
-    raise ArgumentError, "EKV: :node_id is required when :cluster_size is set"
-  end
-
-  defp validate_cas_config!(nil, node_id) when not is_nil(node_id) do
-    raise ArgumentError, "EKV: :cluster_size is required when :node_id is set"
-  end
-
-  defp validate_cas_config!(cluster_size, node_id)
-       when is_integer(cluster_size) and is_integer(node_id) do
-    if cluster_size < 1 do
-      raise ArgumentError, "EKV: :cluster_size must be a positive integer, got: #{cluster_size}"
-    end
-
-    if node_id < 1 do
-      raise ArgumentError, "EKV: :node_id must be a positive integer, got: #{node_id}"
-    end
-
-    if node_id > cluster_size do
+  defp validate_cas_config!(cluster_size, node_id) do
+    unless is_integer(cluster_size) and cluster_size >= 1 do
       raise ArgumentError,
-            "EKV: :node_id (#{node_id}) must be <= :cluster_size (#{cluster_size})"
+            "EKV: :cluster_size must be a positive integer, got: #{inspect(cluster_size)}"
+    end
+
+    # node_id is optional (auto-generated if nil)
+    # If provided, must be a string or positive integer (converted to string)
+    case node_id do
+      nil ->
+        :ok
+
+      id when is_binary(id) and byte_size(id) > 0 ->
+        :ok
+
+      id when is_integer(id) and id >= 1 ->
+        :ok
+
+      _ ->
+        raise ArgumentError,
+              "EKV: :node_id must be a non-empty string or positive integer, got: #{inspect(node_id)}"
     end
   end
 
-  defp validate_cas_config!(_cluster_size, _node_id) do
-    raise ArgumentError, "EKV: :cluster_size and :node_id must be positive integers"
-  end
-
   # =====================================================================
-  # Blue-green slot management
+  # Blue-green handoff
   # =====================================================================
 
-  defp resolve_blue_green_slot(data_dir, num_shards) do
+  defp perform_handoff(name, data_dir, num_shards) do
     File.mkdir_p!(data_dir)
+    old_node_str = read_marker(data_dir)
 
-    case read_marker(data_dir) do
-      nil ->
-        # First boot — use slot_a
-        slot_dir = Path.join(data_dir, "slot_a")
-        File.mkdir_p!(slot_dir)
-        write_marker(data_dir, "a", node())
-        slot_dir
+    cond do
+      # No marker — first boot
+      old_node_str == nil ->
+        write_marker(data_dir, node())
 
-      {slot, node_str} ->
-        if node_str == Atom.to_string(node()) do
-          # Same node restart — reopen same slot
-          Path.join(data_dir, "slot_#{slot}")
-        else
-          # Blue-green deploy — snapshot current slot to other slot
-          other = if slot == "a", do: "b", else: "a"
-          source_dir = Path.join(data_dir, "slot_#{slot}")
-          dest_dir = Path.join(data_dir, "slot_#{other}")
-          snapshot_shards(source_dir, dest_dir, num_shards)
-          write_marker(data_dir, other, node())
-          dest_dir
-        end
+      # Same node restart — no handoff needed
+      old_node_str == Atom.to_string(node()) ->
+        :ok
+
+      # Different node — attempt handoff
+      true ->
+        old_node = String.to_atom(old_node_str)
+
+        require Logger
+        Logger.info("[EKV #{name}] handoff: requesting from #{old_node}")
+
+        0..(num_shards - 1)
+        |> Task.async_stream(
+          fn shard_index ->
+            shard_name = EKV.Replica.shard_name(name, shard_index)
+            ref = make_ref()
+            send({shard_name, old_node}, {:ekv_handoff_request, ref, node(), self()})
+
+            receive do
+              {:ekv_handoff_ack, ^ref} -> :ok
+            after
+              5_000 -> :timeout
+            end
+          end,
+          ordered: false,
+          timeout: 10_000
+        )
+        |> Stream.run()
+
+        # Update marker to current node
+        write_marker(data_dir, node())
     end
   end
 
   defp read_marker(data_dir) do
-    marker_path = Path.join(data_dir, "current")
-
-    case File.read(marker_path) do
+    case File.read(Path.join(data_dir, "current")) do
       {:ok, contents} ->
-        case String.split(String.trim(contents), "\t", parts: 2) do
-          [slot, node_str] -> {slot, node_str}
-          _ -> nil
-        end
+        trimmed = String.trim(contents)
+        if trimmed == "", do: nil, else: trimmed
 
       {:error, _} ->
         nil
     end
   end
 
-  defp write_marker(data_dir, slot, node_name) do
+  defp write_marker(data_dir, node_name) do
     marker_path = Path.join(data_dir, "current")
     tmp_path = marker_path <> ".tmp"
-    File.write!(tmp_path, "#{slot}\t#{node_name}\n")
+    File.write!(tmp_path, "#{node_name}\n")
     File.rename!(tmp_path, marker_path)
-  end
-
-  defp snapshot_shards(source_dir, dest_dir, num_shards) do
-    File.mkdir_p!(dest_dir)
-
-    0..(num_shards - 1)
-    |> Task.async_stream(
-      fn shard_index ->
-        dest_db = Path.join(dest_dir, "shard_#{shard_index}.db")
-        File.rm(dest_db <> "-wal")
-        File.rm(dest_db <> "-shm")
-        File.rm(dest_db)
-        :ok = EKV.Store.backup_shard(source_dir, dest_dir, shard_index)
-      end,
-      ordered: false
-    )
-    |> Stream.run()
   end
 end

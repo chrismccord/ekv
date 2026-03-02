@@ -1988,4 +1988,738 @@ defmodule EKV.CASDistributedTest do
       assert TestCluster.rpc!(node_a, EKV, :get, [ekv_name, "freeze/1"]) == "val"
     end
   end
+
+  # =====================================================================
+  # Handoff — blue-green deployment with synchronized local handoff
+  # =====================================================================
+
+  describe "handoff" do
+    defp start_handoff_cluster(n1, n2, n3, ekv_name, shared_dir) do
+      # n1: shared_dir, node_id "m1", blue_green: true (writes marker on first boot)
+      data_dir_n1 = shared_dir
+      TestCluster.rpc!(n1, File, :mkdir_p!, [data_dir_n1])
+
+      TestCluster.start_ekv(
+        n1,
+        name: ekv_name,
+        data_dir: data_dir_n1,
+        shards: 2,
+        log: false,
+        blue_green: true,
+        gc_interval: :timer.hours(1),
+        tombstone_ttl: :timer.hours(24 * 7),
+        cluster_size: 3,
+        node_id: "m1"
+      )
+
+      # n2: own dir, node_id "m2"
+      data_dir_n2 = "/tmp/ekv_handoff_n2_#{ekv_name}"
+      TestCluster.rpc!(n2, File, :rm_rf!, [data_dir_n2])
+
+      TestCluster.start_ekv(
+        n2,
+        name: ekv_name,
+        data_dir: data_dir_n2,
+        shards: 2,
+        log: false,
+        gc_interval: :timer.hours(1),
+        tombstone_ttl: :timer.hours(24 * 7),
+        cluster_size: 3,
+        node_id: "m2"
+      )
+
+      # n3: own dir, node_id "m3"
+      data_dir_n3 = "/tmp/ekv_handoff_n3_#{ekv_name}"
+      TestCluster.rpc!(n3, File, :rm_rf!, [data_dir_n3])
+
+      TestCluster.start_ekv(
+        n3,
+        name: ekv_name,
+        data_dir: data_dir_n3,
+        shards: 2,
+        log: false,
+        gc_interval: :timer.hours(1),
+        tombstone_ttl: :timer.hours(24 * 7),
+        cluster_size: 3,
+        node_id: "m3"
+      )
+    end
+
+    defp cleanup_handoff_data(peers, ekv_name, shared_dir) do
+      for {_pid, node} <- peers do
+        try do
+          TestCluster.rpc!(node, File, :rm_rf!, ["/tmp/ekv_handoff_n2_#{ekv_name}"])
+          TestCluster.rpc!(node, File, :rm_rf!, ["/tmp/ekv_handoff_n3_#{ekv_name}"])
+        catch
+          _, _ -> :ok
+        end
+      end
+
+      File.rm_rf!(shared_dir)
+    end
+
+    test "basic handoff: data visible after deploy" do
+      peers = TestCluster.start_peers(4)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, n1}, {_, n1b}, {_, n2}, {_, n3}] = peers
+      ekv_name = unique_name(:handoff)
+      shared_dir = "/tmp/ekv_handoff_shared_#{ekv_name}"
+      on_exit(fn -> cleanup_handoff_data(peers, ekv_name, shared_dir) end)
+
+      # Start 3-node cluster: n1, n2, n3
+      start_handoff_cluster(n1, n2, n3, ekv_name, shared_dir)
+      Process.sleep(500)
+
+      # Write data on n1
+      :ok = TestCluster.rpc!(n1, EKV, :put, [ekv_name, "key1", "val1"])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(n2, EKV, :get, [ekv_name, "key1"]) == "val1"
+      end)
+
+      # Start n1b with same shared_dir and same node_id, blue_green: true
+      # n1 wrote the marker on first boot (blue_green: true)
+      # n1b reads it to discover n1 for handoff
+      TestCluster.start_ekv(
+        n1b,
+        name: ekv_name,
+        data_dir: shared_dir,
+        shards: 2,
+        log: false,
+        blue_green: true,
+        gc_interval: :timer.hours(1),
+        tombstone_ttl: :timer.hours(24 * 7),
+        cluster_size: 3,
+        node_id: "m1"
+      )
+
+      Process.sleep(500)
+
+      # Kill n1's EKV
+      TestCluster.rpc!(n1, TestCluster, :kill_registered, [:"#{ekv_name}_ekv_sup"])
+      Process.sleep(200)
+
+      # Data visible on n1b
+      assert TestCluster.rpc!(n1b, EKV, :get, [ekv_name, "key1"]) == "val1"
+      # Data still on n2 and n3
+      assert TestCluster.rpc!(n2, EKV, :get, [ekv_name, "key1"]) == "val1"
+      assert TestCluster.rpc!(n3, EKV, :get, [ekv_name, "key1"]) == "val1"
+    end
+
+    test "CAS works after handoff" do
+      peers = TestCluster.start_peers(4)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, n1}, {_, n1b}, {_, n2}, {_, n3}] = peers
+      ekv_name = unique_name(:handoff)
+      shared_dir = "/tmp/ekv_handoff_shared_#{ekv_name}"
+      on_exit(fn -> cleanup_handoff_data(peers, ekv_name, shared_dir) end)
+
+      start_handoff_cluster(n1, n2, n3, ekv_name, shared_dir)
+      Process.sleep(500)
+
+      # CAS write on n1
+      :ok = TestCluster.rpc!(n1, EKV, :put, [ekv_name, "cas/1", "v1", [if_vsn: nil]])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(n2, EKV, :get, [ekv_name, "cas/1"]) == "v1"
+      end)
+
+      # Handoff to n1b
+      File.write!(Path.join(shared_dir, "current"), "#{n1}\n")
+
+      TestCluster.start_ekv(
+        n1b,
+        name: ekv_name,
+        data_dir: shared_dir,
+        shards: 2,
+        log: false,
+        blue_green: true,
+        gc_interval: :timer.hours(1),
+        tombstone_ttl: :timer.hours(24 * 7),
+        cluster_size: 3,
+        node_id: "m1"
+      )
+
+      Process.sleep(500)
+
+      TestCluster.rpc!(n1, TestCluster, :kill_registered, [:"#{ekv_name}_ekv_sup"])
+      Process.sleep(200)
+
+      # CAS update on n1b with old version
+      {:ok, "v1", vsn} = TestCluster.rpc!(n1b, EKV, :fetch, [ekv_name, "cas/1"])
+      :ok = TestCluster.rpc!(n1b, EKV, :put, [ekv_name, "cas/1", "v2", [if_vsn: vsn]])
+      assert TestCluster.rpc!(n1b, EKV, :get, [ekv_name, "cas/1"]) == "v2"
+
+      # CAS from n2 works (n1b is acceptor)
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(n2, EKV, :get, [ekv_name, "cas/1"]) == "v2"
+      end)
+
+      {:ok, "v2", vsn2} = TestCluster.rpc!(n2, EKV, :fetch, [ekv_name, "cas/1"])
+      :ok = TestCluster.rpc!(n2, EKV, :put, [ekv_name, "cas/1", "v3", [if_vsn: vsn2]])
+      assert TestCluster.rpc!(n2, EKV, :get, [ekv_name, "cas/1"]) == "v3"
+    end
+
+    test "handoff timeout — old node dead" do
+      peers = TestCluster.start_peers(4)
+      [{peer_n1, n1}, {_, n1b}, {_, n2}, {_, n3}] = peers
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      ekv_name = unique_name(:handoff)
+      shared_dir = "/tmp/ekv_handoff_shared_#{ekv_name}"
+      on_exit(fn -> cleanup_handoff_data(peers, ekv_name, shared_dir) end)
+
+      start_handoff_cluster(n1, n2, n3, ekv_name, shared_dir)
+      Process.sleep(500)
+
+      :ok = TestCluster.rpc!(n1, EKV, :put, [ekv_name, "dead/1", "val", [if_vsn: nil]])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(n2, EKV, :get, [ekv_name, "dead/1"]) == "val"
+      end)
+
+      # Kill n1 completely
+      :peer.stop(peer_n1)
+      Process.sleep(200)
+
+      # Start n1b — handoff times out, opens files directly
+      File.write!(Path.join(shared_dir, "current"), "#{n1}\n")
+
+      TestCluster.start_ekv(
+        n1b,
+        name: ekv_name,
+        data_dir: shared_dir,
+        shards: 2,
+        log: false,
+        blue_green: true,
+        gc_interval: :timer.hours(1),
+        tombstone_ttl: :timer.hours(24 * 7),
+        cluster_size: 3,
+        node_id: "m1"
+      )
+
+      Process.sleep(500)
+
+      # Data still there (WAL recovery)
+      assert TestCluster.rpc!(n1b, EKV, :get, [ekv_name, "dead/1"]) == "val"
+
+      # CAS works after peers connect
+      TestCluster.assert_eventually(fn ->
+        try do
+          :ok == TestCluster.rpc!(n1b, EKV, :put, [ekv_name, "dead/2", "new", [if_vsn: nil]])
+        rescue
+          _ -> false
+        end
+      end)
+    end
+
+    test "in-flight CAS aborted during handoff" do
+      peers = TestCluster.start_peers(4)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, n1}, {_, n1b}, {_, n2}, {_, n3}] = peers
+      ekv_name = unique_name(:handoff)
+      shared_dir = "/tmp/ekv_handoff_shared_#{ekv_name}"
+      on_exit(fn -> cleanup_handoff_data(peers, ekv_name, shared_dir) end)
+
+      start_handoff_cluster(n1, n2, n3, ekv_name, shared_dir)
+      Process.sleep(500)
+
+      # Suspend both n2 AND n3 shards to stall CAS responses
+      # (quorum=2, n1 is local acceptor, so we need both remote nodes frozen)
+      TestCluster.suspend_shards(n2, ekv_name)
+      TestCluster.suspend_shards(n3, ekv_name)
+
+      # Start CAS on n1 (will block waiting for remote acceptors)
+      cas_task =
+        Task.async(fn ->
+          TestCluster.rpc!(n1, EKV, :put, [ekv_name, "inflight/1", "val", [if_vsn: nil]])
+        end)
+
+      Process.sleep(100)
+
+      # Handoff n1 → n1b: drains n1's pending_cas
+      File.write!(Path.join(shared_dir, "current"), "#{n1}\n")
+
+      TestCluster.start_ekv(
+        n1b,
+        name: ekv_name,
+        data_dir: shared_dir,
+        shards: 2,
+        log: false,
+        blue_green: true,
+        gc_interval: :timer.hours(1),
+        tombstone_ttl: :timer.hours(24 * 7),
+        cluster_size: 3,
+        node_id: "m1"
+      )
+
+      # n1's CAS caller gets :shutting_down
+      result = Task.await(cas_task, 15_000)
+      assert result == {:error, :shutting_down}
+
+      # Resume n2 and n3, kill n1's EKV
+      TestCluster.resume_shards(n2, ekv_name)
+      TestCluster.resume_shards(n3, ekv_name)
+      TestCluster.rpc!(n1, TestCluster, :kill_registered, [:"#{ekv_name}_ekv_sup"])
+      Process.sleep(500)
+
+      # New CAS on n1b succeeds
+      TestCluster.assert_eventually(fn ->
+        try do
+          :ok == TestCluster.rpc!(n1b, EKV, :put, [ekv_name, "inflight/2", "new", [if_vsn: nil]])
+        rescue
+          _ -> false
+        end
+      end)
+    end
+
+    test "peer replication continues after handoff" do
+      peers = TestCluster.start_peers(4)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, n1}, {_, n1b}, {_, n2}, {_, n3}] = peers
+      ekv_name = unique_name(:handoff)
+      shared_dir = "/tmp/ekv_handoff_shared_#{ekv_name}"
+      on_exit(fn -> cleanup_handoff_data(peers, ekv_name, shared_dir) end)
+
+      start_handoff_cluster(n1, n2, n3, ekv_name, shared_dir)
+      Process.sleep(500)
+
+      # Handoff n1 → n1b
+      File.write!(Path.join(shared_dir, "current"), "#{n1}\n")
+
+      TestCluster.start_ekv(
+        n1b,
+        name: ekv_name,
+        data_dir: shared_dir,
+        shards: 2,
+        log: false,
+        blue_green: true,
+        gc_interval: :timer.hours(1),
+        tombstone_ttl: :timer.hours(24 * 7),
+        cluster_size: 3,
+        node_id: "m1"
+      )
+
+      Process.sleep(500)
+
+      TestCluster.rpc!(n1, TestCluster, :kill_registered, [:"#{ekv_name}_ekv_sup"])
+      Process.sleep(200)
+
+      # Write on n2
+      :ok = TestCluster.rpc!(n2, EKV, :put, [ekv_name, "peer/1", "from_n2"])
+
+      # Value appears on n1b (peers reconnect + replicate)
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(n1b, EKV, :get, [ekv_name, "peer/1"]) == "from_n2"
+      end)
+    end
+
+    test "handoff during partition" do
+      peers = TestCluster.start_peers(4)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, n1}, {_, n1b}, {_, n2}, {_, n3}] = peers
+      ekv_name = unique_name(:handoff)
+      shared_dir = "/tmp/ekv_handoff_shared_#{ekv_name}"
+      on_exit(fn -> cleanup_handoff_data(peers, ekv_name, shared_dir) end)
+
+      start_handoff_cluster(n1, n2, n3, ekv_name, shared_dir)
+      Process.sleep(500)
+
+      # Partition n3 from cluster
+      TestCluster.disconnect_nodes(n1, n3)
+      TestCluster.disconnect_nodes(n2, n3)
+      TestCluster.disconnect_nodes(n1b, n3)
+      Process.sleep(200)
+
+      # Handoff n1 → n1b
+      File.write!(Path.join(shared_dir, "current"), "#{n1}\n")
+
+      TestCluster.start_ekv(
+        n1b,
+        name: ekv_name,
+        data_dir: shared_dir,
+        shards: 2,
+        log: false,
+        blue_green: true,
+        gc_interval: :timer.hours(1),
+        tombstone_ttl: :timer.hours(24 * 7),
+        cluster_size: 3,
+        node_id: "m1"
+      )
+
+      Process.sleep(500)
+
+      TestCluster.rpc!(n1, TestCluster, :kill_registered, [:"#{ekv_name}_ekv_sup"])
+      Process.sleep(200)
+
+      # Write on n1b (quorum from n1b+n2)
+      :ok = TestCluster.rpc!(n1b, EKV, :put, [ekv_name, "part/1", "val", [if_vsn: nil]])
+
+      # Heal partition
+      TestCluster.reconnect_nodes(n1b, n3)
+      TestCluster.reconnect_nodes(n2, n3)
+
+      # n3 syncs with n1b, all data converges
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(n3, EKV, :get, [ekv_name, "part/1"]) == "val"
+      end)
+    end
+
+    test "quorum correct during overlap: same node_id counts as 1" do
+      peers = TestCluster.start_peers(4)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, n1}, {_, n1b}, {_, n2}, {_, n3}] = peers
+      ekv_name = unique_name(:handoff)
+      shared_dir = "/tmp/ekv_handoff_shared_#{ekv_name}"
+      on_exit(fn -> cleanup_handoff_data(peers, ekv_name, shared_dir) end)
+
+      start_handoff_cluster(n1, n2, n3, ekv_name, shared_dir)
+      Process.sleep(500)
+
+      # Handoff n1 → n1b
+      File.write!(Path.join(shared_dir, "current"), "#{n1}\n")
+
+      TestCluster.start_ekv(
+        n1b,
+        name: ekv_name,
+        data_dir: shared_dir,
+        shards: 2,
+        log: false,
+        blue_green: true,
+        gc_interval: :timer.hours(1),
+        tombstone_ttl: :timer.hours(24 * 7),
+        cluster_size: 3,
+        node_id: "m1"
+      )
+
+      Process.sleep(500)
+
+      # Both n1 (proxy mode) and n1b are alive — same node_id "m1"
+      # CAS on n2 should work (n1b + n2 have distinct node_ids, quorum ok)
+      :ok = TestCluster.rpc!(n2, EKV, :put, [ekv_name, "overlap/1", "val", [if_vsn: nil]])
+
+      # count_alive_node_ids should be 3 (not 4)
+      shard_state = TestCluster.rpc!(n2, :sys, :get_state, [:"#{ekv_name}_ekv_replica_0"])
+      peer_ids = Map.values(shard_state.peer_node_ids) |> Enum.reject(&is_nil/1) |> MapSet.new()
+      all_ids = MapSet.put(peer_ids, shard_state.node_id) |> MapSet.size()
+      assert all_ids <= 3
+    end
+
+    test "write proxy during handoff window" do
+      peers = TestCluster.start_peers(4)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, n1}, {_, n1b}, {_, n2}, {_, n3}] = peers
+      ekv_name = unique_name(:handoff)
+      shared_dir = "/tmp/ekv_handoff_shared_#{ekv_name}"
+      on_exit(fn -> cleanup_handoff_data(peers, ekv_name, shared_dir) end)
+
+      start_handoff_cluster(n1, n2, n3, ekv_name, shared_dir)
+      Process.sleep(500)
+
+      # Handoff n1 → n1b
+      File.write!(Path.join(shared_dir, "current"), "#{n1}\n")
+
+      TestCluster.start_ekv(
+        n1b,
+        name: ekv_name,
+        data_dir: shared_dir,
+        shards: 2,
+        log: false,
+        blue_green: true,
+        gc_interval: :timer.hours(1),
+        tombstone_ttl: :timer.hours(24 * 7),
+        cluster_size: 3,
+        node_id: "m1"
+      )
+
+      Process.sleep(500)
+
+      # n1 is in proxy mode — LWW put via n1 proxied to n1b
+      :ok = TestCluster.rpc!(n1, EKV, :put, [ekv_name, "proxy/1", "proxied"])
+
+      # Verify on n1b
+      assert TestCluster.rpc!(n1b, EKV, :get, [ekv_name, "proxy/1"]) == "proxied"
+
+      # Verify on n2 after replication
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(n2, EKV, :get, [ekv_name, "proxy/1"]) == "proxied"
+      end)
+    end
+
+    test "multiple handoff cycles" do
+      peers = TestCluster.start_peers(4)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, n1}, {_, n1b}, {_, n2}, {_, n3}] = peers
+      ekv_name = unique_name(:handoff)
+      shared_dir = "/tmp/ekv_handoff_shared_#{ekv_name}"
+      on_exit(fn -> cleanup_handoff_data(peers, ekv_name, shared_dir) end)
+
+      start_handoff_cluster(n1, n2, n3, ekv_name, shared_dir)
+      Process.sleep(500)
+
+      # Deploy 1: write on n1
+      :ok = TestCluster.rpc!(n1, EKV, :put, [ekv_name, "cycle/1", "from_n1"])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(n2, EKV, :get, [ekv_name, "cycle/1"]) == "from_n1"
+      end)
+
+      # Handoff to n1b
+      File.write!(Path.join(shared_dir, "current"), "#{n1}\n")
+
+      TestCluster.start_ekv(
+        n1b,
+        name: ekv_name,
+        data_dir: shared_dir,
+        shards: 2,
+        log: false,
+        blue_green: true,
+        gc_interval: :timer.hours(1),
+        tombstone_ttl: :timer.hours(24 * 7),
+        cluster_size: 3,
+        node_id: "m1"
+      )
+
+      Process.sleep(500)
+
+      TestCluster.rpc!(n1, TestCluster, :kill_registered, [:"#{ekv_name}_ekv_sup"])
+      Process.sleep(200)
+
+      # Deploy 2: write on n1b
+      :ok = TestCluster.rpc!(n1b, EKV, :put, [ekv_name, "cycle/2", "from_n1b"])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(n2, EKV, :get, [ekv_name, "cycle/2"]) == "from_n1b"
+      end)
+
+      # Stop n1b's EKV and restart on same node (simulates n1b→n1c reusing peer)
+      TestCluster.rpc!(n1b, TestCluster, :kill_registered, [:"#{ekv_name}_ekv_sup"])
+      Process.sleep(200)
+
+      # Marker already points to n1b (written during first handoff)
+      # Restarting n1b with blue_green: true → same-node restart, no handoff
+      TestCluster.start_ekv(
+        n1b,
+        name: ekv_name,
+        data_dir: shared_dir,
+        shards: 2,
+        log: false,
+        blue_green: true,
+        gc_interval: :timer.hours(1),
+        tombstone_ttl: :timer.hours(24 * 7),
+        cluster_size: 3,
+        node_id: "m1"
+      )
+
+      Process.sleep(500)
+
+      # All data from both deploys preserved
+      assert TestCluster.rpc!(n1b, EKV, :get, [ekv_name, "cycle/1"]) == "from_n1"
+      assert TestCluster.rpc!(n1b, EKV, :get, [ekv_name, "cycle/2"]) == "from_n1b"
+    end
+
+    test "CAS proxy through old node in proxy mode" do
+      peers = TestCluster.start_peers(4)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, n1}, {_, n1b}, {_, n2}, {_, n3}] = peers
+      ekv_name = unique_name(:handoff)
+      shared_dir = "/tmp/ekv_handoff_shared_#{ekv_name}"
+      on_exit(fn -> cleanup_handoff_data(peers, ekv_name, shared_dir) end)
+
+      start_handoff_cluster(n1, n2, n3, ekv_name, shared_dir)
+      Process.sleep(500)
+
+      # Handoff n1 → n1b
+      # n1 wrote the marker on first boot (blue_green: true)
+      # n1b reads it to discover n1 for handoff
+      TestCluster.start_ekv(
+        n1b,
+        name: ekv_name,
+        data_dir: shared_dir,
+        shards: 2,
+        log: false,
+        blue_green: true,
+        gc_interval: :timer.hours(1),
+        tombstone_ttl: :timer.hours(24 * 7),
+        cluster_size: 3,
+        node_id: "m1"
+      )
+
+      Process.sleep(500)
+
+      # n1 is now in proxy mode — CAS put via n1 should be proxied to n1b
+      :ok = TestCluster.rpc!(n1, EKV, :put, [ekv_name, "cas_proxy/1", "via_proxy", [if_vsn: nil]])
+
+      # Value visible on n1b (the actual writer)
+      assert TestCluster.rpc!(n1b, EKV, :get, [ekv_name, "cas_proxy/1"]) == "via_proxy"
+
+      # CAS update via proxy
+      {:ok, "via_proxy", vsn} = TestCluster.rpc!(n1, EKV, :fetch, [ekv_name, "cas_proxy/1"])
+      :ok = TestCluster.rpc!(n1, EKV, :put, [ekv_name, "cas_proxy/1", "updated", [if_vsn: vsn]])
+      assert TestCluster.rpc!(n1b, EKV, :get, [ekv_name, "cas_proxy/1"]) == "updated"
+
+      # CAS delete via proxy
+      {:ok, "updated", vsn2} = TestCluster.rpc!(n1, EKV, :fetch, [ekv_name, "cas_proxy/1"])
+      :ok = TestCluster.rpc!(n1, EKV, :delete, [ekv_name, "cas_proxy/1", [if_vsn: vsn2]])
+      assert TestCluster.rpc!(n1b, EKV, :get, [ekv_name, "cas_proxy/1"]) == nil
+
+      # EKV.update via proxy
+      :ok = TestCluster.rpc!(n1, EKV, :put, [ekv_name, "cas_proxy/cnt", "seed", [if_vsn: nil]])
+
+      {:ok, "SEED"} =
+        TestCluster.rpc!(n1, EKV, :update, [ekv_name, "cas_proxy/cnt", &TestCluster.cas_upcase/1])
+
+      assert TestCluster.rpc!(n1b, EKV, :get, [ekv_name, "cas_proxy/cnt"]) == "SEED"
+    end
+
+    test "subscriber events during and after handoff" do
+      peers = TestCluster.start_peers(4)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, n1}, {_, n1b}, {_, n2}, {_, n3}] = peers
+      ekv_name = unique_name(:handoff)
+      shared_dir = "/tmp/ekv_handoff_shared_#{ekv_name}"
+      on_exit(fn -> cleanup_handoff_data(peers, ekv_name, shared_dir) end)
+
+      start_handoff_cluster(n1, n2, n3, ekv_name, shared_dir)
+      Process.sleep(500)
+
+      # Subscribe on n2 for all keys
+      TestCluster.start_collecting_subscriber_on(n2, ekv_name, "", self(), 3000)
+      Process.sleep(100)
+
+      # Write before handoff — should trigger event on n2
+      :ok = TestCluster.rpc!(n1, EKV, :put, [ekv_name, "sub/before", "v1"])
+
+      # Handoff n1 → n1b
+      # n1 wrote the marker on first boot (blue_green: true)
+      # n1b reads it to discover n1 for handoff
+      TestCluster.start_ekv(
+        n1b,
+        name: ekv_name,
+        data_dir: shared_dir,
+        shards: 2,
+        log: false,
+        blue_green: true,
+        gc_interval: :timer.hours(1),
+        tombstone_ttl: :timer.hours(24 * 7),
+        cluster_size: 3,
+        node_id: "m1"
+      )
+
+      Process.sleep(500)
+
+      TestCluster.rpc!(n1, TestCluster, :kill_registered, [:"#{ekv_name}_ekv_sup"])
+      Process.sleep(200)
+
+      # Write after handoff — from n1b, should replicate to n2 and trigger event
+      :ok = TestCluster.rpc!(n1b, EKV, :put, [ekv_name, "sub/after", "v2"])
+
+      # Write from n2 itself — local event
+      :ok = TestCluster.rpc!(n2, EKV, :put, [ekv_name, "sub/local", "v3"])
+
+      # Collect events
+      assert_receive {:collected_events, events}, 5000
+
+      event_keys = Enum.map(events, & &1.key) |> MapSet.new()
+
+      # Pre-handoff write event
+      assert "sub/before" in event_keys
+
+      # Post-handoff write event (from n1b replicated to n2)
+      assert "sub/after" in event_keys
+
+      # Local write event
+      assert "sub/local" in event_keys
+    end
+
+    test "first-boot marker creation via perform_handoff" do
+      peers = TestCluster.start_peers(4)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, n1}, {_, n1b}, {_, n2}, {_, _n3}] = peers
+      ekv_name = unique_name(:handoff)
+      shared_dir = "/tmp/ekv_handoff_shared_#{ekv_name}"
+      on_exit(fn -> cleanup_handoff_data(peers, ekv_name, shared_dir) end)
+
+      # Verify no marker exists before EKV starts
+      refute File.exists?(Path.join(shared_dir, "current"))
+
+      # Start n1 with blue_green: true — first boot creates marker
+      TestCluster.rpc!(n1, File, :mkdir_p!, [shared_dir])
+
+      TestCluster.start_ekv(
+        n1,
+        name: ekv_name,
+        data_dir: shared_dir,
+        shards: 2,
+        log: false,
+        blue_green: true,
+        gc_interval: :timer.hours(1),
+        tombstone_ttl: :timer.hours(24 * 7),
+        cluster_size: 3,
+        node_id: "m1"
+      )
+
+      # Marker should exist and contain n1's node name
+      assert File.exists?(Path.join(shared_dir, "current"))
+      {:ok, marker} = File.read(Path.join(shared_dir, "current"))
+      assert String.trim(marker) == Atom.to_string(n1)
+
+      # Write data on n1
+      :ok = TestCluster.rpc!(n1, EKV, :put, [ekv_name, "marker/1", "val"])
+
+      # Start n2 and n3 (non-blue-green, own dirs)
+      data_dir_n2 = "/tmp/ekv_handoff_n2_#{ekv_name}"
+      TestCluster.rpc!(n2, File, :rm_rf!, [data_dir_n2])
+
+      TestCluster.start_ekv(
+        n2,
+        name: ekv_name,
+        data_dir: data_dir_n2,
+        shards: 2,
+        log: false,
+        gc_interval: :timer.hours(1),
+        tombstone_ttl: :timer.hours(24 * 7),
+        cluster_size: 3,
+        node_id: "m2"
+      )
+
+      Process.sleep(500)
+
+      # n1b starts with blue_green: true → reads marker → discovers n1 → handoff
+      # n1 wrote the marker on first boot (blue_green: true)
+      # n1b reads it to discover n1 for handoff
+      TestCluster.start_ekv(
+        n1b,
+        name: ekv_name,
+        data_dir: shared_dir,
+        shards: 2,
+        log: false,
+        blue_green: true,
+        gc_interval: :timer.hours(1),
+        tombstone_ttl: :timer.hours(24 * 7),
+        cluster_size: 3,
+        node_id: "m1"
+      )
+
+      Process.sleep(500)
+
+      # Data survived handoff
+      assert TestCluster.rpc!(n1b, EKV, :get, [ekv_name, "marker/1"]) == "val"
+
+      # Marker now points to n1b
+      {:ok, marker2} = File.read(Path.join(shared_dir, "current"))
+      assert String.trim(marker2) == Atom.to_string(n1b)
+    end
+  end
 end

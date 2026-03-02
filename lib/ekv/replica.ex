@@ -768,7 +768,7 @@ defmodule EKV.Replica do
         readers:        [{db, stmt}],   # per-scheduler read connections
         remote_shards:  %{node => pid}, # confirmed live peer shards
         # CAS fields (nil if CAS not configured):
-        node_id:        integer | nil,  # this node's CAS identity
+        node_id:        string | nil,   # this node's CAS identity
         cluster_size:   integer | nil,  # total CAS participants
         ballot_counter: integer,        # monotonic, persisted in kv_meta
         peer_node_ids:  %{node => id},  # Erlang node → CAS node_id
@@ -844,7 +844,8 @@ defmodule EKV.Replica do
     cluster_size: nil,
     ballot_counter: 0,
     peer_node_ids: %{},
-    pending_cas: %{}
+    pending_cas: %{},
+    handoff_node: nil
   ]
 
   def start_link(opts) do
@@ -875,7 +876,9 @@ defmodule EKV.Replica do
     config = EKV.get_config(name)
 
     {:ok, db} =
-      Store.open(data_dir, shard_index, config.tombstone_ttl, num_shards, config.gc_interval)
+      Store.open(data_dir, shard_index, config.tombstone_ttl, num_shards, config.gc_interval,
+        skip_stale_check: config[:skip_stale_check] || false
+      )
 
     # Open per-scheduler read connections
     db_path = Path.join(data_dir, "shard_#{shard_index}.db")
@@ -902,6 +905,9 @@ defmodule EKV.Replica do
       else
         0
       end
+
+    # Persist node_id to volume (idempotent — all shards store it)
+    if config.node_id, do: Store.persist_node_id(db, config.node_id)
 
     state = %__MODULE__{
       name: name,
@@ -960,10 +966,27 @@ defmodule EKV.Replica do
   end
 
   # =====================================================================
-  # Write calls
+  # Blue-green handoff proxy
   # =====================================================================
 
   @impl true
+  def handle_call(request, _from, %{handoff_node: handoff_node} = state)
+      when handoff_node != nil do
+    shard_name = shard_name(state.name, state.shard_index)
+
+    try do
+      result = GenServer.call({shard_name, handoff_node}, request, 5_000)
+      {:reply, result, state}
+    catch
+      :exit, _ ->
+        {:reply, {:error, :shutting_down}, state}
+    end
+  end
+
+  # =====================================================================
+  # Write calls
+  # =====================================================================
+
   def handle_call({:put, key, value_binary, opts}, _from, state) do
     %{db: db, stmts: stmts} = state
     now = System.system_time(:nanosecond)
@@ -1044,10 +1067,51 @@ defmodule EKV.Replica do
   end
 
   # =====================================================================
-  # Replication receive
+  # Blue-green handoff
   # =====================================================================
 
   @impl true
+  def handle_info({:ekv_handoff_request, ref, new_node, caller_pid}, state) do
+    # 1. Drain pending CAS ops
+    for {_ref, op} <- state.pending_cas do
+      cancel_timer(op.timer)
+      GenServer.reply(op.from, {:error, :shutting_down})
+    end
+
+    # 2. Persist ballot counter
+    if state.cluster_size && state.db do
+      Store.set_meta(state.db, "ballot_counter", state.ballot_counter)
+    end
+
+    # 3. WAL checkpoint — flush to main db
+    if state.db, do: EKV.Sqlite3.execute(state.db, "PRAGMA wal_checkpoint(TRUNCATE)")
+
+    # 4. Release stmts + close writer
+    if state.stmts, do: Store.release_stmts(state.db, state.stmts)
+    if state.db, do: Store.close(state.db)
+
+    # 5. Ack
+    send(caller_pid, {:ekv_handoff_ack, ref})
+
+    log(state, fn ->
+      "#{log_prefix_shard(state)} handoff to #{new_node} complete, proxy mode"
+    end)
+
+    # 6. Enter proxy mode (readers stay alive until terminate)
+    {:noreply, %{state | db: nil, stmts: nil, pending_cas: %{}, handoff_node: new_node}}
+  end
+
+  # In handoff mode: drop all messages (replication, GC, nodeup/down, CAS)
+  # Readers stay alive for old VM reads. Peers discover new node via nodeup.
+  def handle_info(_msg, %{handoff_node: handoff_node} = state)
+      when handoff_node != nil do
+    {:noreply, state}
+  end
+
+  # =====================================================================
+  # Replication receive
+  # =====================================================================
+
   def handle_info({:ekv_put, key, value_binary, timestamp, origin_node, expires_at}, state) do
     {:ok, applied} =
       merge_remote_entry(state, key, value_binary, timestamp, origin_node, expires_at, nil)
@@ -1560,6 +1624,18 @@ defmodule EKV.Replica do
       state = track_remote_shard(state, remote_node, remote_pid)
       state = track_peer_node_id(state, remote_node, remote_node_id)
 
+      if state.cluster_size do
+        alive = count_alive_node_ids(state)
+
+        if alive > state.cluster_size do
+          Logger.error(
+            "#{log_prefix(state)} cluster overflow: #{alive} distinct node_ids, " <>
+              "cluster_size=#{state.cluster_size}. New peer #{remote_node} " <>
+              "has node_id=#{inspect(remote_node_id)}"
+          )
+        end
+      end
+
       send_to_peer(
         state,
         remote_node,
@@ -1606,6 +1682,18 @@ defmodule EKV.Replica do
 
       state = track_remote_shard(state, remote_node, remote_pid)
       state = track_peer_node_id(state, remote_node, remote_node_id)
+
+      if state.cluster_size do
+        alive = count_alive_node_ids(state)
+
+        if alive > state.cluster_size do
+          Logger.error(
+            "#{log_prefix(state)} cluster overflow: #{alive} distinct node_ids, " <>
+              "cluster_size=#{state.cluster_size}. New peer #{remote_node} " <>
+              "has node_id=#{inspect(remote_node_id)}"
+          )
+        end
+      end
 
       log_once(state, fn ->
         "#{log_prefix(state)} ekv_peer_connect_ack from #{remote_node}"
@@ -1809,72 +1897,92 @@ defmodule EKV.Replica do
     # Check quorum achievable
     alive_count = count_alive_node_ids(state)
 
-    if alive_count < quorum do
-      GenServer.reply(from, {:error, :no_quorum})
-      state
-    else
-      # Generate ballot
-      {ballot_c, ballot_n, state} = next_ballot(state)
-      ref = make_ref()
+    cond do
+      alive_count > cluster_size ->
+        all_ids =
+          [state.node_id | Map.values(state.peer_node_ids) |> Enum.reject(&is_nil/1)]
+          |> Enum.uniq()
 
-      # Local prepare (this node is always an acceptor)
-      local_result = Store.paxos_prepare(db, key, ballot_c, ballot_n)
+        Logger.error(
+          "#{log_prefix(state)} cluster overflow: #{alive_count} distinct node_ids " <>
+            "but cluster_size=#{cluster_size}. IDs: #{inspect(all_ids)}"
+        )
 
-      {local_promise, local_nack} =
-        case local_result do
-          {:ok, :promise, acc_c, acc_n, kv_row} ->
-            {[{node_id, acc_c, acc_n, kv_row}], 0}
+        GenServer.reply(from, {:error, :cluster_overflow})
+        state
 
-          {:ok, :nack, _prom_c, _prom_n} ->
-            {[], 1}
+      alive_count < quorum ->
+        log(state, fn ->
+          "#{log_prefix(state)} CAS no_quorum: #{alive_count}/#{cluster_size} " <>
+            "node_ids reachable, need #{quorum}"
+        end)
+
+        GenServer.reply(from, {:error, :no_quorum})
+        state
+
+      true ->
+        # Generate ballot
+        {ballot_c, ballot_n, state} = next_ballot(state)
+        ref = make_ref()
+
+        # Local prepare (this node is always an acceptor)
+        local_result = Store.paxos_prepare(db, key, ballot_c, ballot_n)
+
+        {local_promise, local_nack} =
+          case local_result do
+            {:ok, :promise, acc_c, acc_n, kv_row} ->
+              {[{node_id, acc_c, acc_n, kv_row}], 0}
+
+            {:ok, :nack, _prom_c, _prom_n} ->
+              {[], 1}
+          end
+
+        # Send prepare to all peers
+        for {remote_node, _pid} <- state.remote_shards do
+          send_to_peer(
+            state,
+            remote_node,
+            {:ekv_prepare, ref, self(), key, ballot_c, ballot_n, state.shard_index}
+          )
         end
 
-      # Send prepare to all peers
-      for {remote_node, _pid} <- state.remote_shards do
-        send_to_peer(
-          state,
-          remote_node,
-          {:ekv_prepare, ref, self(), key, ballot_c, ballot_n, state.shard_index}
-        )
-      end
+        # Start timeout timer
+        timer = Process.send_after(self(), {:cas_timeout, ref}, 5_000)
 
-      # Start timeout timer
-      timer = Process.send_after(self(), {:cas_timeout, ref}, 5_000)
+        op = %{
+          ref: ref,
+          from: from,
+          key: key,
+          ballot: {ballot_c, ballot_n},
+          phase: :prepare,
+          operation: operation,
+          promises: local_promise,
+          nacks: local_nack,
+          accepts: MapSet.new(),
+          accept_nacks: 0,
+          responded: MapSet.new([node_id]),
+          quorum: quorum,
+          timer: timer,
+          reply_value: nil,
+          broadcast_msg: nil,
+          entry_tuple: nil,
+          events: []
+        }
 
-      op = %{
-        ref: ref,
-        from: from,
-        key: key,
-        ballot: {ballot_c, ballot_n},
-        phase: :prepare,
-        operation: operation,
-        promises: local_promise,
-        nacks: local_nack,
-        accepts: MapSet.new(),
-        accept_nacks: 0,
-        responded: MapSet.new([node_id]),
-        quorum: quorum,
-        timer: timer,
-        reply_value: nil,
-        broadcast_msg: nil,
-        entry_tuple: nil,
-        events: []
-      }
+        # Check if local promise already gave us quorum (cluster_size: 1)
+        cond do
+          length(op.promises) >= quorum ->
+            state = %{state | pending_cas: Map.put(state.pending_cas, ref, op)}
+            enter_accept_phase(ref, op, state)
 
-      # Check if local promise already gave us quorum (cluster_size: 1)
-      cond do
-        length(op.promises) >= quorum ->
-          state = %{state | pending_cas: Map.put(state.pending_cas, ref, op)}
-          enter_accept_phase(ref, op, state)
+          local_nack > 0 and alive_count - local_nack < quorum ->
+            # Can't reach quorum
+            cancel_timer(timer)
+            handle_cas_failure(ref, op, %{state | pending_cas: Map.put(state.pending_cas, ref, op)})
 
-        local_nack > 0 and alive_count - local_nack < quorum ->
-          # Can't reach quorum
-          cancel_timer(timer)
-          handle_cas_failure(ref, op, %{state | pending_cas: Map.put(state.pending_cas, ref, op)})
-
-        true ->
-          %{state | pending_cas: Map.put(state.pending_cas, ref, op)}
-      end
+          true ->
+            %{state | pending_cas: Map.put(state.pending_cas, ref, op)}
+        end
     end
   end
 
@@ -1893,7 +2001,7 @@ defmodule EKV.Replica do
     # The value with the highest accepted ballot is the current state
     # If all accepted ballots are {0, 0}, no value was ever accepted
     {current_value, current_vsn} =
-      if best_acc_c == 0 and best_acc_n == 0 do
+      if best_acc_c == 0 and best_acc_n in ["", nil] do
         # Use any non-nil kv_row from promises (there might be LWW-written data)
         best_kv_row_any = Enum.find_value(op.promises, fn {_, _, _, row} -> row end)
         decode_kv_row(best_kv_row_any)

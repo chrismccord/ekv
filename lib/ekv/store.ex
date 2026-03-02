@@ -47,7 +47,8 @@ defmodule EKV.Store do
   VALUES (?1, ?2, ?3, ?4, ?5, ?6)
   """
 
-  def open(data_dir, shard_index, tombstone_ttl, num_shards, gc_interval) do
+  def open(data_dir, shard_index, tombstone_ttl, num_shards, gc_interval, opts \\ []) do
+    skip_stale_check = Keyword.get(opts, :skip_stale_check, false)
     File.mkdir_p!(data_dir)
     path = Path.join(data_dir, "shard_#{shard_index}.db")
 
@@ -61,7 +62,7 @@ defmodule EKV.Store do
     # is always detected as stale, even in the worst case.
     stale_threshold = tombstone_ttl - gc_interval
 
-    if stale_db?(path, stale_threshold) do
+    if not skip_stale_check and stale_db?(path, stale_threshold) do
       File.rm(path)
       File.rm(path <> "-wal")
       File.rm(path <> "-shm")
@@ -113,18 +114,30 @@ defmodule EKV.Store do
       EKV.Sqlite3.execute(db, """
       CREATE TABLE IF NOT EXISTS kv_meta (
         key TEXT NOT NULL PRIMARY KEY,
-        value INTEGER NOT NULL
+        value_int INTEGER,
+        value_text TEXT
       )
       """)
+
+    # Migration for existing databases with old kv_meta schema (single `value` column)
+    case EKV.Sqlite3.execute(db, "ALTER TABLE kv_meta ADD COLUMN value_int INTEGER") do
+      :ok -> :ok
+      {:error, _} -> :ok
+    end
+
+    case EKV.Sqlite3.execute(db, "ALTER TABLE kv_meta ADD COLUMN value_text TEXT") do
+      :ok -> :ok
+      {:error, _} -> :ok
+    end
 
     :ok =
       EKV.Sqlite3.execute(db, """
       CREATE TABLE IF NOT EXISTS kv_paxos (
         key TEXT NOT NULL PRIMARY KEY,
         promised_counter INTEGER NOT NULL DEFAULT 0,
-        promised_node INTEGER NOT NULL DEFAULT 0,
+        promised_node TEXT NOT NULL DEFAULT '',
         accepted_counter INTEGER NOT NULL DEFAULT 0,
-        accepted_node INTEGER NOT NULL DEFAULT 0,
+        accepted_node TEXT NOT NULL DEFAULT '',
         accepted_value BLOB,
         accepted_timestamp INTEGER,
         accepted_origin TEXT,
@@ -581,8 +594,8 @@ defmodule EKV.Store do
 
     {:ok, stmt} =
       EKV.Sqlite3.prepare(db, """
-      INSERT INTO kv_meta (key, value) VALUES ('last_active_at', ?1)
-      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      INSERT INTO kv_meta (key, value_int) VALUES ('last_active_at', ?1)
+      ON CONFLICT(key) DO UPDATE SET value_int = excluded.value_int
       """)
 
     :ok = EKV.Sqlite3.bind(stmt, [now])
@@ -613,7 +626,7 @@ defmodule EKV.Store do
       {:ok, db} ->
         result =
           try do
-            case EKV.Sqlite3.prepare(db, "SELECT value FROM kv_meta WHERE key = 'last_active_at'") do
+            case EKV.Sqlite3.prepare(db, "SELECT value_int FROM kv_meta WHERE key = 'last_active_at'") do
               {:ok, stmt} ->
                 val =
                   case EKV.Sqlite3.step(db, stmt) do
@@ -648,7 +661,15 @@ defmodule EKV.Store do
   # =====================================================================
 
   def get_meta(db, key) do
-    {:ok, stmt} = EKV.Sqlite3.prepare(db, "SELECT value FROM kv_meta WHERE key = ?1")
+    get_meta_int(db, key)
+  end
+
+  def set_meta(db, key, value) do
+    set_meta_int(db, key, value)
+  end
+
+  def get_meta_int(db, key) do
+    {:ok, stmt} = EKV.Sqlite3.prepare(db, "SELECT value_int FROM kv_meta WHERE key = ?1")
     :ok = EKV.Sqlite3.bind(stmt, [key])
 
     result =
@@ -661,17 +682,73 @@ defmodule EKV.Store do
     result
   end
 
-  def set_meta(db, key, value) do
+  def set_meta_int(db, key, value) do
     {:ok, stmt} =
       EKV.Sqlite3.prepare(db, """
-      INSERT INTO kv_meta (key, value) VALUES (?1, ?2)
-      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      INSERT INTO kv_meta (key, value_int) VALUES (?1, ?2)
+      ON CONFLICT(key) DO UPDATE SET value_int = excluded.value_int
       """)
 
     :ok = EKV.Sqlite3.bind(stmt, [key, value])
     :done = EKV.Sqlite3.step(db, stmt)
     :ok = EKV.Sqlite3.release(db, stmt)
     :ok
+  end
+
+  def get_meta_text(db, key) do
+    {:ok, stmt} = EKV.Sqlite3.prepare(db, "SELECT value_text FROM kv_meta WHERE key = ?1")
+    :ok = EKV.Sqlite3.bind(stmt, [key])
+
+    result =
+      case EKV.Sqlite3.step(db, stmt) do
+        {:row, [val]} -> val
+        :done -> nil
+      end
+
+    :ok = EKV.Sqlite3.release(db, stmt)
+    result
+  end
+
+  def set_meta_text(db, key, value) do
+    {:ok, stmt} =
+      EKV.Sqlite3.prepare(db, """
+      INSERT INTO kv_meta (key, value_text) VALUES (?1, ?2)
+      ON CONFLICT(key) DO UPDATE SET value_text = excluded.value_text
+      """)
+
+    :ok = EKV.Sqlite3.bind(stmt, [key, value])
+    :done = EKV.Sqlite3.step(db, stmt)
+    :ok = EKV.Sqlite3.release(db, stmt)
+    :ok
+  end
+
+  def read_node_id(data_dir) do
+    path = Path.join(data_dir, "shard_0.db")
+
+    if File.exists?(path) do
+      case EKV.Sqlite3.open(path) do
+        {:ok, db} ->
+          result =
+            try do
+              get_meta_text(db, "node_id")
+            rescue
+              _ -> nil
+            end
+
+          EKV.Sqlite3.close(db)
+          result
+
+        _ ->
+          nil
+      end
+    end
+  end
+
+  def persist_node_id(db, node_id) do
+    case get_meta_text(db, "node_id") do
+      nil -> set_meta_text(db, "node_id", node_id)
+      _ -> :ok
+    end
   end
 
   # =====================================================================
@@ -691,7 +768,7 @@ defmodule EKV.Store do
   end
 
   @clear_paxos_accepted_sql """
-  UPDATE kv_paxos SET accepted_counter = 0, accepted_node = 0,
+  UPDATE kv_paxos SET accepted_counter = 0, accepted_node = '',
     accepted_value = NULL, accepted_timestamp = NULL, accepted_origin = NULL,
     accepted_expires_at = NULL, accepted_deleted_at = NULL
   WHERE key = ?1
@@ -728,7 +805,7 @@ defmodule EKV.Store do
 
   defp validate_num_shards(db, num_shards, data_dir, shard_index) do
     {:ok, stmt} =
-      EKV.Sqlite3.prepare(db, "SELECT value FROM kv_meta WHERE key = 'num_shards'")
+      EKV.Sqlite3.prepare(db, "SELECT value_int FROM kv_meta WHERE key = 'num_shards'")
 
     stored =
       case EKV.Sqlite3.step(db, stmt) do
@@ -743,7 +820,7 @@ defmodule EKV.Store do
         # First open — persist the shard count
         {:ok, ins} =
           EKV.Sqlite3.prepare(db, """
-          INSERT INTO kv_meta (key, value) VALUES ('num_shards', ?1)
+          INSERT INTO kv_meta (key, value_int) VALUES ('num_shards', ?1)
           """)
 
         :ok = EKV.Sqlite3.bind(ins, [num_shards])
