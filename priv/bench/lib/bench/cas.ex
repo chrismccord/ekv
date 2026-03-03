@@ -133,15 +133,17 @@ defmodule Bench.CAS do
       report_latency("#{format_number(n)} eventual reads (local SQLite)", eventual_samples)
 
       # Consistent reads (CASPaxos round)
-      consistent_samples =
-        collect_remote_samples(n, r1(ctx), fn _i ->
-          rpc(r1(ctx), Bench.Replica, :consistent_get, [
+      {consistent_samples, read_error_counts} =
+        collect_remote_samples_with_results(n, r1(ctx), fn _i ->
+          rpc(r1(ctx), Bench.Replica, :consistent_get_result, [
             @name,
             "cread/#{:rand.uniform(seed)}"
           ])
         end)
 
       report_latency("#{format_number(n)} consistent reads (quorum)", consistent_samples)
+
+      print_error_counts(read_error_counts, "    read_errors")
 
       ev_p50 = percentile(eventual_samples, 50)
       cas_p50 = percentile(consistent_samples, 50)
@@ -287,10 +289,17 @@ defmodule Bench.CAS do
               |> Enum.flat_map(&Task.await(&1, 120_000))
 
             successes = Enum.count(all, &match?({:ok, _}, &1))
-            conflicts = Enum.count(all, &match?({:error, :conflict}, &1))
+            error_counts = count_errors(all)
+            conflicts = Map.get(error_counts, :conflict, 0)
+            uncertain = Map.get(error_counts, :uncertain, 0)
 
             IO.puts("    successes : #{successes}")
             IO.puts("    conflicts : #{conflicts} (retries exhausted)")
+
+            if uncertain > 0,
+              do: IO.puts("    uncertain : #{uncertain} (accept outcome ambiguous)")
+
+            print_error_counts(Map.drop(error_counts, [:conflict, :uncertain]))
           end)
 
         final_val = rpc(r1(ctx), Bench.Replica, :consistent_get, [@name, key])
@@ -422,11 +431,19 @@ defmodule Bench.CAS do
               end
 
             results = Enum.flat_map(tasks, &Task.await(&1, 120_000))
-            conflicts = Enum.count(results, &match?({:error, :conflict}, &1))
+            error_counts = count_errors(results)
+            conflicts = Map.get(error_counts, :conflict, 0)
+            uncertain = Map.get(error_counts, :uncertain, 0)
 
             if conflicts > 0 do
               IO.puts("    conflicts : #{conflicts}")
             end
+
+            if uncertain > 0 do
+              IO.puts("    uncertain : #{uncertain}")
+            end
+
+            print_error_counts(Map.drop(error_counts, [:conflict, :uncertain]))
           end)
 
         report_throughput("#{format_number(ops)} ops across #{workers} workers", ops, wall_us)
@@ -541,6 +558,38 @@ defmodule Bench.CAS do
       us
     end)
     |> Enum.sort()
+  end
+
+  defp collect_remote_samples_with_results(n, _node, fun) do
+    {samples, error_counts} =
+      Enum.reduce(1..n, {[], %{}}, fn i, {acc_samples, acc_errors} ->
+        {us, result} = time_us(fn -> fun.(i) end)
+        {[us | acc_samples], accumulate_error(acc_errors, result)}
+      end)
+
+    {Enum.sort(samples), error_counts}
+  end
+
+  defp count_errors(results) do
+    Enum.reduce(results, %{}, fn result, acc ->
+      accumulate_error(acc, result)
+    end)
+  end
+
+  defp accumulate_error(error_counts, {:error, reason}) do
+    Map.update(error_counts, reason, 1, &(&1 + 1))
+  end
+
+  defp accumulate_error(error_counts, _result), do: error_counts
+
+  defp print_error_counts(error_counts, label_prefix \\ "    errors") do
+    if map_size(error_counts) > 0 do
+      error_counts
+      |> Enum.sort_by(fn {reason, _count} -> inspect(reason) end)
+      |> Enum.each(fn {reason, count} ->
+        IO.puts("#{label_prefix}[#{inspect(reason)}] : #{count}")
+      end)
+    end
   end
 
   defp run_parallel_cas(node, workers, n_per_worker, prefix, _ctx) do

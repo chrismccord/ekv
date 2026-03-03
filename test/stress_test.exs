@@ -1225,8 +1225,8 @@ defmodule EKV.StressTest do
       # (kv_paxos has old accepted values with different version than kv).
       # If commit broadcast completed before partition → :ok
       # Either way: the value must be deterministic and consistent.
-      assert result in [:ok, {:error, :conflict}],
-             "Expected :ok or :conflict, got: #{inspect(result)}"
+      assert result in [:ok, {:error, :conflict}, {:error, :uncertain}],
+             "Expected :ok, :conflict, or :uncertain, got: #{inspect(result)}"
 
       # update/3 always resolves the divergence: it reads the highest accepted
       # value during prepare and applies the transform function to it, so
@@ -2133,7 +2133,7 @@ defmodule EKV.StressTest do
       {:ok, val} ->
         {:ok, val}
 
-      {:error, :conflict} when retries > 0 ->
+      {:error, reason} when retries > 0 and reason in [:conflict, :uncertain] ->
         Process.sleep(:rand.uniform(50) + 10)
         do_update_with_retry(node, ekv_name, key, retries - 1)
 

@@ -121,8 +121,21 @@ Use mode as **key ownership**:
 - Keys managed via CAS should keep using CAS **write** APIs.
 - Reads for CAS-managed keys can be eventual (`EKV.get/2`, `EKV.lookup/2`) for
   lower latency, or consistent (`EKV.get/3, consistent: true`) when freshness
-  matters.
+  matters. `consistent: true` is a barrier/linearizable read.
 - Do not mix eventual writes and CAS writes on the same key.
+
+### CAS write error semantics
+
+CAS writes (`put` with `if_vsn:` or `consistent: true`, `delete` with `if_vsn:`,
+`update`) can return:
+
+- `{:error, :conflict}`: write was rejected before a deciding accept phase
+  (for example: version mismatch or pre-accept contention).
+- `{:error, :uncertain}`: write entered accept phase, but the caller could not
+  confirm final outcome. The write may already be committed.
+
+On `:uncertain`, resolve with `EKV.get(name, key, consistent: true)` before
+taking follow-up actions.
 
 ### Known limitation: mixed-mode single-key writes
 

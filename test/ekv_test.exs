@@ -2197,6 +2197,12 @@ defmodule EKVTest do
       :ok = EKV.put(name, "cg/2", "val")
       assert "val" == EKV.get(name, "cg/2", consistent: true, retries: 3, backoff: {5, 20})
     end
+
+    test "rejects non-boolean consistent option", %{cas_name: name} do
+      assert_raise ArgumentError, ~r/:consistent must be boolean/, fn ->
+        EKV.get(name, "cg/3", consistent: :linearizable)
+      end
+    end
   end
 
   # =====================================================================
@@ -2247,6 +2253,12 @@ defmodule EKVTest do
     test "consistent and if_vsn are mutually exclusive", %{cas_name: name} do
       assert_raise ArgumentError, ~r/mutually exclusive/, fn ->
         EKV.put(name, "cp/4", "val", consistent: true, if_vsn: nil)
+      end
+    end
+
+    test "rejects non-boolean consistent option", %{cas_name: name} do
+      assert_raise ArgumentError, ~r/:consistent must be boolean/, fn ->
+        EKV.put(name, "cp/5", "val", consistent: :linearizable)
       end
     end
   end
@@ -2567,7 +2579,7 @@ defmodule EKVTest do
       assert EKV.get(name, "concurrent") == n
     end
 
-    test "concurrent put(if_vsn:) tasks — exactly one succeeds, others get conflict", %{
+    test "concurrent put(if_vsn:) tasks — exactly one succeeds, others fail", %{
       cas_name: name
     } do
       # Create the key
@@ -2584,10 +2596,16 @@ defmodule EKVTest do
 
       results = Task.await_many(tasks, 10_000)
       successes = Enum.count(results, &(&1 == :ok))
-      conflicts = Enum.count(results, &(&1 == {:error, :conflict}))
+
+      failures =
+        Enum.count(results, fn
+          {:error, :conflict} -> true
+          {:error, :uncertain} -> true
+          _ -> false
+        end)
 
       assert successes == 1
-      assert conflicts == 4
+      assert failures == 4
     end
   end
 
@@ -2657,15 +2675,15 @@ defmodule EKVTest do
       send(shard_name, {:ekv_accept_nack, ref, self(), "2"})
       send(shard_name, {:ekv_accept_nack, ref, self(), "3"})
 
-      # CAS should fail
+      # CAS entered accept phase and then lost quorum, so caller sees uncertain.
       result = Task.await(task, 10_000)
-      assert result == {:error, :conflict}
+      assert result == {:error, :uncertain}
 
       # THE KEY ASSERTION: CAS failed, so the value must NOT be in local SQLite.
       # If local accept was deferred until quorum, this passes.
       # If local accept happened eagerly (the bug), this fails.
       assert EKV.get(name, "phantom_key") == nil,
-             "CAS returned {:error, :conflict} but phantom write is visible via EKV.get"
+             "CAS returned {:error, :uncertain} but phantom write is visible via EKV.get"
     end
 
     test "CAS success still works with deferred local accept" do

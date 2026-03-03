@@ -278,17 +278,23 @@ defmodule EKV.CASDistributedTest do
 
       results = Task.await_many([task_a, task_b], 10_000)
       successes = Enum.count(results, &(&1 == :ok))
-      conflicts = Enum.count(results, &(&1 == {:error, :conflict}))
+
+      failures =
+        Enum.count(results, fn
+          {:error, :conflict} -> true
+          {:error, :uncertain} -> true
+          _ -> false
+        end)
 
       assert successes == 1
-      assert conflicts == 1
+      assert failures == 1
     end
 
-    test "CAS conflict does not leave phantom write on proposer node" do
+    test "CAS failure does not leave phantom write on proposer node" do
       # This test targets a specific bug: the proposer does local paxos_accept
       # BEFORE quorum is confirmed. If the accept phase fails (remote acceptors
       # nack due to a higher-ballot prepare from a third proposer), the proposer
-      # returns {:error, :conflict} but the value is in local SQLite.
+      # returns an error but the value is in local SQLite.
       #
       # Trigger: 3 concurrent proposers. The middle-ballot proposer (B) can get
       # prepare quorum (own + A's promise), enter accept with local accept, but
@@ -853,7 +859,7 @@ defmodule EKV.CASDistributedTest do
       end)
     end
 
-    test "update exhausts retries: returns {:error, :conflict} after max_retries" do
+    test "update exhausts retries: returns {:error, :conflict | :uncertain} after max_retries" do
       # This tests that when update can't succeed after 5 retries, it returns conflict.
       # We simulate this by having two nodes rapidly competing on the same key.
       # With cluster_size: 2, both nodes are proposers and acceptors.
@@ -905,18 +911,24 @@ defmodule EKV.CASDistributedTest do
           res_a
         end
 
-      # At least some updates should succeed (via retry), some may fail with conflict
+      # At least some updates should succeed (via retry), some may fail.
       successes =
         Enum.count(results, fn
           {:ok, _} -> true
           _ -> false
         end)
 
-      conflicts = Enum.count(results, &(&1 == {:error, :conflict}))
+      failures =
+        Enum.count(results, fn
+          {:error, :conflict} -> true
+          {:error, :uncertain} -> true
+          _ -> false
+        end)
 
-      # The key invariant: every result is either {:ok, _} or {:error, :conflict}
-      assert successes + conflicts == 20,
-             "All results should be :ok or :conflict, got: #{inspect(results)}"
+      # The key invariant: every result is either {:ok, _}, {:error, :conflict},
+      # or {:error, :uncertain}.
+      assert successes + failures == 20,
+             "All results should be :ok, :conflict, or :uncertain, got: #{inspect(results)}"
     end
 
     test "update preempted by higher-ballot prepare: retries with higher ballot, succeeds" do

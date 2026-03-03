@@ -151,13 +151,32 @@ defmodule Bench.Replica do
       {:ok, EKV.get(name, key, Keyword.merge([consistent: true], opts))}
     rescue
       e in RuntimeError ->
-        if String.contains?(e.message, "consistent read failed: :conflict") do
-          {:error, :conflict}
-        else
-          reraise e, __STACKTRACE__
+        case parse_consistent_read_failure(e.message) do
+          {:ok, reason} -> {:error, reason}
+          :error -> reraise e, __STACKTRACE__
         end
     end
   end
+
+  @known_consistent_read_reasons %{
+    "conflict" => :conflict,
+    "uncertain" => :uncertain,
+    "quorum_timeout" => :quorum_timeout,
+    "no_quorum" => :no_quorum,
+    "shutting_down" => :shutting_down
+  }
+
+  defp parse_consistent_read_failure("EKV: consistent read failed: " <> reason_str) do
+    {:ok, decode_consistent_read_reason(reason_str)}
+  end
+
+  defp parse_consistent_read_failure(_), do: :error
+
+  defp decode_consistent_read_reason(":" <> atom_name) do
+    Map.get(@known_consistent_read_reasons, atom_name, {:other, ":" <> atom_name})
+  end
+
+  defp decode_consistent_read_reason(other), do: {:other, other}
 
   def session_lifecycle(name, key) do
     # Insert

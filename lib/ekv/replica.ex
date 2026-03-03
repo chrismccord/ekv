@@ -388,6 +388,32 @@ defmodule EKV.Replica do
     - Node death during CAS: fail_pending_cas_if_no_quorum checks all
       pending ops and fails those that can no longer reach quorum.
 
+  Caller-visible CAS write outcomes (put if_vsn/delete if_vsn/update):
+
+    - :ok
+      CAS reached commit and value was applied to kv + oplog.
+
+    - {:error, :conflict}
+      The write was rejected before a deciding accept phase.
+      Typical paths:
+        - prepare phase loses quorum (nacks/no quorum) and retries are exhausted
+        - compare-and-swap predicate fails while applying operation
+          (for example stale if_vsn) before accept messages are sent
+
+    - {:error, :uncertain}
+      The write reached accept phase, so some acceptors may have accepted
+      it, but the proposer could not confirm final outcome.
+      Typical paths:
+        - accept phase loses quorum after accept messages were sent
+        - local proposer is pre-empted at final local paxos_accept in commit
+
+  In code, this mapping is phase-based: failures in :accept for write ops are
+  returned as :uncertain; other CAS write failures are :conflict.
+
+  Operational rule: on :uncertain, issue a barrier read
+  (EKV.get(name, key, consistent: true)) to resolve committed state before
+  taking follow-up actions.
+
   For EKV.update (read-modify-write), failures auto-retry up to 5 times
   with random backoff (10-60ms). Each retry generates a new ballot.
 
@@ -1539,7 +1565,7 @@ defmodule EKV.Replica do
     end
   end
 
-  # CAS retry (for update only)
+  # CAS retry (for operations with retry budget)
   def handle_info({:cas_retry, ref, key, operation}, state) do
     # Re-check if we still have the pending op (might have been cleaned up)
     case Map.pop(state.pending_cas, ref) do
@@ -2117,64 +2143,53 @@ defmodule EKV.Replica do
         decode_kv_row(best_kv_row)
       end
 
-    # Read-only CAS: if operation is :cas_read and no pending accepted value,
-    # reply immediately without accept/commit phases.
-    case op.operation do
-      {:cas_read, _, _} when best_acc_c == 0 ->
-        cancel_timer(op.timer)
-        GenServer.reply(op.from, {:ok, current_value})
-        %{state | pending_cas: Map.delete(state.pending_cas, ref)}
+    # Apply operation. For :cas_read recovery, pass the raw kv_row so
+    # metadata (expires_at, deleted_at) is preserved.
+    apply_result =
+      case op.operation do
+        {:cas_read, _, _} ->
+          apply_cas_read_recovery(op.key, best_kv_row, current_value, current_vsn)
 
-      _ ->
-        # Apply operation. For :cas_read recovery (best_acc_c > 0), pass
-        # the raw kv_row so metadata (expires_at, deleted_at) is preserved.
-        apply_result =
-          case op.operation do
-            {:cas_read, _, _} ->
-              apply_cas_read_recovery(op.key, best_kv_row, current_value)
+        _ ->
+          apply_operation(op.operation, op.key, current_value, current_vsn)
+      end
 
-            _ ->
-              apply_operation(op.operation, op.key, current_value, current_vsn)
-          end
-
-        case apply_result do
-          {:ok, _new_value_binary, new_entry_tuple, reply_value, broadcast_msg, events} ->
-            # Send accept to all peers (do NOT do local accept yet — deferred until quorum)
-            for {remote_node, _pid} <- state.remote_shards do
-              send_to_peer(
-                state,
-                remote_node,
-                {:ekv_accept, ref, self(), op.key, elem(op.ballot, 0), elem(op.ballot, 1),
-                 new_entry_tuple, state.shard_index}
-              )
-            end
-
-            timer = Process.send_after(self(), {:cas_timeout, ref}, 5_000)
-
-            op = %{
-              op
-              | phase: :accept,
-                accepts: MapSet.new(),
-                accept_nacks: 0,
-                responded: MapSet.new(),
-                timer: timer,
-                reply_value: reply_value,
-                broadcast_msg: broadcast_msg,
-                entry_tuple: new_entry_tuple,
-                events: events
-            }
-
-            # For cluster_size: 1 (no peers), commit immediately
-            if MapSet.size(op.accepts) + 1 >= op.quorum do
-              commit_cas(ref, op, state)
-            else
-              %{state | pending_cas: Map.put(state.pending_cas, ref, op)}
-            end
-
-          {:error, :conflict} ->
-            GenServer.reply(op.from, {:error, :conflict})
-            %{state | pending_cas: Map.delete(state.pending_cas, ref)}
+    case apply_result do
+      {:ok, _new_value_binary, new_entry_tuple, reply_value, broadcast_msg, events} ->
+        # Send accept to all peers (do NOT do local accept yet — deferred until quorum)
+        for {remote_node, _pid} <- state.remote_shards do
+          send_to_peer(
+            state,
+            remote_node,
+            {:ekv_accept, ref, self(), op.key, elem(op.ballot, 0), elem(op.ballot, 1),
+             new_entry_tuple, state.shard_index}
+          )
         end
+
+        timer = Process.send_after(self(), {:cas_timeout, ref}, 5_000)
+
+        op = %{
+          op
+          | phase: :accept,
+            accepts: MapSet.new(),
+            accept_nacks: 0,
+            responded: MapSet.new(),
+            timer: timer,
+            reply_value: reply_value,
+            broadcast_msg: broadcast_msg,
+            entry_tuple: new_entry_tuple,
+            events: events
+        }
+
+        # For cluster_size: 1 (no peers), commit immediately
+        if MapSet.size(op.accepts) + 1 >= op.quorum do
+          commit_cas(ref, op, state)
+        else
+          %{state | pending_cas: Map.put(state.pending_cas, ref, op)}
+        end
+
+      {:error, :conflict} ->
+        handle_cas_failure(ref, op, state)
     end
   end
 
@@ -2311,10 +2326,22 @@ defmodule EKV.Replica do
 
   # Build entry_tuple for cas_read recovery directly from the raw accepted
   # kv_row columns, preserving expires_at and deleted_at exactly as accepted.
+  defp apply_cas_read_recovery(key, nil, _current_value, _current_vsn) do
+    # Absent key: barrier read proposes a tombstone marker at a fresh timestamp.
+    # This closes outstanding accept-state ambiguity for this key.
+    now = System.system_time(:nanosecond)
+    origin = node()
+    origin_str = Atom.to_string(origin)
+    entry_tuple = {key, nil, now, origin_str, nil, now}
+    broadcast_msg = {:ekv_delete, key, now, origin}
+    {:ok, nil, entry_tuple, {:ok, nil}, broadcast_msg, []}
+  end
+
   defp apply_cas_read_recovery(
          key,
          [value_binary, ts, origin_str, expires_at, deleted_at],
-         current_value
+         current_value,
+         current_vsn
        ) do
     origin = if is_binary(origin_str), do: String.to_atom(origin_str), else: origin_str
 
@@ -2325,8 +2352,20 @@ defmodule EKV.Replica do
       {:ok, nil, entry_tuple, {:ok, nil}, broadcast_msg, []}
     else
       # Live value — re-propose with original expires_at
-      entry_tuple = {key, value_binary, ts, to_string(origin), expires_at, nil}
-      broadcast_msg = {:ekv_put, key, value_binary, ts, origin, expires_at}
+      {final_ts, final_origin} =
+        case current_vsn do
+          {vsn_ts, vsn_origin} ->
+            {vsn_ts, Atom.to_string(vsn_origin)}
+
+          _ ->
+            {ts, to_string(origin)}
+        end
+
+      entry_tuple = {key, value_binary, final_ts, final_origin, expires_at, nil}
+
+      broadcast_msg =
+        {:ekv_put, key, value_binary, final_ts, String.to_atom(final_origin), expires_at}
+
       {:ok, value_binary, entry_tuple, {:ok, current_value}, broadcast_msg, []}
     end
   end
@@ -2365,10 +2404,23 @@ defmodule EKV.Replica do
         state
 
       _ ->
-        GenServer.reply(op.from, {:error, :conflict})
+        GenServer.reply(op.from, {:error, cas_failure_reason(op)})
         %{state | pending_cas: Map.delete(state.pending_cas, ref)}
     end
   end
+
+  defp cas_failure_reason(op) do
+    if op.phase == :accept and writes_operation?(op.operation) do
+      :uncertain
+    else
+      :conflict
+    end
+  end
+
+  defp writes_operation?({:cas_put, _, _, _}), do: true
+  defp writes_operation?({:cas_delete, _}), do: true
+  defp writes_operation?({:update, _, _, _}), do: true
+  defp writes_operation?(_), do: false
 
   defp count_alive_node_ids(state) do
     if state.cluster_size do

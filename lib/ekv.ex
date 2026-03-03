@@ -359,8 +359,13 @@ defmodule EKV do
 
   - `:ttl` — time-to-live in milliseconds. Entry expires after this duration.
   - `:if_vsn` — compare-and-swap. Only succeeds if the key's current version
-    matches. Use `nil` for insert-if-absent. Returns `{:error, :conflict}` on
-    mismatch. Requires `cluster_size` and `node_id` config.
+    matches. Use `nil` for insert-if-absent.
+    Returns `{:error, :conflict}` if the expected version does not match and
+    the write was not applied.
+    Returns `{:error, :uncertain}` when the write entered accept phase but the
+    caller could not confirm final outcome; in this case, issue
+    `get(name, key, consistent: true)` to resolve the committed value.
+    Requires `cluster_size` and `node_id` config.
   - `:consistent` — when `true`, uses CASPaxos consensus for the write
     (quorum-backed CAS write). Mutually exclusive with `:if_vsn`. Requires
     `cluster_size` and `node_id` config.
@@ -373,11 +378,12 @@ defmodule EKV do
   """
   def put(name, key, value, opts \\ []) do
     opts = Keyword.validate!(opts, [:ttl, :if_vsn, :consistent, :retries, :backoff, :timeout])
+    consistent? = validate_boolean_opt!(opts, :consistent)
     config = get_config(name)
     shard_index = Replica.shard_index_for(key, config.num_shards)
     timeout = Keyword.get(opts, :timeout, 10_000)
 
-    case {Keyword.fetch(opts, :if_vsn), Keyword.get(opts, :consistent, false)} do
+    case {Keyword.fetch(opts, :if_vsn), consistent?} do
       {_, true} ->
         if Keyword.has_key?(opts, :if_vsn) do
           raise ArgumentError, "EKV: :consistent and :if_vsn are mutually exclusive"
@@ -416,16 +422,18 @@ defmodule EKV do
   ## Options
 
   - `:consistent` — when `true`, performs a CASPaxos consensus read
-    (linearizable for CAS-managed keys). Requires `cluster_size` and `node_id`
-    config.
+    (barrier/linearizable for CAS-managed keys). This read always goes through
+    CAS accept+commit to resolve any in-flight accepted value before replying.
+    Requires `cluster_size` and `node_id` config.
   - `:retries` — max CAS retries (default 5). Only for `consistent: true`.
   - `:backoff` — `{min_ms, max_ms}` random backoff range (default `{10, 60}`).
   - `:timeout` — GenServer call timeout in ms (default 10_000).
   """
   def get(name, key, opts \\ []) do
     opts = Keyword.validate!(opts, [:consistent, :retries, :backoff, :timeout])
+    consistent? = validate_boolean_opt!(opts, :consistent)
 
-    if Keyword.get(opts, :consistent, false) do
+    if consistent? do
       config = get_config(name)
       validate_cas_config!(config)
       shard_index = Replica.shard_index_for(key, config.num_shards)
@@ -475,8 +483,13 @@ defmodule EKV do
   ## Options
 
   - `:if_vsn` — compare-and-swap delete. Only succeeds if the key's current
-    version matches. Returns `{:error, :conflict}` on mismatch. Requires
-    `cluster_size` and `node_id` config.
+    version matches.
+    Returns `{:error, :conflict}` if the expected version does not match and
+    the delete was not applied.
+    Returns `{:error, :uncertain}` when the delete entered accept phase but the
+    caller could not confirm final outcome; issue `get(name, key, consistent: true)`
+    to resolve.
+    Requires `cluster_size` and `node_id` config.
     For strict behavior, keep the key in CAS mode and do not mix with eventual
     `put`/`delete` on the same key.
   """
@@ -507,8 +520,12 @@ defmodule EKV do
   Reads the current value, applies `fun`, and writes the result using CASPaxos.
   Auto-retries on conflict (up to 5 times with random backoff).
 
-  Returns `{:ok, new_value}` on success, or `{:error, :conflict}` if retries
-  are exhausted.
+  Returns `{:ok, new_value}` on success.
+  Returns `{:error, :conflict}` when retries are exhausted before entering an
+  accept phase that could decide the write.
+  Returns `{:error, :uncertain}` when accept phase started but the caller could
+  not confirm final outcome; issue `get(name, key, consistent: true)` to
+  resolve.
 
   Requires `cluster_size` and `node_id` config.
   Intended for keys managed in CAS mode (do not mix with eventual writes on
@@ -796,6 +813,16 @@ defmodule EKV do
   end
 
   defp validate_cas_config!(_config), do: :ok
+
+  defp validate_boolean_opt!(opts, key) do
+    case Keyword.get(opts, key, false) do
+      value when is_boolean(value) ->
+        value
+
+      other ->
+        raise ArgumentError, "EKV: #{inspect(key)} must be boolean, got: #{inspect(other)}"
+    end
+  end
 
   defp read_conn(name, shard_index) do
     readers = :persistent_term.get({EKV, name, :readers, shard_index})
