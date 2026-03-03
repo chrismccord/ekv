@@ -19,8 +19,9 @@ defmodule EKV do
       EKV.get(:my_kv, "user/1")          #=> nil
 
       # Prefix scans
-      EKV.scan(:my_kv, "user/")          #=> %{"user/1" => %{name: "Alice"}}
-      EKV.keys(:my_kv, "user/")          #=> ["user/1"]
+      EKV.scan(:my_kv, "user/") |> Enum.to_list()
+      #=> [{"user/1", %{name: "Alice"}, {ts, origin_node}}]
+      EKV.keys(:my_kv, "user/")          #=> [{"user/1", {ts, origin_node}}]
 
       # TTL — entry expires after 30 minutes
       EKV.put(:my_kv, "session/abc", token, ttl: :timer.minutes(30))
@@ -362,7 +363,7 @@ defmodule EKV do
     matches. Use `nil` for insert-if-absent.
     Returns `{:error, :conflict}` if the expected version does not match and
     the write was not applied.
-    Returns `{:error, :uncertain}` when the write entered accept phase but the
+    Returns `{:error, :unconfirmed}` when the write entered accept phase but the
     caller could not confirm final outcome; in this case, issue
     `get(name, key, consistent: true)` to resolve the committed value.
     Requires `cluster_size` and `node_id` config.
@@ -375,6 +376,12 @@ defmodule EKV do
     `:consistent` and `:if_vsn` paths.
   - `:backoff` — `{min_ms, max_ms}` random backoff range (default `{10, 60}`).
   - `:timeout` — GenServer call timeout in ms (default 10_000).
+
+  ## Returns
+
+  - Eventual put (`put` without CAS options): `:ok`
+  - CAS put (`if_vsn:` or `consistent: true`): `{:ok, vsn}` where
+    `vsn` is `{timestamp, origin_node}`
   """
   def put(name, key, value, opts \\ []) do
     opts = Keyword.validate!(opts, [:ttl, :if_vsn, :consistent, :retries, :backoff, :timeout])
@@ -393,7 +400,7 @@ defmodule EKV do
         update_opts = Keyword.take(opts, [:ttl, :retries, :backoff, :timeout])
 
         case update(name, key, fn _ -> value end, update_opts) do
-          {:ok, _} -> :ok
+          {:ok, _new_value, vsn} -> {:ok, vsn}
           error -> error
         end
 
@@ -486,12 +493,17 @@ defmodule EKV do
     version matches.
     Returns `{:error, :conflict}` if the expected version does not match and
     the delete was not applied.
-    Returns `{:error, :uncertain}` when the delete entered accept phase but the
+    Returns `{:error, :unconfirmed}` when the delete entered accept phase but the
     caller could not confirm final outcome; issue `get(name, key, consistent: true)`
     to resolve.
     Requires `cluster_size` and `node_id` config.
     For strict behavior, keep the key in CAS mode and do not mix with eventual
     `put`/`delete` on the same key.
+
+  ## Returns
+
+  - Eventual delete (`delete` without CAS options): `:ok`
+  - CAS delete (`if_vsn:`): `{:ok, vsn}` where `vsn` is `{timestamp, origin_node}`
   """
   def delete(name, key, opts \\ []) do
     opts = Keyword.validate!(opts, [:if_vsn, :timeout])
@@ -520,10 +532,11 @@ defmodule EKV do
   Reads the current value, applies `fun`, and writes the result using CASPaxos.
   Auto-retries on conflict (up to 5 times with random backoff).
 
-  Returns `{:ok, new_value}` on success.
+  Returns `{:ok, new_value, vsn}` on success where
+  `vsn` is `{timestamp, origin_node}` for the committed value.
   Returns `{:error, :conflict}` when retries are exhausted before entering an
   accept phase that could decide the write.
-  Returns `{:error, :uncertain}` when accept phase started but the caller could
+  Returns `{:error, :unconfirmed}` when accept phase started but the caller could
   not confirm final outcome; issue `get(name, key, consistent: true)` to
   resolve.
 
@@ -571,7 +584,7 @@ defmodule EKV do
   """
 
   @keys_first_chunk_sql """
-  SELECT key FROM kv
+  SELECT key, timestamp, origin_node FROM kv
   WHERE key >= ?1 AND key < ?2
     AND (deleted_at IS NULL OR deleted_at > ?3)
     AND (expires_at IS NULL OR expires_at > ?3)
@@ -579,7 +592,7 @@ defmodule EKV do
   """
 
   @keys_next_chunk_sql """
-  SELECT key FROM kv
+  SELECT key, timestamp, origin_node FROM kv
   WHERE key > ?1 AND key < ?2
     AND (deleted_at IS NULL OR deleted_at > ?3)
     AND (expires_at IS NULL OR expires_at > ?3)
@@ -646,10 +659,17 @@ defmodule EKV do
   end
 
   @doc """
-  List keys matching a prefix. Scans all shards using cursor-based streaming.
+  List keys (with versions) matching a prefix. Scans all shards using
+  cursor-based streaming.
 
-  Returns a `Stream` of key strings. Results are sorted by key within each
-  shard but not globally sorted across shards.
+  Returns a `Stream` of `{key, vsn}` tuples where `vsn` is
+  `{timestamp, origin_node}`.
+
+  This avoids decoding values while still allowing CAS workflows to chain
+  `if_vsn:` operations from scan output.
+
+  Results are sorted by key within each shard but not globally sorted across
+  shards.
   """
   def keys(name, prefix) do
     config = get_config(name)
@@ -681,12 +701,15 @@ defmodule EKV do
               if rows == [] do
                 {:halt, :done}
               else
-                items = Enum.map(rows, fn [key] -> key end)
+                items =
+                  Enum.map(rows, fn [key, ts, origin_str] ->
+                    {key, {ts, String.to_atom(origin_str)}}
+                  end)
 
                 if length(rows) < @scan_chunk_size do
                   {items, :done}
                 else
-                  last_key = rows |> List.last() |> hd()
+                  [last_key | _] = List.last(rows)
                   {items, {last_key, :next}}
                 end
               end

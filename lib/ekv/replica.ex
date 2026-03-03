@@ -400,7 +400,7 @@ defmodule EKV.Replica do
         - compare-and-swap predicate fails while applying operation
           (for example stale if_vsn) before accept messages are sent
 
-    - {:error, :uncertain}
+    - {:error, :unconfirmed}
       The write reached accept phase, so some acceptors may have accepted
       it, but the proposer could not confirm final outcome.
       Typical paths:
@@ -408,9 +408,9 @@ defmodule EKV.Replica do
         - local proposer is pre-empted at final local paxos_accept in commit
 
   In code, this mapping is phase-based: failures in :accept for write ops are
-  returned as :uncertain; other CAS write failures are :conflict.
+  returned as :unconfirmed; other CAS write failures are :conflict.
 
-  Operational rule: on :uncertain, issue a barrier read
+  Operational rule: on :unconfirmed, issue a barrier read
   (EKV.get(name, key, consistent: true)) to resolve committed state before
   taking follow-up actions.
 
@@ -2250,7 +2250,8 @@ defmodule EKV.Replica do
           entry_tuple = {key, value_binary, now, origin_str, expires_at, nil}
           broadcast_msg = {:ekv_put, key, value_binary, now, origin, expires_at}
           events = [%EKV.Event{type: :put, key: key, value: :erlang.binary_to_term(value_binary)}]
-          {:ok, value_binary, entry_tuple, :ok, broadcast_msg, events}
+          reply_value = {:ok, {now, origin}}
+          {:ok, value_binary, entry_tuple, reply_value, broadcast_msg, events}
         else
           {:error, :conflict}
         end
@@ -2264,7 +2265,7 @@ defmodule EKV.Replica do
           entry_tuple = {key, nil, now, origin_str, nil, now}
           broadcast_msg = {:ekv_delete, key, now, origin}
           events = [%EKV.Event{type: :delete, key: key, value: current_value}]
-          {:ok, nil, entry_tuple, :ok, broadcast_msg, events}
+          {:ok, nil, entry_tuple, {:ok, {now, origin}}, broadcast_msg, events}
         else
           {:error, :conflict}
         end
@@ -2281,7 +2282,8 @@ defmodule EKV.Replica do
         entry_tuple = {key, new_value_binary, now, origin_str, expires_at, nil}
         broadcast_msg = {:ekv_put, key, new_value_binary, now, origin, expires_at}
         events = [%EKV.Event{type: :put, key: key, value: new_value}]
-        {:ok, new_value_binary, entry_tuple, {:ok, new_value}, broadcast_msg, events}
+        reply_value = {:ok, new_value, {now, origin}}
+        {:ok, new_value_binary, entry_tuple, reply_value, broadcast_msg, events}
 
       {:cas_read, _opts, _retries} ->
         # Unreachable: cas_read recovery is handled via apply_cas_read_recovery
@@ -2411,7 +2413,7 @@ defmodule EKV.Replica do
 
   defp cas_failure_reason(op) do
     if op.phase == :accept and writes_operation?(op.operation) do
-      :uncertain
+      :unconfirmed
     else
       :conflict
     end

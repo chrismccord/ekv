@@ -183,7 +183,8 @@ defmodule EKV.TestCluster do
   end
 
   @doc false
-  def do_keys_sorted(name, prefix), do: EKV.keys(name, prefix) |> Enum.sort()
+  def do_keys_sorted(name, prefix),
+    do: EKV.keys(name, prefix) |> Enum.map(fn {key, _vsn} -> key end) |> Enum.sort()
   def do_keys_count(name, prefix), do: EKV.keys(name, prefix) |> Enum.count()
   def do_scan_count(name, prefix), do: EKV.scan(name, prefix) |> Enum.count()
 

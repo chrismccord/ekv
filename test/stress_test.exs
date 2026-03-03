@@ -128,7 +128,8 @@ defmodule EKV.StressTest do
       Process.sleep(300)
 
       # Commit CAS from majority with proposer timestamp likely lower than old_ts.
-      assert :ok = TestCluster.rpc!(n1, EKV, :put, [ekv_name, key, "new", [consistent: true]])
+      assert {:ok, _} =
+               TestCluster.rpc!(n1, EKV, :put, [ekv_name, key, "new", [consistent: true]])
 
       TestCluster.assert_eventually(fn ->
         Enum.all?(majority, fn node ->
@@ -291,7 +292,7 @@ defmodule EKV.StressTest do
       [result_maj, result_min] = Task.await_many([task_maj, task_min], 15_000)
 
       # Majority (3 nodes, quorum=3) should succeed
-      assert result_maj == :ok,
+      assert match?({:ok, _}, result_maj),
              "Majority side should succeed, got: #{inspect(result_maj)}"
 
       # Minority (2 nodes, quorum=3) must fail
@@ -381,7 +382,7 @@ defmodule EKV.StressTest do
       )
 
       # CAS now works after heal
-      assert :ok =
+      assert {:ok, _} =
                TestCluster.rpc!(n1, EKV, :put, [ekv_name, "three/1", "after_heal", [if_vsn: nil]])
 
       TestCluster.assert_eventually(
@@ -424,7 +425,7 @@ defmodule EKV.StressTest do
           # CAS increment from the first node in the majority
           proposer = hd(majority)
 
-          {:ok, new_val} =
+          {:ok, new_val, _} =
             TestCluster.rpc!(proposer, EKV, :update, [
               ekv_name,
               key,
@@ -480,7 +481,8 @@ defmodule EKV.StressTest do
       Process.sleep(500)
 
       # CAS put from n1 (commits with quorum of n1 + some others)
-      :ok = TestCluster.rpc!(n1, EKV, :put, [ekv_name, "crash/1", "committed", [if_vsn: nil]])
+      {:ok, _} =
+        TestCluster.rpc!(n1, EKV, :put, [ekv_name, "crash/1", "committed", [if_vsn: nil]])
 
       # Wait for replication to at least n3
       TestCluster.assert_eventually(fn ->
@@ -504,7 +506,7 @@ defmodule EKV.StressTest do
       # CAS update from n3 with quorum n3+n4+n5 succeeds and sees previous value
       {_, vsn} = TestCluster.rpc!(n3, EKV, :lookup, [ekv_name, "crash/1"])
       assert vsn != nil, "Version should exist for committed value"
-      :ok = TestCluster.rpc!(n3, EKV, :put, [ekv_name, "crash/1", "updated", [if_vsn: vsn]])
+      {:ok, _} = TestCluster.rpc!(n3, EKV, :put, [ekv_name, "crash/1", "updated", [if_vsn: vsn]])
 
       for node <- survivors do
         TestCluster.assert_eventually(fn ->
@@ -526,7 +528,7 @@ defmodule EKV.StressTest do
 
       # CAS put 5 keys from 5 different nodes
       for {node, i} <- Enum.with_index(nodes, 1) do
-        :ok =
+        {:ok, _} =
           TestCluster.rpc!(node, EKV, :put, [ekv_name, "restart/#{i}", "val#{i}", [if_vsn: nil]])
       end
 
@@ -579,7 +581,7 @@ defmodule EKV.StressTest do
       # CAS update on one key succeeds (ballot counter restored)
       {_, vsn} = TestCluster.rpc!(hd(nodes), EKV, :lookup, [ekv_name, "restart/1"])
 
-      assert :ok =
+      assert {:ok, _} =
                TestCluster.rpc!(hd(nodes), EKV, :put, [
                  ekv_name,
                  "restart/1",
@@ -671,7 +673,7 @@ defmodule EKV.StressTest do
       assert TestCluster.rpc!(n3, EKV, :get, [ekv_name, key]) == nil
 
       # CAS insert from n1 → quorum n1+n2+n3
-      :ok = TestCluster.rpc!(n1, EKV, :put, [ekv_name, key, "visible", [if_vsn: nil]])
+      {:ok, _} = TestCluster.rpc!(n1, EKV, :put, [ekv_name, key, "visible", [if_vsn: nil]])
 
       # After CAS completes: get from n2,n3 returns committed value
       TestCluster.assert_eventually(fn ->
@@ -717,7 +719,7 @@ defmodule EKV.StressTest do
             result =
               TestCluster.rpc!(node, EKV, :put, [ekv_name, "pscan/#{i}", val, [if_vsn: nil]])
 
-            if result == :ok do
+            if match?({:ok, _}, result) do
               :atomics.put(committed_ref, i, 1)
               {i, val}
             else
@@ -801,7 +803,7 @@ defmodule EKV.StressTest do
 
       successes =
         Enum.count(results, fn
-          {:ok, _} -> true
+          {:ok, _, _} -> true
           _ -> false
         end)
 
@@ -883,7 +885,7 @@ defmodule EKV.StressTest do
       for i <- 1..20 do
         proposer = Enum.at(active, rem(i - 1, 4))
 
-        {:ok, ^i} =
+        {:ok, ^i, _} =
           TestCluster.rpc!(proposer, EKV, :update, [
             ekv_name,
             key,
@@ -934,7 +936,7 @@ defmodule EKV.StressTest do
         Enum.reduce(1..20, [], fn i, vsns ->
           proposer = Enum.at(nodes, rem(i - 1, 5))
 
-          {:ok, ^i} =
+          {:ok, ^i, _} =
             TestCluster.rpc!(proposer, EKV, :update, [
               ekv_name,
               key,
@@ -969,7 +971,7 @@ defmodule EKV.StressTest do
       key = "vsn/heal"
 
       # CAS put "v1", record vsn1
-      :ok = TestCluster.rpc!(n1, EKV, :put, [ekv_name, key, "v1", [if_vsn: nil]])
+      {:ok, _} = TestCluster.rpc!(n1, EKV, :put, [ekv_name, key, "v1", [if_vsn: nil]])
       {"v1", vsn1} = TestCluster.rpc!(n1, EKV, :lookup, [ekv_name, key])
       assert vsn1 != nil
 
@@ -986,7 +988,7 @@ defmodule EKV.StressTest do
 
       # CAS update to "v2" on majority, record vsn2
       {_, vsn_before} = TestCluster.rpc!(n1, EKV, :lookup, [ekv_name, key])
-      :ok = TestCluster.rpc!(n1, EKV, :put, [ekv_name, key, "v2", [if_vsn: vsn_before]])
+      {:ok, _} = TestCluster.rpc!(n1, EKV, :put, [ekv_name, key, "v2", [if_vsn: vsn_before]])
       {"v2", vsn2} = TestCluster.rpc!(n1, EKV, :lookup, [ekv_name, key])
       assert vsn2 > vsn1, "vsn2 should be greater than vsn1"
 
@@ -1018,7 +1020,7 @@ defmodule EKV.StressTest do
       key = "ballot/crash"
 
       # CAS put from n1, record vsn_before
-      :ok = TestCluster.rpc!(n1, EKV, :put, [ekv_name, key, "before_crash", [if_vsn: nil]])
+      {:ok, _} = TestCluster.rpc!(n1, EKV, :put, [ekv_name, key, "before_crash", [if_vsn: nil]])
       {"before_crash", vsn_before} = TestCluster.rpc!(n1, EKV, :lookup, [ekv_name, key])
 
       # Kill shard 0 on n1 via Process.exit(:kill) (supervisor restarts it)
@@ -1039,7 +1041,10 @@ defmodule EKV.StressTest do
 
       # CAS put from n1 again, record vsn_after
       {_, vsn_current} = TestCluster.rpc!(n1, EKV, :lookup, [ekv_name, key])
-      :ok = TestCluster.rpc!(n1, EKV, :put, [ekv_name, key, "after_crash", [if_vsn: vsn_current]])
+
+      {:ok, _} =
+        TestCluster.rpc!(n1, EKV, :put, [ekv_name, key, "after_crash", [if_vsn: vsn_current]])
+
       {"after_crash", vsn_after} = TestCluster.rpc!(n1, EKV, :lookup, [ekv_name, key])
 
       # Version after crash must be strictly higher
@@ -1075,7 +1080,8 @@ defmodule EKV.StressTest do
       Process.sleep(500)
 
       # CAS put from n1 (quorum n1+n2+n3)
-      :ok = TestCluster.rpc!(n1, EKV, :put, [ekv_name, "chaos/cas", "cas_val", [if_vsn: nil]])
+      {:ok, _} =
+        TestCluster.rpc!(n1, EKV, :put, [ekv_name, "chaos/cas", "cas_val", [if_vsn: nil]])
 
       # Immediately after :ok return, partition {n1,n2} from {n3,n4,n5}
       # (n3 may not have received commit notification yet)
@@ -1132,7 +1138,7 @@ defmodule EKV.StressTest do
       key = "gc/1"
 
       # CAS put
-      :ok = TestCluster.rpc!(n1, EKV, :put, [ekv_name, key, "original", [if_vsn: nil]])
+      {:ok, _} = TestCluster.rpc!(n1, EKV, :put, [ekv_name, key, "original", [if_vsn: nil]])
 
       TestCluster.assert_eventually(fn ->
         Enum.all?(all_nodes, fn n ->
@@ -1142,7 +1148,7 @@ defmodule EKV.StressTest do
 
       # CAS delete
       {_, vsn} = TestCluster.rpc!(n1, EKV, :lookup, [ekv_name, key])
-      :ok = TestCluster.rpc!(n1, EKV, :delete, [ekv_name, key, [if_vsn: vsn]])
+      {:ok, _} = TestCluster.rpc!(n1, EKV, :delete, [ekv_name, key, [if_vsn: vsn]])
 
       TestCluster.assert_eventually(fn ->
         Enum.all?(all_nodes, fn n -> TestCluster.rpc!(n, EKV, :get, [ekv_name, key]) == nil end)
@@ -1152,7 +1158,7 @@ defmodule EKV.StressTest do
       Process.sleep(3000)
 
       # CAS insert-if-absent with new value → must succeed
-      :ok = TestCluster.rpc!(n1, EKV, :put, [ekv_name, key, "reborn", [if_vsn: nil]])
+      {:ok, _} = TestCluster.rpc!(n1, EKV, :put, [ekv_name, key, "reborn", [if_vsn: nil]])
 
       # All 5 agree
       TestCluster.assert_eventually(
@@ -1179,7 +1185,7 @@ defmodule EKV.StressTest do
       key = "mix/1"
 
       # CAS put from n1 (committed on quorum via kv_force_upsert)
-      :ok = TestCluster.rpc!(n1, EKV, :put, [ekv_name, key, "cas_v1", [if_vsn: nil]])
+      {:ok, _} = TestCluster.rpc!(n1, EKV, :put, [ekv_name, key, "cas_v1", [if_vsn: nil]])
 
       # Wait for replication to n4,n5
       TestCluster.assert_eventually(fn ->
@@ -1223,15 +1229,15 @@ defmodule EKV.StressTest do
 
       # If commit broadcast was interrupted by partition → :conflict
       # (kv_paxos has old accepted values with different version than kv).
-      # If commit broadcast completed before partition → :ok
+      # If commit broadcast completed before partition → {:ok, _}
       # Either way: the value must be deterministic and consistent.
-      assert result in [:ok, {:error, :conflict}, {:error, :uncertain}],
-             "Expected :ok, :conflict, or :uncertain, got: #{inspect(result)}"
+      assert match?({:ok, _}, result) or result in [{:error, :conflict}, {:error, :unconfirmed}],
+             "Expected {:ok, _}, :conflict, or :unconfirmed, got: #{inspect(result)}"
 
       # update/3 always resolves the divergence: it reads the highest accepted
       # value during prepare and applies the transform function to it, so
       # there's no version mismatch — it doesn't use if_vsn.
-      {:ok, new_val} =
+      {:ok, new_val, _} =
         TestCluster.rpc!(n2, EKV, :update, [
           ekv_name,
           key,
@@ -1254,7 +1260,7 @@ defmodule EKV.StressTest do
       # (proves kv_paxos is clean after update resolved the divergence)
       {^new_val, fresh_vsn} = TestCluster.rpc!(n2, EKV, :lookup, [ekv_name, key])
       assert fresh_vsn != nil
-      :ok = TestCluster.rpc!(n2, EKV, :put, [ekv_name, key, "final", [if_vsn: fresh_vsn]])
+      {:ok, _} = TestCluster.rpc!(n2, EKV, :put, [ekv_name, key, "final", [if_vsn: fresh_vsn]])
 
       TestCluster.assert_eventually(
         fn ->
@@ -1533,8 +1539,8 @@ defmodule EKV.StressTest do
       end
 
       # Both should commit
-      assert Task.await(task_a, 5000) == :ok
-      assert Task.await(task_b, 5000) == :ok
+      assert match?({:ok, _}, Task.await(task_a, 5000))
+      assert match?({:ok, _}, Task.await(task_b, 5000))
 
       # No cross-contamination
       assert EKV.get(name, key_a) == "val_a"
@@ -1574,7 +1580,7 @@ defmodule EKV.StressTest do
       send(shard_pid, {:ekv_accepted, ref, self(), "2"})
       send(shard_pid, {:ekv_accepted, ref, self(), "3"})
 
-      assert Task.await(task, 5000) == :ok
+      assert match?({:ok, _}, Task.await(task, 5000))
       assert EKV.get(name, key) == "committed_val"
 
       # Now send late accepts with the old ref — ref already removed from pending_cas
@@ -1631,7 +1637,7 @@ defmodule EKV.StressTest do
       send(shard_pid, {:ekv_accepted, ref, self(), "2"})
       send(shard_pid, {:ekv_accepted, ref, self(), "3"})
 
-      {:ok, result} = Task.await(task, 5000)
+      {:ok, result, _} = Task.await(task, 5000)
 
       # The update function uppercased the value with the highest {ts, origin}.
       # "val_C" has ts=now+200 (highest), so it always wins deterministically.
@@ -2130,10 +2136,10 @@ defmodule EKV.StressTest do
            key,
            &TestCluster.cas_increment/1
          ]) do
-      {:ok, val} ->
+      {:ok, val, _vsn} ->
         {:ok, val}
 
-      {:error, reason} when retries > 0 and reason in [:conflict, :uncertain] ->
+      {:error, reason} when retries > 0 and reason in [:conflict, :unconfirmed] ->
         Process.sleep(:rand.uniform(50) + 10)
         do_update_with_retry(node, ekv_name, key, retries - 1)
 
@@ -2151,7 +2157,7 @@ defmodule EKV.StressTest do
              key,
              &TestCluster.cas_increment/1
            ]) do
-        {:ok, _} ->
+        {:ok, _, _} ->
           do_sustained_updates(node, ekv_name, key, deadline, count + 1)
 
         {:error, _} ->

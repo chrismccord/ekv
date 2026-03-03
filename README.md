@@ -45,11 +45,14 @@ EKV.put(:my_kv, "session/abc", token, ttl: :timer.minutes(30))
 EKV.put(:my_kv, "user/1", %{name: "Alice"})
 EKV.put(:my_kv, "user/2", %{name: "Bob"})
 
-EKV.scan(:my_kv, "user/")
-#=> %{"user/1" => %{name: "Alice"}, "user/2" => %{name: "Bob"}}
+EKV.scan(:my_kv, "user/") |> Enum.to_list()
+#=> [
+#=>   {"user/1", %{name: "Alice"}, {ts, origin_node}},
+#=>   {"user/2", %{name: "Bob"}, {ts, origin_node}}
+#=> ]
 
 EKV.keys(:my_kv, "user/")
-#=> ["user/1", "user/2"]
+#=> [{"user/1", {ts, origin_node}}, {"user/2", {ts, origin_node}}]
 
 # Subscribe to a key
 EKV.subscribe(:my_kv, "room/1")
@@ -122,6 +125,11 @@ Use mode as **key ownership**:
 - Reads for CAS-managed keys can be eventual (`EKV.get/2`, `EKV.lookup/2`) for
   lower latency, or consistent (`EKV.get/3, consistent: true`) when freshness
   matters. `consistent: true` is a barrier/linearizable read.
+- `EKV.keys/2` returns `{key, vsn}` tuples so callers can pipeline scans into
+  CAS writes (`if_vsn:`) without fetching full values.
+- CAS write APIs return committed VSNs on success (`{:ok, vsn}` for
+  `put/delete`, `{:ok, value, vsn}` for `update`) so callers can chain
+  later `if_vsn:` guards without an extra lookup.
 - Do not mix eventual writes and CAS writes on the same key.
 
 ### CAS write error semantics
@@ -131,10 +139,10 @@ CAS writes (`put` with `if_vsn:` or `consistent: true`, `delete` with `if_vsn:`,
 
 - `{:error, :conflict}`: write was rejected before a deciding accept phase
   (for example: version mismatch or pre-accept contention).
-- `{:error, :uncertain}`: write entered accept phase, but the caller could not
+- `{:error, :unconfirmed}`: write entered accept phase, but the caller could not
   confirm final outcome. The write may already be committed.
 
-On `:uncertain`, resolve with `EKV.get(name, key, consistent: true)` before
+On `:unconfirmed`, resolve with `EKV.get(name, key, consistent: true)` before
 taking follow-up actions.
 
 ### Known limitation: mixed-mode single-key writes

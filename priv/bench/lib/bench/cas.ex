@@ -52,11 +52,12 @@ defmodule Bench.CAS do
       warmup(warmup_n, fn ->
         key = "cas_warm/#{:rand.uniform(100_000)}"
 
-        rpc(r1(ctx), Bench.Replica, :cas_update, [
-          @name,
-          key,
-          &Bench.Replica.cas_increment/1
-        ])
+        {:ok, _, _} =
+          rpc(r1(ctx), Bench.Replica, :cas_update, [
+            @name,
+            key,
+            &Bench.Replica.cas_increment/1
+          ])
       end)
 
       # Insert-if-absent (lookup + put if_vsn: nil)
@@ -64,7 +65,7 @@ defmodule Bench.CAS do
         collect_remote_samples(n, r1(ctx), fn i ->
           key = "cas_insert/#{i}"
           nil = rpc(r1(ctx), Bench.Replica, :cas_lookup, [@name, key])
-          :ok = rpc(r1(ctx), Bench.Replica, :cas_put, [@name, key, %{i: i}, nil])
+          {:ok, _} = rpc(r1(ctx), Bench.Replica, :cas_put, [@name, key, %{i: i}, nil])
         end)
 
       report_latency(
@@ -77,7 +78,7 @@ defmodule Bench.CAS do
         collect_remote_samples(n, r1(ctx), fn i ->
           key = "cas_insert/#{i}"
           {_val, vsn} = rpc(r1(ctx), Bench.Replica, :cas_lookup, [@name, key])
-          :ok = rpc(r1(ctx), Bench.Replica, :cas_put, [@name, key, %{i: i, v: 2}, vsn])
+          {:ok, _} = rpc(r1(ctx), Bench.Replica, :cas_put, [@name, key, %{i: i, v: 2}, vsn])
         end)
 
       report_latency(
@@ -89,7 +90,7 @@ defmodule Bench.CAS do
       consistent_samples =
         collect_remote_samples(n, r1(ctx), fn i ->
           key = "cas_cons/#{i}"
-          rpc(r1(ctx), Bench.Replica, :consistent_put, [@name, key, %{i: i}])
+          {:ok, _} = rpc(r1(ctx), Bench.Replica, :consistent_put, [@name, key, %{i: i}])
         end)
 
       report_latency(
@@ -112,11 +113,12 @@ defmodule Bench.CAS do
 
       # Seed data via CAS
       for i <- 1..seed do
-        rpc(r1(ctx), Bench.Replica, :cas_update, [
-          @name,
-          "cread/#{i}",
-          &Bench.Replica.cas_increment/1
-        ])
+        {:ok, _, _} =
+          rpc(r1(ctx), Bench.Replica, :cas_update, [
+            @name,
+            "cread/#{i}",
+            &Bench.Replica.cas_increment/1
+          ])
       end
 
       Process.sleep(300)
@@ -165,11 +167,12 @@ defmodule Bench.CAS do
       # Different keys — no contention
       distinct_samples =
         collect_remote_samples(n, r1(ctx), fn i ->
-          rpc(r1(ctx), Bench.Replica, :cas_update, [
-            @name,
-            "upd/#{i}",
-            &Bench.Replica.cas_increment/1
-          ])
+          {:ok, _, _} =
+            rpc(r1(ctx), Bench.Replica, :cas_update, [
+              @name,
+              "upd/#{i}",
+              &Bench.Replica.cas_increment/1
+            ])
         end)
 
       report_latency(
@@ -180,11 +183,12 @@ defmodule Bench.CAS do
       # Same key — sequential increments (ballot escalation, no concurrent conflict)
       same_key_samples =
         collect_remote_samples(n, r1(ctx), fn _i ->
-          rpc(r1(ctx), Bench.Replica, :cas_update, [
-            @name,
-            "upd/hot",
-            &Bench.Replica.cas_increment/1
-          ])
+          {:ok, _, _} =
+            rpc(r1(ctx), Bench.Replica, :cas_update, [
+              @name,
+              "upd/hot",
+              &Bench.Replica.cas_increment/1
+            ])
         end)
 
       report_latency("#{format_number(n)} sequential updates on same key", same_key_samples)
@@ -192,12 +196,13 @@ defmodule Bench.CAS do
       # With TTL
       ttl_samples =
         collect_remote_samples(n, r1(ctx), fn i ->
-          rpc(r1(ctx), Bench.Replica, :cas_update_with_ttl, [
-            @name,
-            "upd_ttl/#{i}",
-            &Bench.Replica.cas_increment/1,
-            :timer.minutes(30)
-          ])
+          {:ok, _, _} =
+            rpc(r1(ctx), Bench.Replica, :cas_update_with_ttl, [
+              @name,
+              "upd_ttl/#{i}",
+              &Bench.Replica.cas_increment/1,
+              :timer.minutes(30)
+            ])
         end)
 
       report_latency("#{format_number(n)} updates with TTL (30 min)", ttl_samples)
@@ -213,33 +218,55 @@ defmodule Bench.CAS do
 
     with_remote_ekv(shards, ctx, "s4", fn ->
       proposer_count = length(ctx.replicas)
+      base_ops_per_node = if ctx.quick, do: 2_048, else: 4_096
+      min_ops_per_worker = if ctx.quick, do: 8, else: 16
 
-      cases =
-        if ctx.quick, do: [{4, 80}, {8, 60}, {16, 40}], else: [{4, 200}, {8, 150}, {16, 100}]
+      worker_tiers =
+        if ctx.quick do
+          [64, 128, 256, 512, 1024, 1536, 2048]
+        else
+          [64, 128, 256, 512, 1024, 1536, 2048]
+        end
 
-      for {workers_per_node, n_per_worker} <- cases do
-        total = workers_per_node * n_per_worker * proposer_count
+      for workers_per_node <- worker_tiers do
+        ops_per_node = max(base_ops_per_node, workers_per_node * min_ops_per_worker)
+        total = ops_per_node * proposer_count
 
         subheader(
           "#{workers_per_node} workers/node across #{proposer_count} proposers, " <>
-            "#{format_number(total)} total updates"
+            "#{format_number(ops_per_node)} ops/node (#{min_ops_per_worker} ops/worker floor) " <>
+            "(#{format_number(total)} total updates)"
         )
 
-        {wall_us, _} =
+        {wall_us, summaries} =
           time_us(fn ->
             ctx.replicas
             |> Enum.with_index(1)
             |> Enum.map(fn {node, node_ix} ->
               Task.async(fn ->
-                run_parallel_cas(node, workers_per_node, n_per_worker, "par_n#{node_ix}", ctx)
+                run_parallel_cas(node, workers_per_node, ops_per_node, "par_n#{node_ix}")
               end)
             end)
-            |> Enum.each(&Task.await(&1, 120_000))
+            |> Enum.map(&Task.await(&1, 240_000))
           end)
+
+        attempted = Enum.sum(Enum.map(summaries, & &1.attempted))
+        succeeded = Enum.sum(Enum.map(summaries, & &1.ok))
+
+        error_counts =
+          summaries
+          |> Enum.map(& &1.errors)
+          |> Enum.reduce(%{}, &merge_error_counts/2)
+
+        if map_size(error_counts) > 0 do
+          IO.puts("    successes : #{format_number(succeeded)}")
+          IO.puts("    failures  : #{format_number(attempted - succeeded)}")
+          print_error_counts(error_counts)
+        end
 
         report_throughput(
           "CAS updates from #{workers_per_node} workers/node across #{proposer_count} proposers",
-          total,
+          succeeded,
           wall_us
         )
       end
@@ -288,18 +315,18 @@ defmodule Bench.CAS do
               end)
               |> Enum.flat_map(&Task.await(&1, 120_000))
 
-            successes = Enum.count(all, &match?({:ok, _}, &1))
+            successes = Enum.count(all, &match?({:ok, _, _}, &1))
             error_counts = count_errors(all)
             conflicts = Map.get(error_counts, :conflict, 0)
-            uncertain = Map.get(error_counts, :uncertain, 0)
+            unconfirmed = Map.get(error_counts, :unconfirmed, 0)
 
             IO.puts("    successes : #{successes}")
             IO.puts("    conflicts : #{conflicts} (retries exhausted)")
 
-            if uncertain > 0,
-              do: IO.puts("    uncertain : #{uncertain} (accept outcome ambiguous)")
+            if unconfirmed > 0,
+              do: IO.puts("    unconfirmed : #{unconfirmed} (accept outcome ambiguous)")
 
-            print_error_counts(Map.drop(error_counts, [:conflict, :uncertain]))
+            print_error_counts(Map.drop(error_counts, [:conflict, :unconfirmed]))
           end)
 
         final_val = rpc(r1(ctx), Bench.Replica, :consistent_get, [@name, key])
@@ -330,11 +357,12 @@ defmodule Bench.CAS do
           {:watching, ^ref} -> :ok
         end
 
-        rpc(r1(ctx), Bench.Replica, :cas_update, [
-          @name,
-          key,
-          &Bench.Replica.cas_increment/1
-        ])
+        {:ok, _, _} =
+          rpc(r1(ctx), Bench.Replica, :cas_update, [
+            @name,
+            key,
+            &Bench.Replica.cas_increment/1
+          ])
 
         receive do
           {:found, ^ref} -> :ok
@@ -355,11 +383,12 @@ defmodule Bench.CAS do
 
           {us, _} =
             time_us(fn ->
-              rpc(r1(ctx), Bench.Replica, :cas_update, [
-                @name,
-                key,
-                &Bench.Replica.cas_increment/1
-              ])
+              {:ok, _, _} =
+                rpc(r1(ctx), Bench.Replica, :cas_update, [
+                  @name,
+                  key,
+                  &Bench.Replica.cas_increment/1
+                ])
 
               receive do
                 {:found, ^ref} -> :ok
@@ -397,11 +426,12 @@ defmodule Bench.CAS do
 
       # Seed config keys
       for i <- 1..seed do
-        rpc(r1(ctx), Bench.Replica, :cas_update, [
-          @name,
-          "cfg/#{i}",
-          &Bench.Replica.cas_increment/1
-        ])
+        {:ok, _, _} =
+          rpc(r1(ctx), Bench.Replica, :cas_update, [
+            @name,
+            "cfg/#{i}",
+            &Bench.Replica.cas_increment/1
+          ])
       end
 
       Process.sleep(300)
@@ -433,17 +463,17 @@ defmodule Bench.CAS do
             results = Enum.flat_map(tasks, &Task.await(&1, 120_000))
             error_counts = count_errors(results)
             conflicts = Map.get(error_counts, :conflict, 0)
-            uncertain = Map.get(error_counts, :uncertain, 0)
+            unconfirmed = Map.get(error_counts, :unconfirmed, 0)
 
             if conflicts > 0 do
               IO.puts("    conflicts : #{conflicts}")
             end
 
-            if uncertain > 0 do
-              IO.puts("    uncertain : #{uncertain}")
+            if unconfirmed > 0 do
+              IO.puts("    unconfirmed : #{unconfirmed}")
             end
 
-            print_error_counts(Map.drop(error_counts, [:conflict, :uncertain]))
+            print_error_counts(Map.drop(error_counts, [:conflict, :unconfirmed]))
           end)
 
         report_throughput("#{format_number(ops)} ops across #{workers} workers", ops, wall_us)
@@ -483,7 +513,7 @@ defmodule Bench.CAS do
         collect_remote_samples(n, r1(ctx), fn i ->
           key = "xsess/#{i}"
           # Create on R1
-          :ok =
+          {:ok, _} =
             rpc(r1(ctx), Bench.Replica, :consistent_put, [
               @name,
               key,
@@ -494,7 +524,7 @@ defmodule Bench.CAS do
           rpc(r2(ctx), Bench.Replica, :consistent_get, [@name, key])
 
           # Update on R2
-          {:ok, _} =
+          {:ok, _, updated_vsn} =
             rpc(r2(ctx), Bench.Replica, :cas_update, [
               @name,
               key,
@@ -502,8 +532,7 @@ defmodule Bench.CAS do
             ])
 
           # Delete on R1
-          {_val, vsn} = rpc(r1(ctx), Bench.Replica, :cas_lookup, [@name, key])
-          rpc(r1(ctx), Bench.Replica, :cas_delete, [@name, key, vsn])
+          {:ok, _} = rpc(r1(ctx), Bench.Replica, :cas_delete, [@name, key, updated_vsn])
         end)
 
       report_latency("#{format_number(n)} cross-node lifecycles (R1→R2→R2→R1)", cross_samples)
@@ -531,11 +560,12 @@ defmodule Bench.CAS do
       # CAS updates (prepare + accept + commit quorum)
       cas_samples =
         collect_remote_samples(n, r1(ctx), fn i ->
-          rpc(r1(ctx), Bench.Replica, :cas_update, [
-            @name,
-            "cmp_cas/#{i}",
-            &Bench.Replica.cas_increment/1
-          ])
+          {:ok, _, _} =
+            rpc(r1(ctx), Bench.Replica, :cas_update, [
+              @name,
+              "cmp_cas/#{i}",
+              &Bench.Replica.cas_increment/1
+            ])
         end)
 
       report_latency("#{format_number(n)} CAS updates (quorum round-trip)", cas_samples)
@@ -592,21 +622,12 @@ defmodule Bench.CAS do
     end
   end
 
-  defp run_parallel_cas(node, workers, n_per_worker, prefix, _ctx) do
-    tasks =
-      for w <- 1..workers do
-        Task.async(fn ->
-          for i <- 1..n_per_worker do
-            rpc(node, Bench.Replica, :cas_update, [
-              @name,
-              "#{prefix}/w#{w}/#{i}",
-              &Bench.Replica.cas_increment/1
-            ])
-          end
-        end)
-      end
+  defp run_parallel_cas(node, workers, total_ops, prefix) do
+    rpc(node, Bench.Replica, :run_parallel_cas_batch, [@name, workers, total_ops, prefix])
+  end
 
-    Enum.each(tasks, &Task.await(&1, 120_000))
+  defp merge_error_counts(left, right) do
+    Map.merge(left, right, fn _reason, a, b -> a + b end)
   end
 
   defp with_remote_ekv(shards, ctx, scope, fun) do

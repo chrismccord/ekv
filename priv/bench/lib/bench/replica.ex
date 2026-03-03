@@ -74,7 +74,7 @@ defmodule Bench.Replica do
   end
 
   def list_keys(name, prefix) do
-    EKV.keys(name, prefix) |> Enum.sort()
+    EKV.keys(name, prefix) |> Enum.map(fn {key, _vsn} -> key end) |> Enum.sort()
   end
 
   def start_watcher(name, notify_pid) do
@@ -132,6 +132,38 @@ defmodule Bench.Replica do
     EKV.update(name, key, fun, ttl: ttl)
   end
 
+  def run_parallel_cas_batch(name, workers, total_ops, prefix)
+      when is_integer(workers) and workers > 0 and is_integer(total_ops) and total_ops >= 0 do
+    base_ops = div(total_ops, workers)
+    extra_ops = rem(total_ops, workers)
+
+    assignments =
+      for worker <- 1..workers do
+        ops = base_ops + if(worker <= extra_ops, do: 1, else: 0)
+        {worker, ops}
+      end
+
+    Enum.reduce(
+      Task.async_stream(
+        assignments,
+        fn {worker, ops} ->
+          run_parallel_worker(name, prefix, worker, ops)
+        end,
+        max_concurrency: workers,
+        ordered: false,
+        timeout: :infinity
+      ),
+      %{ok: 0, attempted: total_ops, errors: %{}},
+      fn
+        {:ok, %{ok: ok, errors: errors}}, acc ->
+          %{acc | ok: acc.ok + ok, errors: merge_error_counts(acc.errors, errors)}
+
+        {:exit, reason}, acc ->
+          %{acc | errors: Map.update(acc.errors, {:worker_exit, reason}, 1, &(&1 + 1))}
+      end
+    )
+  end
+
   def cas_lookup(name, key) do
     EKV.lookup(name, key)
   end
@@ -160,7 +192,8 @@ defmodule Bench.Replica do
 
   @known_consistent_read_reasons %{
     "conflict" => :conflict,
-    "uncertain" => :uncertain,
+    "unconfirmed" => :unconfirmed,
+    "uncertain" => :unconfirmed,
     "quorum_timeout" => :quorum_timeout,
     "no_quorum" => :no_quorum,
     "shutting_down" => :shutting_down
@@ -180,14 +213,14 @@ defmodule Bench.Replica do
 
   def session_lifecycle(name, key) do
     # Insert
-    :ok = EKV.put(name, key, %{state: :created}, consistent: true)
+    {:ok, _} = EKV.put(name, key, %{state: :created}, consistent: true)
     # Read back
     _val = EKV.get(name, key, consistent: true)
     # Update
-    {:ok, _} = EKV.update(name, key, &session_activate/1)
+    {:ok, _, _} = EKV.update(name, key, &session_activate/1)
     # Delete
     {_val, vsn} = EKV.lookup(name, key)
-    EKV.delete(name, key, if_vsn: vsn)
+    {:ok, _} = EKV.delete(name, key, if_vsn: vsn)
   end
 
   def cas_increment(nil), do: 1
@@ -195,6 +228,43 @@ defmodule Bench.Replica do
 
   def session_activate(v) when is_map(v), do: Map.put(v, :state, :active)
   def session_activate(v), do: v
+
+  defp run_parallel_worker(_name, _prefix, _worker, 0), do: %{ok: 0, errors: %{}}
+
+  defp run_parallel_worker(name, prefix, worker, ops) do
+    Enum.reduce(1..ops, %{ok: 0, errors: %{}}, fn i, acc ->
+      key = "#{prefix}/w#{worker}/#{i}"
+
+      case safe_parallel_update(name, key) do
+        {:ok, _, _} ->
+          %{acc | ok: acc.ok + 1}
+
+        {:error, reason} ->
+          %{acc | errors: Map.update(acc.errors, reason, 1, &(&1 + 1))}
+
+        _other ->
+          %{acc | errors: Map.update(acc.errors, :unexpected, 1, &(&1 + 1))}
+      end
+    end)
+  end
+
+  defp safe_parallel_update(name, key) do
+    try do
+      # High-concurrency benchmark runs can queue deeply on shard GenServers.
+      # Use a larger call timeout so we measure saturation, not default call timeout.
+      EKV.update(name, key, &cas_increment/1, timeout: 60_000)
+    catch
+      :exit, {:timeout, _} ->
+        {:error, :call_timeout}
+
+      :exit, reason ->
+        {:error, {:call_exit, reason}}
+    end
+  end
+
+  defp merge_error_counts(left, right) do
+    Map.merge(left, right, fn _reason, a, b -> a + b end)
+  end
 
   @doc "Start a subscriber that forwards event timestamps to a remote pid"
   def start_event_subscriber(name, prefix, notify_pid) do

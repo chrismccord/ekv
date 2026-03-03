@@ -1,137 +1,105 @@
-# EKV Benchmark Results
+# EKV Local Benchmark Results
 
-**Date:** 2026-02-21
-**Machine:** Darwin 23.6.0, 8 schedulers
-**Config:** 8 shards (default), log disabled, GC disabled
+**Date:** 2026-03-03 11:35 EST  
+**Machine:** Darwin 23.6.0 (arm64), 8 schedulers  
+**Config:** 8 shards (default)
 
-## Local Benchmarks
+Command run:
 
-### 1. Get Throughput (ETS hot path, no GenServer)
+```bash
+cd /Users/chris/oss/ekv/priv/bench
+./run_local.sh
+```
 
-| Mode | ops/sec | p50 | p99 | max |
-|------|---------|-----|-----|-----|
-| Sequential | 1,428,183 | 1 us | 2 us | 730 us |
-| Parallel (16 workers) | 226,075 | — | — | — |
-
-### 2. Put Throughput (GenServer call per write)
+## 1. Get Throughput (SQLite read path, no GenServer)
 
 | Mode | ops/sec | p50 | p99 | max |
 |------|---------|-----|-----|-----|
-| Sequential | 18,564 | 39 us | 146 us | 13,585 us |
-| Parallel (16 workers) | 25,650 | — | — | — |
+| Sequential | 204,180 | 3 us | 18 us | 1,281 us |
+| Parallel (16 workers) | 138,689 | - | - | - |
 
-### 3. Mixed Workload (80% reads, 20% writes)
+## 2. Put Throughput (GenServer call per write)
+
+| Mode | ops/sec | p50 | p99 | max |
+|------|---------|-----|-----|-----|
+| Sequential | 17,651 | 29 us | 137 us | 20,819 us |
+| Parallel (16 workers) | 27,868 | - | - | - |
+
+## 3. Mixed Workload (80% reads, 20% writes)
 
 | ops/sec |
 |---------|
-| 99,140 |
+| 95,107 |
 
-### 4. Delete Throughput
+## 4. Delete Throughput
 
 | ops/sec | p50 | p99 | max |
 |---------|-----|-----|-----|
-| 16,772 | 43 us | 104 us | 3,892 us |
+| 17,259 | 32 us | 101 us | 13,669 us |
 
-### 5. Prefix Scan (fan-out to all 8 shards)
+## 5. Prefix Scan (fan-out to all 8 shards)
 
 | Keys | Operation | ops/sec | p50 | p99 | max |
 |------|-----------|---------|-----|-----|-----|
-| 100 | list/2 | 25,213 | 38 us | 59 us | 78 us |
-| 100 | keys/2 | 34,567 | 28 us | 51 us | 81 us |
-| 1,000 | list/2 | 3,309 | 296 us | 350 us | 462 us |
-| 1,000 | keys/2 | 5,290 | 186 us | 226 us | 282 us |
-| 10,000 | list/2 | 322 | 3,069 us | 3,559 us | 4,367 us |
-| 10,000 | keys/2 | 473 | 2,092 us | 2,405 us | 3,296 us |
+| 100 | scan/2 | 5,079 | 159 us | 560 us | 8,955 us |
+| 100 | keys/2 | 7,575 | 121 us | 410 us | 743 us |
+| 1,000 | scan/2 | 1,371 | 691 us | 1,388 us | 2,097 us |
+| 1,000 | keys/2 | 2,205 | 444 us | 674 us | 960 us |
+| 10,000 | scan/2 | 165 | 5,801 us | 9,645 us | 31,290 us |
+| 10,000 | keys/2 | 326 | 3,021 us | 3,672 us | 5,948 us |
 
-### 6. TTL Put Throughput
+## 6. TTL Put Throughput
 
 | Mode | ops/sec | p50 | p99 | max |
 |------|---------|-----|-----|-----|
-| Without TTL | 17,868 | 39 us | 159 us | 14,905 us |
-| With TTL | 14,875 | 49 us | 158 us | 5,747 us |
+| Without TTL | 18,975 | 29 us | 137 us | 105,711 us |
+| With TTL | 17,333 | 34 us | 123 us | 11,538 us |
 
-### 7. Value Size Scaling
+## 7. Value Size Scaling
 
-| Size | Put ops/sec | Get ops/sec | Get p50 | Get p99 |
-|------|-------------|-------------|---------|---------|
-| 64 B | 13,841 | 1,346,982 | 1 us | 1 us |
-| 1 KB | 12,267 | 957,762 | 1 us | 2 us |
-| 10 KB | 4,157 | 495,712 | 2 us | 12 us |
-| 100 KB | 580 | 49,236 | 16 us | 49 us |
+| Size | Put ops/sec | Get ops/sec | Get p50 | Get p99 | Get max |
+|------|-------------|-------------|---------|---------|---------|
+| 64 B | 9,105 | 288,875 | 3 us | 8 us | 67 us |
+| 1 KB | 4,302 | 245,272 | 4 us | 12 us | 65 us |
+| 10 KB | 1,861 | 111,861 | 7 us | 65 us | 548 us |
+| 100 KB | 264 | 2,141 | 32 us | 2,960 us | 31,128 us |
 
-### 8. Shard Scaling (parallel puts, 32 workers)
+## 8. Shard Scaling (parallel puts, 32 workers)
 
 | Shards | ops/sec |
 |--------|---------|
-| 1 | 17,102 |
-| 2 | 15,281 |
-| 4 | 17,537 |
-| 8 | 21,219 |
+| 1 | 17,111 |
+| 2 | 19,669 |
+| 4 | 16,930 |
+| 8 | 15,150 |
 
-## Distributed Benchmarks
+## 9. Subscribe Overhead on Writes
 
-### 1. Replication Latency (put on replica1, visible on replica2)
+| Subscribers | ops/sec | p50 | p99 | max |
+|-------------|---------|-----|-----|-----|
+| 0 | 9,267 | 33 us | 240 us | 119,385 us |
+| 1 | 12,583 | 33 us | 168 us | 70,882 us |
+| 10 | 9,225 | 41 us | 261 us | 73,810 us |
+| 100 | 8,459 | 63 us | 263 us | 243,128 us |
+
+## 10. Subscribe Fan-out (all subscribers match)
+
+| Subscribers | ops/sec | p50 | p99 | max |
+|-------------|---------|-----|-----|-----|
+| 1 | 7,225 | 43 us | 1,243 us | 45,026 us |
+| 10 | 9,496 | 52 us | 331 us | 27,115 us |
+| 50 | 9,273 | 56 us | 387 us | 16,139 us |
+| 200 | 6,803 | 113 us | 386 us | 38,451 us |
+
+## 11. Subscribe at Scale (10,000 subscribers)
+
+| Mode | ops/sec | p50 | p99 | max |
+|------|---------|-----|-----|-----|
+| Random keys (5,000 puts) | 10,477 | 43 us | 282 us | 9,893 us |
+| Same key (5,000 puts) | 15,263 | 24 us | 433 us | 8,396 us |
+
+## 12. Subscribe Event Latency (put call -> event received)
 
 | ops/sec | p50 | p99 | max |
 |---------|-----|-----|-----|
-| 19,515 | 44 us | 80 us | 5,234 us |
-
-### 2. Bulk Sync (new peer catches up)
-
-| Keys | Sync time | keys/sec |
-|------|-----------|----------|
-| 1,000 | 105 ms | 9,519 |
-| 10,000 | 644 ms | 15,505 |
-
-### 3. Concurrent Cross-Node Writes (5K per node)
-
-| Total keys | ops/sec | Wall time |
-|------------|---------|-----------|
-| 10,000 | 5,920 | 1,688 ms |
-
-### 4. Delete Replication
-
-| Deletes | Wall time | deletes/sec |
-|---------|-----------|-------------|
-| 1,000 | 257 ms | 3,879 |
-| 5,000 | 621 ms | 8,043 |
-
-### 5. Network Partition & Heal
-
-| Metric | Value |
-|--------|-------|
-| Isolation verified | yes (0 leaked keys) |
-| Convergence after heal (2,000 keys) | 126 ms |
-
-### 6. Value Size Replication Latency
-
-| Size | ops/sec | p50 | p99 | max |
-|------|---------|-----|-----|-----|
-| 64 B | 14,703 | 44 us | 93 us | 5,461 us |
-| 1 KB | 21,691 | 44 us | 77 us | 150 us |
-| 10 KB | 4,626 | 41 us | 5,969 us | 11,866 us |
-| 100 KB | 1,175 | 85 us | 23,802 us | 35,919 us |
-
-### 7. Busy App Simulation (10 workers/node, 200 keys/worker, 5 churn rounds)
-
-| Phase | ops/sec |
-|-------|---------|
-| Initial load + converge (4,000 keys) | 5,252 |
-| Churn round 1 | 11,558 |
-| Churn round 2 | 12,266 |
-| Churn round 3 | 12,429 |
-| Churn round 4 | 13,255 |
-| Churn round 5 | 13,256 |
-| Cross-node reads (10,000) | 97,298 |
-| **Total wall time** | **2,462 ms** |
-| Final consistency | replica1=4000, replica2=4000, match=true |
-
-## Key Takeaways
-
-- **Reads are fast:** ~1.4M ops/sec sequential gets (ETS hot path, sub-microsecond p50)
-- **Writes are SQLite-bound:** ~18K ops/sec sequential puts, ~25K parallel (GenServer + WAL)
-- **Replication is tight:** 44 us p50 replication latency across nodes
-- **Partition heal is quick:** 126 ms to converge 2,000 keys after reconnect
-- **Value size matters for writes:** 100KB values drop puts to 580 ops/sec but gets stay at 49K
-- **Shard scaling helps parallel writes:** 8 shards = 21K ops/sec vs 17K for 1 shard (32 workers)
-- **Bulk sync scales well:** 15.5K keys/sec for 10K key sync (better throughput at scale)
+| 13,861 | 40 us | 249 us | 12,550 us |

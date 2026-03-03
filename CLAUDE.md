@@ -17,8 +17,8 @@ EKV.put(:my_kv, "user/1", %{name: "Alice"})
 EKV.put(:my_kv, "key", value, ttl: :timer.minutes(30))
 EKV.get(:my_kv, "user/1")          # => %{name: "Alice"} | nil
 EKV.delete(:my_kv, "user/1")
-EKV.scan(:my_kv, "user/")          # => %{"user/1" => val}
-EKV.keys(:my_kv, "user/")          # => ["user/1"] sorted
+EKV.scan(:my_kv, "user/") |> Enum.to_list()  # => [{"user/1", val, {ts, origin_node}}]
+EKV.keys(:my_kv, "user/")          # => [{"user/1", {ts, origin_node}}] sorted by key
 
 # Subscribe to changes (matches at "/" boundaries, "" = all keys)
 EKV.subscribe(:my_kv, "user/")
