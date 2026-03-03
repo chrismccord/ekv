@@ -128,12 +128,54 @@ defmodule Bench.Replica do
     EKV.update(name, key, fun)
   end
 
+  def cas_update_with_ttl(name, key, fun, ttl) do
+    EKV.update(name, key, fun, ttl: ttl)
+  end
+
   def cas_lookup(name, key) do
     EKV.lookup(name, key)
   end
 
+  def consistent_put(name, key, value) do
+    EKV.put(name, key, value, consistent: true)
+  end
+
+  def consistent_get(name, key) do
+    EKV.get(name, key, consistent: true)
+  end
+
+  def consistent_get_result(name, key, opts \\ []) do
+    opts = Keyword.validate!(opts, [:retries, :backoff, :timeout])
+
+    try do
+      {:ok, EKV.get(name, key, Keyword.merge([consistent: true], opts))}
+    rescue
+      e in RuntimeError ->
+        if String.contains?(e.message, "consistent read failed: :conflict") do
+          {:error, :conflict}
+        else
+          reraise e, __STACKTRACE__
+        end
+    end
+  end
+
+  def session_lifecycle(name, key) do
+    # Insert
+    :ok = EKV.put(name, key, %{state: :created}, consistent: true)
+    # Read back
+    _val = EKV.get(name, key, consistent: true)
+    # Update
+    {:ok, _} = EKV.update(name, key, &session_activate/1)
+    # Delete
+    {_val, vsn} = EKV.lookup(name, key)
+    EKV.delete(name, key, if_vsn: vsn)
+  end
+
   def cas_increment(nil), do: 1
-  def cas_increment(n), do: n + 1
+  def cas_increment(n) when is_integer(n), do: n + 1
+
+  def session_activate(v) when is_map(v), do: Map.put(v, :state, :active)
+  def session_activate(v), do: v
 
   @doc "Start a subscriber that forwards event timestamps to a remote pid"
   def start_event_subscriber(name, prefix, notify_pid) do
