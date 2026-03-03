@@ -372,6 +372,8 @@ defmodule EKV do
     `cluster_size` and `node_id` config.
     For strict behavior, keep the key in CAS mode and do not mix with eventual
     `put`/`delete` on the same key.
+    Eventual writes to CAS-managed keys are rejected with
+    `{:error, :cas_managed_key}`.
   - `:retries` — max CAS retries on conflict (default 5). Only for
     `:consistent` and `:if_vsn` paths.
   - `:backoff` — `{min_ms, max_ms}` random backoff range (default `{10, 60}`).
@@ -379,7 +381,8 @@ defmodule EKV do
 
   ## Returns
 
-  - Eventual put (`put` without CAS options): `:ok`
+  - Eventual put (`put` without CAS options): `:ok` or
+    `{:error, :cas_managed_key}` when the key is CAS-managed
   - CAS put (`if_vsn:` or `consistent: true`): `{:ok, vsn}` where
     `vsn` is `{timestamp, origin_node}`
   """
@@ -499,10 +502,13 @@ defmodule EKV do
     Requires `cluster_size` and `node_id` config.
     For strict behavior, keep the key in CAS mode and do not mix with eventual
     `put`/`delete` on the same key.
+    Eventual deletes on CAS-managed keys are rejected with
+    `{:error, :cas_managed_key}`.
 
   ## Returns
 
-  - Eventual delete (`delete` without CAS options): `:ok`
+  - Eventual delete (`delete` without CAS options): `:ok` or
+    `{:error, :cas_managed_key}` when the key is CAS-managed
   - CAS delete (`if_vsn:`): `{:ok, vsn}` where `vsn` is `{timestamp, origin_node}`
   """
   def delete(name, key, opts \\ []) do

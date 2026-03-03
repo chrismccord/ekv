@@ -292,6 +292,9 @@ defmodule EKV.Replica do
         │                           │                      │
         │ ── Phase 2: ACCEPT ───    │                      │
         │                           │                      │
+        │ local paxos_accept        │                      │
+        │ (durable self-accept)     │                      │
+        │                           │                      │
         │ {:ekv_accept, ref, pid,   │                      │
         │  key, ballot, entry}      │                      │
         │──────────────────────────>│                      │
@@ -308,23 +311,19 @@ defmodule EKV.Replica do
         │                           │                      │
         │ ── Phase 3: COMMIT ───    │                      │
         │                           │                      │
-        │  local: paxos_accept +    │                      │
-        │    write_entry (kv+oplog) │                      │
-        │    clear kv_paxos accepted│                      │
+        │  local: paxos_promote     │                      │
+        │   (kv_paxos -> kv+oplog)  │                      │
         │                           │                      │
-        │ {:ekv_cas_committed, ...} │  (to acceptors)      │
+        │ {:ekv_cas_committed, ...} │  (to all peers)      │
         │──────────────────────────>│                      │
         │──────────────────────────────────────────────────>│
         │                           │                      │
-        │ {:ekv_put, ...}           │  (LWW to non-        │
-        │──────────────────────────>│   acceptors)         │
-        │                           │                      │
-        │  acceptors: paxos_promote │                      │
-        │  (kv_paxos → kv + oplog)  │                      │
+        │  receivers: paxos_promote │                      │
+        │  or paxos_accept+promote  │                      │
 
-  The proposer defers its own local accept until after remote quorum.
-  This prevents phantom reads — if the proposer crashes before quorum,
-  no value was written to kv locally.
+  The proposer records local accept before sending remote accepts, then
+  commits only after accepted quorum is reached. Accepted values remain
+  invisible to reads until promote writes them to kv.
 
   ### Phantom Prevention
 
@@ -343,19 +342,13 @@ defmodule EKV.Replica do
 
   ### Commit Dissemination
 
-  After commit, the proposer sends two types of messages:
+  After commit, the proposer sends:
 
-    - {:ekv_cas_committed, key, ballot_c, ballot_n, shard}
-      → sent to nodes that participated as acceptors (have kv_paxos state)
-      → receiver calls paxos_promote: reads from kv_paxos, writes to
-        kv + oplog, clears kv_paxos accepted columns
-
-    - {:ekv_put, key, value, ts, origin, expires_at}
-      → sent to nodes that were NOT acceptors (no kv_paxos state)
-      → receiver applies via normal LWW merge (idempotent)
-
-  This split avoids sending the value twice to acceptors (they already
-  have it in kv_paxos) while ensuring non-acceptors still get the data.
+    - {:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple, shard}
+      → sent to all peers
+      → receiver first tries paxos_promote
+      → if stale/missing accepted state, receiver can paxos_accept(entry_tuple)
+        then paxos_promote (ballot-guarded)
 
   ### paxos_promote (commit on acceptor side)
 
@@ -366,12 +359,10 @@ defmodule EKV.Replica do
     4. Read previous value from kv (for subscriber events)
     5. Force-upsert to kv (no LWW — Paxos ballots determine ordering)
     6. Insert to oplog
-    7. Clear kv_paxos accepted columns
-    8. COMMIT
+    7. COMMIT
 
-  Clearing accepted columns means future paxos_prepare reads fall back
-  to kv (committed state). Also allows GC to purge the kv_paxos row
-  when the kv entry itself is tombstone-purged.
+  Accepted state is retained so future paxos_prepare can recover the
+  latest chosen CAS value directly from kv_paxos.
 
   ### Quorum and Failure Handling
 
@@ -405,7 +396,7 @@ defmodule EKV.Replica do
       it, but the proposer could not confirm final outcome.
       Typical paths:
         - accept phase loses quorum after accept messages were sent
-        - local proposer is pre-empted at final local paxos_accept in commit
+        - local accepted ballot is superseded before commit can promote
 
   In code, this mapping is phase-based: failures in :accept for write ops are
   returned as :unconfirmed; other CAS write failures are :conflict.
@@ -414,8 +405,9 @@ defmodule EKV.Replica do
   (EKV.get(name, key, consistent: true)) to resolve committed state before
   taking follow-up actions.
 
-  For EKV.update (read-modify-write), failures auto-retry up to 5 times
-  with random backoff (10-60ms). Each retry generates a new ballot.
+  For EKV.update (read-modify-write), retries happen only for definite
+  conflicts. :unconfirmed is returned directly so callers can resolve via
+  a barrier read before deciding whether to retry.
 
   ### CAS + LWW Interaction
 
@@ -426,7 +418,8 @@ defmodule EKV.Replica do
     - Different keys may use different modes in the same EKV instance.
     - A key managed via CAS should continue to use CAS write APIs.
       Reads may still choose eventual or consistent paths based on needs.
-    - Mixed-mode writes on the same key (eventual + CAS) are unsupported.
+    - Eventual writes (`put/delete` without CAS options) to CAS-managed keys
+      are rejected with `{:error, :cas_managed_key}`.
     - Sync sends entries from kv (committed state). kv_paxos tentative
       values are not included in sync — they only exist locally until
       committed.
@@ -840,10 +833,10 @@ defmodule EKV.Replica do
     {:continue_full_sync, node, last_key, cutoff, my_seq, chunk_size}
     {:continue_delta_sync, node, last_seq, my_seq, chunk_size}
 
-  CAS proposer → acceptors:
+  CAS proposer → peers:
     {:ekv_prepare, ref, proposer_pid, key, ballot_c, ballot_n, shard}
     {:ekv_accept, ref, proposer_pid, key, ballot_c, ballot_n, entry_tuple, shard}
-    {:ekv_cas_committed, key, ballot_c, ballot_n, shard}
+    {:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple, shard}
 
   CAS acceptors → proposer:
     {:ekv_promise, ref, pid, node_id, acc_c, acc_n, kv_row}
@@ -1049,31 +1042,35 @@ defmodule EKV.Replica do
     now = System.system_time(:nanosecond)
     origin_node = node()
 
-    ttl = Keyword.get(opts, :ttl)
-    expires_at = if ttl, do: now + ttl * 1_000_000
+    if Store.cas_managed_key?(db, key) do
+      {:reply, {:error, :cas_managed_key}, state}
+    else
+      ttl = Keyword.get(opts, :ttl)
+      expires_at = if ttl, do: now + ttl * 1_000_000
 
-    {:ok, applied} =
-      Store.write_entry(
-        db,
-        stmts.kv_upsert,
-        stmts.oplog_insert,
-        key,
-        value_binary,
-        now,
-        origin_node,
-        expires_at,
-        nil
-      )
+      {:ok, applied} =
+        Store.write_entry(
+          db,
+          stmts.kv_upsert,
+          stmts.oplog_insert,
+          key,
+          value_binary,
+          now,
+          origin_node,
+          expires_at,
+          nil
+        )
 
-    if applied do
-      broadcast_to_peers(state, {:ekv_put, key, value_binary, now, origin_node, expires_at})
+      if applied do
+        broadcast_to_peers(state, {:ekv_put, key, value_binary, now, origin_node, expires_at})
 
-      dispatch_events(state, [
-        %EKV.Event{type: :put, key: key, value: :erlang.binary_to_term(value_binary)}
-      ])
+        dispatch_events(state, [
+          %EKV.Event{type: :put, key: key, value: :erlang.binary_to_term(value_binary)}
+        ])
+      end
+
+      {:reply, :ok, state}
     end
-
-    {:reply, :ok, state}
   end
 
   def handle_call({:delete, key}, _from, state) do
@@ -1081,27 +1078,31 @@ defmodule EKV.Replica do
     now = System.system_time(:nanosecond)
     origin_node = node()
 
-    prev_value = if has_subscribers?(state), do: read_previous_value(state, key)
+    if Store.cas_managed_key?(db, key) do
+      {:reply, {:error, :cas_managed_key}, state}
+    else
+      prev_value = if has_subscribers?(state), do: read_previous_value(state, key)
 
-    {:ok, applied} =
-      Store.write_entry(
-        db,
-        stmts.kv_upsert,
-        stmts.oplog_insert,
-        key,
-        nil,
-        now,
-        origin_node,
-        nil,
-        now
-      )
+      {:ok, applied} =
+        Store.write_entry(
+          db,
+          stmts.kv_upsert,
+          stmts.oplog_insert,
+          key,
+          nil,
+          now,
+          origin_node,
+          nil,
+          now
+        )
 
-    if applied do
-      broadcast_to_peers(state, {:ekv_delete, key, now, origin_node})
-      dispatch_events(state, [%EKV.Event{type: :delete, key: key, value: prev_value}])
+      if applied do
+        broadcast_to_peers(state, {:ekv_delete, key, now, origin_node})
+        dispatch_events(state, [%EKV.Event{type: :delete, key: key, value: prev_value}])
+      end
+
+      {:reply, :ok, state}
     end
-
-    {:reply, :ok, state}
   end
 
   # =====================================================================
@@ -1394,7 +1395,7 @@ defmodule EKV.Replica do
     value_args = [value_binary, timestamp, origin_node_str, expires_at, deleted_at]
 
     # Write to kv_paxos only — no kv write, no oplog, no events.
-    # The proposer will send {:ekv_cas_committed} after quorum, which triggers promote.
+    # The proposer will send {:ekv_cas_committed, ..., entry_tuple, ...} after quorum.
     case Store.paxos_accept(db, key, ballot_c, ballot_n, value_args) do
       {:ok, true} ->
         send(proposer_pid, {:ekv_accepted, ref, self(), state.node_id})
@@ -1406,36 +1407,9 @@ defmodule EKV.Replica do
     {:noreply, state}
   end
 
-  # CAS commit notification — acceptor promotes kv_paxos → kv + oplog
-  def handle_info({:ekv_cas_committed, key, ballot_c, ballot_n, _shard}, state) do
-    %{db: db, stmts: stmts} = state
-
-    case Store.paxos_promote(
-           db,
-           stmts.kv_force_upsert,
-           stmts.oplog_insert,
-           key,
-           ballot_c,
-           ballot_n
-         ) do
-      {:ok, value_binary, _ts, _origin, _expires, deleted_at, prev_value_binary} ->
-        if deleted_at != nil and deleted_at != nil do
-          prev =
-            if prev_value_binary != nil and prev_value_binary != nil,
-              do: :erlang.binary_to_term(prev_value_binary)
-
-          dispatch_events(state, [%EKV.Event{type: :delete, key: key, value: prev}])
-        else
-          dispatch_events(state, [
-            %EKV.Event{type: :put, key: key, value: :erlang.binary_to_term(value_binary)}
-          ])
-        end
-
-      {:ok, :stale} ->
-        :ok
-    end
-
-    {:noreply, state}
+  # CAS commit notification carries committed entry tuple.
+  def handle_info({:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple, _shard}, state) do
+    {:noreply, apply_cas_commit(state, key, ballot_c, ballot_n, entry_tuple)}
   end
 
   # =====================================================================
@@ -1510,8 +1484,8 @@ defmodule EKV.Replica do
           responded = MapSet.put(op.responded, remote_node_id)
           op = %{op | accepts: accepts, responded: responded}
 
-          if MapSet.size(accepts) + 1 >= op.quorum do
-            # Remote quorum reached — do local accept and commit
+          if MapSet.size(accepts) >= op.quorum do
+            # Accept quorum reached — commit
             {:noreply, commit_cas(ref, op, state)}
           else
             {:noreply, %{state | pending_cas: Map.put(state.pending_cas, ref, op)}}
@@ -1992,20 +1966,15 @@ defmodule EKV.Replica do
     end
   end
 
-  # Send commit notification to acceptors (they promote kv_paxos → kv),
-  # send LWW broadcast to non-acceptors (they don't have kv_paxos state).
-  defp broadcast_commit_and_lww(state, key, ballot_c, ballot_n, lww_msg, accepted_node_ids) do
+  # Broadcast committed CAS entry to all peers.
+  defp broadcast_cas_commit(state, key, ballot_c, ballot_n, entry_tuple) do
     shard_name = shard_name(state.name, state.shard_index)
 
     for {target_node, _pid} <- state.remote_shards do
-      if MapSet.member?(accepted_node_ids, Map.get(state.peer_node_ids, target_node)) do
-        send(
-          {shard_name, target_node},
-          {:ekv_cas_committed, key, ballot_c, ballot_n, state.shard_index}
-        )
-      else
-        send({shard_name, target_node}, lww_msg)
-      end
+      send(
+        {shard_name, target_node},
+        {:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple, state.shard_index}
+      )
     end
   end
 
@@ -2130,25 +2099,24 @@ defmodule EKV.Replica do
     # pick the kv_row with the highest {timestamp, origin} to match LWW
     # ordering. This ensures deterministic selection regardless of message
     # arrival order.
-    {current_value, current_vsn} =
+    selected_kv_row =
       if best_acc_c == 0 and best_acc_n in ["", nil] do
-        best_kv_row_any =
-          op.promises
-          |> Enum.map(fn {_, _, _, row} -> row end)
-          |> Enum.reject(&is_nil/1)
-          |> Enum.max_by(fn [_val, ts, origin | _] -> {ts, origin} end, fn -> nil end)
-
-        decode_kv_row(best_kv_row_any)
+        op.promises
+        |> Enum.map(fn {_, _, _, row} -> row end)
+        |> Enum.reject(&is_nil/1)
+        |> Enum.max_by(fn [_val, ts, origin | _] -> {ts, origin} end, fn -> nil end)
       else
-        decode_kv_row(best_kv_row)
+        best_kv_row
       end
+
+    {current_value, current_vsn} = decode_kv_row(selected_kv_row)
 
     # Apply operation. For :cas_read recovery, pass the raw kv_row so
     # metadata (expires_at, deleted_at) is preserved.
     apply_result =
       case op.operation do
         {:cas_read, _, _} ->
-          apply_cas_read_recovery(op.key, best_kv_row, current_value, current_vsn)
+          apply_cas_read_recovery(op.key, selected_kv_row, current_value, current_vsn)
 
         _ ->
           apply_operation(op.operation, op.key, current_value, current_vsn)
@@ -2156,36 +2124,48 @@ defmodule EKV.Replica do
 
     case apply_result do
       {:ok, _new_value_binary, new_entry_tuple, reply_value, broadcast_msg, events} ->
-        # Send accept to all peers (do NOT do local accept yet — deferred until quorum)
-        for {remote_node, _pid} <- state.remote_shards do
-          send_to_peer(
-            state,
-            remote_node,
-            {:ekv_accept, ref, self(), op.key, elem(op.ballot, 0), elem(op.ballot, 1),
-             new_entry_tuple, state.shard_index}
-          )
-        end
+        {_key, value_binary, ts, origin_str, expires_at, deleted_at} = new_entry_tuple
+        value_args = [value_binary, ts, origin_str, expires_at, deleted_at]
+        {ballot_c, ballot_n} = op.ballot
 
-        timer = Process.send_after(self(), {:cas_timeout, ref}, 5_000)
+        # Local accept first. We only count this node toward quorum after the
+        # accept is durably recorded. This avoids "assumed self-accept" races.
+        case Store.paxos_accept(state.db, op.key, ballot_c, ballot_n, value_args) do
+          {:ok, false} ->
+            handle_cas_failure(ref, op, state)
 
-        op = %{
-          op
-          | phase: :accept,
-            accepts: MapSet.new(),
-            accept_nacks: 0,
-            responded: MapSet.new(),
-            timer: timer,
-            reply_value: reply_value,
-            broadcast_msg: broadcast_msg,
-            entry_tuple: new_entry_tuple,
-            events: events
-        }
+          {:ok, true} ->
+            # Send accept to all peers.
+            for {remote_node, _pid} <- state.remote_shards do
+              send_to_peer(
+                state,
+                remote_node,
+                {:ekv_accept, ref, self(), op.key, ballot_c, ballot_n, new_entry_tuple,
+                 state.shard_index}
+              )
+            end
 
-        # For cluster_size: 1 (no peers), commit immediately
-        if MapSet.size(op.accepts) + 1 >= op.quorum do
-          commit_cas(ref, op, state)
-        else
-          %{state | pending_cas: Map.put(state.pending_cas, ref, op)}
+            timer = Process.send_after(self(), {:cas_timeout, ref}, 5_000)
+
+            op = %{
+              op
+              | phase: :accept,
+                accepts: MapSet.new([state.node_id]),
+                accept_nacks: 0,
+                responded: MapSet.new([state.node_id]),
+                timer: timer,
+                reply_value: reply_value,
+                broadcast_msg: broadcast_msg,
+                entry_tuple: new_entry_tuple,
+                events: events
+            }
+
+            # For cluster_size: 1 (no peers), or if local accept already meets quorum.
+            if MapSet.size(op.accepts) >= op.quorum do
+              commit_cas(ref, op, state)
+            else
+              %{state | pending_cas: Map.put(state.pending_cas, ref, op)}
+            end
         end
 
       {:error, :conflict} ->
@@ -2193,46 +2173,23 @@ defmodule EKV.Replica do
     end
   end
 
-  # Commit CAS: do local paxos_accept (kv_paxos), then write to kv + oplog.
-  # Called only when remote accepts + self >= quorum.
+  # Commit CAS: promote already-accepted local ballot into kv + oplog.
+  # Called only when actual accepts (including local) reach quorum.
   defp commit_cas(ref, op, state) do
     %{db: db, stmts: stmts} = state
-    {key, value_binary, timestamp, origin_str, expires_at, deleted_at} = op.entry_tuple
+    {key, _value_binary, _timestamp, _origin_str, _expires_at, _deleted_at} = op.entry_tuple
     {ballot_c, ballot_n} = op.ballot
-    value_args = [value_binary, timestamp, origin_str, expires_at, deleted_at]
 
-    case Store.paxos_accept(db, key, ballot_c, ballot_n, value_args) do
-      {:ok, true} ->
-        # Write committed value to kv + oplog
-        is_delete = if deleted_at, do: 1, else: 0
-        kv_args = [key, value_binary, timestamp, origin_str, expires_at, deleted_at]
-        oplog_args = [key, value_binary, timestamp, origin_str, expires_at, is_delete]
-
-        {:ok, true} =
-          EKV.Sqlite3.write_entry(
-            db,
-            stmts.kv_force_upsert,
-            stmts.oplog_insert,
-            kv_args,
-            oplog_args
-          )
-
-        # Clear kv_paxos accepted columns so future prepares read from kv
-        # and GC can purge the row when the kv entry is tombstone-purged
-        Store.clear_paxos_accepted(db, key)
-
+    case Store.paxos_promote(db, stmts.kv_force_upsert, stmts.oplog_insert, key, ballot_c, ballot_n) do
+      {:ok, _value_binary, _ts, _origin, _expires, _deleted_at, _prev_value_binary} ->
         cancel_timer(op.timer)
         dispatch_events(state, op.events)
         GenServer.reply(op.from, op.reply_value)
-
-        if op.broadcast_msg do
-          broadcast_commit_and_lww(state, key, ballot_c, ballot_n, op.broadcast_msg, op.accepts)
-        end
-
+        broadcast_cas_commit(state, key, ballot_c, ballot_n, op.entry_tuple)
         %{state | pending_cas: Map.delete(state.pending_cas, ref)}
 
-      {:ok, false} ->
-        # Local accept rejected (pre-empted between send and commit)
+      {:ok, :stale} ->
+        # Local accepted ballot was superseded before commit.
         handle_cas_failure(ref, op, state)
     end
   end
@@ -2377,19 +2334,27 @@ defmodule EKV.Replica do
 
     case op.operation do
       {:update, fun, opts, retries} when retries > 0 ->
-        # Retry with new ballot after random backoff
-        new_op = %{op | operation: {:update, fun, opts, retries - 1}}
-        state = %{state | pending_cas: Map.put(state.pending_cas, ref, new_op)}
-        {min_ms, max_ms} = Keyword.get(opts, :backoff, {10, 60})
-        delay = Enum.random(min_ms..max_ms)
+        case cas_failure_reason(op) do
+          :conflict ->
+            # Retry only for definite conflicts (no accept-phase ambiguity).
+            # If accept may have happened, do not auto-retry the same logical op.
+            new_op = %{op | operation: {:update, fun, opts, retries - 1}}
+            state = %{state | pending_cas: Map.put(state.pending_cas, ref, new_op)}
+            {min_ms, max_ms} = Keyword.get(opts, :backoff, {10, 60})
+            delay = Enum.random(min_ms..max_ms)
 
-        Process.send_after(
-          self(),
-          {:cas_retry, ref, op.key, {:update, fun, opts, retries - 1}},
-          delay
-        )
+            Process.send_after(
+              self(),
+              {:cas_retry, ref, op.key, {:update, fun, opts, retries - 1}},
+              delay
+            )
 
-        state
+            state
+
+          :unconfirmed ->
+            GenServer.reply(op.from, {:error, :unconfirmed})
+            %{state | pending_cas: Map.delete(state.pending_cas, ref)}
+        end
 
       {:cas_read, opts, retries} when retries > 0 ->
         new_op = %{op | operation: {:cas_read, opts, retries - 1}}
@@ -2423,6 +2388,69 @@ defmodule EKV.Replica do
   defp writes_operation?({:cas_delete, _}), do: true
   defp writes_operation?({:update, _, _, _}), do: true
   defp writes_operation?(_), do: false
+
+  defp apply_cas_commit(state, key, ballot_c, ballot_n, entry_tuple) do
+    %{db: db, stmts: stmts} = state
+
+    case Store.paxos_promote(
+           db,
+           stmts.kv_force_upsert,
+           stmts.oplog_insert,
+           key,
+           ballot_c,
+           ballot_n
+         ) do
+      {:ok, value_binary, _ts, _origin, _expires, deleted_at, prev_value_binary} ->
+        dispatch_promote_event(state, key, value_binary, deleted_at, prev_value_binary)
+        state
+
+      {:ok, :stale} ->
+        # Node may have missed original accept; try to stage accepted state
+        # from commit payload, then promote.
+        if is_tuple(entry_tuple) and tuple_size(entry_tuple) == 6 do
+          {_key, value_binary, ts, origin_str, expires_at, deleted_at} = entry_tuple
+          value_args = [value_binary, ts, origin_str, expires_at, deleted_at]
+
+          case Store.paxos_accept(db, key, ballot_c, ballot_n, value_args) do
+            {:ok, true} ->
+              case Store.paxos_promote(
+                     db,
+                     stmts.kv_force_upsert,
+                     stmts.oplog_insert,
+                     key,
+                     ballot_c,
+                     ballot_n
+                   ) do
+                {:ok, promoted_value, _ts, _origin, _expires, promoted_deleted, prev_value_binary} ->
+                  dispatch_promote_event(
+                    state,
+                    key,
+                    promoted_value,
+                    promoted_deleted,
+                    prev_value_binary
+                  )
+
+                {:ok, :stale} ->
+                  :ok
+              end
+
+            {:ok, false} ->
+              :ok
+          end
+        end
+
+        state
+    end
+  end
+
+  defp dispatch_promote_event(state, key, value_binary, deleted_at, prev_value_binary) do
+    if deleted_at != nil do
+      prev = if prev_value_binary != nil, do: :erlang.binary_to_term(prev_value_binary)
+      dispatch_events(state, [%EKV.Event{type: :delete, key: key, value: prev}])
+    else
+      dispatch_events(state, [%EKV.Event{type: :put, key: key, value: :erlang.binary_to_term(value_binary)}])
+    end
+  end
 
   defp count_alive_node_ids(state) do
     if state.cluster_size do

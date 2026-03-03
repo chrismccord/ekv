@@ -1138,7 +1138,7 @@ defmodule EKV.CASDistributedTest do
       # CAS write on node A
       {:ok, _} = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "sub/1", "val", [if_vsn: nil]])
 
-      # Remote subscriber should get event (via LWW replication)
+      # Remote subscriber should get event via CAS commit replication
       assert_receive {:remote_ekv_event, events, _}, 3000
       assert Enum.any?(events, fn e -> e.key == "sub/1" and e.type == :put end)
     end
@@ -1240,7 +1240,7 @@ defmodule EKV.CASDistributedTest do
       refute_receive {:remote_ekv_event, _, _}, 500
     end
 
-    test "acceptor node does not get duplicate events from CAS accept + LWW broadcast" do
+    test "acceptor node does not get duplicate events from CAS accept + commit fanout" do
       peers = TestCluster.start_peers(2)
       on_exit(fn -> TestCluster.stop_peers(peers) end)
 
@@ -1255,13 +1255,13 @@ defmodule EKV.CASDistributedTest do
       TestCluster.start_collecting_subscriber_on(node_b, ekv_name, "nodup/", self(), 1000)
       Process.sleep(50)
 
-      # CAS put on A — B will get accept event, then LWW broadcast
+      # CAS put on A — B should see only one subscriber event
       {:ok, _} = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "nodup/1", "val", [if_vsn: nil]])
 
       # Wait for collection window
       assert_receive {:collected_events, events}, 3000
 
-      # Should have exactly 1 put event, not 2 (no duplicate from LWW)
+      # Should have exactly 1 put event (no duplicate delivery)
       put_events = Enum.filter(events, fn e -> e.key == "nodup/1" and e.type == :put end)
       assert length(put_events) == 1
     end
@@ -1811,12 +1811,12 @@ defmodule EKV.CASDistributedTest do
       # Resume B
       TestCluster.resume_shards(node_b, ekv_name)
 
-      # All nodes eventually agree
+      # All nodes eventually agree (value may be nil if both contenders lose)
       TestCluster.assert_eventually(fn ->
         val_a = TestCluster.rpc!(node_a, EKV, :get, [ekv_name, "asym/1"])
         val_b = TestCluster.rpc!(node_b, EKV, :get, [ekv_name, "asym/1"])
         val_c = TestCluster.rpc!(node_c, EKV, :get, [ekv_name, "asym/1"])
-        val_a != nil and val_a == val_b and val_b == val_c
+        val_a == val_b and val_b == val_c
       end)
     end
 

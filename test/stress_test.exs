@@ -1170,7 +1170,7 @@ defmodule EKV.StressTest do
       )
     end
 
-    test "CAS + LWW on same key: second CAS resolves divergence" do
+    test "CAS-managed key rejects eventual writes (including during partition)" do
       peers = TestCluster.start_peers(5)
       on_exit(fn -> TestCluster.stop_peers(peers) end)
 
@@ -1196,47 +1196,29 @@ defmodule EKV.StressTest do
       partition([n1, n2, n3], [n4, n5])
       Process.sleep(300)
 
-      # LWW put from n4 (higher timestamp, wins on n4,n5 via LWW)
-      # Sleep to ensure higher timestamp
-      Process.sleep(10)
-      :ok = TestCluster.rpc!(n4, EKV, :put, [ekv_name, key, "lww_v1"])
+      # Eventual write on CAS-managed key is rejected.
+      assert {:error, :cas_managed_key} =
+               TestCluster.rpc!(n4, EKV, :put, [ekv_name, key, "lww_v1"])
 
-      # State may diverge: majority has "cas_v1", minority has "lww_v1"
       assert TestCluster.rpc!(n1, EKV, :get, [ekv_name, key]) == "cas_v1"
-      assert TestCluster.rpc!(n4, EKV, :get, [ekv_name, key]) == "lww_v1"
+      assert TestCluster.rpc!(n4, EKV, :get, [ekv_name, key]) == "cas_v1"
 
       # Heal
       heal([n1, n2, n3], [n4, n5])
       Process.sleep(500)
 
-      # LWW has higher timestamp, so after sync all should converge to "lww_v1"
+      # Key remains on CAS value after heal.
       TestCluster.assert_eventually(
         fn ->
-          vals = Enum.map(all_nodes, fn n -> TestCluster.rpc!(n, EKV, :get, [ekv_name, key]) end)
-          first = hd(vals)
-          first != nil and Enum.all?(vals, &(&1 == first))
+          vals = Enum.map([n1, n2, n3, n4, n5], fn n -> TestCluster.rpc!(n, EKV, :get, [ekv_name, key]) end)
+          Enum.all?(vals, &(&1 == "cas_v1"))
         end,
         timeout: 5000
       )
 
-      # CAS put with if_vsn may conflict: fetch reads version from kv (which
-      # has LWW value), but Paxos prepare reads kv_paxos on acceptors that may
-      # not have received the commit notification (partition could interrupt it).
-      # Those acceptors still have accepted_value="cas_v1" with a different
-      # version, causing the if_vsn check to fail during the accept phase.
-      {_converged_val, stale_vsn} = TestCluster.rpc!(n2, EKV, :lookup, [ekv_name, key])
-      result = TestCluster.rpc!(n2, EKV, :put, [ekv_name, key, "cas_v2", [if_vsn: stale_vsn]])
+      {_cas_val, vsn} = TestCluster.rpc!(n2, EKV, :lookup, [ekv_name, key])
+      assert {:ok, _} = TestCluster.rpc!(n2, EKV, :put, [ekv_name, key, "cas_v2", [if_vsn: vsn]])
 
-      # If commit broadcast was interrupted by partition → :conflict
-      # (kv_paxos has old accepted values with different version than kv).
-      # If commit broadcast completed before partition → {:ok, _}
-      # Either way: the value must be deterministic and consistent.
-      assert match?({:ok, _}, result) or result in [{:error, :conflict}, {:error, :unconfirmed}],
-             "Expected {:ok, _}, :conflict, or :unconfirmed, got: #{inspect(result)}"
-
-      # update/3 always resolves the divergence: it reads the highest accepted
-      # value during prepare and applies the transform function to it, so
-      # there's no version mismatch — it doesn't use if_vsn.
       {:ok, new_val, _} =
         TestCluster.rpc!(n2, EKV, :update, [
           ekv_name,
@@ -1391,7 +1373,7 @@ defmodule EKV.StressTest do
       assert_receive {:ekv_accepted, ^ref2, _, _}, 2000
 
       # Commit and verify the value
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", 0})
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0})
       :sys.get_state(shard_name)
       assert EKV.get(name, key) == "gc_survivor"
     end
@@ -1412,22 +1394,25 @@ defmodule EKV.StressTest do
       send(shard_name, {:ekv_accept, ref, self(), key, 100, "2", entry, 0})
       assert_receive {:ekv_accepted, ^ref, _, _}, 2000
 
-      # Commit — promotes to kv, clears accepted columns, keeps promised_counter
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", 0})
+      # Commit — promotes to kv while retaining accepted+promised ballot state
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0})
       :sys.get_state(shard_name)
       assert EKV.get(name, key) == "accepted"
 
-      # Delete the key so kv row goes away (tombstone)
-      :ok = EKV.delete(name, key)
+      # Delete the key via a replicated delete message so kv row goes away
+      # without requiring CAS quorum in this fault-injection setup.
+      delete_ts = System.system_time(:nanosecond) + 1
+      send(shard_name, {:ekv_delete, key, delete_ts, node()})
+      :sys.get_state(shard_name)
 
       # Trigger GC with future cutoff to purge the tombstone
       future_ms = System.system_time(:millisecond) + 1_000_000
       send(shard_name, {:gc, future_ms, future_ms})
       :sys.get_state(shard_name)
 
-      # kv_paxos row survives: promised_counter > 0 (from the accept's implicit
-      # prepare). This is necessary — clearing it would allow stale accepts from
-      # older ballots, and kv_force_upsert would overwrite committed values.
+      # kv_paxos row survives with both promised and accepted ballot state.
+      # Retaining accepted state is required so future prepares recover the
+      # latest chosen CAS value directly from kv_paxos.
       state = :sys.get_state(shard_name)
 
       {:ok, rows} =
@@ -1440,15 +1425,15 @@ defmodule EKV.StressTest do
       assert length(rows) == 1
       [[prom_c, acc_c]] = rows
       assert prom_c > 0, "promised_counter should be preserved"
-      assert acc_c == 0, "accepted_counter should be cleared"
+      assert acc_c > 0, "accepted_counter should be preserved"
 
-      # A fresh prepare still works — accepted state is clean
+      # A fresh higher-ballot prepare still returns the retained accepted state
       ref2 = make_ref()
       send(shard_name, {:ekv_prepare, ref2, self(), key, 200, "3", 0})
 
       assert_receive {:ekv_promise, ^ref2, _, _, acc_c2, acc_n2, _kv_row}, 2000
-      assert acc_c2 == 0
-      assert acc_n2 in ["", nil]
+      assert acc_c2 == acc_c
+      assert acc_n2 == "2"
     end
 
     test "commit to non-acceptor: no kv_paxos row exists", %{
@@ -1458,7 +1443,7 @@ defmodule EKV.StressTest do
       key = "fi/commit_no_row"
 
       # Send a commit for a key that was never prepared/accepted on this shard
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", 0})
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0})
       :sys.get_state(shard_name)
 
       # paxos_promote looks up kv_paxos row → no row → should return :stale
@@ -1667,7 +1652,7 @@ defmodule EKV.StressTest do
       assert EKV.get(name, key) == nil
 
       # Send commit with WRONG ballot {101, "2"} (doesn't match accepted {100, "2"})
-      send(shard_name, {:ekv_cas_committed, key, 101, "2", 0})
+      send(shard_name, {:ekv_cas_committed, key, 101, "2", nil, 0})
       :sys.get_state(shard_name)
 
       # paxos_promote checks ballot matches → :stale
@@ -1675,7 +1660,7 @@ defmodule EKV.StressTest do
       assert Process.alive?(Process.whereis(shard_name))
 
       # Correct ballot commit should still work
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", 0})
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0})
       :sys.get_state(shard_name)
       assert EKV.get(name, key) == "accepted_val"
     end
@@ -1712,7 +1697,7 @@ defmodule EKV.StressTest do
       assert_receive {:ekv_accepted, ^ref4, _, _}, 2000
 
       # Commit ballot=200 → value in kv
-      send(shard_name, {:ekv_cas_committed, key, 200, "3", 0})
+      send(shard_name, {:ekv_cas_committed, key, 200, "3", nil, 0})
       :sys.get_state(shard_name)
       assert EKV.get(name, key) == "ballot_200_val"
 
@@ -1805,13 +1790,13 @@ defmodule EKV.StressTest do
       assert_receive {:ekv_accepted, ^ref4, _, _}, 2000
 
       # Commit round 2 — value promoted to kv
-      send(shard_name, {:ekv_cas_committed, key, 200, "3", 0})
+      send(shard_name, {:ekv_cas_committed, key, 200, "3", nil, 0})
       :sys.get_state(shard_name)
       assert EKV.get(name, key) == "new_val"
 
       # Delayed commit for round 1 arrives — stale because accepted columns
       # were cleared after round 2's commit (ballot {100,"2"} doesn't match)
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", 0})
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0})
       :sys.get_state(shard_name)
 
       # Value unchanged — stale commit rejected
@@ -1876,7 +1861,7 @@ defmodule EKV.StressTest do
       assert_receive {:ekv_accepted, ^ref4, _, _}, 2000
 
       # Commit ballot 200 — only B's value committed
-      send(shard_name, {:ekv_cas_committed, key, 200, "3", 0})
+      send(shard_name, {:ekv_cas_committed, key, 200, "3", nil, 0})
       :sys.get_state(shard_name)
       assert EKV.get(name, key) == "val_b"
       refute_receive {:DOWN, ^mref, :process, _, _}
@@ -1915,7 +1900,7 @@ defmodule EKV.StressTest do
       assert_receive {:ekv_accepted, ^ref_b2, _, _}, 2000
 
       # Partial commit: proposer crashes after sending commit for key_a only
-      send(shard_name, {:ekv_cas_committed, key_a, 100, "2", 0})
+      send(shard_name, {:ekv_cas_committed, key_a, 100, "2", nil, 0})
       :sys.get_state(shard_name)
 
       # key_a committed, key_b NOT committed
@@ -1953,7 +1938,7 @@ defmodule EKV.StressTest do
       assert_receive {:ekv_accepted, ^ref_b4, _, _}, 2000
 
       # Commit ballot 200 — key_b now in kv
-      send(shard_name, {:ekv_cas_committed, key_b, 200, "3", 0})
+      send(shard_name, {:ekv_cas_committed, key_b, 200, "3", nil, 0})
       :sys.get_state(shard_name)
 
       # Both keys readable and correct

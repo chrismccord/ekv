@@ -818,6 +818,14 @@ defmodule EKV.Store do
     EKV.Sqlite3.paxos_promote(db, kv_force_stmt, oplog_stmt, key, ballot_c, ballot_n)
   end
 
+  def cas_managed_key?(db, key) do
+    case EKV.Sqlite3.fetch_all(db, "SELECT 1 FROM kv_paxos WHERE key = ?1 LIMIT 1", [key]) do
+      {:ok, []} -> false
+      {:ok, _rows} -> true
+      _ -> false
+    end
+  end
+
   @clear_paxos_accepted_sql """
   UPDATE kv_paxos SET accepted_counter = 0, accepted_node = '',
     accepted_value = NULL, accepted_timestamp = NULL, accepted_origin = NULL,

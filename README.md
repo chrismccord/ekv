@@ -130,7 +130,8 @@ Use mode as **key ownership**:
 - CAS write APIs return committed VSNs on success (`{:ok, vsn}` for
   `put/delete`, `{:ok, value, vsn}` for `update`) so callers can chain
   later `if_vsn:` guards without an extra lookup.
-- Do not mix eventual writes and CAS writes on the same key.
+- Eventual writes on CAS-managed keys are rejected with
+  `{:error, :cas_managed_key}`.
 
 ### CAS write error semantics
 
@@ -145,11 +146,10 @@ CAS writes (`put` with `if_vsn:` or `consistent: true`, `delete` with `if_vsn:`,
 On `:unconfirmed`, resolve with `EKV.get(name, key, consistent: true)` before
 taking follow-up actions.
 
-### Known limitation: mixed-mode single-key writes
+### Mixed-mode note
 
-Mixing eventual and CAS writes on the same key is unsupported. Under clock skew and/or partitions, mixed-mode writes can produce surprising ordering or convergence outcomes.
-
-If you need strong per-key behavior, keep that keyspace CAS-only (for example, reserve a prefix like `cas/*` and route all writes for those keys through CAS APIs).
+Once a key is CAS-managed, eventual `put/delete` on that key are rejected
+(`{:error, :cas_managed_key}`). Keep lock/ownership keyspaces CAS-write-only.
 
 ### Garbage collection
 

@@ -1306,7 +1306,7 @@ static ERL_NIF_TERM ekv_paxos_accept(ErlNifEnv *env, int argc, const ERL_NIF_TER
 /*   -> {:error, msg}                                                  */
 /*                                                                     */
 /* Single dirty IO bounce. Promotes accepted value from kv_paxos to    */
-/* kv + oplog on commit confirmation. Clears kv_paxos value columns.  */
+/* kv + oplog on commit confirmation. Keeps accepted state in kv_paxos.*/
 /* ------------------------------------------------------------------ */
 
 static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
@@ -1534,24 +1534,7 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
     }
     sqlite3_reset(oplog_s->stmt);
 
-    /* 7. Clear accepted columns in kv_paxos (no storage doubling).
-     * Keep promised_counter/promised_node — clearing them would allow stale
-     * accepts from older ballots, and kv_force_upsert would unconditionally
-     * overwrite the committed value (CASPaxos violation). */
-    sqlite3_stmt *clr = NULL;
-    rc = sqlite3_prepare_v3(conn->db,
-        "UPDATE kv_paxos SET accepted_counter = 0, accepted_node = '', "
-        "accepted_value = NULL, accepted_timestamp = NULL, accepted_origin = NULL, "
-        "accepted_expires_at = NULL, accepted_deleted_at = NULL "
-        "WHERE key = ?1",
-        -1, 0, &clr, NULL);
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_text(clr, 1, (const char *)key_bin.data, (int)key_bin.size, SQLITE_TRANSIENT);
-        sqlite3_step(clr);
-        sqlite3_finalize(clr);
-    }
-
-    /* 8. COMMIT */
+    /* 7. COMMIT */
     rc = sqlite3_exec(conn->db, "COMMIT", NULL, NULL, NULL);
     if (value_copy) enif_free(value_copy);
     if (origin_copy) enif_free(origin_copy);

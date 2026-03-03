@@ -2247,6 +2247,18 @@ defmodule EKVTest do
       assert EKV.get(name, "cp/2") == "v2"
     end
 
+    test "eventual put on CAS-managed key is rejected", %{cas_name: name} do
+      assert {:ok, _} = EKV.put(name, "cp/guard_put", "v1", consistent: true)
+      assert {:error, :cas_managed_key} = EKV.put(name, "cp/guard_put", "v2")
+      assert EKV.get(name, "cp/guard_put") == "v1"
+    end
+
+    test "eventual delete on CAS-managed key is rejected", %{cas_name: name} do
+      assert {:ok, _} = EKV.put(name, "cp/guard_del", "v1", consistent: true)
+      assert {:error, :cas_managed_key} = EKV.delete(name, "cp/guard_del")
+      assert EKV.get(name, "cp/guard_del") == "v1"
+    end
+
     test "with TTL", %{cas_name: name} do
       assert {:ok, _} = EKV.put(name, "cp/3", "val", consistent: true, ttl: 60_000)
       assert EKV.get(name, "cp/3") == "val"
@@ -2462,7 +2474,7 @@ defmodule EKVTest do
         EKV.Store.paxos_promote(db, stmts.kv_force_upsert, stmts.oplog_insert, "pax/13", 100, "1")
     end
 
-    test "promote clears kv_paxos accepted columns", %{db: db, stmts: stmts} do
+    test "promote retains kv_paxos accepted columns", %{db: db, stmts: stmts} do
       {:ok, :promise, 0, "", nil} = EKV.Store.paxos_prepare(db, "pax/14", 100, "1")
 
       now = System.system_time(:nanosecond)
@@ -2476,8 +2488,10 @@ defmodule EKVTest do
       {:ok, _, _, _, _, _, _} =
         EKV.Store.paxos_promote(db, stmts.kv_force_upsert, stmts.oplog_insert, "pax/14", 100, "1")
 
-      # After promote, higher prepare should read from kv (kv_paxos accepted cleared)
-      {:ok, :promise, 0, "", [v, _, _, _, _]} = EKV.Store.paxos_prepare(db, "pax/14", 300, "1")
+      # After promote, higher prepare recovers retained accepted state
+      {:ok, :promise, 100, "1", [v, _, _, _, _]} =
+        EKV.Store.paxos_prepare(db, "pax/14", 300, "1")
+
       assert :erlang.binary_to_term(v) == "cleared"
     end
   end
@@ -2799,7 +2813,7 @@ defmodule EKVTest do
       pax_keys = Enum.map(rows, fn [k] -> k end)
       assert "gc/1" in pax_keys
 
-      # But accepted_value is cleared (no storage doubling)
+      # The latest accepted delete ballot is retained.
       {:ok, val_rows} =
         EKV.Sqlite3.fetch_all(
           state.db,
@@ -2808,7 +2822,7 @@ defmodule EKVTest do
         )
 
       [[acc_counter, acc_value]] = val_rows
-      assert acc_counter == 0
+      assert acc_counter > 0
       assert acc_value == nil
 
       # A fresh prepare on the key resets promised state, and after that
@@ -3089,7 +3103,7 @@ defmodule EKVTest do
       assert EKV.get(name, key) == nil
 
       # Commit notification → promote
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", 0})
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0})
       :sys.get_state(shard_name)
 
       assert EKV.get(name, key) == "promoted"
@@ -3113,11 +3127,61 @@ defmodule EKVTest do
       refute_receive {:ekv, _, _}, 100
 
       # Commit — event dispatched
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", 0})
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0})
       :sys.get_state(shard_name)
       flush_dispatchers(name)
 
       assert_receive {:ekv, [%EKV.Event{type: :put, key: ^key, value: "event_val"}], _}, 1000
+    end
+
+    test "commit payload can promote without prior local accept", %{
+      name: name,
+      shard_name: shard_name
+    } do
+      :ok = EKV.subscribe(name, "phantom/")
+      Process.sleep(50)
+
+      key = "phantom/commit_payload_put"
+      now = System.system_time(:nanosecond)
+      origin_str = Atom.to_string(node())
+      val_bin = :erlang.term_to_binary("payload_put")
+      entry_tuple = {key, val_bin, now, origin_str, nil, nil}
+
+      send(shard_name, {:ekv_cas_committed, key, 150, "2", entry_tuple, 0})
+      :sys.get_state(shard_name)
+      flush_dispatchers(name)
+
+      assert_receive {:ekv, [%EKV.Event{type: :put, key: ^key, value: "payload_put"}], _}, 1000
+      assert EKV.get(name, key) == "payload_put"
+    end
+
+    test "commit payload delete can promote without prior local accept", %{
+      name: name,
+      shard_name: shard_name
+    } do
+      key = "phantom/commit_payload_del"
+      :ok = EKV.put(name, key, "payload_old")
+      assert EKV.get(name, key) == "payload_old"
+
+      :ok = EKV.subscribe(name, "phantom/")
+      Process.sleep(50)
+      flush_dispatchers(name)
+      receive do
+        {:ekv, _, _} -> :ok
+      after
+        100 -> :ok
+      end
+
+      now = System.system_time(:nanosecond)
+      origin_str = Atom.to_string(node())
+      entry_tuple = {key, nil, now, origin_str, nil, now}
+
+      send(shard_name, {:ekv_cas_committed, key, 250, "3", entry_tuple, 0})
+      :sys.get_state(shard_name)
+      flush_dispatchers(name)
+
+      assert_receive {:ekv, [%EKV.Event{type: :delete, key: ^key, value: "payload_old"}], _}, 1000
+      assert EKV.get(name, key) == nil
     end
 
     test "promote with stale ballot is ignored", %{name: name, shard_name: shard_name} do
@@ -3140,7 +3204,7 @@ defmodule EKVTest do
       assert_receive {:ekv_accepted, ^ref2, _, _}, 1000
 
       # Stale commit for ballot {100, "2"} — should be ignored
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", 0})
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0})
       :sys.get_state(shard_name)
 
       # Neither value promoted to kv
@@ -3163,7 +3227,7 @@ defmodule EKVTest do
       assert_receive {:ekv_accepted, ^ref, _, _}, 1000
 
       # Commit → promote
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", 0})
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0})
       :sys.get_state(shard_name)
 
       assert EKV.get(name, key) == "clear_test"
@@ -3260,7 +3324,7 @@ defmodule EKVTest do
       assert EKV.get(name, key) == "v1"
 
       # Commit → promote writes tombstone to kv
-      send(shard_name, {:ekv_cas_committed, key, 200, "2", 0})
+      send(shard_name, {:ekv_cas_committed, key, 200, "2", nil, 0})
       :sys.get_state(shard_name)
       flush_dispatchers(name)
 
@@ -3622,12 +3686,12 @@ defmodule EKVTest do
       assert_receive {:ekv_accepted, ^ref2, _, _}, 1000
 
       # Stale commit for ballot {100, "2"} — should return :stale, value NOT in kv
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", 0})
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0})
       :sys.get_state(shard_name)
       assert EKV.get(name, key) == nil
 
       # Commit for ballot {200, "3"} — should succeed
-      send(shard_name, {:ekv_cas_committed, key, 200, "3", 0})
+      send(shard_name, {:ekv_cas_committed, key, 200, "3", nil, 0})
       :sys.get_state(shard_name)
       assert EKV.get(name, key) == "v2"
     end
@@ -3644,24 +3708,24 @@ defmodule EKVTest do
       send(shard_name, {:ekv_accept, ref, self(), key, 100, "2", entry, 0})
       assert_receive {:ekv_accepted, ^ref, _, _}, 1000
 
-      # Subscribe to verify no duplicate events
+      # Subscribe to verify commit notifications
       :ok = EKV.subscribe(name, "order/")
       Process.sleep(50)
 
       # First commit — succeeds
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", 0})
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0})
       :sys.get_state(shard_name)
       flush_dispatchers(name)
 
       assert EKV.get(name, key) == "dup_val"
       assert_receive {:ekv, [%EKV.Event{type: :put, key: ^key, value: "dup_val"}], _}, 1000
 
-      # Second commit (duplicate) — should be :stale, no event
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", 0})
+      # Second commit (duplicate) replays the same promoted value/event.
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0})
       :sys.get_state(shard_name)
       flush_dispatchers(name)
 
-      refute_receive {:ekv, _, _}, 200
+      assert_receive {:ekv, [%EKV.Event{type: :put, key: ^key, value: "dup_val"}], _}, 1000
     end
 
     test "late promise after CAS timeout is silently ignored", %{shard_name: shard_name} do
@@ -3756,7 +3820,7 @@ defmodule EKVTest do
       assert_receive {:ekv_accepted, ^ref_accept_b, _, _}, 1000
 
       # B commits
-      send(shard_name, {:ekv_cas_committed, key, 200, "3", 0})
+      send(shard_name, {:ekv_cas_committed, key, 200, "3", nil, 0})
       :sys.get_state(shard_name)
       assert EKV.get(name, key) == "from_b"
     end
@@ -3794,7 +3858,7 @@ defmodule EKVTest do
       send(shard_name, {:ekv_accept, ref_accept, self(), key, 100, "2", entry, 0})
       assert_receive {:ekv_accepted, ^ref_accept, _, _}, 1000
 
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", 0})
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0})
       :sys.get_state(shard_name)
 
       assert EKV.get(name, key) == "cas_val"
@@ -3835,7 +3899,7 @@ defmodule EKVTest do
       end)
 
       # Send commit notification — kv_paxos should still have the accepted value
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", 0})
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0})
       :sys.get_state(shard_name)
 
       assert EKV.get(name, key) == "survive_restart"
