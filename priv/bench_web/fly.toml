@@ -1,0 +1,25 @@
+app = "ekv-bench"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PHX_SERVER = "true"
+  PHX_HOST = "ekv-bench.fly.dev"
+  RELEASE_DISTRIBUTION = "name"
+
+[http_service]
+  internal_port = 4000
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+[mounts]
+  source = "ekv_data"
+  destination = "/data"
+
+[[vm]]
+  size = "performance-6x"

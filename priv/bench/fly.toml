@@ -1,0 +1,9 @@
+app = "ekv-bench"
+primary_region = "iad"
+
+[mounts]
+  source = "ekv_data"
+  destination = "/data"
+
+[[vm]]
+  size = "performance-6x"
