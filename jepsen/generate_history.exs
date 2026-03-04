@@ -3,23 +3,30 @@ defmodule EkvJepsen.HistoryGen do
 
   @ekv_name :jepsen_kv
   @key "jepsen/register"
-  @valid_modes [:none, :partition_flap, :restart_one]
+  @cas_timeout 30_000
 
-  def run(path, workers, total_ops, cluster_nodes, mode)
-      when workers > 0 and total_ops > 0 and cluster_nodes >= 3 and mode in @valid_modes do
+  @valid_modes [:none, :partition_flap, :restart_one, :partition_restart]
+  @valid_profiles [:register, :lock]
+
+  def run(path, workers, total_ops, cluster_nodes, mode, profile, seed)
+      when workers > 0 and total_ops > 0 and cluster_nodes >= 3 and mode in @valid_modes and
+             profile in @valid_profiles and is_integer(seed) do
     ensure_distributed!()
+    run_nonce = "#{seed}-#{System.unique_integer([:positive])}"
 
-    IO.puts("starting #{cluster_nodes}-node peer cluster (mode=#{mode})...")
+    IO.puts(
+      "starting #{cluster_nodes}-node peer cluster (mode=#{mode}, profile=#{profile}, seed=#{seed})..."
+    )
+
     {peers, nodes} = start_peers(cluster_nodes)
     IO.puts("peer nodes: #{Enum.map_join(nodes, ", ", &Atom.to_string/1)}")
 
     IO.puts("starting EKV on peer nodes...")
-    cluster_meta = start_ekv_cluster(nodes)
+    cluster_meta = start_ekv_cluster(nodes, run_nonce)
 
     IO.puts("connecting peer mesh...")
     connect_full_mesh(nodes)
     wait_for_node_mesh!(nodes, 15_000)
-
     wait_for_ekv_mesh!(nodes, 30_000)
 
     {:ok, events} = Agent.start_link(fn -> [] end)
@@ -32,12 +39,11 @@ defmodule EkvJepsen.HistoryGen do
       Agent.update(events, fn acc -> [{idx, op} | acc] end)
     end
 
-    nemesis_pid = start_nemesis(mode, nodes, cluster_meta)
+    nemesis_pids = start_nemesis(mode, nodes, cluster_meta)
 
     try do
       seed_node = hd(nodes)
-      IO.puts("seeding initial register value on #{seed_node}...")
-      seed_initial_value(seed_node, log)
+      seed_initial_value(seed_node, log, profile)
 
       per_worker = div(total_ops, workers)
       extra = rem(total_ops, workers)
@@ -52,7 +58,17 @@ defmodule EkvJepsen.HistoryGen do
       Task.async_stream(
         assignments,
         fn {worker, n_ops} ->
-          run_worker(nodes, worker, n_ops, log, progress_counter, progress_every, total_ops)
+          run_worker(
+            nodes,
+            worker,
+            n_ops,
+            log,
+            progress_counter,
+            progress_every,
+            total_ops,
+            profile,
+            seed
+          )
         end,
         max_concurrency: workers,
         ordered: false,
@@ -66,12 +82,11 @@ defmodule EkvJepsen.HistoryGen do
         |> Enum.sort_by(fn {idx, _} -> idx end)
         |> Enum.map(fn {_idx, op} -> op end)
 
-      stop_nemesis(nemesis_pid)
       write_history!(path, history)
       IO.puts("history written: #{path}")
     after
       Agent.stop(events)
-      stop_nemesis(nemesis_pid)
+      stop_nemesis(nemesis_pids)
       stop_ekv_cluster(nodes)
       stop_peers(peers)
       Enum.each(cluster_meta, fn {_node, meta} -> File.rm_rf!(meta.data_dir) end)
@@ -119,7 +134,7 @@ defmodule EkvJepsen.HistoryGen do
 
   defp connect_full_mesh(nodes) do
     for node <- nodes, other <- nodes, node != other do
-      _ = :erpc.call(node, Node, :connect, [other])
+      _ = safe_erpc(node, Node, :connect, [other])
     end
   end
 
@@ -133,12 +148,12 @@ defmodule EkvJepsen.HistoryGen do
     end)
   end
 
-  defp start_ekv_cluster(nodes) do
+  defp start_ekv_cluster(nodes, run_nonce) do
     cluster_size = length(nodes)
 
     Enum.with_index(nodes, 1)
     |> Enum.map(fn {node, idx} ->
-      data_dir = "/tmp/ekv_jepsen_#{idx}_#{System.unique_integer([:positive])}"
+      data_dir = "/tmp/ekv_jepsen_#{run_nonce}_#{idx}"
 
       opts = [
         name: @ekv_name,
@@ -147,11 +162,10 @@ defmodule EkvJepsen.HistoryGen do
         log: false,
         gc_interval: :timer.hours(1),
         cluster_size: cluster_size,
-        node_id: "jepsen-node-#{idx}"
+        node_id: "jepsen-#{run_nonce}-node-#{idx}"
       ]
 
       {:ok, _pid} = :erpc.call(node, EKV.JepsenHelper, :start_ekv, [opts])
-
       {node, %{opts: opts, data_dir: data_dir}}
     end)
     |> Map.new()
@@ -207,28 +221,34 @@ defmodule EkvJepsen.HistoryGen do
     end)
   end
 
-  defp start_nemesis(:none, _nodes, _cluster_meta), do: nil
+  defp start_nemesis(:none, _nodes, _cluster_meta), do: []
 
   defp start_nemesis(:partition_flap, nodes, _cluster_meta) do
     IO.puts("starting nemesis: partition_flap")
-
-    spawn_link(fn ->
-      partition_flap_loop(nodes, 0)
-    end)
+    [spawn_link(fn -> partition_flap_loop(nodes, 0) end)]
   end
 
   defp start_nemesis(:restart_one, nodes, cluster_meta) do
     IO.puts("starting nemesis: restart_one")
-
-    spawn_link(fn ->
-      restart_one_loop(nodes, cluster_meta, 0)
-    end)
+    [spawn_link(fn -> restart_one_loop(nodes, cluster_meta, 0) end)]
   end
 
-  defp stop_nemesis(nil), do: :ok
+  defp start_nemesis(:partition_restart, nodes, cluster_meta) do
+    IO.puts("starting nemesis: partition_flap + restart_one")
 
-  defp stop_nemesis(pid) when is_pid(pid) do
-    send(pid, :stop)
+    [
+      spawn_link(fn -> partition_flap_loop(nodes, 0) end),
+      spawn_link(fn -> restart_one_loop(nodes, cluster_meta, 0) end)
+    ]
+  end
+
+  defp stop_nemesis([]), do: :ok
+
+  defp stop_nemesis(pids) when is_list(pids) do
+    Enum.each(pids, fn pid ->
+      if is_pid(pid) and Process.alive?(pid), do: send(pid, :stop)
+    end)
+
     :ok
   end
 
@@ -307,10 +327,10 @@ defmodule EkvJepsen.HistoryGen do
     end)
   end
 
-  defp seed_initial_value(seed_node, log) do
+  defp seed_initial_value(seed_node, log, :register) do
     log.(%{process: -1, type: :invoke, f: :write, value: 0})
 
-    case :erpc.call(seed_node, EKV, :put, [@ekv_name, @key, 0, [consistent: true, timeout: 30_000]]) do
+    case :erpc.call(seed_node, EKV, :put, [@ekv_name, @key, 0, [consistent: true, timeout: @cas_timeout]]) do
       {:ok, _vsn} ->
         log.(%{process: -1, type: :ok, f: :write, value: 0})
 
@@ -319,114 +339,561 @@ defmodule EkvJepsen.HistoryGen do
     end
   end
 
-  defp run_worker(_nodes, _worker, 0, _log, _counter, _every, _total), do: :ok
+  defp seed_initial_value(seed_node, _log, :lock) do
+    ensure_lock_key_nil!(seed_node, 15)
+  end
 
-  defp run_worker(nodes, worker, n_ops, log, counter, every, total) do
-    seed = {
-      rem(System.unique_integer([:positive]), 1_000_000),
-      rem(System.monotonic_time(:microsecond), 1_000_000),
-      worker + 1
-    }
+  defp ensure_lock_key_nil!(_seed_node, 0) do
+    raise "failed to establish nil baseline for lock key"
+  end
 
-    :rand.seed(:exsplus, seed)
+  defp ensure_lock_key_nil!(seed_node, attempts_left) do
+    _delete_result =
+      safe_erpc(seed_node, EKV, :delete, [@ekv_name, @key, [consistent: true, timeout: @cas_timeout]])
 
+    case safe_erpc(seed_node, EKV, :get, [@ekv_name, @key, [consistent: true, timeout: @cas_timeout]]) do
+      nil ->
+        :ok
+
+      _other ->
+        Process.sleep(100)
+        ensure_lock_key_nil!(seed_node, attempts_left - 1)
+    end
+  end
+
+  defp run_worker(_nodes, _worker, 0, _log, _counter, _every, _total, _profile, _seed), do: :ok
+
+  defp run_worker(nodes, worker, n_ops, log, counter, every, total, profile, seed) do
+    seed_worker(seed, worker)
+
+    case profile do
+      :register ->
+        run_worker_register(nodes, worker, n_ops, log, counter, every, total)
+
+      :lock ->
+        run_worker_lock(nodes, worker, n_ops, log, counter, every, total)
+    end
+  end
+
+  defp run_worker_register(nodes, worker, n_ops, log, counter, every, total) do
     Enum.each(1..n_ops, fn i ->
       process_id = worker * 10_000_000 + i
 
       if :rand.uniform(100) <= 50 do
-        do_read(nodes, process_id, i, log)
+        do_register_read(nodes, process_id, i, log)
       else
-        do_write(nodes, process_id, i, log)
+        do_register_write(nodes, process_id, i, log)
       end
 
       maybe_report_progress(counter, every, total)
     end)
   end
 
-  defp do_read(nodes, process_id, i, log) do
+  defp run_worker_lock(nodes, worker, n_ops, log, counter, every, total) do
+    initial = %{
+      owner: "owner-#{worker}",
+      token: nil,
+      vsn: nil
+    }
+
+    _state =
+      Enum.reduce(1..n_ops, initial, fn i, state ->
+        process_id = worker * 10_000_000 + i
+
+        next_state =
+          if state.vsn == nil do
+            if :rand.uniform(100) <= 65 do
+              do_lock_acquire(nodes, process_id, i, log, state)
+            else
+              do_lock_read(nodes, process_id, i, log, state)
+            end
+          else
+            case :rand.uniform(100) do
+              n when n <= 45 -> do_lock_renew(nodes, process_id, i, log, state)
+              n when n <= 70 -> do_lock_release(nodes, process_id, i, log, state)
+              _ -> do_lock_read(nodes, process_id, i, log, state)
+            end
+          end
+
+        maybe_report_progress(counter, every, total)
+        next_state
+      end)
+
+    :ok
+  end
+
+  defp do_register_read(nodes, process_id, i, log) do
     target = random_node(nodes)
     log.(%{process: process_id, type: :invoke, f: :read, value: nil})
 
     try do
-      value = :erpc.call(target, EKV, :get, [@ekv_name, @key, [consistent: true, timeout: 30_000]])
+      value = :erpc.call(target, EKV, :get, [@ekv_name, @key, [consistent: true, timeout: @cas_timeout]])
       log.(%{process: process_id, type: :ok, f: :read, value: value})
     rescue
       e ->
-        log.(%{
-          process: process_id,
-          type: :fail,
-          f: :read,
-          value: nil,
-          error: "read_failed_#{i}@#{target}: #{Exception.message(e)}"
-        })
+        log.(%{process: process_id, type: :fail, f: :read, value: nil, error: "read_failed_#{i}@#{target}: #{Exception.message(e)}"})
     catch
       :exit, reason ->
-        log.(%{
-          process: process_id,
-          type: :fail,
-          f: :read,
-          value: nil,
-          error: "read_exit_#{i}@#{target}: #{inspect(reason)}"
-        })
+        log.(%{process: process_id, type: :fail, f: :read, value: nil, error: "read_exit_#{i}@#{target}: #{inspect(reason)}"})
     end
   end
 
-  defp do_write(nodes, process_id, i, log) do
+  defp do_register_write(nodes, process_id, i, log) do
     target = random_node(nodes)
-    value = process_id
+    value = process_id * 1_000_000 + i
     log.(%{process: process_id, type: :invoke, f: :write, value: value})
 
     try do
-      case :erpc.call(target, EKV, :put, [@ekv_name, @key, value, [consistent: true, timeout: 30_000]]) do
+      case :erpc.call(target, EKV, :put, [@ekv_name, @key, value, [consistent: true, timeout: @cas_timeout]]) do
         {:ok, _vsn} ->
           log.(%{process: process_id, type: :ok, f: :write, value: value})
 
         {:error, :unconfirmed} ->
           resolver = random_node(nodes)
-
-          resolved =
-            :erpc.call(resolver, EKV, :get, [@ekv_name, @key, [consistent: true, timeout: 30_000]])
+          resolved = :erpc.call(resolver, EKV, :get, [@ekv_name, @key, [consistent: true, timeout: @cas_timeout]])
 
           if resolved == value do
             log.(%{process: process_id, type: :ok, f: :write, value: value})
           else
-            log.(%{
-              process: process_id,
-              type: :info,
-              f: :write,
-              value: value,
-              error: "unconfirmed_not_observed@#{resolver}: resolved=#{inspect(resolved)}"
-            })
+            log.(%{process: process_id, type: :info, f: :write, value: value, error: "unconfirmed_not_observed@#{resolver}: resolved=#{inspect(resolved)}"})
           end
+
+        {:error, reason} ->
+          log.(%{process: process_id, type: :info, f: :write, value: value, error: "write_failed_#{i}@#{target}: #{inspect(reason)}"})
+      end
+    rescue
+      e ->
+        log.(%{process: process_id, type: :info, f: :write, value: value, error: "write_exception_#{i}@#{target}: #{Exception.message(e)}"})
+    catch
+      :exit, reason ->
+        log.(%{process: process_id, type: :info, f: :write, value: value, error: "write_exit_#{i}@#{target}: #{inspect(reason)}"})
+    end
+  end
+
+  defp do_lock_read(nodes, process_id, i, log, state) do
+    target = random_node(nodes)
+    log.(%{process: process_id, type: :invoke, f: :read, value: nil})
+
+    try do
+      value = :erpc.call(target, EKV, :get, [@ekv_name, @key, [consistent: true, timeout: @cas_timeout]])
+      owner = lock_owner(value)
+      log.(%{process: process_id, type: :ok, f: :read, value: owner})
+
+      if state.vsn != nil and owner != state.owner do
+        %{state | token: nil, vsn: nil}
+      else
+        state
+      end
+    rescue
+      e ->
+        log.(%{process: process_id, type: :fail, f: :read, value: nil, error: "lock_read_failed_#{i}@#{target}: #{Exception.message(e)}"})
+        state
+    catch
+      :exit, reason ->
+        log.(%{process: process_id, type: :fail, f: :read, value: nil, error: "lock_read_exit_#{i}@#{target}: #{inspect(reason)}"})
+        state
+    end
+  end
+
+  defp do_lock_acquire(nodes, process_id, i, log, state) do
+    target = random_node(nodes)
+    token = "acq/#{state.owner}/#{i}/#{System.unique_integer([:positive])}"
+    lock_value = %{owner: state.owner, token: token}
+    cas_value = [nil, state.owner]
+
+    log.(%{process: process_id, type: :invoke, f: :cas, value: cas_value})
+
+    try do
+      case :erpc.call(target, EKV, :put, [@ekv_name, @key, lock_value, [if_vsn: nil, timeout: @cas_timeout]]) do
+        {:ok, vsn} ->
+          log.(%{process: process_id, type: :ok, f: :cas, value: cas_value})
+          %{state | token: token, vsn: vsn}
+
+        {:error, :conflict} ->
+          log.(%{process: process_id, type: :fail, f: :cas, value: cas_value})
+          state
+
+        {:error, :unconfirmed} ->
+          resolve_unconfirmed_acquire(nodes, process_id, i, log, state, token, cas_value)
 
         {:error, reason} ->
           log.(%{
             process: process_id,
             type: :info,
-            f: :write,
-            value: value,
-            error: "write_failed_#{i}@#{target}: #{inspect(reason)}"
+            f: :cas,
+            value: cas_value,
+            error: "acquire_failed_#{i}@#{target}: #{inspect(reason)}"
           })
+
+          %{state | token: nil, vsn: nil}
       end
     rescue
       e ->
         log.(%{
           process: process_id,
           type: :info,
-          f: :write,
-          value: value,
-          error: "write_exception_#{i}@#{target}: #{Exception.message(e)}"
+          f: :cas,
+          value: cas_value,
+          error: "acquire_exception_#{i}@#{target}: #{Exception.message(e)}"
         })
+
+        %{state | token: nil, vsn: nil}
     catch
       :exit, reason ->
         log.(%{
           process: process_id,
           type: :info,
-          f: :write,
-          value: value,
-          error: "write_exit_#{i}@#{target}: #{inspect(reason)}"
+          f: :cas,
+          value: cas_value,
+          error: "acquire_exit_#{i}@#{target}: #{inspect(reason)}"
         })
+
+        %{state | token: nil, vsn: nil}
     end
+  end
+
+  defp do_lock_renew(nodes, process_id, i, log, state) do
+    target = random_node(nodes)
+    new_token = "ren/#{state.owner}/#{i}/#{System.unique_integer([:positive])}"
+    lock_value = %{owner: state.owner, token: new_token}
+    cas_value = [state.owner, state.owner]
+
+    log.(%{process: process_id, type: :invoke, f: :cas, value: cas_value})
+
+    try do
+      case :erpc.call(target, EKV, :put, [@ekv_name, @key, lock_value, [if_vsn: state.vsn, timeout: @cas_timeout]]) do
+        {:ok, vsn} ->
+          log.(%{process: process_id, type: :ok, f: :cas, value: cas_value})
+          %{state | token: new_token, vsn: vsn}
+
+        {:error, :conflict} ->
+          log.(%{process: process_id, type: :fail, f: :cas, value: cas_value})
+          %{state | token: nil, vsn: nil}
+
+        {:error, :unconfirmed} ->
+          resolve_unconfirmed_renew(nodes, process_id, i, log, state, new_token, cas_value)
+
+        {:error, reason} ->
+          log.(%{
+            process: process_id,
+            type: :info,
+            f: :cas,
+            value: cas_value,
+            error: "renew_failed_#{i}@#{target}: #{inspect(reason)}"
+          })
+
+          %{state | token: nil, vsn: nil}
+      end
+    rescue
+      e ->
+        log.(%{
+          process: process_id,
+          type: :info,
+          f: :cas,
+          value: cas_value,
+          error: "renew_exception_#{i}@#{target}: #{Exception.message(e)}"
+        })
+
+        %{state | token: nil, vsn: nil}
+    catch
+      :exit, reason ->
+        log.(%{
+          process: process_id,
+          type: :info,
+          f: :cas,
+          value: cas_value,
+          error: "renew_exit_#{i}@#{target}: #{inspect(reason)}"
+        })
+
+        %{state | token: nil, vsn: nil}
+    end
+  end
+
+  defp do_lock_release(nodes, process_id, i, log, state) do
+    target = random_node(nodes)
+    cas_value = [state.owner, nil]
+
+    log.(%{process: process_id, type: :invoke, f: :cas, value: cas_value})
+
+    try do
+      case :erpc.call(target, EKV, :delete, [@ekv_name, @key, [if_vsn: state.vsn, timeout: @cas_timeout]]) do
+        {:ok, _vsn} ->
+          log.(%{process: process_id, type: :ok, f: :cas, value: cas_value})
+          %{state | token: nil, vsn: nil}
+
+        {:error, :conflict} ->
+          log.(%{process: process_id, type: :fail, f: :cas, value: cas_value})
+          %{state | token: nil, vsn: nil}
+
+        {:error, :unconfirmed} ->
+          resolve_unconfirmed_release(nodes, process_id, i, log, state, cas_value)
+
+        {:error, reason} ->
+          log.(%{
+            process: process_id,
+            type: :info,
+            f: :cas,
+            value: cas_value,
+            error: "release_failed_#{i}@#{target}: #{inspect(reason)}"
+          })
+
+          %{state | token: nil, vsn: nil}
+      end
+    rescue
+      e ->
+        log.(%{
+          process: process_id,
+          type: :info,
+          f: :cas,
+          value: cas_value,
+          error: "release_exception_#{i}@#{target}: #{Exception.message(e)}"
+        })
+
+        %{state | token: nil, vsn: nil}
+    catch
+      :exit, reason ->
+        log.(%{
+          process: process_id,
+          type: :info,
+          f: :cas,
+          value: cas_value,
+          error: "release_exit_#{i}@#{target}: #{inspect(reason)}"
+        })
+
+        %{state | token: nil, vsn: nil}
+    end
+  end
+
+  defp resolve_unconfirmed_acquire(nodes, process_id, i, log, state, token, cas_value) do
+    resolver = random_node(nodes)
+
+    try do
+      resolved = :erpc.call(resolver, EKV, :get, [@ekv_name, @key, [consistent: true, timeout: @cas_timeout]])
+
+      case resolved do
+        %{owner: owner, token: ^token} when owner == state.owner ->
+          log.(%{process: process_id, type: :ok, f: :cas, value: cas_value})
+
+          case recover_vsn_for_token(nodes, token, 8) do
+            {:ok, vsn} -> %{state | token: token, vsn: vsn}
+            :error -> %{state | token: nil, vsn: nil}
+          end
+
+        %{owner: _owner, token: _other} ->
+          log.(%{
+            process: process_id,
+            type: :info,
+            f: :cas,
+            value: cas_value,
+            error: "acquire_unconfirmed_not_matched_#{i}@#{resolver}"
+          })
+
+          %{state | token: nil, vsn: nil}
+
+        nil ->
+          log.(%{
+            process: process_id,
+            type: :info,
+            f: :cas,
+            value: cas_value,
+            error: "acquire_unconfirmed_nil_#{i}@#{resolver}"
+          })
+
+          %{state | token: nil, vsn: nil}
+
+        other ->
+          log.(%{
+            process: process_id,
+            type: :info,
+            f: :cas,
+            value: cas_value,
+            error: "acquire_unconfirmed_unknown_#{i}@#{resolver}: #{inspect(other)}"
+          })
+
+          %{state | token: nil, vsn: nil}
+      end
+    rescue
+      e ->
+        log.(%{
+          process: process_id,
+          type: :info,
+          f: :cas,
+          value: cas_value,
+          error: "acquire_unconfirmed_exception_#{i}@#{resolver}: #{Exception.message(e)}"
+        })
+
+        %{state | token: nil, vsn: nil}
+    catch
+      :exit, reason ->
+        log.(%{
+          process: process_id,
+          type: :info,
+          f: :cas,
+          value: cas_value,
+          error: "acquire_unconfirmed_exit_#{i}@#{resolver}: #{inspect(reason)}"
+        })
+
+        %{state | token: nil, vsn: nil}
+    end
+  end
+
+  defp resolve_unconfirmed_renew(nodes, process_id, i, log, state, new_token, cas_value) do
+    resolver = random_node(nodes)
+
+    try do
+      resolved = :erpc.call(resolver, EKV, :get, [@ekv_name, @key, [consistent: true, timeout: @cas_timeout]])
+
+      case resolved do
+        %{owner: owner, token: ^new_token} when owner == state.owner ->
+          log.(%{process: process_id, type: :ok, f: :cas, value: cas_value})
+
+          case recover_vsn_for_token(nodes, new_token, 8) do
+            {:ok, vsn} -> %{state | token: new_token, vsn: vsn}
+            :error -> %{state | token: nil, vsn: nil}
+          end
+
+        %{owner: owner, token: token} when owner == state.owner ->
+          log.(%{
+            process: process_id,
+            type: :info,
+            f: :cas,
+            value: cas_value,
+            error: "renew_unconfirmed_old_token_#{i}@#{resolver}: #{token}"
+          })
+
+          case recover_vsn_for_token(nodes, token, 8) do
+            {:ok, vsn} -> %{state | token: token, vsn: vsn}
+            :error -> %{state | token: nil, vsn: nil}
+          end
+
+        _other ->
+          log.(%{
+            process: process_id,
+            type: :info,
+            f: :cas,
+            value: cas_value,
+            error: "renew_unconfirmed_not_matched_#{i}@#{resolver}"
+          })
+
+          %{state | token: nil, vsn: nil}
+      end
+    rescue
+      e ->
+        log.(%{
+          process: process_id,
+          type: :info,
+          f: :cas,
+          value: cas_value,
+          error: "renew_unconfirmed_exception_#{i}@#{resolver}: #{Exception.message(e)}"
+        })
+
+        %{state | token: nil, vsn: nil}
+    catch
+      :exit, reason ->
+        log.(%{
+          process: process_id,
+          type: :info,
+          f: :cas,
+          value: cas_value,
+          error: "renew_unconfirmed_exit_#{i}@#{resolver}: #{inspect(reason)}"
+        })
+
+        %{state | token: nil, vsn: nil}
+    end
+  end
+
+  defp resolve_unconfirmed_release(nodes, process_id, i, log, state, cas_value) do
+    resolver = random_node(nodes)
+
+    try do
+      resolved = :erpc.call(resolver, EKV, :get, [@ekv_name, @key, [consistent: true, timeout: @cas_timeout]])
+
+      case resolved do
+        nil ->
+          log.(%{process: process_id, type: :ok, f: :cas, value: cas_value})
+          %{state | token: nil, vsn: nil}
+
+        %{owner: owner, token: token} when owner == state.owner ->
+          log.(%{
+            process: process_id,
+            type: :info,
+            f: :cas,
+            value: cas_value,
+            error: "release_unconfirmed_owner_still_present_#{i}@#{resolver}: #{token}"
+          })
+
+          case recover_vsn_for_token(nodes, token, 8) do
+            {:ok, vsn} -> %{state | token: token, vsn: vsn}
+            :error -> %{state | token: nil, vsn: nil}
+          end
+
+        _other ->
+          log.(%{
+            process: process_id,
+            type: :info,
+            f: :cas,
+            value: cas_value,
+            error: "release_unconfirmed_not_matched_#{i}@#{resolver}"
+          })
+
+          %{state | token: nil, vsn: nil}
+      end
+    rescue
+      e ->
+        log.(%{
+          process: process_id,
+          type: :info,
+          f: :cas,
+          value: cas_value,
+          error: "release_unconfirmed_exception_#{i}@#{resolver}: #{Exception.message(e)}"
+        })
+
+        %{state | token: nil, vsn: nil}
+    catch
+      :exit, reason ->
+        log.(%{
+          process: process_id,
+          type: :info,
+          f: :cas,
+          value: cas_value,
+          error: "release_unconfirmed_exit_#{i}@#{resolver}: #{inspect(reason)}"
+        })
+
+        %{state | token: nil, vsn: nil}
+    end
+  end
+
+  defp recover_vsn_for_token(_nodes, _token, 0), do: :error
+
+  defp recover_vsn_for_token(nodes, token, attempts) do
+    found =
+      Enum.find_value(nodes, fn node ->
+        case safe_erpc(node, EKV, :lookup, [@ekv_name, @key]) do
+          {%{token: ^token}, vsn} ->
+            vsn
+
+          _ ->
+            nil
+        end
+      end)
+
+    if found do
+      {:ok, found}
+    else
+      Process.sleep(50)
+      recover_vsn_for_token(nodes, token, attempts - 1)
+    end
+  end
+
+  defp lock_owner(%{owner: owner}) when is_binary(owner), do: owner
+  defp lock_owner(_), do: nil
+
+  defp seed_worker(seed_base, worker) do
+    h = :erlang.phash2({seed_base, worker}, 2_147_483_647)
+    a = rem(h, 30_269) + 1
+    b = rem(div(h, 30_269), 30_307) + 1
+    c = rem(div(h, 30_269 * 30_307), 30_323) + 1
+    :rand.seed(:exsplus, {a, b, c})
   end
 
   defp random_node(nodes) do
@@ -498,6 +965,7 @@ defmodule EkvJepsen.HistoryGen do
   defp encode_value(v) when is_boolean(v), do: if(v, do: "true", else: "false")
   defp encode_value(v) when is_atom(v), do: ":#{Atom.to_string(v)}"
   defp encode_value(v) when is_binary(v), do: encode_string(v)
+  defp encode_value(v) when is_list(v), do: "[#{Enum.map_join(v, " ", &encode_value/1)}]"
   defp encode_value(v), do: encode_string(inspect(v))
 
   defp encode_string(v) do
@@ -513,28 +981,58 @@ defmodule EkvJepsen.HistoryGen do
   def parse_mode!("none"), do: :none
   def parse_mode!("partition_flap"), do: :partition_flap
   def parse_mode!("restart_one"), do: :restart_one
+  def parse_mode!("partition_restart"), do: :partition_restart
 
   def parse_mode!(other) do
-    raise "invalid mode #{inspect(other)} (expected none|partition_flap|restart_one)"
+    raise "invalid mode #{inspect(other)} (expected none|partition_flap|restart_one|partition_restart)"
+  end
+
+  def parse_profile!("register"), do: :register
+  def parse_profile!("lock"), do: :lock
+
+  def parse_profile!(other) do
+    raise "invalid profile #{inspect(other)} (expected register|lock)"
   end
 end
 
-[path, workers, total_ops, cluster_nodes, mode] =
+[path, workers, total_ops, cluster_nodes, mode, profile, seed] =
   case System.argv() do
+    [p, w, t, c, m, pr, s] ->
+      [
+        p,
+        String.to_integer(w),
+        String.to_integer(t),
+        String.to_integer(c),
+        EkvJepsen.HistoryGen.parse_mode!(m),
+        EkvJepsen.HistoryGen.parse_profile!(pr),
+        String.to_integer(s)
+      ]
+
+    [p, w, t, c, m, pr] ->
+      [
+        p,
+        String.to_integer(w),
+        String.to_integer(t),
+        String.to_integer(c),
+        EkvJepsen.HistoryGen.parse_mode!(m),
+        EkvJepsen.HistoryGen.parse_profile!(pr),
+        1
+      ]
+
     [p, w, t, c, m] ->
-      [p, String.to_integer(w), String.to_integer(t), String.to_integer(c), EkvJepsen.HistoryGen.parse_mode!(m)]
+      [p, String.to_integer(w), String.to_integer(t), String.to_integer(c), EkvJepsen.HistoryGen.parse_mode!(m), :register, 1]
 
     [p, w, t, c] ->
-      [p, String.to_integer(w), String.to_integer(t), String.to_integer(c), :none]
+      [p, String.to_integer(w), String.to_integer(t), String.to_integer(c), :none, :register, 1]
 
     [p, w, t] ->
-      [p, String.to_integer(w), String.to_integer(t), 3, :none]
+      [p, String.to_integer(w), String.to_integer(t), 3, :none, :register, 1]
 
     [p] ->
-      [p, 4, 200, 3, :none]
+      [p, 4, 200, 3, :none, :register, 1]
 
     _ ->
-      ["jepsen/results/history.edn", 4, 200, 3, :none]
+      ["jepsen/results/history.edn", 4, 200, 3, :none, :register, 1]
   end
 
-EkvJepsen.HistoryGen.run(path, workers, total_ops, cluster_nodes, mode)
+EkvJepsen.HistoryGen.run(path, workers, total_ops, cluster_nodes, mode, profile, seed)
