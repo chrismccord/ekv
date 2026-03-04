@@ -1210,7 +1210,11 @@ defmodule EKV.StressTest do
       # Key remains on CAS value after heal.
       TestCluster.assert_eventually(
         fn ->
-          vals = Enum.map([n1, n2, n3, n4, n5], fn n -> TestCluster.rpc!(n, EKV, :get, [ekv_name, key]) end)
+          vals =
+            Enum.map([n1, n2, n3, n4, n5], fn n ->
+              TestCluster.rpc!(n, EKV, :get, [ekv_name, key])
+            end)
+
           Enum.all?(vals, &(&1 == "cas_v1"))
         end,
         timeout: 5000

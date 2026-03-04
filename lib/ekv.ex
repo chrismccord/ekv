@@ -3,9 +3,11 @@ defmodule EKV do
   Eventually consistent durable key-value store with zero runtime dependencies.
 
   EKV stores data on disk (survives restarts and node death) and replicates
-  across all connected Erlang nodes automatically. There is no leader — every
-  node accepts reads and writes at all times, including during network
-  partitions. When connectivity is restored, nodes converge to the same state.
+  across all connected Erlang nodes automatically. There is no leader for
+  eventual mode — every node serves reads and eventual writes at all times,
+  including during network partitions. CAS writes (`if_vsn:`, `consistent: true`,
+  `update/4`) require quorum and may fail when quorum is unavailable. When
+  connectivity is restored, nodes converge to the same state.
 
   ## Quick Start
 
@@ -32,6 +34,37 @@ defmodule EKV do
       # receive
       # => {:ekv, [%EKV.Event{type: :put, key: "rooms/1", value: %{title: ...}}], %{name: :my_kv}}
 
+      # CAS setup (requires cluster_size + node_id)
+      {EKV, name: :my_kv_cas, data_dir: "/var/data/ekv_cas", cluster_size: 3, node_id: 1}
+
+      # CAS put via lookup + if_vsn
+      case EKV.lookup(:my_kv_cas, "lock/job-123") do
+        nil ->
+          EKV.put(:my_kv_cas, "lock/job-123", %{owner: "node-a"}, if_vsn: nil)
+
+        {_value, vsn} ->
+          EKV.put(:my_kv_cas, "lock/job-123", %{owner: "node-a"}, if_vsn: vsn)
+      end
+
+      # Handling ambiguous CAS result explicitly
+      case EKV.put(:my_kv_cas, "lock/job-123", %{owner: "node-a"}, if_vsn: nil) do
+        {:ok, vsn} ->
+          {:locked, vsn}
+
+        {:error, :conflict} ->
+          :already_locked
+
+        {:error, :unconfirmed} ->
+          # Resolve by reading through the CAS barrier
+          EKV.get(:my_kv_cas, "lock/job-123", consistent: true)
+      end
+
+      # Or opt in to internal ambiguity resolution for this call
+      EKV.put(:my_kv_cas, "lock/job-123", %{owner: "node-a"},
+        if_vsn: nil,
+        resolve_unconfirmed: true
+      )
+
   Values can be any Erlang/Elixir term. They are stored as `:erlang.term_to_binary/1`
   internally and deserialized with `:erlang.binary_to_term/1` on read.
   *Note*: Avoid storing structs or anonymous functions within values.
@@ -49,15 +82,16 @@ defmodule EKV do
   - **Causal ordering.** If node A writes key "x" then key "y", another node
     may see "y" before "x" (or "y" without "x" during a partition).
 
-  - **Transactions.** There is no way to atomically read-modify-write, or to
-    write multiple keys as a single unit. Each key is independent.
+  - **Multi-key transactions.** There is no way to atomically write multiple
+    keys as a single unit. Per-key atomic read-modify-write is available via
+    `update/4` (CAS mode).
 
   ### Conflict Resolution: Last-Writer-Wins (LWW)
 
-  When two nodes write the same key concurrently, EKV keeps the write with the
-  **highest nanosecond timestamp**. If timestamps are identical (unlikely but
-  possible with clock sync), the write from the **lexicographically greater
-  node name** wins as a deterministic tiebreaker.
+  For eventual-mode writes (`put/4` and `delete/3` without CAS options), EKV
+  keeps the write with the **highest nanosecond timestamp**. If timestamps are
+  identical (unlikely but possible with clock sync), the write from the
+  **lexicographically greater node name** wins as a deterministic tiebreaker.
 
   This means:
 
@@ -77,12 +111,16 @@ defmodule EKV do
     higher timestamp always wins regardless of whether the operation was a put
     or a delete.
 
+  CAS-mode writes do not use LWW ordering; they are ordered by CASPaxos ballots.
+
   ### Reads During Partitions
 
   During a network partition, each side of the partition continues to serve
-  reads and accept writes independently. When the partition heals, the nodes
-  sync and converge using LWW. Data is never lost — the "losing" write is
-  simply overwritten by the "winning" one.
+  reads and accept eventual writes independently. CAS writes continue only on
+  partitions that can reach quorum; minority partitions return CAS errors such
+  as `{:error, :no_quorum}` or `{:error, :quorum_timeout}`. When the partition
+  heals, nodes sync and converge. For eventual writes, LWW determines the
+  surviving value for conflicting writes on the same key.
 
   ### Consistency Modes Per Key (Important)
 
@@ -94,14 +132,35 @@ defmodule EKV do
 
   For predictable semantics, treat mode as **key ownership**:
 
+  - Different keys may use different modes in the same EKV instance.
+  - A key may start in eventual/LWW mode and later transition to CAS mode
+    (`LWW -> CAS` is supported).
+  - Once a key is CAS-managed, eventual writes on that key are rejected
+    (`CAS -> LWW` is not supported for writes).
   - Keys managed via CAS should continue to use CAS **write** APIs.
   - Reads for CAS-managed keys may be eventual (`get/2`, `lookup/2`) when
     staleness is acceptable, or consistent (`get/3, consistent: true`) when
     fresh linearizable reads are required.
-  - Do not mix eventual writes and CAS writes on the same key.
+  - After transition to CAS mode, do not issue eventual writes on that key.
 
-  Mixed-mode writes on a single key are unsupported and can produce surprising
-  ordering/convergence outcomes under clock skew or partitions.
+  ### CAS Outcomes and `:unconfirmed`
+
+  CAS write APIs (`put/4` with `if_vsn:` or `consistent: true`, `delete/3`
+  with `if_vsn:`, and `update/4`) can return:
+
+  - `{:ok, ...}` — write committed; returns the committed VSN.
+  - `{:error, :conflict}` — definite non-application for this attempt
+    (for example stale `if_vsn`).
+  - `{:error, :unconfirmed}` — write reached accept phase, so final outcome is
+    ambiguous from the caller's perspective.
+
+  On `:unconfirmed`, callers can issue `get(name, key, consistent: true)` to
+  resolve current committed state before taking follow-up actions.
+
+  For convenience, pass `resolve_unconfirmed: true` on CAS writes to make EKV
+  perform one internal barrier read and map ambiguous outcomes to current-state
+  results: `{:ok, ...}` / `{:error, :conflict}` when resolvable, or
+  `{:error, :unavailable}` if the resolution read cannot complete.
 
   ## Configuration
 
@@ -120,6 +179,8 @@ defmodule EKV do
   | `:name` | *required* | Atom identifying this EKV instance. Used to register processes and as the first argument to all API functions. |
   | `:data_dir` | *required* | Directory where SQLite database files are stored. Created automatically if it doesn't exist. Each shard gets its own file (`shard_0.db`, `shard_1.db`, etc.). |
   | `:shards` | `8` | Number of shards. See "Choosing a Shard Count" below. |
+  | `:cluster_size` | `nil` | Logical cluster size for CAS quorum math. Required for CAS operations (`if_vsn:`, `consistent: true`, `update/4`). |
+  | `:node_id` | `nil` | Stable logical member identity used by CAS ballots. Required for CAS operations. Should remain stable for each logical cluster member. |
   | `:tombstone_ttl` | `604_800_000` (7 days) | How long tombstones (deleted entries) are kept before being permanently purged, in milliseconds. See "Tombstone Lifetime" below. |
   | `:gc_interval` | `300_000` (5 min) | How often garbage collection runs, in milliseconds. GC expires TTL entries, purges old tombstones, and truncates the replication oplog. |
   | `:log` | `:info` | Logging level. `:info` logs cluster events (connects, syncs). `false` disables logging. `:verbose` logs per-shard detail. |
@@ -358,7 +419,8 @@ defmodule EKV do
 
   ## Options
 
-  - `:ttl` — time-to-live in milliseconds. Entry expires after this duration.
+  - `:ttl` — positive integer time-to-live in milliseconds. Entry expires
+    after this duration.
   - `:if_vsn` — compare-and-swap. Only succeeds if the key's current version
     matches. Use `nil` for insert-if-absent.
     Returns `{:error, :conflict}` if the expected version does not match and
@@ -367,17 +429,27 @@ defmodule EKV do
     caller could not confirm final outcome; in this case, issue
     `get(name, key, consistent: true)` to resolve the committed value.
     Requires `cluster_size` and `node_id` config.
+    Can be used on an existing LWW key to transition it to CAS-managed
+    (`LWW -> CAS`).
   - `:consistent` — when `true`, uses CASPaxos consensus for the write
     (quorum-backed CAS write). Mutually exclusive with `:if_vsn`. Requires
     `cluster_size` and `node_id` config.
-    For strict behavior, keep the key in CAS mode and do not mix with eventual
-    `put`/`delete` on the same key.
+    For strict behavior, keep the key in CAS mode after transition and do not
+    mix with eventual `put`/`delete` on the same key (`CAS -> LWW` writes are
+    rejected).
     Eventual writes to CAS-managed keys are rejected with
     `{:error, :cas_managed_key}`.
-  - `:retries` — max CAS retries on conflict (default 5). Only for
-    `:consistent` and `:if_vsn` paths.
-  - `:backoff` — `{min_ms, max_ms}` random backoff range (default `{10, 60}`).
-  - `:timeout` — GenServer call timeout in ms (default 10_000).
+  - `:retries` — non-negative integer max CAS retries on conflict (default 5).
+    Only for `:consistent` and `:if_vsn` paths.
+  - `:backoff` — `{min_ms, max_ms}` backoff range in ms where both are
+    non-negative integers and `min_ms <= max_ms` (default `{10, 60}`).
+  - `:timeout` — positive integer call timeout in ms (or `:infinity`, default
+    10_000).
+  - `:resolve_unconfirmed` — boolean (default `false`). When `true`, if a CAS
+    write enters accept phase but cannot confirm final outcome, EKV performs one
+    internal barrier read to resolve current state and returns
+    `{:ok, vsn}`/`{:error, :conflict}` when possible, or
+    `{:error, :unavailable}` if that resolution cannot complete.
 
   ## Returns
 
@@ -385,10 +457,27 @@ defmodule EKV do
     `{:error, :cas_managed_key}` when the key is CAS-managed
   - CAS put (`if_vsn:` or `consistent: true`): `{:ok, vsn}` where
     `vsn` is `{timestamp, origin_node}`
+  - With `resolve_unconfirmed: true`, CAS put may also return
+    `{:error, :unavailable}` if ambiguity resolution cannot complete.
   """
   def put(name, key, value, opts \\ []) do
-    opts = Keyword.validate!(opts, [:ttl, :if_vsn, :consistent, :retries, :backoff, :timeout])
+    opts =
+      Keyword.validate!(opts, [
+        :ttl,
+        :if_vsn,
+        :consistent,
+        :retries,
+        :backoff,
+        :timeout,
+        :resolve_unconfirmed
+      ])
+
+    validate_ttl_opt!(opts)
+    validate_retries_opt!(opts)
+    validate_backoff_opt!(opts)
+    validate_timeout_opt!(opts)
     consistent? = validate_boolean_opt!(opts, :consistent)
+    _resolve_unconfirmed? = validate_boolean_opt!(opts, :resolve_unconfirmed)
     config = get_config(name)
     shard_index = Replica.shard_index_for(key, config.num_shards)
     timeout = Keyword.get(opts, :timeout, 10_000)
@@ -400,7 +489,9 @@ defmodule EKV do
         end
 
         validate_cas_config!(config)
-        update_opts = Keyword.take(opts, [:ttl, :retries, :backoff, :timeout])
+
+        update_opts =
+          Keyword.take(opts, [:ttl, :retries, :backoff, :timeout, :resolve_unconfirmed])
 
         case update(name, key, fn _ -> value end, update_opts) do
           {:ok, _new_value, vsn} -> {:ok, vsn}
@@ -435,12 +526,18 @@ defmodule EKV do
     (barrier/linearizable for CAS-managed keys). This read always goes through
     CAS accept+commit to resolve any in-flight accepted value before replying.
     Requires `cluster_size` and `node_id` config.
-  - `:retries` — max CAS retries (default 5). Only for `consistent: true`.
-  - `:backoff` — `{min_ms, max_ms}` random backoff range (default `{10, 60}`).
-  - `:timeout` — GenServer call timeout in ms (default 10_000).
+  - `:retries` — non-negative integer max CAS retries (default 5). Only for
+    `consistent: true`.
+  - `:backoff` — `{min_ms, max_ms}` backoff range in ms where both are
+    non-negative integers and `min_ms <= max_ms` (default `{10, 60}`).
+  - `:timeout` — positive integer call timeout in ms (or `:infinity`, default
+    10_000).
   """
   def get(name, key, opts \\ []) do
     opts = Keyword.validate!(opts, [:consistent, :retries, :backoff, :timeout])
+    validate_retries_opt!(opts)
+    validate_backoff_opt!(opts)
+    validate_timeout_opt!(opts)
     consistent? = validate_boolean_opt!(opts, :consistent)
 
     if consistent? do
@@ -456,6 +553,7 @@ defmodule EKV do
              timeout
            ) do
         {:ok, value} -> value
+        {:ok, value, _vsn} -> value
         {:error, reason} -> raise "EKV: consistent read failed: #{inspect(reason)}"
       end
     else
@@ -500,19 +598,29 @@ defmodule EKV do
     caller could not confirm final outcome; issue `get(name, key, consistent: true)`
     to resolve.
     Requires `cluster_size` and `node_id` config.
-    For strict behavior, keep the key in CAS mode and do not mix with eventual
-    `put`/`delete` on the same key.
+    For strict behavior, keep the key in CAS mode after transition and do not
+    mix with eventual `put`/`delete` on the same key (`CAS -> LWW` writes are
+    rejected).
     Eventual deletes on CAS-managed keys are rejected with
     `{:error, :cas_managed_key}`.
+  - `:resolve_unconfirmed` — boolean (default `false`). When `true`, if a CAS
+    delete enters accept phase but cannot confirm final outcome, EKV performs
+    one internal barrier read to resolve current state and returns
+    `{:ok, vsn}`/`{:error, :conflict}` when possible, or
+    `{:error, :unavailable}` if that resolution cannot complete.
 
   ## Returns
 
   - Eventual delete (`delete` without CAS options): `:ok` or
     `{:error, :cas_managed_key}` when the key is CAS-managed
   - CAS delete (`if_vsn:`): `{:ok, vsn}` where `vsn` is `{timestamp, origin_node}`
+  - With `resolve_unconfirmed: true`, CAS delete may also return
+    `{:error, :unavailable}` if ambiguity resolution cannot complete.
   """
   def delete(name, key, opts \\ []) do
-    opts = Keyword.validate!(opts, [:if_vsn, :timeout])
+    opts = Keyword.validate!(opts, [:if_vsn, :timeout, :resolve_unconfirmed])
+    validate_timeout_opt!(opts)
+    _resolve_unconfirmed? = validate_boolean_opt!(opts, :resolve_unconfirmed)
     config = get_config(name)
     shard_index = Replica.shard_index_for(key, config.num_shards)
     timeout = Keyword.get(opts, :timeout, 10_000)
@@ -523,7 +631,7 @@ defmodule EKV do
 
         GenServer.call(
           Replica.shard_name(name, shard_index),
-          {:cas_delete, key, expected_vsn},
+          {:cas_delete, key, expected_vsn, opts},
           timeout
         )
 
@@ -547,18 +655,31 @@ defmodule EKV do
   resolve.
 
   Requires `cluster_size` and `node_id` config.
-  Intended for keys managed in CAS mode (do not mix with eventual writes on
-  the same key).
+  Can be used to move a key from LWW to CAS-managed mode. After transition,
+  do not mix with eventual writes on the same key (`CAS -> LWW` writes are
+  rejected).
 
   ## Options
 
-  - `:ttl` — time-to-live in milliseconds for the new value.
-  - `:retries` — max CAS retries on conflict (default 5).
-  - `:backoff` — `{min_ms, max_ms}` random backoff range (default `{10, 60}`).
-  - `:timeout` — GenServer call timeout in ms (default 10_000).
+  - `:ttl` — positive integer time-to-live in milliseconds for the new value.
+  - `:retries` — non-negative integer max CAS retries on conflict (default 5).
+  - `:backoff` — `{min_ms, max_ms}` backoff range in ms where both are
+    non-negative integers and `min_ms <= max_ms` (default `{10, 60}`).
+  - `:timeout` — positive integer call timeout in ms (or `:infinity`, default
+    10_000).
+  - `:resolve_unconfirmed` — boolean (default `false`). When `true`, if an
+    update enters accept phase but cannot confirm final outcome, EKV performs
+    one internal barrier read to resolve current state and returns
+    `{:ok, new_value, vsn}`/`{:error, :conflict}` when possible, or
+    `{:error, :unavailable}` if that resolution cannot complete.
   """
   def update(name, key, fun, opts \\ []) when is_function(fun, 1) do
-    opts = Keyword.validate!(opts, [:ttl, :retries, :backoff, :timeout])
+    opts = Keyword.validate!(opts, [:ttl, :retries, :backoff, :timeout, :resolve_unconfirmed])
+    validate_ttl_opt!(opts)
+    validate_retries_opt!(opts)
+    validate_backoff_opt!(opts)
+    validate_timeout_opt!(opts)
+    _resolve_unconfirmed? = validate_boolean_opt!(opts, :resolve_unconfirmed)
     config = get_config(name)
     validate_cas_config!(config)
     shard_index = Replica.shard_index_for(key, config.num_shards)
@@ -850,6 +971,65 @@ defmodule EKV do
 
       other ->
         raise ArgumentError, "EKV: #{inspect(key)} must be boolean, got: #{inspect(other)}"
+    end
+  end
+
+  defp validate_ttl_opt!(opts) do
+    case Keyword.fetch(opts, :ttl) do
+      :error ->
+        :ok
+
+      {:ok, ttl} when is_integer(ttl) and ttl > 0 ->
+        :ok
+
+      {:ok, other} ->
+        raise ArgumentError, "EKV: :ttl must be a positive integer, got: #{inspect(other)}"
+    end
+  end
+
+  defp validate_retries_opt!(opts) do
+    case Keyword.fetch(opts, :retries) do
+      :error ->
+        :ok
+
+      {:ok, retries} when is_integer(retries) and retries >= 0 ->
+        :ok
+
+      {:ok, other} ->
+        raise ArgumentError,
+              "EKV: :retries must be a non-negative integer, got: #{inspect(other)}"
+    end
+  end
+
+  defp validate_backoff_opt!(opts) do
+    case Keyword.fetch(opts, :backoff) do
+      :error ->
+        :ok
+
+      {:ok, {min_ms, max_ms}}
+      when is_integer(min_ms) and is_integer(max_ms) and min_ms >= 0 and max_ms >= min_ms ->
+        :ok
+
+      {:ok, other} ->
+        raise ArgumentError,
+              "EKV: :backoff must be {min_ms, max_ms} with non-negative integers and min <= max, got: #{inspect(other)}"
+    end
+  end
+
+  defp validate_timeout_opt!(opts) do
+    case Keyword.fetch(opts, :timeout) do
+      :error ->
+        :ok
+
+      {:ok, :infinity} ->
+        :ok
+
+      {:ok, timeout} when is_integer(timeout) and timeout > 0 ->
+        :ok
+
+      {:ok, other} ->
+        raise ArgumentError,
+              "EKV: :timeout must be a positive integer or :infinity, got: #{inspect(other)}"
     end
   end
 

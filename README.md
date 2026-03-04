@@ -121,6 +121,11 @@ EKV supports two write modes:
 
 Use mode as **key ownership**:
 
+- Different keys may use different modes in the same EKV instance.
+- A key may start in eventual/LWW mode and later transition to CAS mode
+  (`LWW -> CAS` is supported).
+- Once a key is CAS-managed, eventual writes on that key are rejected
+  (`CAS -> LWW` is not supported for writes).
 - Keys managed via CAS should keep using CAS **write** APIs.
 - Reads for CAS-managed keys can be eventual (`EKV.get/2`, `EKV.lookup/2`) for
   lower latency, or consistent (`EKV.get/3, consistent: true`) when freshness
@@ -130,8 +135,7 @@ Use mode as **key ownership**:
 - CAS write APIs return committed VSNs on success (`{:ok, vsn}` for
   `put/delete`, `{:ok, value, vsn}` for `update`) so callers can chain
   later `if_vsn:` guards without an extra lookup.
-- Eventual writes on CAS-managed keys are rejected with
-  `{:error, :cas_managed_key}`.
+- Eventual writes on CAS-managed keys return `{:error, :cas_managed_key}`.
 
 ### CAS write error semantics
 
@@ -146,10 +150,21 @@ CAS writes (`put` with `if_vsn:` or `consistent: true`, `delete` with `if_vsn:`,
 On `:unconfirmed`, resolve with `EKV.get(name, key, consistent: true)` before
 taking follow-up actions.
 
+You can opt in to internal resolution per call with
+`resolve_unconfirmed: true` on CAS write APIs. In that mode, EKV performs one
+barrier read when an ambiguous accept outcome occurs and returns resolved
+current-state outcomes (`{:ok, ...}` or `{:error, :conflict}`) when possible,
+or `{:error, :unavailable}` if the resolution read itself cannot complete.
+
 ### Mixed-mode note
 
-Once a key is CAS-managed, eventual `put/delete` on that key are rejected
-(`{:error, :cas_managed_key}`). Keep lock/ownership keyspaces CAS-write-only.
+Transition rule per key:
+
+- `LWW -> CAS`: allowed.
+- `CAS -> LWW` (eventual `put/delete`): rejected with
+  `{:error, :cas_managed_key}`.
+
+Keep lock/ownership keyspaces CAS-write-only after transition.
 
 ### Garbage collection
 

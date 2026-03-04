@@ -249,6 +249,146 @@ defmodule EKV.CASDistributedTest do
       {:ok, 1, _} =
         TestCluster.rpc!(node_a, EKV, :update, [ekv_name, "counter", &TestCluster.cas_increment/1])
     end
+
+    @tag timeout: 120_000
+    test "fresh late joiner hydrates all CAS data while writes are in-flight" do
+      peers = TestCluster.start_peers(3)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
+      ekv_name = unique_name(:cas_join)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      # Start only 2 of 3 logical members first; quorum is still possible (2/3).
+      start_cas_cluster(Enum.take(peers, 2), ekv_name, cluster_size: 3)
+      Process.sleep(300)
+
+      writes_per_writer = 300
+      cutover_at = 100
+      parent = self()
+
+      expected =
+        for {prefix, _node} <- [{"a", node_a}, {"b", node_b}],
+            i <- 1..writes_per_writer,
+            into: %{} do
+          {"join/#{prefix}/#{i}", "#{prefix}-#{i}"}
+        end
+
+      put_and_confirm = fn node, key, value ->
+        do_put = fn ->
+          TestCluster.rpc!(node, EKV, :put, [ekv_name, key, value, [if_vsn: nil]])
+        end
+
+        resolve = fn ->
+          TestCluster.rpc!(node, EKV, :get, [ekv_name, key, [consistent: true]]) == value
+        end
+
+        Enum.reduce_while(1..3, :error, fn attempt, _acc ->
+          case do_put.() do
+            {:ok, _} ->
+              {:halt, :ok}
+
+            {:ok, _, _} ->
+              {:halt, :ok}
+
+            {:error, reason}
+            when reason in [:conflict, :unconfirmed, :uncertain, :no_quorum, :quorum_timeout] ->
+              if resolve.() do
+                {:halt, :ok}
+              else
+                if attempt < 3, do: {:cont, :error}, else: {:halt, {:error, reason}}
+              end
+
+            other ->
+              if resolve.() do
+                {:halt, :ok}
+              else
+                if attempt < 3, do: {:cont, :error}, else: {:halt, {:error, other}}
+              end
+          end
+        end)
+      end
+
+      writer = fn node, prefix ->
+        Task.async(fn ->
+          for i <- 1..writes_per_writer do
+            if i == cutover_at do
+              send(parent, {:writer_cutover, prefix, self()})
+
+              receive do
+                :resume_writer -> :ok
+              after
+                30_000 -> flunk("writer #{prefix} timed out waiting to resume after joiner boot")
+              end
+            end
+
+            key = "join/#{prefix}/#{i}"
+            value = "#{prefix}-#{i}"
+            assert :ok == put_and_confirm.(node, key, value)
+          end
+
+          :ok
+        end)
+      end
+
+      task_a = writer.(node_a, "a")
+      task_b = writer.(node_b, "b")
+
+      cutover_pids =
+        Enum.reduce(1..2, %{}, fn _, acc ->
+          receive do
+            {:writer_cutover, prefix, pid} -> Map.put(acc, prefix, pid)
+          after
+            30_000 -> flunk("timed out waiting for writers to reach cutover")
+          end
+        end)
+
+      data_dir_c = "/tmp/ekv_cas_test_#{node_c}_#{ekv_name}"
+      TestCluster.rpc!(node_c, File, :rm_rf!, [data_dir_c])
+
+      TestCluster.start_ekv(
+        node_c,
+        name: ekv_name,
+        data_dir: data_dir_c,
+        shards: 2,
+        log: false,
+        gc_interval: :timer.hours(1),
+        tombstone_ttl: :timer.hours(24 * 7),
+        cluster_size: 3,
+        node_id: 3
+      )
+
+      Enum.each(cutover_pids, fn {_prefix, pid} -> send(pid, :resume_writer) end)
+
+      assert :ok == Task.await(task_a, 90_000)
+      assert :ok == Task.await(task_b, 90_000)
+
+      expected_count = map_size(expected)
+
+      TestCluster.assert_eventually(
+        fn ->
+          TestCluster.keys_count(node_c, ekv_name, "join/") == expected_count
+        end,
+        timeout: 30_000,
+        interval: 100
+      )
+
+      TestCluster.assert_eventually(
+        fn ->
+          TestCluster.scan_to_map(node_c, ekv_name, "join/") == expected
+        end,
+        timeout: 30_000,
+        interval: 200
+      )
+
+      {:ok, _} =
+        TestCluster.rpc!(node_c, EKV, :put, [ekv_name, "join/post", "from_c", [if_vsn: nil]])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_a, EKV, :get, [ekv_name, "join/post"]) == "from_c" and
+          TestCluster.rpc!(node_b, EKV, :get, [ekv_name, "join/post"]) == "from_c"
+      end)
+    end
   end
 
   # =====================================================================
@@ -1512,18 +1652,42 @@ defmodule EKV.CASDistributedTest do
         end
 
       results = Task.await_many(tasks, 15_000)
-      successes = Enum.count(results, &match?({:ok, _}, &1))
+
+      successes =
+        Enum.count(results, fn
+          {:ok, _} -> true
+          {:ok, _, _} -> true
+          _ -> false
+        end)
 
       # At most one should succeed
       assert successes <= 1,
              "Expected at most 1 success, got #{successes}: #{inspect(results)}"
 
-      # All nodes should eventually agree on the final value
-      TestCluster.assert_eventually(fn ->
-        vals = Enum.map(nodes, fn n -> TestCluster.rpc!(n, EKV, :get, [ekv_name, "race5/1"]) end)
-        first = hd(vals)
-        first != nil and Enum.all?(vals, &(&1 == first))
-      end)
+      # Resolve the globally committed winner via linearizable reads (independent of local sync lag).
+      TestCluster.assert_eventually(
+        fn ->
+          Enum.any?(nodes, fn n ->
+            TestCluster.rpc!(n, EKV, :get, [ekv_name, "race5/1", [consistent: true]]) != nil
+          end)
+        end,
+        timeout: 10_000,
+        interval: 100
+      )
+
+      winner = TestCluster.rpc!(hd(nodes), EKV, :get, [ekv_name, "race5/1", [consistent: true]])
+      assert winner in Enum.map(1..5, &"from_#{&1}")
+
+      # Then verify eventual replication converges all local reads to that winner.
+      TestCluster.assert_eventually(
+        fn ->
+          Enum.all?(nodes, fn n ->
+            TestCluster.rpc!(n, EKV, :get, [ekv_name, "race5/1"]) == winner
+          end)
+        end,
+        timeout: 10_000,
+        interval: 100
+      )
     end
 
     test "sequential updates across all 5 nodes: counter correct" do

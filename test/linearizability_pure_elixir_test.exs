@@ -126,9 +126,7 @@ defmodule EKV.LinearizabilityPureElixirTest do
            """
            expected all pure-Elixir linearizability checks to pass, but found #{length(invalid)} invalid run(s).
 
-           #{Enum.map_join(results, "\n", fn r ->
-             "seed=#{r.seed} retry=#{r.retry} completed_ops=#{r.completed_ops} info_writes=#{r.info_writes} events=#{r.total_events} linearizable?=#{r.linearizable?} history=#{r.history_path || "-"}"
-           end)}
+           #{Enum.map_join(results, "\n", fn r -> "seed=#{r.seed} retry=#{r.retry} completed_ops=#{r.completed_ops} info_writes=#{r.info_writes} events=#{r.total_events} linearizable?=#{r.linearizable?} history=#{r.history_path || "-"}" end)}
            """
   end
 
@@ -199,7 +197,9 @@ defmodule EKV.LinearizabilityPureElixirTest do
 
             {:error, :unconfirmed} ->
               resolver = Enum.at(nodes, :rand.uniform(length(nodes)) - 1)
-              resolved = TestCluster.rpc!(resolver, EKV, :get, [ekv_name, key, [consistent: true]])
+
+              resolved =
+                TestCluster.rpc!(resolver, EKV, :get, [ekv_name, key, [consistent: true]])
 
               if resolved == value do
                 # Unknown client outcome, but value is now linearizably visible.
@@ -306,7 +306,7 @@ defmodule EKV.LinearizabilityPureElixirTest do
         Enum.reduce(indexed, 0, fn
           {op_j, j}, acc when j != i ->
             if op_j.ok_idx < op_i.invoke_idx do
-              acc ||| (1 <<< j)
+              acc ||| 1 <<< j
             else
               acc
             end

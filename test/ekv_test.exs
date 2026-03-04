@@ -1969,6 +1969,25 @@ defmodule EKVTest do
       assert EKV.get(name, "ttl/1") == "val"
     end
 
+    test "rejects invalid ttl at call site before hitting shard", %{cas_name: name} do
+      config = EKV.get_config(name)
+      shard_index = EKV.Replica.shard_index_for("ttl/bad", config.num_shards)
+      shard_name = EKV.Replica.shard_name(name, shard_index)
+      shard_pid = Process.whereis(shard_name)
+
+      assert_raise ArgumentError, ~r/:ttl must be a positive integer/, fn ->
+        EKV.put(name, "ttl/bad", "val", if_vsn: nil, ttl: "10")
+      end
+
+      assert Process.whereis(shard_name) == shard_pid
+    end
+
+    test "rejects invalid timeout at call site", %{cas_name: name} do
+      assert_raise ArgumentError, ~r/:timeout must be a positive integer or :infinity/, fn ->
+        EKV.put(name, "timeout/bad", "val", if_vsn: nil, timeout: 0)
+      end
+    end
+
     test "after CAS put, get returns new value", %{cas_name: name} do
       {:ok, _} = EKV.put(name, "get/1", "v1", if_vsn: nil)
       assert EKV.get(name, "get/1") == "v1"
@@ -2085,6 +2104,15 @@ defmodule EKVTest do
       {:ok, _} = EKV.put(name, "del/5", "reborn", if_vsn: nil)
       assert EKV.get(name, "del/5") == "reborn"
     end
+
+    test "rejects non-boolean resolve_unconfirmed option", %{cas_name: name} do
+      :ok = EKV.put(name, "del/6", "val")
+      {_, vsn} = EKV.lookup(name, "del/6")
+
+      assert_raise ArgumentError, ~r/:resolve_unconfirmed must be boolean/, fn ->
+        EKV.delete(name, "del/6", if_vsn: vsn, resolve_unconfirmed: 1)
+      end
+    end
   end
 
   # =====================================================================
@@ -2148,6 +2176,24 @@ defmodule EKVTest do
       assert EKV.get(name, "ttl/u") == "val"
     end
 
+    test "rejects invalid retries and backoff at call site", %{cas_name: name} do
+      assert_raise ArgumentError, ~r/:retries must be a non-negative integer/, fn ->
+        EKV.update(name, "opt/u1", fn nil -> "val" end, retries: -1)
+      end
+
+      assert_raise ArgumentError,
+                   ~r/:backoff must be \{min_ms, max_ms\} with non-negative integers and min <= max/,
+                   fn ->
+                     EKV.update(name, "opt/u2", fn nil -> "val" end, backoff: {20, 10})
+                   end
+    end
+
+    test "rejects non-boolean resolve_unconfirmed option", %{cas_name: name} do
+      assert_raise ArgumentError, ~r/:resolve_unconfirmed must be boolean/, fn ->
+        EKV.update(name, "opt/u3", fn nil -> "val" end, resolve_unconfirmed: :yes)
+      end
+    end
+
     test "update dispatches subscriber events", %{cas_name: name} do
       :ok = EKV.subscribe(name, "u/")
       {:ok, "val", _} = EKV.update(name, "u/4", fn nil -> "val" end)
@@ -2198,6 +2244,18 @@ defmodule EKVTest do
     test "accepts retries and backoff opts", %{cas_name: name} do
       :ok = EKV.put(name, "cg/2", "val")
       assert "val" == EKV.get(name, "cg/2", consistent: true, retries: 3, backoff: {5, 20})
+    end
+
+    test "rejects invalid retries/backoff at call site", %{cas_name: name} do
+      assert_raise ArgumentError, ~r/:retries must be a non-negative integer/, fn ->
+        EKV.get(name, "cg/2", consistent: true, retries: :many)
+      end
+
+      assert_raise ArgumentError,
+                   ~r/:backoff must be \{min_ms, max_ms\} with non-negative integers and min <= max/,
+                   fn ->
+                     EKV.get(name, "cg/2", consistent: true, backoff: {5, -1})
+                   end
     end
 
     test "rejects non-boolean consistent option", %{cas_name: name} do
@@ -2259,9 +2317,13 @@ defmodule EKVTest do
       assert EKV.get(name, "cp/guard_del") == "v1"
     end
 
-    test "with TTL", %{cas_name: name} do
-      assert {:ok, _} = EKV.put(name, "cp/3", "val", consistent: true, ttl: 60_000)
-      assert EKV.get(name, "cp/3") == "val"
+    test "with TTL expires as expected", %{cas_name: name} do
+      assert {:ok, _} = EKV.put(name, "cp/3", "val", consistent: true, ttl: 1)
+      assert EKV.get(name, "cp/3", consistent: true) == "val"
+
+      Process.sleep(10)
+      assert EKV.get(name, "cp/3") == nil
+      assert EKV.get(name, "cp/3", consistent: true) == nil
     end
 
     test "consistent and if_vsn are mutually exclusive", %{cas_name: name} do
@@ -2273,6 +2335,12 @@ defmodule EKVTest do
     test "rejects non-boolean consistent option", %{cas_name: name} do
       assert_raise ArgumentError, ~r/:consistent must be boolean/, fn ->
         EKV.put(name, "cp/5", "val", consistent: :linearizable)
+      end
+    end
+
+    test "rejects non-boolean resolve_unconfirmed option", %{cas_name: name} do
+      assert_raise ArgumentError, ~r/:resolve_unconfirmed must be boolean/, fn ->
+        EKV.put(name, "cp/6", "val", if_vsn: nil, resolve_unconfirmed: :yes)
       end
     end
   end
@@ -2700,6 +2768,60 @@ defmodule EKVTest do
       # If local accept happened eagerly (the bug), this fails.
       assert EKV.get(name, "phantom_key") == nil,
              "CAS returned {:error, :unconfirmed} but phantom write is visible via EKV.get"
+    end
+
+    test "resolve_unconfirmed maps ambiguous CAS outcome to resolved error" do
+      name = :"ekv_resolve_unconfirmed_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+
+      {:ok, pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: data_dir,
+          shards: 1,
+          log: false,
+          cluster_size: 3,
+          node_id: 1,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      shard_name = :"#{name}_ekv_replica_0"
+
+      :sys.replace_state(shard_name, fn state ->
+        %{
+          state
+          | peer_node_ids: %{:fake_b@localhost => "2", :fake_c@localhost => "3"},
+            remote_shards: %{:fake_b@localhost => self(), :fake_c@localhost => self()}
+        }
+      end)
+
+      task =
+        Task.async(fn ->
+          EKV.put(name, "resolve_key", "v1", if_vsn: nil, resolve_unconfirmed: true)
+        end)
+
+      Process.sleep(50)
+      shard_state = :sys.get_state(shard_name)
+      assert map_size(shard_state.pending_cas) == 1
+      [{ref, _op}] = Map.to_list(shard_state.pending_cas)
+
+      send(shard_name, {:ekv_promise, ref, self(), "2", 0, "", nil})
+      Process.sleep(50)
+      send(shard_name, {:ekv_accept_nack, ref, self(), "2"})
+      send(shard_name, {:ekv_accept_nack, ref, self(), "3"})
+
+      result = Task.await(task, 10_000)
+
+      assert result in [{:error, :conflict}, {:error, :unavailable}]
+
+      assert EKV.get(name, "resolve_key") == nil,
+             "CAS resolved to error but phantom write is visible via EKV.get"
     end
 
     test "CAS success still works with deferred local accept" do
@@ -3166,6 +3288,7 @@ defmodule EKVTest do
       :ok = EKV.subscribe(name, "phantom/")
       Process.sleep(50)
       flush_dispatchers(name)
+
       receive do
         {:ekv, _, _} -> :ok
       after

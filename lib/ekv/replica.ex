@@ -405,9 +405,17 @@ defmodule EKV.Replica do
   (EKV.get(name, key, consistent: true)) to resolve committed state before
   taking follow-up actions.
 
+  Optional API behavior: CAS write calls can pass `resolve_unconfirmed: true`.
+  In that mode, when a write fails in :accept, EKV performs one internal
+  barrier read and maps the result to current-state outcomes:
+    - returns the original `{:ok, ...}` if resolved VSN matches the attempted write
+    - returns `{:error, :conflict}` if current VSN differs
+    - returns `{:error, :unavailable}` if the resolution read cannot complete
+
   For EKV.update (read-modify-write), retries happen only for definite
-  conflicts. :unconfirmed is returned directly so callers can resolve via
-  a barrier read before deciding whether to retry.
+  conflicts. Ambiguous accept outcomes return :unconfirmed by default,
+  or the resolved current-state mapping above when
+  `resolve_unconfirmed: true` is set.
 
   ### CAS + LWW Interaction
 
@@ -416,7 +424,10 @@ defmodule EKV.Replica do
   LWW). The supported model is key-level ownership:
 
     - Different keys may use different modes in the same EKV instance.
-    - A key managed via CAS should continue to use CAS write APIs.
+    - A key may start in LWW mode and later transition to CAS mode
+      (`LWW -> CAS` is supported).
+    - A key managed via CAS should continue to use CAS write APIs
+      (`CAS -> LWW` writes are not supported).
       Reads may still choose eventual or consistent paths based on needs.
     - Eventual writes (`put/delete` without CAS options) to CAS-managed keys
       are rejected with `{:error, :cas_managed_key}`.
@@ -1114,8 +1125,8 @@ defmodule EKV.Replica do
     {:noreply, start_cas(state, key, operation, from)}
   end
 
-  def handle_call({:cas_delete, key, expected_vsn}, from, state) do
-    operation = {:cas_delete, expected_vsn}
+  def handle_call({:cas_delete, key, expected_vsn, opts}, from, state) do
+    operation = {:cas_delete, expected_vsn, opts}
     {:noreply, start_cas(state, key, operation, from)}
   end
 
@@ -2180,7 +2191,14 @@ defmodule EKV.Replica do
     {key, _value_binary, _timestamp, _origin_str, _expires_at, _deleted_at} = op.entry_tuple
     {ballot_c, ballot_n} = op.ballot
 
-    case Store.paxos_promote(db, stmts.kv_force_upsert, stmts.oplog_insert, key, ballot_c, ballot_n) do
+    case Store.paxos_promote(
+           db,
+           stmts.kv_force_upsert,
+           stmts.oplog_insert,
+           key,
+           ballot_c,
+           ballot_n
+         ) do
       {:ok, _value_binary, _ts, _origin, _expires, _deleted_at, _prev_value_binary} ->
         cancel_timer(op.timer)
         dispatch_events(state, op.events)
@@ -2213,7 +2231,7 @@ defmodule EKV.Replica do
           {:error, :conflict}
         end
 
-      {:cas_delete, expected_vsn} ->
+      {:cas_delete, expected_vsn, _opts} ->
         if current_vsn == expected_vsn do
           now = monotonic_cas_ts(current_vsn)
           origin = node()
@@ -2293,7 +2311,7 @@ defmodule EKV.Replica do
     origin_str = Atom.to_string(origin)
     entry_tuple = {key, nil, now, origin_str, nil, now}
     broadcast_msg = {:ekv_delete, key, now, origin}
-    {:ok, nil, entry_tuple, {:ok, nil}, broadcast_msg, []}
+    {:ok, nil, entry_tuple, {:ok, nil, nil}, broadcast_msg, []}
   end
 
   defp apply_cas_read_recovery(
@@ -2308,7 +2326,7 @@ defmodule EKV.Replica do
       # Tombstone — re-propose as delete with original metadata
       entry_tuple = {key, nil, ts, to_string(origin), nil, deleted_at}
       broadcast_msg = {:ekv_delete, key, ts, origin}
-      {:ok, nil, entry_tuple, {:ok, nil}, broadcast_msg, []}
+      {:ok, nil, entry_tuple, {:ok, nil, nil}, broadcast_msg, []}
     else
       # Live value — re-propose with original expires_at
       {final_ts, final_origin} =
@@ -2325,7 +2343,8 @@ defmodule EKV.Replica do
       broadcast_msg =
         {:ekv_put, key, value_binary, final_ts, String.to_atom(final_origin), expires_at}
 
-      {:ok, value_binary, entry_tuple, {:ok, current_value}, broadcast_msg, []}
+      {:ok, value_binary, entry_tuple,
+       {:ok, current_value, {final_ts, String.to_atom(final_origin)}}, broadcast_msg, []}
     end
   end
 
@@ -2352,7 +2371,7 @@ defmodule EKV.Replica do
             state
 
           :unconfirmed ->
-            GenServer.reply(op.from, {:error, :unconfirmed})
+            reply_unconfirmed_or_resolve(op, state)
             %{state | pending_cas: Map.delete(state.pending_cas, ref)}
         end
 
@@ -2371,7 +2390,14 @@ defmodule EKV.Replica do
         state
 
       _ ->
-        GenServer.reply(op.from, {:error, cas_failure_reason(op)})
+        reason = cas_failure_reason(op)
+
+        if reason == :unconfirmed do
+          reply_unconfirmed_or_resolve(op, state)
+        else
+          GenServer.reply(op.from, {:error, reason})
+        end
+
         %{state | pending_cas: Map.delete(state.pending_cas, ref)}
     end
   end
@@ -2385,9 +2411,86 @@ defmodule EKV.Replica do
   end
 
   defp writes_operation?({:cas_put, _, _, _}), do: true
-  defp writes_operation?({:cas_delete, _}), do: true
+  defp writes_operation?({:cas_delete, _, _}), do: true
   defp writes_operation?({:update, _, _, _}), do: true
   defp writes_operation?(_), do: false
+
+  defp reply_unconfirmed_or_resolve(op, state) do
+    if resolve_unconfirmed_enabled?(op.operation) do
+      resolve_unconfirmed_current_async(op, state)
+    else
+      GenServer.reply(op.from, {:error, :unconfirmed})
+    end
+  end
+
+  defp resolve_unconfirmed_enabled?({:cas_put, _, _, opts}),
+    do: Keyword.get(opts, :resolve_unconfirmed, false)
+
+  defp resolve_unconfirmed_enabled?({:cas_delete, _, opts}),
+    do: Keyword.get(opts, :resolve_unconfirmed, false)
+
+  defp resolve_unconfirmed_enabled?({:update, _, opts, _}),
+    do: Keyword.get(opts, :resolve_unconfirmed, false)
+
+  defp resolve_unconfirmed_enabled?(_), do: false
+
+  defp resolve_unconfirmed_opts({:cas_put, _, _, opts}),
+    do: Keyword.take(opts, [:retries, :backoff, :timeout])
+
+  defp resolve_unconfirmed_opts({:cas_delete, _, opts}),
+    do: Keyword.take(opts, [:retries, :backoff, :timeout])
+
+  defp resolve_unconfirmed_opts({:update, _, opts, _}),
+    do: Keyword.take(opts, [:retries, :backoff, :timeout])
+
+  defp resolve_unconfirmed_opts(_), do: []
+
+  defp expected_vsn_from_reply({:ok, {ts, origin}})
+       when is_integer(ts) and is_atom(origin),
+       do: {ts, origin}
+
+  defp expected_vsn_from_reply({:ok, _value, {ts, origin}})
+       when is_integer(ts) and is_atom(origin),
+       do: {ts, origin}
+
+  defp expected_vsn_from_reply(_), do: nil
+
+  defp resolve_unconfirmed_current_async(op, state) do
+    expected_vsn = expected_vsn_from_reply(op.reply_value)
+    from = op.from
+    reply_value = op.reply_value
+    key = op.key
+    shard = shard_name(state.name, state.shard_index)
+    opts = resolve_unconfirmed_opts(op.operation)
+    timeout = Keyword.get(opts, :timeout, 10_000)
+    cas_opts = Keyword.take(opts, [:retries, :backoff])
+
+    Task.start(fn ->
+      try do
+        result =
+          case GenServer.call(shard, {:cas_read, key, cas_opts}, timeout) do
+            {:ok, _value, resolved_vsn} ->
+              if resolved_vsn == expected_vsn do
+                reply_value
+              else
+                {:error, :conflict}
+              end
+
+            {:ok, _value} ->
+              {:error, :unavailable}
+
+            {:error, _reason} ->
+              {:error, :unavailable}
+          end
+
+        GenServer.reply(from, result)
+      rescue
+        _ -> GenServer.reply(from, {:error, :unavailable})
+      catch
+        :exit, _ -> GenServer.reply(from, {:error, :unavailable})
+      end
+    end)
+  end
 
   defp apply_cas_commit(state, key, ballot_c, ballot_n, entry_tuple) do
     %{db: db, stmts: stmts} = state
@@ -2448,7 +2551,9 @@ defmodule EKV.Replica do
       prev = if prev_value_binary != nil, do: :erlang.binary_to_term(prev_value_binary)
       dispatch_events(state, [%EKV.Event{type: :delete, key: key, value: prev}])
     else
-      dispatch_events(state, [%EKV.Event{type: :put, key: key, value: :erlang.binary_to_term(value_binary)}])
+      dispatch_events(state, [
+        %EKV.Event{type: :put, key: key, value: :erlang.binary_to_term(value_binary)}
+      ])
     end
   end
 
