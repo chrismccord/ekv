@@ -23,7 +23,8 @@ defmodule EKV do
       # Prefix scans
       EKV.scan(:my_kv, "user/") |> Enum.to_list()
       #=> [{"user/1", %{name: "Alice"}, {ts, origin_node}}]
-      EKV.keys(:my_kv, "user/")          #=> [{"user/1", {ts, origin_node}}]
+
+      EKV.keys(:my_kv, "user/") |> Enum.to_list() #=> [{"user/1", {ts, origin_node}}]
 
       # TTL — entry expires after 30 minutes
       EKV.put(:my_kv, "session/abc", token, ttl: :timer.minutes(30))
