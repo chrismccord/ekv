@@ -1175,6 +1175,8 @@ defmodule EKV.Replica do
 
   @impl true
   def handle_info({:ekv_handoff_request, ref, new_node, caller_pid}, state) do
+    EKV.MarkerGuard.mark_handoff_performed(state.name)
+
     # 1. Drain pending CAS ops
     for {_ref, op} <- state.pending_cas do
       cancel_timer(op.timer)

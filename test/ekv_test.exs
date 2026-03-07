@@ -1548,6 +1548,123 @@ defmodule EKVTest do
       Process.sleep(50)
     end
 
+    test "blue_green startup skips stale marker when old node is unreachable", %{
+      ho_name: name,
+      ho_dir: dir
+    } do
+      File.mkdir_p!(dir)
+      File.write!(Path.join(dir, "current"), "nonexistent@node\n")
+
+      started_at = System.monotonic_time(:millisecond)
+
+      {:ok, pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: dir,
+          shards: 2,
+          log: false,
+          blue_green: true,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      elapsed = System.monotonic_time(:millisecond) - started_at
+
+      assert elapsed < 2_000
+
+      {:ok, marker} = File.read(Path.join(dir, "current"))
+      assert String.trim(marker) == Atom.to_string(node())
+
+      Process.flag(:trap_exit, true)
+      Process.exit(pid, :shutdown)
+      Process.sleep(50)
+    end
+
+    test "blue_green graceful shutdown clears marker when it still points to self", %{
+      ho_name: name,
+      ho_dir: dir
+    } do
+      {:ok, pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: dir,
+          shards: 2,
+          log: false,
+          blue_green: true,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      Process.unlink(pid)
+
+      marker_path = Path.join(dir, "current")
+      assert File.exists?(marker_path)
+      {:ok, marker} = File.read(marker_path)
+      assert String.trim(marker) == Atom.to_string(node())
+
+      Supervisor.stop(:"#{name}_ekv_sup", :shutdown)
+      refute File.exists?(marker_path)
+    end
+
+    test "blue_green graceful shutdown preserves marker when it points elsewhere", %{
+      ho_name: name,
+      ho_dir: dir
+    } do
+      {:ok, pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: dir,
+          shards: 2,
+          log: false,
+          blue_green: true,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      Process.unlink(pid)
+
+      marker_path = Path.join(dir, "current")
+      File.write!(marker_path, "other@node\n")
+
+      Supervisor.stop(:"#{name}_ekv_sup", :shutdown)
+
+      assert File.exists?(marker_path)
+      assert File.read!(marker_path) == "other@node\n"
+    end
+
+    test "blue_green graceful shutdown preserves self marker after handoff", %{
+      ho_name: name,
+      ho_dir: dir
+    } do
+      {:ok, pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: dir,
+          shards: 2,
+          log: false,
+          blue_green: true,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      Process.unlink(pid)
+
+      marker_path = Path.join(dir, "current")
+      assert File.exists?(marker_path)
+      assert String.trim(File.read!(marker_path)) == Atom.to_string(node())
+
+      shard_name = :"#{name}_ekv_replica_0"
+      ref = make_ref()
+      send(shard_name, {:ekv_handoff_request, ref, :incoming@node, self()})
+      assert_receive {:ekv_handoff_ack, ^ref}, 2000
+
+      # Simulate shutdown racing before the incoming node rewrites the marker.
+      Supervisor.stop(:"#{name}_ekv_sup", :shutdown)
+
+      assert File.exists?(marker_path)
+      assert String.trim(File.read!(marker_path)) == Atom.to_string(node())
+    end
+
     test "double handoff request acks both", %{ho_name: name, ho_dir: dir} do
       {:ok, pid} =
         EKV.start_link(

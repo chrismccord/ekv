@@ -2440,7 +2440,7 @@ defmodule EKV.CASDistributedTest do
       assert TestCluster.rpc!(n2, EKV, :get, [ekv_name, "cas/1"]) == "v3"
     end
 
-    test "handoff timeout — old node dead" do
+    test "stale marker on dead old node skips handoff wait" do
       peers = TestCluster.start_peers(4)
       [{peer_n1, n1}, {_, n1b}, {_, n2}, {_, n3}] = peers
       on_exit(fn -> TestCluster.stop_peers(peers) end)
@@ -2462,8 +2462,10 @@ defmodule EKV.CASDistributedTest do
       :peer.stop(peer_n1)
       Process.sleep(200)
 
-      # Start n1b — handoff times out, opens files directly
+      # Start n1b — stale marker should be skipped immediately
       File.write!(Path.join(shared_dir, "current"), "#{n1}\n")
+
+      started_at = System.monotonic_time(:millisecond)
 
       TestCluster.start_ekv(
         n1b,
@@ -2477,6 +2479,9 @@ defmodule EKV.CASDistributedTest do
         cluster_size: 3,
         node_id: "m1"
       )
+
+      elapsed = System.monotonic_time(:millisecond) - started_at
+      assert elapsed < 3_000
 
       Process.sleep(500)
 

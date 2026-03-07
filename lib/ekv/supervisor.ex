@@ -38,7 +38,8 @@ defmodule EKV.Supervisor do
 
   The `current` marker is a single line: `"node_name\n"`. Written atomically
   via write-to-tmp + `File.rename!/2`. Read on every startup to discover the
-  old node for handoff.
+  old node for handoff. On graceful shutdown without a completed handoff, the
+  old VM clears its own marker.
 
   ### Handoff Resolution (`perform_handoff/3`)
 
@@ -46,9 +47,10 @@ defmodule EKV.Supervisor do
 
   2. **Marker node == `node()`** → same-VM restart. No handoff needed.
 
-  3. **Marker node != `node()`** → blue-green deploy. Send handoff request
-     to old VM's shards in parallel (5s timeout per shard). If old VM is
-     dead, requests timeout and new VM opens files directly (WAL recovery).
+  3. **Marker node != `node()`** → potential blue-green deploy. If the marker
+     node is reachable now, send handoff request to old VM's shards in
+     parallel (5s timeout per shard). If the marker node is unreachable, treat
+     the marker as stale and proceed without handoff.
 
   ### Key Invariants
 
@@ -165,25 +167,19 @@ defmodule EKV.Supervisor do
 
     :persistent_term.put({EKV, name}, config)
 
-    gate_children =
-      case wait_for_quorum do
-        timeout when is_integer(timeout) ->
-          [{EKV.QuorumGate, name: name, timeout: timeout, log: log}]
-
-        _ ->
-          []
-      end
-
     children =
       [
+        if(blue_green, do: {EKV.MarkerGuard, name: name, data_dir: data_dir, log: log}),
         {EKV.SubTracker, name: sub_tracker_name, sub_count: sub_count},
         {Registry, keys: :duplicate, name: registry_name, listeners: [sub_tracker_name]},
         {EKV.SubDispatcher.Supervisor, name: name, num_shards: num_shards},
         {EKV.Replica.Supervisor, name: name, num_shards: num_shards, data_dir: data_dir},
+        if(is_integer(wait_for_quorum),
+          do: {EKV.QuorumGate, name: name, timeout: wait_for_quorum, log: log}
+        ),
         {EKV.GC, name: name}
       ]
-      |> List.insert_at(4, gate_children)
-      |> List.flatten()
+      |> Enum.filter(& &1)
 
     Supervisor.init(children, strategy: :rest_for_one)
   end
@@ -265,30 +261,39 @@ defmodule EKV.Supervisor do
       true ->
         old_node = String.to_atom(old_node_str)
 
-        require Logger
-        Logger.info("[EKV #{name}] handoff: requesting from #{old_node}")
+        if handoff_reachable?(old_node) do
+          require Logger
+          Logger.info("[EKV #{name}] handoff: requesting from #{old_node}")
 
-        0..(num_shards - 1)
-        |> Task.async_stream(
-          fn shard_index ->
-            shard_name = EKV.Replica.shard_name(name, shard_index)
-            ref = make_ref()
-            send({shard_name, old_node}, {:ekv_handoff_request, ref, node(), self()})
+          0..(num_shards - 1)
+          |> Task.async_stream(
+            fn shard_index ->
+              shard_name = EKV.Replica.shard_name(name, shard_index)
+              ref = make_ref()
+              send({shard_name, old_node}, {:ekv_handoff_request, ref, node(), self()})
 
-            receive do
-              {:ekv_handoff_ack, ^ref} -> :ok
-            after
-              5_000 -> :timeout
-            end
-          end,
-          ordered: false,
-          timeout: 10_000
-        )
-        |> Stream.run()
+              receive do
+                {:ekv_handoff_ack, ^ref} -> :ok
+              after
+                5_000 -> :timeout
+              end
+            end,
+            ordered: false,
+            timeout: 10_000
+          )
+          |> Stream.run()
+        else
+          require Logger
+          Logger.info("[EKV #{name}] handoff: stale marker #{old_node}, skipping handoff")
+        end
 
         # Update marker to current node
         write_marker(data_dir, node())
     end
+  end
+
+  defp handoff_reachable?(old_node) do
+    old_node in Node.list() or Node.connect(old_node)
   end
 
   defp read_marker(data_dir) do
