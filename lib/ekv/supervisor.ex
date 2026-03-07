@@ -169,7 +169,7 @@ defmodule EKV.Supervisor do
 
     children =
       [
-        if(blue_green, do: {EKV.MarkerGuard, name: name, data_dir: data_dir, log: log}),
+        if(blue_green, do: {EKV.BlueGreenMarker, name: name, data_dir: data_dir, log: log}),
         {EKV.SubTracker, name: sub_tracker_name, sub_count: sub_count},
         {Registry, keys: :duplicate, name: registry_name, listeners: [sub_tracker_name]},
         {EKV.SubDispatcher.Supervisor, name: name, num_shards: num_shards},

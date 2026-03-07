@@ -1,4 +1,4 @@
-defmodule EKV.MarkerGuard do
+defmodule EKV.BlueGreenMarker do
   @moduledoc false
 
   _archdoc = """
@@ -13,11 +13,11 @@ defmodule EKV.MarkerGuard do
   def start_link(opts) do
     opts = Keyword.validate!(opts, [:name, :data_dir, :log])
     name = Keyword.fetch!(opts, :name)
-    GenServer.start_link(__MODULE__, opts, name: :"#{name}_ekv_marker_guard")
+    GenServer.start_link(__MODULE__, opts, name: :"#{name}_ekv_blue_green_marker")
   end
 
   def mark_handoff_performed(name) do
-    case Process.whereis(:"#{name}_ekv_marker_guard") do
+    case Process.whereis(:"#{name}_ekv_blue_green_marker") do
       nil -> :ok
       pid -> GenServer.cast(pid, :handoff_performed)
     end
