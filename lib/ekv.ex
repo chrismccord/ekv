@@ -36,7 +36,12 @@ defmodule EKV do
       # => {:ekv, [%EKV.Event{type: :put, key: "rooms/1", value: %{title: ...}}], %{name: :my_kv}}
 
       # CAS setup (requires cluster_size + node_id)
-      {EKV, name: :my_kv_cas, data_dir: "/var/data/ekv_cas", cluster_size: 3, node_id: 1}
+      {EKV,
+       name: :my_kv_cas,
+       data_dir: "/var/data/ekv_cas",
+       cluster_size: 3,
+       node_id: 1,
+       wait_for_quorum: :timer.seconds(30)}
 
       # CAS put via lookup + if_vsn
       case EKV.lookup(:my_kv_cas, "lock/job-123") do
@@ -182,11 +187,31 @@ defmodule EKV do
   | `:shards` | `8` | Number of shards. See "Choosing a Shard Count" below. |
   | `:cluster_size` | `nil` | Logical cluster size for CAS quorum math. Required for CAS operations (`if_vsn:`, `consistent: true`, `update/4`). |
   | `:node_id` | `nil` | Stable logical member identity used by CAS ballots. Required for CAS operations. Should remain stable for each logical cluster member. |
+  | `:wait_for_quorum` | `false` | Opt-in startup gate for CAS instances. Set to a timeout in milliseconds to block `EKV.start_link/1` until quorum is reachable on this node, or fail startup on timeout. |
   | `:tombstone_ttl` | `604_800_000` (7 days) | How long tombstones (deleted entries) are kept before being permanently purged, in milliseconds. See "Tombstone Lifetime" below. |
   | `:gc_interval` | `300_000` (5 min) | How often garbage collection runs, in milliseconds. GC expires TTL entries, purges old tombstones, and truncates the replication oplog. |
   | `:log` | `:info` | Logging level. `:info` logs cluster events (connects, syncs). `false` disables logging. `:verbose` logs per-shard detail. |
   | `:partition_ttl_policy` | `:quarantine` | Policy for reconnects after downtime longer than `tombstone_ttl`. `:quarantine` blocks replication with that peer identity until operator rebuild. `:ignore` keeps legacy behavior. |
   | `:blue_green` | `false` | Enable blue-green deployment mode. See "Blue-Green Deployment" below. |
+
+  ### Startup Quorum Gate
+
+  CAS-enabled EKV instances can optionally block startup until quorum is
+  reachable:
+
+      {EKV,
+       name: :my_kv_cas,
+       data_dir: "/var/data/ekv_cas",
+       cluster_size: 3,
+       node_id: 1,
+       wait_for_quorum: :timer.seconds(30)}
+
+  This is useful when downstream children perform CAS reads or writes during
+  their own `init/1` or startup callbacks. With `:wait_for_quorum` set, EKV
+  does not finish starting until quorum is reachable (or the timeout expires).
+
+  The gate is opt-in and only applies to CAS-configured instances. Eventual
+  reads/writes never require quorum and are unaffected.
 
   ### Choosing a Shard Count
 
@@ -952,6 +977,39 @@ defmodule EKV do
       data_dir: config.data_dir,
       connected_peers: peers
     }
+  end
+
+  @doc """
+  Block until this node can reach CAS quorum, or return an error on timeout.
+
+  This checks the same member-reachability predicate that CAS writes use for
+  early `:no_quorum` rejection. It is primarily useful for startup orchestration
+  and other cases where callers want a bounded wait before issuing CAS traffic.
+
+  Returns:
+
+  - `:ok` when quorum is reachable
+  - `{:error, :timeout}` when quorum was not reached before `timeout_ms`
+  - `{:error, :cluster_overflow}` when more distinct `node_id`s are visible
+    than `cluster_size` allows
+
+  Raises `ArgumentError` if this EKV instance is not configured for CAS.
+  """
+  def await_quorum(name, timeout_ms) when is_integer(timeout_ms) and timeout_ms >= 0 do
+    config = get_config(name)
+
+    if is_nil(config.cluster_size) do
+      raise ArgumentError,
+            "EKV: await_quorum/2 requires :cluster_size and :node_id to be configured"
+    else
+      call_timeout = timeout_ms + 1_000
+      GenServer.call(Replica.shard_name(name, 0), {:await_quorum, timeout_ms}, call_timeout)
+    end
+  end
+
+  def await_quorum(_name, timeout_ms) do
+    raise ArgumentError,
+          "EKV: await_quorum/2 timeout must be a non-negative integer, got: #{inspect(timeout_ms)}"
   end
 
   def get_config(name) do

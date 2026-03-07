@@ -820,7 +820,8 @@ defmodule EKV.Replica do
         cluster_size:   integer | nil,  # total CAS participants
         ballot_counter: integer,        # monotonic, persisted in kv_meta
         peer_node_ids:  %{node => string},  # Erlang node → CAS node_id
-        pending_cas:    %{ref => op}    # in-flight CAS operations
+        pending_cas:    %{ref => op},   # in-flight CAS operations
+        quorum_waiters: %{ref => waiter} # pending await_quorum callers
       }
 
 
@@ -858,6 +859,7 @@ defmodule EKV.Replica do
   CAS internal (self-messages):
     {:cas_timeout, ref}
     {:cas_retry, ref, key, operation}
+    {:await_quorum_timeout, ref}
 
   GC (from EKV.GC timer):
     {:gc, now_nanoseconds, tombstone_cutoff_nanoseconds}
@@ -903,6 +905,7 @@ defmodule EKV.Replica do
     ballot_counter: 0,
     peer_node_ids: %{},
     pending_cas: %{},
+    quorum_waiters: %{},
     handoff_node: nil
   ]
 
@@ -1143,6 +1146,29 @@ defmodule EKV.Replica do
     {:noreply, start_cas(state, key, operation, from)}
   end
 
+  def handle_call({:await_quorum, timeout_ms}, from, state) do
+    case quorum_status(state) do
+      :ok ->
+        {:reply, :ok, state}
+
+      {:error, :cluster_overflow} = error ->
+        {:reply, error, state}
+
+      {:error, :cas_not_configured} = error ->
+        {:reply, error, state}
+
+      {:error, :no_quorum} ->
+        if timeout_ms == 0 do
+          {:reply, {:error, :timeout}, state}
+        else
+          ref = make_ref()
+          timer = Process.send_after(self(), {:await_quorum_timeout, ref}, timeout_ms)
+          waiter = %{from: from, timer: timer}
+          {:noreply, %{state | quorum_waiters: Map.put(state.quorum_waiters, ref, waiter)}}
+        end
+    end
+  end
+
   # =====================================================================
   # Blue-green handoff
   # =====================================================================
@@ -1154,6 +1180,8 @@ defmodule EKV.Replica do
       cancel_timer(op.timer)
       GenServer.reply(op.from, {:error, :shutting_down})
     end
+
+    state = fail_quorum_waiters(state, {:error, :shutting_down})
 
     # 2. Persist ballot counter
     if state.cluster_size && state.db do
@@ -1175,7 +1203,8 @@ defmodule EKV.Replica do
     end)
 
     # 6. Enter proxy mode (readers stay alive until terminate)
-    {:noreply, %{state | db: nil, stmts: nil, pending_cas: %{}, handoff_node: new_node}}
+    {:noreply,
+     %{state | db: nil, stmts: nil, pending_cas: %{}, quorum_waiters: %{}, handoff_node: new_node}}
   end
 
   # In handoff mode: drop all messages (replication, GC, nodeup/down, CAS)
@@ -1346,6 +1375,7 @@ defmodule EKV.Replica do
 
     # Check if any pending CAS ops lost quorum
     state = fail_pending_cas_if_no_quorum(state)
+    state = maybe_reply_to_quorum_waiters(state)
 
     {:noreply, state}
   end
@@ -1372,9 +1402,21 @@ defmodule EKV.Replica do
 
       state = mark_peer_down(state, remote_node, remote_node_id)
       state = fail_pending_cas_if_no_quorum(state)
+      state = maybe_reply_to_quorum_waiters(state)
       {:noreply, state}
     else
       {:noreply, state}
+    end
+  end
+
+  def handle_info({:await_quorum_timeout, ref}, state) do
+    case Map.pop(state.quorum_waiters, ref) do
+      {nil, _waiters} ->
+        {:noreply, state}
+
+      {%{from: from}, waiters} ->
+        GenServer.reply(from, {:error, :timeout})
+        {:noreply, %{state | quorum_waiters: waiters}}
     end
   end
 
@@ -1466,7 +1508,7 @@ defmodule EKV.Replica do
         else
           op = %{op | nacks: op.nacks + 1, responded: MapSet.put(op.responded, remote_node_id)}
 
-          max_possible_promises = count_alive_node_ids(state) - op.nacks
+          max_possible_promises = alive_node_id_count(state) - op.nacks
 
           if max_possible_promises < op.quorum do
             # Can't reach quorum — fail or retry
@@ -1523,7 +1565,7 @@ defmodule EKV.Replica do
               responded: MapSet.put(op.responded, remote_node_id)
           }
 
-          max_possible = count_alive_node_ids(state) - op.accept_nacks
+          max_possible = alive_node_id_count(state) - op.accept_nacks
 
           if max_possible < op.quorum do
             state = handle_cas_failure(ref, op, state)
@@ -1716,7 +1758,7 @@ defmodule EKV.Replica do
           state = track_peer_node_id(state, remote_node, remote_node_id)
 
           if state.cluster_size do
-            alive = count_alive_node_ids(state)
+            alive = alive_node_id_count(state)
 
             if alive > state.cluster_size do
               Logger.error(
@@ -1737,7 +1779,7 @@ defmodule EKV.Replica do
           log_once(state, fn -> "#{log_prefix(state)} ekv_peer_connect from #{remote_node}" end)
           send_sync_data(state, remote_node, remote_hwm)
 
-          state
+          maybe_reply_to_quorum_waiters(state)
       end
     end
   end
@@ -1781,7 +1823,7 @@ defmodule EKV.Replica do
           state = track_peer_node_id(state, remote_node, remote_node_id)
 
           if state.cluster_size do
-            alive = count_alive_node_ids(state)
+            alive = alive_node_id_count(state)
 
             if alive > state.cluster_size do
               Logger.error(
@@ -1798,7 +1840,7 @@ defmodule EKV.Replica do
 
           send_sync_data(state, remote_node, remote_hwm)
 
-          state
+          maybe_reply_to_quorum_waiters(state)
       end
     end
   end
@@ -1998,7 +2040,7 @@ defmodule EKV.Replica do
     quorum = div(cluster_size, 2) + 1
 
     # Check quorum achievable
-    alive_count = count_alive_node_ids(state)
+    alive_count = alive_node_id_count(state)
 
     cond do
       alive_count > cluster_size ->
@@ -2557,7 +2599,7 @@ defmodule EKV.Replica do
     end
   end
 
-  defp count_alive_node_ids(state) do
+  def alive_node_id_count(%__MODULE__{} = state) do
     if state.cluster_size do
       # Our own node_id + distinct peer node_ids
       peer_ids =
@@ -2572,11 +2614,58 @@ defmodule EKV.Replica do
     end
   end
 
+  def quorum_status(%__MODULE__{cluster_size: nil}), do: {:error, :cas_not_configured}
+
+  def quorum_status(%__MODULE__{} = state) do
+    quorum = div(state.cluster_size, 2) + 1
+    alive_count = alive_node_id_count(state)
+
+    cond do
+      alive_count > state.cluster_size -> {:error, :cluster_overflow}
+      alive_count < quorum -> {:error, :no_quorum}
+      true -> :ok
+    end
+  end
+
+  defp maybe_reply_to_quorum_waiters(%__MODULE__{quorum_waiters: waiters} = state)
+       when map_size(waiters) == 0,
+       do: state
+
+  defp maybe_reply_to_quorum_waiters(state) do
+    case quorum_status(state) do
+      :ok ->
+        reply_and_clear_quorum_waiters(state, :ok)
+
+      {:error, :cluster_overflow} = error ->
+        reply_and_clear_quorum_waiters(state, error)
+
+      _ ->
+        state
+    end
+  end
+
+  defp fail_quorum_waiters(%__MODULE__{quorum_waiters: waiters} = state, _reason)
+       when map_size(waiters) == 0,
+       do: state
+
+  defp fail_quorum_waiters(state, reason) do
+    reply_and_clear_quorum_waiters(state, reason)
+  end
+
+  defp reply_and_clear_quorum_waiters(state, reply) do
+    Enum.each(state.quorum_waiters, fn {_ref, %{from: from, timer: timer}} ->
+      cancel_timer(timer)
+      GenServer.reply(from, reply)
+    end)
+
+    %{state | quorum_waiters: %{}}
+  end
+
   defp fail_pending_cas_if_no_quorum(state) do
     if state.cluster_size == nil or map_size(state.pending_cas) == 0 do
       state
     else
-      alive_count = count_alive_node_ids(state)
+      alive_count = alive_node_id_count(state)
 
       {to_fail, to_keep} =
         Enum.split_with(state.pending_cas, fn {_ref, op} ->

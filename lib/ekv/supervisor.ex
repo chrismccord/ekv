@@ -71,7 +71,8 @@ defmodule EKV.Supervisor do
     :node_id,
     :sync_chunk_size,
     :skip_stale_check,
-    :partition_ttl_policy
+    :partition_ttl_policy,
+    :wait_for_quorum
   ]
 
   def start_link(opts) do
@@ -94,9 +95,11 @@ defmodule EKV.Supervisor do
     sync_chunk_size = Keyword.get(opts, :sync_chunk_size, 500)
     skip_stale_check = Keyword.get(opts, :skip_stale_check, false)
     partition_ttl_policy = Keyword.get(opts, :partition_ttl_policy, :quarantine)
+    wait_for_quorum = Keyword.get(opts, :wait_for_quorum, false)
 
     validate_cas_config!(cluster_size, node_id)
     validate_partition_ttl_policy!(partition_ttl_policy)
+    validate_wait_for_quorum!(wait_for_quorum, cluster_size)
 
     # Normalize node_id to string early
     node_id =
@@ -162,13 +165,25 @@ defmodule EKV.Supervisor do
 
     :persistent_term.put({EKV, name}, config)
 
-    children = [
-      {EKV.SubTracker, name: sub_tracker_name, sub_count: sub_count},
-      {Registry, keys: :duplicate, name: registry_name, listeners: [sub_tracker_name]},
-      {EKV.SubDispatcher.Supervisor, name: name, num_shards: num_shards},
-      {EKV.Replica.Supervisor, name: name, num_shards: num_shards, data_dir: data_dir},
-      {EKV.GC, name: name}
-    ]
+    gate_children =
+      case wait_for_quorum do
+        timeout when is_integer(timeout) ->
+          [{EKV.QuorumGate, name: name, timeout: timeout, log: log}]
+
+        _ ->
+          []
+      end
+
+    children =
+      [
+        {EKV.SubTracker, name: sub_tracker_name, sub_count: sub_count},
+        {Registry, keys: :duplicate, name: registry_name, listeners: [sub_tracker_name]},
+        {EKV.SubDispatcher.Supervisor, name: name, num_shards: num_shards},
+        {EKV.Replica.Supervisor, name: name, num_shards: num_shards, data_dir: data_dir},
+        {EKV.GC, name: name}
+      ]
+      |> List.insert_at(4, gate_children)
+      |> List.flatten()
 
     Supervisor.init(children, strategy: :rest_for_one)
   end
@@ -210,6 +225,23 @@ defmodule EKV.Supervisor do
   defp validate_partition_ttl_policy!(policy) do
     raise ArgumentError,
           "EKV: :partition_ttl_policy must be :quarantine or :ignore, got: #{inspect(policy)}"
+  end
+
+  defp validate_wait_for_quorum!(false, _cluster_size), do: :ok
+  defp validate_wait_for_quorum!(nil, _cluster_size), do: :ok
+
+  defp validate_wait_for_quorum!(_timeout, nil) do
+    raise ArgumentError,
+          "EKV: :wait_for_quorum requires CAS configuration (:cluster_size and :node_id)"
+  end
+
+  defp validate_wait_for_quorum!(timeout, _cluster_size)
+       when is_integer(timeout) and timeout >= 0,
+       do: :ok
+
+  defp validate_wait_for_quorum!(timeout, _cluster_size) do
+    raise ArgumentError,
+          "EKV: :wait_for_quorum must be false/nil or a non-negative timeout in ms, got: #{inspect(timeout)}"
   end
 
   # =====================================================================

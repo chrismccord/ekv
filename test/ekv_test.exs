@@ -1737,6 +1737,60 @@ defmodule EKVTest do
       assert byte_size(config.node_id) > 0
     end
 
+    test "wait_for_quorum requires CAS configuration" do
+      name = :"ekv_cas_cfg_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_cas_cfg_#{name}")
+      Process.flag(:trap_exit, true)
+
+      assert {:error, {%ArgumentError{message: msg}, _}} =
+               EKV.start_link(
+                 name: name,
+                 data_dir: data_dir,
+                 wait_for_quorum: 100,
+                 log: false
+               )
+
+      assert msg =~ ":wait_for_quorum requires CAS configuration"
+
+      File.rm_rf!(data_dir)
+    end
+
+    test "await_quorum requires CAS configuration" do
+      name = :"ekv_cas_cfg_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_cas_cfg_#{name}")
+
+      {:ok, pid} = EKV.start_link(name: name, data_dir: data_dir, shards: 1, log: false)
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      assert_raise ArgumentError, ~r/await_quorum\/2 requires :cluster_size and :node_id/, fn ->
+        EKV.await_quorum(name, 0)
+      end
+    end
+
+    test "invalid wait_for_quorum type raises" do
+      name = :"ekv_cas_cfg_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_cas_cfg_#{name}")
+      Process.flag(:trap_exit, true)
+
+      assert {:error, {%ArgumentError{message: msg}, _}} =
+               EKV.start_link(
+                 name: name,
+                 data_dir: data_dir,
+                 cluster_size: 3,
+                 node_id: 1,
+                 wait_for_quorum: true,
+                 log: false
+               )
+
+      assert msg =~ ":wait_for_quorum must be false/nil or a non-negative timeout in ms"
+
+      File.rm_rf!(data_dir)
+    end
+
     test "invalid node_id type raises" do
       name = :"ekv_cas_cfg_#{System.unique_integer([:positive])}"
       data_dir = Path.join(System.tmp_dir!(), "ekv_cas_cfg_#{name}")
@@ -1797,6 +1851,54 @@ defmodule EKVTest do
       assert Process.alive?(pid)
       config = EKV.get_config(name)
       assert config.node_id == "1"
+    end
+
+    test "start does not block for quorum by default" do
+      name = :"ekv_cas_cfg_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_cas_cfg_#{name}")
+
+      {:ok, pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: data_dir,
+          cluster_size: 3,
+          node_id: 1,
+          shards: 1,
+          log: false
+        )
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      assert {:error, :timeout} = EKV.await_quorum(name, 0)
+      assert {:error, :no_quorum} = EKV.put(name, "boot/default", "v", consistent: true)
+    end
+
+    test "wait_for_quorum times out startup when quorum is unavailable" do
+      name = :"ekv_cas_cfg_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_cas_cfg_#{name}")
+      Process.flag(:trap_exit, true)
+      started_at = System.monotonic_time(:millisecond)
+
+      assert {:error, reason} =
+               EKV.start_link(
+                 name: name,
+                 data_dir: data_dir,
+                 cluster_size: 3,
+                 node_id: 1,
+                 shards: 1,
+                 wait_for_quorum: 100,
+                 log: false
+               )
+
+      elapsed = System.monotonic_time(:millisecond) - started_at
+
+      assert elapsed >= 100
+      assert inspect(reason) =~ "timeout"
+
+      File.rm_rf!(data_dir)
     end
 
     test "string node_id works" do

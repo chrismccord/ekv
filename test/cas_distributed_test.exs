@@ -159,6 +159,75 @@ defmodule EKV.CASDistributedTest do
     end
   end
 
+  describe "startup quorum gate" do
+    test "wait_for_quorum blocks startup until quorum becomes reachable" do
+      peers = TestCluster.start_peers(1)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, remote_node}] = peers
+      ekv_name = unique_name(:cas_wait)
+      local_data_dir = Path.join(System.tmp_dir!(), "ekv_cas_wait_#{ekv_name}")
+      remote_data_dir = "/tmp/ekv_cas_test_#{remote_node}_#{ekv_name}"
+
+      File.rm_rf!(local_data_dir)
+      TestCluster.rpc!(remote_node, File, :rm_rf!, [remote_data_dir])
+
+      local_task =
+        Task.async(fn ->
+          {:ok, pid} =
+            EKV.start_link(
+              name: ekv_name,
+              data_dir: local_data_dir,
+              shards: 1,
+              log: false,
+              gc_interval: :timer.hours(1),
+              tombstone_ttl: :timer.hours(24 * 7),
+              cluster_size: 2,
+              node_id: 1,
+              wait_for_quorum: 2_000
+            )
+
+          Process.unlink(pid)
+          {:ok, pid}
+        end)
+
+      Process.sleep(150)
+      assert Task.yield(local_task, 0) == nil
+
+      {:ok, _remote_pid} =
+        TestCluster.start_ekv(
+          remote_node,
+          name: ekv_name,
+          data_dir: remote_data_dir,
+          shards: 1,
+          log: false,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7),
+          cluster_size: 2,
+          node_id: 2
+        )
+
+      {:ok, local_pid} = Task.await(local_task, 3_000)
+
+      on_exit(fn ->
+        if Process.alive?(local_pid), do: Process.exit(local_pid, :shutdown)
+        File.rm_rf!(local_data_dir)
+        TestCluster.rpc!(remote_node, File, :rm_rf!, [remote_data_dir])
+      end)
+
+      assert :ok = EKV.await_quorum(ekv_name, 0)
+      assert {:ok, _} = EKV.put(ekv_name, "boot/1", "ready", if_vsn: nil)
+
+      TestCluster.assert_eventually(
+        fn ->
+          TestCluster.rpc!(remote_node, EKV, :get, [ekv_name, "boot/1", [consistent: true]]) ==
+            "ready"
+        end,
+        timeout: 5_000
+      )
+    end
+  end
+
   # =====================================================================
   # Quorum — 3-node, cluster_size: 3
   # =====================================================================
