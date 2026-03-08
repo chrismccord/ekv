@@ -38,18 +38,45 @@ defmodule EKV.Replica do
         │   └── ...               N shards (default 8)
         ├── EKV.QuorumGate?       optional startup barrier for CAS quorum
         ├── EKV.MemberPresence    publishes ready member in :pg region group
-        └── EKV.GC                periodic timer, sends :gc to each shard
+        ├── EKV.GC                periodic timer, sends :gc to each shard
+        └── EKV.ShutdownBarrier?  optional graceful shutdown barrier
 
       Client mode:
         EKV.Supervisor (rest_for_one)
         ├── EKV.ClientRouter         region-ordered backend selection
         ├── EKV.RouteGate?           optional startup barrier for route selection
         ├── EKV.QuorumGate?          optional startup barrier via selected member
-        └── EKV.ClientSubscriptions  local subscribe/unsubscribe bookkeeping
+        ├── EKV.ClientSubscriptions  local subscribe/unsubscribe bookkeeping
+        └── EKV.ShutdownBarrier?     optional graceful shutdown barrier
 
   rest_for_one: SubTracker crash restarts everything. Registry crash
   restarts Dispatchers + Replicas. Single Replica crash → only that shard
-  restarts. QuorumGate, MemberPresence, and GC are downstream of Replicas.
+  restarts. QuorumGate, MemberPresence, GC, and ShutdownBarrier are downstream
+  of Replicas.
+
+
+  ## Graceful Shutdown Barrier
+
+  `shutdown_barrier: timeout_ms` is an opt-in coordinated shutdown aid.
+  `EKV.ShutdownBarrier` is the last child in the tree, so it receives shutdown
+  first and can block while the rest of EKV is still serving traffic.
+
+  Coordination is via `:pg`:
+
+    - `{:ekv_shutdown_live, name}` / `{:ekv_shutdown_terminal, name}`
+      track all EKV instances for this logical store
+    - `{:ekv_shutdown_live_member, name, node_id}` /
+      `{:ekv_shutdown_terminal_member, name, node_id}`
+      track logical voting members only
+
+  Members count quorum by logical `node_id`, not Erlang node name, so
+  blue-green overlap still counts as one voter. A member waits only when
+  coordinated shutdown is in progress or exiting would risk dropping the live
+  voting set below quorum while peers are still non-terminal. Clients
+  participate in terminal coordination but never count toward quorum.
+
+  A blue-green outgoing member that has already entered proxy mode skips the
+  barrier wait: it has already handed responsibility to its replacement.
 
 
   ## Storage: SQLite Only

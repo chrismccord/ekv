@@ -63,6 +63,32 @@ defmodule EKV.Supervisor do
   - No data loss: WAL checkpoint flushes everything before close
   - Client routing safety: incoming member is advertised only after startup;
     outgoing member leaves its :pg route before proxy mode
+  - Shutdown safety: graceful coordinated shutdown keeps members serving until
+    peers have also entered terminal state, or timeout; outgoing proxy-mode
+    blue-green members skip this wait
+
+  ## Graceful Shutdown Barrier
+
+  When `shutdown_barrier: timeout_ms` is enabled, EKV adds a final
+  `EKV.ShutdownBarrier` child at the bottom of the tree. Supervisor shutdown
+  happens in reverse child order, so the barrier blocks first while replicas,
+  routing, and subscriptions are still alive.
+
+  The barrier publishes shutdown state through `:pg`:
+
+  - `{:ekv_shutdown_live, name}` — all live EKV instances
+  - `{:ekv_shutdown_terminal, name}` — EKV instances currently terminating
+  - `{:ekv_shutdown_live_member, name, node_id}` — live logical voting members
+  - `{:ekv_shutdown_terminal_member, name, node_id}` — terminating logical members
+
+  Member mode waits only when it is useful:
+
+  - coordinated shutdown is already in progress, or
+  - exiting now would drop live logical members below quorum while other
+    snapshotted peers are still non-terminal
+
+  Client mode participates in terminal coordination, but it does not count
+  toward quorum. Forced exits (`kill -9`, VM crash) bypass the barrier.
   """
 
   @valid_opts [
@@ -82,7 +108,8 @@ defmodule EKV.Supervisor do
     :skip_stale_check,
     :partition_ttl_policy,
     :wait_for_quorum,
-    :wait_for_route
+    :wait_for_route,
+    :shutdown_barrier
   ]
 
   def start_link(opts) do
@@ -122,11 +149,13 @@ defmodule EKV.Supervisor do
     partition_ttl_policy = Keyword.get(opts, :partition_ttl_policy, :quarantine)
     wait_for_quorum = Keyword.get(opts, :wait_for_quorum, false)
     wait_for_route = Keyword.get(opts, :wait_for_route, false)
+    shutdown_barrier = Keyword.get(opts, :shutdown_barrier, false)
 
     validate_cas_config!(cluster_size, node_id)
     validate_partition_ttl_policy!(partition_ttl_policy)
     validate_wait_for_quorum!(wait_for_quorum, cluster_size)
     validate_wait_for_route!(wait_for_route, :member)
+    validate_shutdown_barrier!(shutdown_barrier)
 
     node_id =
       case node_id do
@@ -203,7 +232,14 @@ defmodule EKV.Supervisor do
           do: {EKV.QuorumGate, name: name, timeout: wait_for_quorum, log: log}
         ),
         {EKV.MemberPresence, name: name, region: region},
-        {EKV.GC, name: name}
+        {EKV.GC, name: name},
+        if(is_integer(shutdown_barrier),
+          do:
+            Supervisor.child_spec(
+              {EKV.ShutdownBarrier, name: name, timeout: shutdown_barrier, log: log},
+              shutdown: shutdown_barrier + 1_000
+            )
+        )
       ]
       |> Enum.filter(& &1)
 
@@ -214,8 +250,9 @@ defmodule EKV.Supervisor do
     region_routing = Keyword.get(opts, :region_routing)
     wait_for_route = Keyword.get(opts, :wait_for_route, false)
     wait_for_quorum = Keyword.get(opts, :wait_for_quorum, false)
+    shutdown_barrier = Keyword.get(opts, :shutdown_barrier, false)
 
-    validate_client_opts!(opts, region_routing, wait_for_route, wait_for_quorum)
+    validate_client_opts!(opts, region_routing, wait_for_route, wait_for_quorum, shutdown_barrier)
 
     config = %{
       mode: :client,
@@ -239,7 +276,14 @@ defmodule EKV.Supervisor do
         if(is_integer(wait_for_quorum),
           do: {EKV.QuorumGate, name: name, timeout: wait_for_quorum, log: log}
         ),
-        {EKV.ClientSubscriptions, name: name}
+        {EKV.ClientSubscriptions, name: name},
+        if(is_integer(shutdown_barrier),
+          do:
+            Supervisor.child_spec(
+              {EKV.ShutdownBarrier, name: name, timeout: shutdown_barrier, log: log},
+              shutdown: shutdown_barrier + 1_000
+            )
+        )
       ]
       |> Enum.filter(& &1)
 
@@ -314,6 +358,18 @@ defmodule EKV.Supervisor do
           "EKV: :wait_for_route must be false/nil or a non-negative timeout in ms, got: #{inspect(timeout)}"
   end
 
+  defp validate_shutdown_barrier!(false), do: :ok
+  defp validate_shutdown_barrier!(nil), do: :ok
+
+  defp validate_shutdown_barrier!(timeout)
+       when is_integer(timeout) and timeout >= 0,
+       do: :ok
+
+  defp validate_shutdown_barrier!(timeout) do
+    raise ArgumentError,
+          "EKV: :shutdown_barrier must be false/nil or a non-negative timeout in ms, got: #{inspect(timeout)}"
+  end
+
   defp validate_mode!(mode) when mode in [:member, :client], do: :ok
 
   defp validate_mode!(mode) do
@@ -327,10 +383,17 @@ defmodule EKV.Supervisor do
           "EKV: #{inspect(key)} must be a non-empty string, got: #{inspect(region)}"
   end
 
-  defp validate_client_opts!(opts, region_routing, wait_for_route, wait_for_quorum) do
+  defp validate_client_opts!(
+         opts,
+         region_routing,
+         wait_for_route,
+         wait_for_quorum,
+         shutdown_barrier
+       ) do
     validate_region_routing!(region_routing)
     validate_wait_for_route!(wait_for_route, :client)
     validate_wait_for_quorum!(wait_for_quorum, 1)
+    validate_shutdown_barrier!(shutdown_barrier)
 
     reject_client_opt!(opts, :blue_green, [false, nil])
     reject_client_opt!(opts, :data_dir, [nil])

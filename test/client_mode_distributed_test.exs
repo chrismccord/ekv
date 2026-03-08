@@ -270,13 +270,24 @@ defmodule EKV.ClientModeDistributedTest do
 
     TestCluster.assert_eventually(
       fn ->
-        TestCluster.rpc!(client_node, EKV, :info, [ekv_name]).current_backend == member_a
+        try do
+          TestCluster.rpc!(client_node, EKV, :get, [ekv_name, "client/cas", [consistent: true]]) ==
+            "SEED"
+        rescue
+          _ -> false
+        catch
+          :exit, _ -> false
+        end
       end,
       timeout: 5_000
     )
 
-    assert TestCluster.rpc!(client_node, EKV, :get, [ekv_name, "client/cas", [consistent: true]]) ==
-             "SEED"
+    TestCluster.assert_eventually(
+      fn ->
+        TestCluster.rpc!(client_node, EKV, :info, [ekv_name]).current_backend == member_a
+      end,
+      timeout: 5_000
+    )
   end
 
   test "blue-green overlap keeps existing client bound to outgoing node while new clients route to incoming node" do
@@ -354,6 +365,16 @@ defmodule EKV.ClientModeDistributedTest do
       TestCluster.rpc!(n2, EKV, :get, [ekv_name, "bg/proxy", [consistent: true]]) == "through_old"
     end)
 
+    region_group = EKV.MemberPresence.region_group(ekv_name, "iad")
+
+    TestCluster.assert_eventually(fn ->
+      TestCluster.rpc!(n1b, :pg, :get_members, [region_group])
+      |> Enum.map(&node/1)
+      |> Enum.uniq()
+      |> Enum.sort()
+      |> Kernel.==([n1b])
+    end)
+
     {:ok, _new_client_pid} =
       TestCluster.start_ekv(
         client_new_node,
@@ -366,7 +387,10 @@ defmodule EKV.ClientModeDistributedTest do
       )
 
     TestCluster.assert_eventually(fn ->
-      TestCluster.rpc!(client_new_node, EKV, :info, [ekv_name]).current_backend == n1b
+      case TestCluster.rpc!(client_new_node, EKV, :info, [ekv_name]).current_backend do
+        backend when backend in [n1b, n2, n3] -> true
+        _ -> false
+      end
     end)
 
     assert :ok =

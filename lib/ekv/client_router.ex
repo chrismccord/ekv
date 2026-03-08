@@ -5,6 +5,7 @@ defmodule EKV.ClientRouter do
 
   @cooldown_ms 1_000
   @await_timeout_margin 1_000
+  @route_probe_timeout 500
 
   defstruct [:name, :region_routing, waiters: %{}, monitors: %{}, members_by_region: %{}]
 
@@ -199,15 +200,17 @@ defmodule EKV.ClientRouter do
   defp reply_waiters_if_ready(_reply, state), do: state
 
   defp select_backend(%__MODULE__{} = state) do
-    case pick_backend(state, true) do
+    case pick_valid_backend(state, true) do
       {:ok, backend} ->
         put_backend(state.name, backend)
+        prime_member_visibility(state.name, backend)
         {{:ok, backend}, state}
 
       :error ->
-        case pick_backend(state, false) do
+        case pick_valid_backend(state, false) do
           {:ok, backend} ->
             put_backend(state.name, backend)
+            prime_member_visibility(state.name, backend)
             {{:ok, backend}, state}
 
           :error ->
@@ -217,22 +220,47 @@ defmodule EKV.ClientRouter do
     end
   end
 
-  defp pick_backend(%__MODULE__{} = state, respect_cooldown?) do
+  defp pick_valid_backend(%__MODULE__{} = state, respect_cooldown?) do
+    state
+    |> candidate_nodes(respect_cooldown?)
+    |> Enum.find_value(:error, fn node ->
+      if route_candidate?(state.name, node) do
+        {:ok, node}
+      else
+        mark_candidate_invalid(state, node)
+        false
+      end
+    end)
+  end
+
+  defp candidate_nodes(%__MODULE__{} = state, respect_cooldown?) do
     table = table_name(state.name)
 
-    state.region_routing
-    |> Enum.find_value(fn region ->
-      state.members_by_region
-      |> Map.get(region, MapSet.new())
-      |> Enum.reject(fn node ->
-        respect_cooldown? and cooled_down?(table, node)
+    case region_candidates(state, table, respect_cooldown?) do
+      [] -> connected_member_candidates(state, table, respect_cooldown?)
+      candidates -> candidates
+    end
+  end
+
+  defp route_candidate?(name, node) do
+    try do
+      :erpc.call(node, EKV.MemberPresence, :advertised?, [name], @route_probe_timeout)
+    catch
+      :exit, _reason -> false
+    end
+  end
+
+  defp prime_member_visibility(name, backend) do
+    try do
+      backend
+      |> :erpc.call(EKV.MemberPresence, :member_nodes, [name], @route_probe_timeout)
+      |> Enum.each(fn node ->
+        if node != node() do
+          Node.connect(node)
+        end
       end)
-      |> Enum.sort_by(&Atom.to_string/1)
-      |> Enum.at(0)
-    end)
-    |> case do
-      nil -> :error
-      node -> {:ok, node}
+    catch
+      :exit, _reason -> :ok
     end
   end
 
@@ -272,7 +300,8 @@ defmodule EKV.ClientRouter do
 
     case cached_backend_from_table(table) do
       {:ok, backend} ->
-        if cooled_down?(table, backend) do
+        if cooled_down?(table, backend) or not connected?(backend) do
+          clear_backend_for_name(name)
           :error
         else
           {:ok, backend}
@@ -328,6 +357,20 @@ defmodule EKV.ClientRouter do
     ArgumentError -> state
   end
 
+  defp mark_candidate_invalid(state, node) do
+    table = table_name(state.name)
+
+    :ets.insert(table, {{:cooldown_until, node}, now_ms() + @cooldown_ms})
+
+    if cached_backend_from_table(table) == {:ok, node} do
+      clear_backend_from_table(table)
+    end
+
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
   defp cleanup_waiter(waiter) do
     Process.cancel_timer(waiter.timer_ref)
     Process.demonitor(waiter.mon_ref, [:flush])
@@ -341,6 +384,60 @@ defmodule EKV.ClientRouter do
     end
   rescue
     ArgumentError -> false
+  end
+
+  defp connected?(node), do: node in Node.list()
+
+  defp region_candidates(state, table, respect_cooldown?) do
+    state.region_routing
+    |> Enum.find_value([], fn region ->
+      candidates =
+        state.members_by_region
+        |> Map.get(region, MapSet.new())
+        |> Enum.reject(fn node ->
+          respect_cooldown? and cooled_down?(table, node)
+        end)
+        |> Enum.sort_by(&Atom.to_string/1)
+
+      if candidates == [], do: false, else: candidates
+    end)
+  end
+
+  defp connected_member_candidates(state, table, respect_cooldown?) do
+    Node.list()
+    |> Task.async_stream(
+      fn node ->
+        case EKV.remote_invoke(node, :info, [state.name], @route_probe_timeout) do
+          {:ok, %{mode: :member, region: region}} -> {:ok, node, region}
+          _ -> :error
+        end
+      end,
+      ordered: false,
+      timeout: @route_probe_timeout + 100,
+      on_timeout: :kill_task
+    )
+    |> Enum.reduce(%{}, fn
+      {:ok, {:ok, node, region}}, acc ->
+        Map.update(acc, region, [node], &[node | &1])
+
+      _, acc ->
+        acc
+    end)
+    |> then(fn by_region ->
+      state.region_routing
+      |> Enum.find_value([], fn region ->
+        candidates =
+          by_region
+          |> Map.get(region, [])
+          |> Enum.uniq()
+          |> Enum.reject(fn node ->
+            respect_cooldown? and cooled_down?(table, node)
+          end)
+          |> Enum.sort_by(&Atom.to_string/1)
+
+        if candidates == [], do: false, else: candidates
+      end)
+    end)
   end
 
   defp now_ms, do: System.monotonic_time(:millisecond)

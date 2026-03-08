@@ -3,6 +3,8 @@ defmodule EKV.MemberPresence do
 
   use GenServer
 
+  @probe_timeout 500
+
   def start_link(opts) do
     opts = Keyword.validate!(opts, [:name, :region])
     name = Keyword.fetch!(opts, :name)
@@ -12,6 +14,28 @@ defmodule EKV.MemberPresence do
   def server_name(name), do: :"#{name}_ekv_member_presence"
 
   def region_group(name, region), do: {:ekv_members, name, region}
+
+  def advertised?(name) do
+    case Process.whereis(server_name(name)) do
+      nil -> false
+      pid -> GenServer.call(pid, :advertised?)
+    end
+  end
+
+  def member_nodes(name) do
+    [node() | Node.list()]
+    |> Enum.uniq()
+    |> Enum.filter(fn remote_node ->
+      remote_member_running?(remote_node, name)
+    end)
+  end
+
+  def member_running?(name) do
+    case :persistent_term.get({EKV, name}, :missing) do
+      %{mode: :member} -> true
+      _ -> false
+    end
+  end
 
   def leave(name) do
     case Process.whereis(server_name(name)) do
@@ -26,6 +50,11 @@ defmodule EKV.MemberPresence do
     region = Keyword.fetch!(opts, :region)
     state = %{name: name, region: region, joined?: false}
     {:ok, join_groups(state)}
+  end
+
+  @impl true
+  def handle_call(:advertised?, _from, state) do
+    {:reply, state.joined?, state}
   end
 
   @impl true
@@ -49,5 +78,17 @@ defmodule EKV.MemberPresence do
   defp leave_groups(state) do
     :ok = :pg.leave(region_group(state.name, state.region), self())
     %{state | joined?: false}
+  end
+
+  defp remote_member_running?(remote_node, name) when remote_node == node() do
+    member_running?(name)
+  end
+
+  defp remote_member_running?(remote_node, name) do
+    try do
+      :erpc.call(remote_node, __MODULE__, :member_running?, [name], @probe_timeout)
+    catch
+      :exit, _reason -> false
+    end
   end
 end

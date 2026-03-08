@@ -14,6 +14,7 @@ defmodule EKV.CASDistributedTest do
     cluster_size = Keyword.get(opts, :cluster_size, length(peers))
     shards = Keyword.get(opts, :shards, 2)
     await_quorum? = Keyword.get(opts, :await_quorum, length(peers) == cluster_size)
+    shutdown_barrier = Keyword.get(opts, :shutdown_barrier, false)
 
     peers
     |> Enum.with_index(1)
@@ -30,7 +31,8 @@ defmodule EKV.CASDistributedTest do
         gc_interval: :timer.hours(1),
         tombstone_ttl: :timer.hours(24 * 7),
         cluster_size: cluster_size,
-        node_id: node_id
+        node_id: node_id,
+        shutdown_barrier: shutdown_barrier
       )
     end)
 
@@ -2281,11 +2283,124 @@ defmodule EKV.CASDistributedTest do
   end
 
   # =====================================================================
+  describe "shutdown barrier" do
+    @tag timeout: 60_000
+    test "single member stop exits promptly when quorum remains" do
+      peers = TestCluster.start_peers(3)
+      ekv_name = unique_name(:cas_shutdown_prompt)
+
+      on_exit(fn ->
+        TestCluster.stop_peers(peers)
+        cleanup_data(peers, ekv_name)
+      end)
+
+      start_cas_cluster(peers, ekv_name, shutdown_barrier: 2_000)
+
+      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
+
+      started_at = System.monotonic_time(:millisecond)
+      TestCluster.rpc!(node_a, Supervisor, :stop, [:"#{ekv_name}_ekv_sup", :shutdown])
+      elapsed = System.monotonic_time(:millisecond) - started_at
+
+      assert elapsed < 1_500
+
+      assert {:ok, _vsn} =
+               TestCluster.rpc!(node_b, EKV, :put, [
+                 ekv_name,
+                 "shutdown/prompt",
+                 "ok",
+                 [if_vsn: nil]
+               ])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_c, EKV, :get, [ekv_name, "shutdown/prompt", [consistent: true]]) ==
+          "ok"
+      end)
+    end
+
+    @tag timeout: 60_000
+    test "member stop waits up to timeout when its exit would break quorum" do
+      peers = TestCluster.start_peers(2)
+      ekv_name = unique_name(:cas_shutdown_wait)
+
+      on_exit(fn ->
+        TestCluster.stop_peers(peers)
+        cleanup_data(peers, ekv_name)
+      end)
+
+      start_cas_cluster(peers, ekv_name, shutdown_barrier: 1_000)
+
+      [{_, node_a}, {_, _node_b}] = peers
+
+      started_at = System.monotonic_time(:millisecond)
+      TestCluster.rpc!(node_a, Supervisor, :stop, [:"#{ekv_name}_ekv_sup", :shutdown])
+      elapsed = System.monotonic_time(:millisecond) - started_at
+
+      assert elapsed >= 900
+      assert elapsed < 2_500
+    end
+
+    @tag timeout: 60_000
+    test "coordinated member shutdown keeps quorum available for final CAS writes" do
+      peers = TestCluster.start_peers(3)
+      ekv_name = unique_name(:cas_shutdown_coord)
+
+      on_exit(fn ->
+        TestCluster.stop_peers(peers)
+        cleanup_data(peers, ekv_name)
+      end)
+
+      start_cas_cluster(peers, ekv_name, shutdown_barrier: 5_000)
+
+      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
+
+      stop_a =
+        Task.async(fn ->
+          TestCluster.rpc!(node_a, Supervisor, :stop, [:"#{ekv_name}_ekv_sup", :shutdown])
+        end)
+
+      stop_b =
+        Task.async(fn ->
+          TestCluster.rpc!(node_b, Supervisor, :stop, [:"#{ekv_name}_ekv_sup", :shutdown])
+        end)
+
+      terminal_group = EKV.ShutdownBarrier.terminal_all_group(ekv_name)
+
+      TestCluster.assert_eventually(
+        fn ->
+          length(TestCluster.rpc!(node_c, :pg, :get_members, [terminal_group])) >= 2
+        end,
+        timeout: 5_000
+      )
+
+      for i <- 1..10 do
+        assert {:ok, _vsn} =
+                 TestCluster.rpc!(node_c, EKV, :put, [
+                   ekv_name,
+                   "shutdown/final/#{i}",
+                   i,
+                   [if_vsn: nil]
+                 ])
+      end
+
+      stop_c =
+        Task.async(fn ->
+          TestCluster.rpc!(node_c, Supervisor, :stop, [:"#{ekv_name}_ekv_sup", :shutdown])
+        end)
+
+      Task.await(stop_a, 10_000)
+      Task.await(stop_b, 10_000)
+      Task.await(stop_c, 10_000)
+    end
+  end
+
   # Handoff — blue-green deployment with synchronized local handoff
   # =====================================================================
 
   describe "handoff" do
-    defp start_handoff_cluster(n1, n2, n3, ekv_name, shared_dir) do
+    defp start_handoff_cluster(n1, n2, n3, ekv_name, shared_dir, opts \\ []) do
+      shutdown_barrier = Keyword.get(opts, :shutdown_barrier, false)
+
       # n1: shared_dir, node_id "m1", blue_green: true (writes marker on first boot)
       data_dir_n1 = shared_dir
       TestCluster.rpc!(n1, File, :mkdir_p!, [data_dir_n1])
@@ -2300,7 +2415,8 @@ defmodule EKV.CASDistributedTest do
         gc_interval: :timer.hours(1),
         tombstone_ttl: :timer.hours(24 * 7),
         cluster_size: 3,
-        node_id: "m1"
+        node_id: "m1",
+        shutdown_barrier: shutdown_barrier
       )
 
       # n2: own dir, node_id "m2"
@@ -2316,7 +2432,8 @@ defmodule EKV.CASDistributedTest do
         gc_interval: :timer.hours(1),
         tombstone_ttl: :timer.hours(24 * 7),
         cluster_size: 3,
-        node_id: "m2"
+        node_id: "m2",
+        shutdown_barrier: shutdown_barrier
       )
 
       # n3: own dir, node_id "m3"
@@ -2332,7 +2449,8 @@ defmodule EKV.CASDistributedTest do
         gc_interval: :timer.hours(1),
         tombstone_ttl: :timer.hours(24 * 7),
         cluster_size: 3,
-        node_id: "m3"
+        node_id: "m3",
+        shutdown_barrier: shutdown_barrier
       )
     end
 
@@ -2396,6 +2514,41 @@ defmodule EKV.CASDistributedTest do
       # Data still on n2 and n3
       assert TestCluster.rpc!(n2, EKV, :get, [ekv_name, "key1"]) == "val1"
       assert TestCluster.rpc!(n3, EKV, :get, [ekv_name, "key1"]) == "val1"
+    end
+
+    test "outgoing blue-green member does not wait on shutdown barrier after handoff" do
+      peers = TestCluster.start_peers(4)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, n1}, {_, n1b}, {_, n2}, {_, n3}] = peers
+      ekv_name = unique_name(:handoff)
+      shared_dir = "/tmp/ekv_handoff_shared_#{ekv_name}"
+      on_exit(fn -> cleanup_handoff_data(peers, ekv_name, shared_dir) end)
+
+      start_handoff_cluster(n1, n2, n3, ekv_name, shared_dir, shutdown_barrier: 2_000)
+      Process.sleep(500)
+
+      TestCluster.start_ekv(
+        n1b,
+        name: ekv_name,
+        data_dir: shared_dir,
+        shards: 2,
+        log: false,
+        blue_green: true,
+        gc_interval: :timer.hours(1),
+        tombstone_ttl: :timer.hours(24 * 7),
+        cluster_size: 3,
+        node_id: "m1",
+        shutdown_barrier: 2_000
+      )
+
+      Process.sleep(500)
+
+      started_at = System.monotonic_time(:millisecond)
+      TestCluster.rpc!(n1, Supervisor, :stop, [:"#{ekv_name}_ekv_sup", :shutdown])
+      elapsed = System.monotonic_time(:millisecond) - started_at
+
+      assert elapsed < 1_500
     end
 
     test "CAS works after handoff" do

@@ -58,7 +58,8 @@ defmodule EKV do
        region: "ord",
        region_routing: ["iad", "dfw", "lhr"],
        wait_for_route: :timer.seconds(10),
-       wait_for_quorum: :timer.seconds(10)}
+       wait_for_quorum: :timer.seconds(10),
+       shutdown_barrier: :timer.seconds(5)}
 
       # CAS put via lookup + if_vsn
       case EKV.lookup(:my_kv_cas, "lock/job-123") do
@@ -221,6 +222,7 @@ defmodule EKV do
   | `:cluster_size` | `nil` | Member mode only. Logical cluster size for CAS quorum math. Required for CAS operations (`if_vsn:`, `consistent: true`, `update/4`). |
   | `:node_id` | `nil` | Member mode only. Stable logical member identity used by CAS ballots. Required for CAS operations. Should remain stable for each logical cluster member. |
   | `:wait_for_quorum` | `false` | Optional startup gate. In member mode, blocks startup until this EKV member can reach CAS quorum. In client mode, blocks startup until the selected backend member reports CAS quorum reachable. |
+  | `:shutdown_barrier` | `false` | Optional graceful-shutdown barrier. Keeps EKV serving during coordinated shutdown for up to the configured timeout so peers can finish final writes and replication. |
   | `:tombstone_ttl` | `604_800_000` (7 days) | Member mode only. How long tombstones (deleted entries) are kept before being permanently purged, in milliseconds. See "Tombstone Lifetime" below. |
   | `:gc_interval` | `300_000` (5 min) | Member mode only. How often garbage collection runs, in milliseconds. GC expires TTL entries, purges old tombstones, and truncates the replication oplog. |
   | `:log` | `:info` | Logging level. `:info` logs cluster events (connects, syncs). `false` disables logging. `:verbose` logs per-shard detail. |
@@ -246,6 +248,18 @@ defmodule EKV do
     `{:error, :unavailable}`.
   - After backend failover, eventual reads may observe an older replica view.
     Use `consistent: true` when freshness matters.
+
+  ### Shutdown Barrier
+
+  `shutdown_barrier: timeout_ms` is an opt-in graceful-shutdown aid.
+
+  - In coordinated shutdowns, members can stay alive briefly while peers and
+    clients enter terminal state, which reduces final-write `:no_quorum`
+    failures and allows more replication to complete before exit.
+  - Blue-green outgoing members skip the barrier after successful handoff.
+  - This is best-effort only: crashes, `:kill`, and VM death bypass it.
+  - It does not replace correct supervision ordering; processes that must flush
+    state should still shut down before EKV fully exits.
 
   ### Startup Quorum Gate
 

@@ -4622,6 +4622,20 @@ defmodule EKVTest do
       assert msg =~ ":wait_for_route must be false/nil or a non-negative timeout in ms"
     end
 
+    test "invalid shutdown_barrier type raises" do
+      Process.flag(:trap_exit, true)
+
+      assert {:error, {%ArgumentError{message: msg}, _}} =
+               EKV.start_link(
+                 name: :"ekv_client_shutdown_barrier_bad_#{System.unique_integer([:positive])}",
+                 mode: :client,
+                 region_routing: ["iad"],
+                 shutdown_barrier: true
+               )
+
+      assert msg =~ ":shutdown_barrier must be false/nil or a non-negative timeout in ms"
+    end
+
     test "reports client info and rejects member-only APIs" do
       name = :"ekv_client_info_#{System.unique_integer([:positive])}"
 
