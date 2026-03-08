@@ -13,6 +13,7 @@ defmodule EKV.CASDistributedTest do
   defp start_cas_cluster(peers, ekv_name, opts \\ []) do
     cluster_size = Keyword.get(opts, :cluster_size, length(peers))
     shards = Keyword.get(opts, :shards, 2)
+    await_quorum? = Keyword.get(opts, :await_quorum, length(peers) == cluster_size)
 
     peers
     |> Enum.with_index(1)
@@ -32,6 +33,18 @@ defmodule EKV.CASDistributedTest do
         node_id: node_id
       )
     end)
+
+    if await_quorum? do
+      Enum.each(peers, fn {_pid, node} ->
+        case TestCluster.rpc!(node, EKV, :await_quorum, [ekv_name, 5_000]) do
+          :ok ->
+            :ok
+
+          other ->
+            raise "expected quorum after cluster start for #{inspect(node)}, got: #{inspect(other)}"
+        end
+      end)
+    end
   end
 
   defp cleanup_data(peers, ekv_name) do

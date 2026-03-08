@@ -55,7 +55,7 @@ defmodule EKV.SubDispatcher do
     # boundaries, then collect per-pid event lists.
     pid_events =
       Enum.reduce(events, %{}, fn %EKV.Event{} = event, acc ->
-        pids = matching_pids(registry, event.key)
+        pids = matching_pids(registry, name, event.key)
 
         Enum.reduce(pids, acc, fn pid, inner ->
           Map.update(inner, pid, [event], &[event | &1])
@@ -78,28 +78,39 @@ defmodule EKV.SubDispatcher do
   #
   # For key "user/123/data", we check: "", "user/", "user/123/", "user/123/data"
   # Each check is a direct Registry.lookup (ETS hash lookup), not a scan.
-  defp matching_pids(registry, key) do
+  defp matching_pids(registry, name, key) do
     # Start with "" (match-all), then each "/" boundary, then exact key
-    pids = collect_pids(registry, "", MapSet.new())
-    pids = collect_slash_prefixes(registry, key, 0, pids)
-    collect_pids(registry, key, pids)
+    pids = collect_pids(registry, name, "", MapSet.new())
+    pids = collect_slash_prefixes(registry, name, key, 0, pids)
+    collect_pids(registry, name, key, pids)
   end
 
-  defp collect_slash_prefixes(registry, key, from, acc) do
+  defp collect_slash_prefixes(registry, name, key, from, acc) do
     case :binary.match(key, "/", scope: {from, byte_size(key) - from}) do
       {pos, 1} ->
         prefix = binary_part(key, 0, pos + 1)
-        acc = collect_pids(registry, prefix, acc)
-        collect_slash_prefixes(registry, key, pos + 1, acc)
+        acc = collect_pids(registry, name, prefix, acc)
+        collect_slash_prefixes(registry, name, key, pos + 1, acc)
 
       :nomatch ->
         acc
     end
   end
 
-  defp collect_pids(registry, prefix, acc) do
-    Enum.reduce(Registry.lookup(registry, prefix), acc, fn {pid, _}, set ->
+  defp collect_pids(registry, name, prefix, acc) do
+    acc =
+      Enum.reduce(Registry.lookup(registry, prefix), acc, fn {pid, _}, set ->
+        MapSet.put(set, pid)
+      end)
+
+    Enum.reduce(client_members(name, prefix), acc, fn pid, set ->
       MapSet.put(set, pid)
     end)
+  end
+
+  defp client_members(name, prefix) do
+    :pg.get_members(EKV.client_sub_group(name, prefix))
+  rescue
+    _ -> []
   end
 end

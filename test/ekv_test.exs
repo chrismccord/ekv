@@ -4571,11 +4571,141 @@ defmodule EKVTest do
 
       info = EKV.info(name)
       assert info.name == name
+      assert info.mode == :member
+      assert info.region == "default"
       assert info.node_id == "my-node"
       assert info.cluster_size == 3
       assert info.shards == 4
       assert info.data_dir == data_dir
       assert info.connected_peers == []
+    end
+  end
+
+  describe "client mode" do
+    test "requires region_routing" do
+      Process.flag(:trap_exit, true)
+
+      assert {:error, {%ArgumentError{message: msg}, _}} =
+               EKV.start_link(
+                 name: :"ekv_client_#{System.unique_integer([:positive])}",
+                 mode: :client
+               )
+
+      assert msg =~ ":region_routing must be a non-empty list"
+    end
+
+    test "rejects member-only options" do
+      Process.flag(:trap_exit, true)
+
+      assert {:error, {%ArgumentError{message: msg}, _}} =
+               EKV.start_link(
+                 name: :"ekv_client_bad_#{System.unique_integer([:positive])}",
+                 mode: :client,
+                 data_dir: "/tmp/nope",
+                 region_routing: ["iad"]
+               )
+
+      assert msg =~ ":data_dir is not supported in :client mode"
+    end
+
+    test "invalid wait_for_route type raises" do
+      Process.flag(:trap_exit, true)
+
+      assert {:error, {%ArgumentError{message: msg}, _}} =
+               EKV.start_link(
+                 name: :"ekv_client_wait_route_bad_#{System.unique_integer([:positive])}",
+                 mode: :client,
+                 region_routing: ["iad"],
+                 wait_for_route: true
+               )
+
+      assert msg =~ ":wait_for_route must be false/nil or a non-negative timeout in ms"
+    end
+
+    test "reports client info and rejects member-only APIs" do
+      name = :"ekv_client_info_#{System.unique_integer([:positive])}"
+
+      {:ok, pid} =
+        EKV.start_link(
+          name: name,
+          mode: :client,
+          region: "ord",
+          region_routing: ["iad", "dfw"]
+        )
+
+      on_exit(fn -> Process.exit(pid, :shutdown) end)
+
+      info = EKV.info(name)
+      assert info.name == name
+      assert info.mode == :client
+      assert info.region == "ord"
+      assert info.region_routing == ["iad", "dfw"]
+      assert info.current_backend == nil
+
+      assert {:error, :timeout} = EKV.await_quorum(name, 0)
+      assert_raise ArgumentError, fn -> EKV.backup(name, Path.join(System.tmp_dir!(), "x")) end
+    end
+
+    test "await_backend waiter is removed when caller exits" do
+      name = :"ekv_client_waiter_#{System.unique_integer([:positive])}"
+
+      {:ok, pid} =
+        EKV.start_link(
+          name: name,
+          mode: :client,
+          region: "ord",
+          region_routing: ["iad"]
+        )
+
+      on_exit(fn -> Process.exit(pid, :shutdown) end)
+
+      {waiter_pid, waiter_ref} =
+        spawn_monitor(fn ->
+          EKV.ClientRouter.await_backend(name, 5_000)
+        end)
+
+      EKV.TestCluster.assert_eventually(fn ->
+        %{waiters: waiters} = :sys.get_state(EKV.ClientRouter.router_name(name))
+        map_size(waiters) == 1
+      end)
+
+      Process.exit(waiter_pid, :kill)
+
+      assert_receive {:DOWN, ^waiter_ref, :process, _pid, _reason}, 5_000
+
+      EKV.TestCluster.assert_eventually(fn ->
+        %{waiters: waiters} = :sys.get_state(EKV.ClientRouter.router_name(name))
+        map_size(waiters) == 0
+      end)
+    end
+
+    test "failing an old backend does not clear a newer current backend" do
+      name = :"ekv_client_failover_#{System.unique_integer([:positive])}"
+
+      {:ok, pid} =
+        EKV.start_link(
+          name: name,
+          mode: :client,
+          region: "ord",
+          region_routing: ["iad"]
+        )
+
+      on_exit(fn -> Process.exit(pid, :shutdown) end)
+
+      table = EKV.ClientRouter.table_name(name)
+      old_backend = :old_backend@invalid
+      new_backend = :new_backend@invalid
+
+      :ets.insert(table, {:current_backend, new_backend})
+      send(EKV.ClientRouter.router_name(name), {:mark_backend_failed, old_backend})
+
+      EKV.TestCluster.assert_eventually(fn ->
+        :ets.lookup(table, :current_backend) == [{:current_backend, new_backend}] and
+          match?(
+            [{{:cooldown_until, ^old_backend}, _deadline}],
+            :ets.lookup(table, {:cooldown_until, old_backend})
+          )
+      end)
     end
   end
 

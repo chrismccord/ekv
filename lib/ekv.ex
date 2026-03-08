@@ -2,12 +2,20 @@ defmodule EKV do
   @moduledoc """
   Eventually consistent durable key-value store with zero runtime dependencies.
 
-  EKV stores data on disk (survives restarts and node death) and replicates
-  across all connected Erlang nodes automatically. There is no leader for
-  eventual mode — every node serves reads and eventual writes at all times,
-  including during network partitions. CAS writes (`if_vsn:`, `consistent: true`,
-  `update/4`) require quorum and may fail when quorum is unavailable. When
-  connectivity is restored, nodes converge to the same state.
+  EKV supports two runtime roles:
+
+  - **member mode** — the default. Stores data on disk, replicates to other
+    members, serves eventual reads locally, and participates in CAS quorum.
+  - **client mode** — stateless. Uses the same public API, but forwards
+    operations to a selected member based on configured region preference.
+
+  In member mode, EKV stores data on disk (survives restarts and node death)
+  and replicates across all connected Erlang nodes automatically. There is no
+  leader for eventual mode — every member serves reads and eventual writes at
+  all times, including during network partitions. CAS writes (`if_vsn:`,
+  `consistent: true`, `update/4`) require quorum and may fail when quorum is
+  unavailable. When connectivity is restored, members converge to the same
+  state.
 
   ## Quick Start
 
@@ -42,6 +50,15 @@ defmodule EKV do
        cluster_size: 3,
        node_id: 1,
        wait_for_quorum: :timer.seconds(30)}
+
+      # Client mode — stateless EKV API that routes to members by region order
+      {EKV,
+       name: :my_kv_client,
+       mode: :client,
+       region: "ord",
+       region_routing: ["iad", "dfw", "lhr"],
+       wait_for_route: :timer.seconds(10),
+       wait_for_quorum: :timer.seconds(10)}
 
       # CAS put via lookup + if_vsn
       case EKV.lookup(:my_kv_cas, "lock/job-123") do
@@ -170,29 +187,65 @@ defmodule EKV do
 
   ## Configuration
 
-  All options are passed when starting EKV:
+  All options are passed when starting EKV.
+
+  Member mode (default):
 
       {EKV,
         name: :my_kv,
         data_dir: "/var/data/ekv",
+        region: "iad",
         shards: 8,
         tombstone_ttl: :timer.hours(24 * 7),
         gc_interval: :timer.minutes(5),
         log: :info}
 
+  Client mode:
+
+      {EKV,
+        name: :my_kv_client,
+        mode: :client,
+        region: "ord",
+        region_routing: ["iad", "dfw", "lhr"],
+        log: false}
+
   | Option | Default | Description |
   |--------|---------|-------------|
   | `:name` | *required* | Atom identifying this EKV instance. Used to register processes and as the first argument to all API functions. |
-  | `:data_dir` | *required* | Directory where SQLite database files are stored. Created automatically if it doesn't exist. Each shard gets its own file (`shard_0.db`, `shard_1.db`, etc.). |
-  | `:shards` | `8` | Number of shards. See "Choosing a Shard Count" below. |
-  | `:cluster_size` | `nil` | Logical cluster size for CAS quorum math. Required for CAS operations (`if_vsn:`, `consistent: true`, `update/4`). |
-  | `:node_id` | `nil` | Stable logical member identity used by CAS ballots. Required for CAS operations. Should remain stable for each logical cluster member. |
-  | `:wait_for_quorum` | `false` | Opt-in startup gate for CAS instances. Set to a timeout in milliseconds to block `EKV.start_link/1` until quorum is reachable on this node, or fail startup on timeout. |
-  | `:tombstone_ttl` | `604_800_000` (7 days) | How long tombstones (deleted entries) are kept before being permanently purged, in milliseconds. See "Tombstone Lifetime" below. |
-  | `:gc_interval` | `300_000` (5 min) | How often garbage collection runs, in milliseconds. GC expires TTL entries, purges old tombstones, and truncates the replication oplog. |
+  | `:mode` | `:member` | Runtime role. `:member` stores/replicates data and participates in CAS quorum. `:client` is stateless and routes operations to members. |
+  | `:region` | `"default"` | Region label for this EKV instance. Members expose it for client routing. Clients may set it for observability. |
+  | `:region_routing` | `nil` | Client mode only. Ordered list of preferred member regions, e.g. `["iad", "dfw", "lhr"]`. |
+  | `:wait_for_route` | `false` | Client mode only. Optional startup gate. Blocks `EKV.start_link/1` until the first reachable member in `:region_routing` order is selected, or fails startup on timeout. |
+  | `:data_dir` | *required in `:member`* | Directory where SQLite database files are stored. Created automatically if it doesn't exist. Each shard gets its own file (`shard_0.db`, `shard_1.db`, etc.). |
+  | `:shards` | `8` | Member mode only. Number of shards. See "Choosing a Shard Count" below. |
+  | `:cluster_size` | `nil` | Member mode only. Logical cluster size for CAS quorum math. Required for CAS operations (`if_vsn:`, `consistent: true`, `update/4`). |
+  | `:node_id` | `nil` | Member mode only. Stable logical member identity used by CAS ballots. Required for CAS operations. Should remain stable for each logical cluster member. |
+  | `:wait_for_quorum` | `false` | Optional startup gate. In member mode, blocks startup until this EKV member can reach CAS quorum. In client mode, blocks startup until the selected backend member reports CAS quorum reachable. |
+  | `:tombstone_ttl` | `604_800_000` (7 days) | Member mode only. How long tombstones (deleted entries) are kept before being permanently purged, in milliseconds. See "Tombstone Lifetime" below. |
+  | `:gc_interval` | `300_000` (5 min) | Member mode only. How often garbage collection runs, in milliseconds. GC expires TTL entries, purges old tombstones, and truncates the replication oplog. |
   | `:log` | `:info` | Logging level. `:info` logs cluster events (connects, syncs). `false` disables logging. `:verbose` logs per-shard detail. |
-  | `:partition_ttl_policy` | `:quarantine` | Policy for reconnects after downtime longer than `tombstone_ttl`. `:quarantine` blocks replication with that peer identity until operator rebuild. `:ignore` keeps legacy behavior. |
-  | `:blue_green` | `false` | Enable blue-green deployment mode. See "Blue-Green Deployment" below. |
+  | `:partition_ttl_policy` | `:quarantine` | Member mode only. Policy for reconnects after downtime longer than `tombstone_ttl`. `:quarantine` blocks replication with that peer identity until operator rebuild. `:ignore` keeps legacy behavior. |
+  | `:blue_green` | `false` | Member mode only. Enable blue-green deployment mode. See "Blue-Green Deployment" below. |
+
+  ### Client Mode
+
+  Client mode is intended for application nodes that need the EKV API but
+  should not expand the durable replica set or CAS quorum size.
+
+  - Clients do not start SQLite, replication, GC, or blue-green machinery.
+  - Eventual reads are no longer local SQLite reads; they are routed to the
+    selected member.
+  - `wait_for_route` can delay startup until a member route is selected.
+  - `wait_for_quorum` can additionally delay startup until that selected member
+    reports CAS quorum reachable.
+  - `scan/2` and `keys/2` still return Elixir streams, but are backed by paged
+    RPC to the selected member.
+  - `subscribe/2` works in client mode; client subscribers are delivered
+    cluster-wide via `:pg`.
+  - If no backend is reachable, read APIs raise and write APIs return
+    `{:error, :unavailable}`.
+  - After backend failover, eventual reads may observe an older replica view.
+    Use `consistent: true` when freshness matters.
 
   ### Startup Quorum Gate
 
@@ -394,6 +447,8 @@ defmodule EKV do
 
   alias EKV.Replica
 
+  @client_rpc_timeout_margin 1_000
+
   # ===========================================================================
   # Startup
   # ===========================================================================
@@ -416,27 +471,34 @@ defmodule EKV do
   """
   def lookup(name, key) do
     config = get_config(name)
-    shard_index = Replica.shard_index_for(key, config.num_shards)
-    {db, get_stmt} = read_conn(name, shard_index)
 
-    case EKV.Store.get_cached(db, get_stmt, key) do
-      nil ->
-        nil
+    case mode(config) do
+      :client ->
+        client_read_call!(name, :lookup, [name, key], 10_000)
 
-      {_value_binary, _ts, _origin, _expires_at, deleted_at} when is_integer(deleted_at) ->
-        nil
+      :member ->
+        shard_index = Replica.shard_index_for(key, config.num_shards)
+        {db, get_stmt} = read_conn(name, shard_index)
 
-      {value_binary, ts, origin, expires_at, nil} when is_integer(expires_at) ->
-        now = System.system_time(:nanosecond)
+        case EKV.Store.get_cached(db, get_stmt, key) do
+          nil ->
+            nil
 
-        if expires_at <= now do
-          nil
-        else
-          {:erlang.binary_to_term(value_binary), {ts, origin}}
+          {_value_binary, _ts, _origin, _expires_at, deleted_at} when is_integer(deleted_at) ->
+            nil
+
+          {value_binary, ts, origin, expires_at, nil} when is_integer(expires_at) ->
+            now = System.system_time(:nanosecond)
+
+            if expires_at <= now do
+              nil
+            else
+              {:erlang.binary_to_term(value_binary), {ts, origin}}
+            end
+
+          {value_binary, ts, origin, _expires_at, nil} ->
+            {:erlang.binary_to_term(value_binary), {ts, origin}}
         end
-
-      {value_binary, ts, origin, _expires_at, nil} ->
-        {:erlang.binary_to_term(value_binary), {ts, origin}}
     end
   end
 
@@ -505,38 +567,45 @@ defmodule EKV do
     consistent? = validate_boolean_opt!(opts, :consistent)
     _resolve_unconfirmed? = validate_boolean_opt!(opts, :resolve_unconfirmed)
     config = get_config(name)
-    shard_index = Replica.shard_index_for(key, config.num_shards)
-    timeout = Keyword.get(opts, :timeout, 10_000)
+    timeout = rpc_timeout_from_opts(opts)
 
-    case {Keyword.fetch(opts, :if_vsn), consistent?} do
-      {_, true} ->
-        if Keyword.has_key?(opts, :if_vsn) do
-          raise ArgumentError, "EKV: :consistent and :if_vsn are mutually exclusive"
+    case mode(config) do
+      :client ->
+        client_write_call(name, :put, [name, key, value, opts], timeout)
+
+      :member ->
+        shard_index = Replica.shard_index_for(key, config.num_shards)
+
+        case {Keyword.fetch(opts, :if_vsn), consistent?} do
+          {_, true} ->
+            if Keyword.has_key?(opts, :if_vsn) do
+              raise ArgumentError, "EKV: :consistent and :if_vsn are mutually exclusive"
+            end
+
+            validate_cas_config!(config)
+
+            update_opts =
+              Keyword.take(opts, [:ttl, :retries, :backoff, :timeout, :resolve_unconfirmed])
+
+            case update(name, key, fn _ -> value end, update_opts) do
+              {:ok, _new_value, vsn} -> {:ok, vsn}
+              error -> error
+            end
+
+          {{:ok, expected_vsn}, false} ->
+            validate_cas_config!(config)
+            value_binary = :erlang.term_to_binary(value)
+
+            GenServer.call(
+              Replica.shard_name(name, shard_index),
+              {:cas_put, key, value_binary, expected_vsn, opts},
+              timeout
+            )
+
+          {:error, false} ->
+            value_binary = :erlang.term_to_binary(value)
+            GenServer.call(Replica.shard_name(name, shard_index), {:put, key, value_binary, opts})
         end
-
-        validate_cas_config!(config)
-
-        update_opts =
-          Keyword.take(opts, [:ttl, :retries, :backoff, :timeout, :resolve_unconfirmed])
-
-        case update(name, key, fn _ -> value end, update_opts) do
-          {:ok, _new_value, vsn} -> {:ok, vsn}
-          error -> error
-        end
-
-      {{:ok, expected_vsn}, false} ->
-        validate_cas_config!(config)
-        value_binary = :erlang.term_to_binary(value)
-
-        GenServer.call(
-          Replica.shard_name(name, shard_index),
-          {:cas_put, key, value_binary, expected_vsn, opts},
-          timeout
-        )
-
-      {:error, false} ->
-        value_binary = :erlang.term_to_binary(value)
-        GenServer.call(Replica.shard_name(name, shard_index), {:put, key, value_binary, opts})
     end
   end
 
@@ -565,47 +634,52 @@ defmodule EKV do
     validate_backoff_opt!(opts)
     validate_timeout_opt!(opts)
     consistent? = validate_boolean_opt!(opts, :consistent)
+    config = get_config(name)
+    timeout = rpc_timeout_from_opts(opts)
 
-    if consistent? do
-      config = get_config(name)
-      validate_cas_config!(config)
-      shard_index = Replica.shard_index_for(key, config.num_shards)
-      timeout = Keyword.get(opts, :timeout, 10_000)
-      cas_opts = Keyword.take(opts, [:retries, :backoff])
+    case mode(config) do
+      :client ->
+        client_read_call!(name, :get, [name, key, opts], timeout)
 
-      case GenServer.call(
-             Replica.shard_name(name, shard_index),
-             {:cas_read, key, cas_opts},
-             timeout
-           ) do
-        {:ok, value} -> value
-        {:ok, value, _vsn} -> value
-        {:error, reason} -> raise "EKV: consistent read failed: #{inspect(reason)}"
-      end
-    else
-      config = get_config(name)
-      shard_index = Replica.shard_index_for(key, config.num_shards)
-      {db, get_stmt} = read_conn(name, shard_index)
+      :member ->
+        if consistent? do
+          validate_cas_config!(config)
+          shard_index = Replica.shard_index_for(key, config.num_shards)
+          cas_opts = Keyword.take(opts, [:retries, :backoff])
 
-      case EKV.Store.get_cached(db, get_stmt, key) do
-        nil ->
-          nil
-
-        {_value_binary, _ts, _origin, _expires_at, deleted_at} when is_integer(deleted_at) ->
-          nil
-
-        {value_binary, _ts, _origin, expires_at, nil} when is_integer(expires_at) ->
-          now = System.system_time(:nanosecond)
-
-          if expires_at <= now do
-            nil
-          else
-            :erlang.binary_to_term(value_binary)
+          case GenServer.call(
+                 Replica.shard_name(name, shard_index),
+                 {:cas_read, key, cas_opts},
+                 timeout
+               ) do
+            {:ok, value} -> value
+            {:ok, value, _vsn} -> value
+            {:error, reason} -> raise "EKV: consistent read failed: #{inspect(reason)}"
           end
+        else
+          shard_index = Replica.shard_index_for(key, config.num_shards)
+          {db, get_stmt} = read_conn(name, shard_index)
 
-        {value_binary, _ts, _origin, _expires_at, nil} ->
-          :erlang.binary_to_term(value_binary)
-      end
+          case EKV.Store.get_cached(db, get_stmt, key) do
+            nil ->
+              nil
+
+            {_value_binary, _ts, _origin, _expires_at, deleted_at} when is_integer(deleted_at) ->
+              nil
+
+            {value_binary, _ts, _origin, expires_at, nil} when is_integer(expires_at) ->
+              now = System.system_time(:nanosecond)
+
+              if expires_at <= now do
+                nil
+              else
+                :erlang.binary_to_term(value_binary)
+              end
+
+            {value_binary, _ts, _origin, _expires_at, nil} ->
+              :erlang.binary_to_term(value_binary)
+          end
+        end
     end
   end
 
@@ -648,21 +722,28 @@ defmodule EKV do
     validate_timeout_opt!(opts)
     _resolve_unconfirmed? = validate_boolean_opt!(opts, :resolve_unconfirmed)
     config = get_config(name)
-    shard_index = Replica.shard_index_for(key, config.num_shards)
-    timeout = Keyword.get(opts, :timeout, 10_000)
+    timeout = rpc_timeout_from_opts(opts)
 
-    case Keyword.fetch(opts, :if_vsn) do
-      {:ok, expected_vsn} ->
-        validate_cas_config!(config)
+    case mode(config) do
+      :client ->
+        client_write_call(name, :delete, [name, key, opts], timeout)
 
-        GenServer.call(
-          Replica.shard_name(name, shard_index),
-          {:cas_delete, key, expected_vsn, opts},
-          timeout
-        )
+      :member ->
+        shard_index = Replica.shard_index_for(key, config.num_shards)
 
-      :error ->
-        GenServer.call(Replica.shard_name(name, shard_index), {:delete, key})
+        case Keyword.fetch(opts, :if_vsn) do
+          {:ok, expected_vsn} ->
+            validate_cas_config!(config)
+
+            GenServer.call(
+              Replica.shard_name(name, shard_index),
+              {:cas_delete, key, expected_vsn, opts},
+              timeout
+            )
+
+          :error ->
+            GenServer.call(Replica.shard_name(name, shard_index), {:delete, key})
+        end
     end
   end
 
@@ -698,6 +779,10 @@ defmodule EKV do
     one internal barrier read to resolve current state and returns
     `{:ok, new_value, vsn}`/`{:error, :conflict}` when possible, or
     `{:error, :unavailable}` if that resolution cannot complete.
+
+  In client mode, `fun` is executed on the selected member, so it must be a
+  serializable function that is available on member nodes (for example a named
+  function capture like `&MyModule.bump/1`).
   """
   def update(name, key, fun, opts \\ []) when is_function(fun, 1) do
     opts = Keyword.validate!(opts, [:ttl, :retries, :backoff, :timeout, :resolve_unconfirmed])
@@ -707,15 +792,22 @@ defmodule EKV do
     validate_timeout_opt!(opts)
     _resolve_unconfirmed? = validate_boolean_opt!(opts, :resolve_unconfirmed)
     config = get_config(name)
-    validate_cas_config!(config)
-    shard_index = Replica.shard_index_for(key, config.num_shards)
-    timeout = Keyword.get(opts, :timeout, 10_000)
+    timeout = rpc_timeout_from_opts(opts)
 
-    GenServer.call(
-      Replica.shard_name(name, shard_index),
-      {:update, key, fun, opts},
-      timeout
-    )
+    case mode(config) do
+      :client ->
+        client_write_call(name, :update, [name, key, fun, opts], timeout)
+
+      :member ->
+        validate_cas_config!(config)
+        shard_index = Replica.shard_index_for(key, config.num_shards)
+
+        GenServer.call(
+          Replica.shard_name(name, shard_index),
+          {:update, key, fun, opts},
+          timeout
+        )
+    end
   end
 
   @scan_chunk_size 500
@@ -760,55 +852,20 @@ defmodule EKV do
 
   Results are sorted by key within each shard but not globally sorted
   across shards.
+
+  In client mode, the returned stream is still local to the caller, but each
+  chunk is fetched from the selected member via paged RPC.
   """
   def scan(name, prefix) do
     config = get_config(name)
-    prefix_end = EKV.Store.next_binary_prefix(prefix)
 
-    shard_streams =
-      for shard <- 0..(config.num_shards - 1) do
-        Stream.resource(
-          fn -> {prefix, :first} end,
-          fn
-            :done ->
-              {:halt, :done}
+    case mode(config) do
+      :client ->
+        remote_page_stream(name, prefix, :scan_page)
 
-            {cursor, phase} ->
-              now = System.system_time(:nanosecond)
-              {db, _} = read_conn(name, shard)
-
-              {sql, args} =
-                case phase do
-                  :first ->
-                    {@scan_first_chunk_sql, [cursor, prefix_end, now, @scan_chunk_size]}
-
-                  :next ->
-                    {@scan_next_chunk_sql, [cursor, prefix_end, now, @scan_chunk_size]}
-                end
-
-              {:ok, rows} = EKV.Sqlite3.fetch_all(db, sql, args)
-
-              if rows == [] do
-                {:halt, :done}
-              else
-                items =
-                  Enum.map(rows, fn [key, value_binary, ts, origin_str] ->
-                    {key, :erlang.binary_to_term(value_binary), {ts, String.to_atom(origin_str)}}
-                  end)
-
-                if length(rows) < @scan_chunk_size do
-                  {items, :done}
-                else
-                  [last_key | _] = List.last(rows)
-                  {items, {last_key, :next}}
-                end
-              end
-          end,
-          fn _ -> :ok end
-        )
-      end
-
-    Stream.concat(shard_streams)
+      :member ->
+        member_scan_stream(name, prefix)
+    end
   end
 
   @doc """
@@ -823,55 +880,58 @@ defmodule EKV do
 
   Results are sorted by key within each shard but not globally sorted across
   shards.
+
+  In client mode, the returned stream is still local to the caller, but each
+  chunk is fetched from the selected member via paged RPC.
   """
   def keys(name, prefix) do
     config = get_config(name)
-    prefix_end = EKV.Store.next_binary_prefix(prefix)
 
-    shard_streams =
-      for shard <- 0..(config.num_shards - 1) do
-        Stream.resource(
-          fn -> {prefix, :first} end,
-          fn
-            :done ->
-              {:halt, :done}
+    case mode(config) do
+      :client ->
+        remote_page_stream(name, prefix, :keys_page)
 
-            {cursor, phase} ->
-              now = System.system_time(:nanosecond)
-              {db, _} = read_conn(name, shard)
+      :member ->
+        member_keys_stream(name, prefix)
+    end
+  end
 
-              {sql, args} =
-                case phase do
-                  :first ->
-                    {@keys_first_chunk_sql, [cursor, prefix_end, now, @scan_chunk_size]}
+  # Invoked by a client-originated paged scan RPC; runs on the selected member node.
+  @doc false
+  def scan_page(name, prefix, cursor, limit)
+      when is_binary(prefix) and is_integer(limit) and limit >= 1 do
+    config = get_config(name)
+    ensure_member_mode!(config, :scan_page)
 
-                  :next ->
-                    {@keys_next_chunk_sql, [cursor, prefix_end, now, @scan_chunk_size]}
-                end
+    page_results(
+      name,
+      prefix,
+      cursor,
+      limit,
+      config.num_shards,
+      @scan_first_chunk_sql,
+      @scan_next_chunk_sql,
+      &decode_scan_row/1
+    )
+  end
 
-              {:ok, rows} = EKV.Sqlite3.fetch_all(db, sql, args)
+  # Invoked by a client-originated paged keys RPC; runs on the selected member node.
+  @doc false
+  def keys_page(name, prefix, cursor, limit)
+      when is_binary(prefix) and is_integer(limit) and limit >= 1 do
+    config = get_config(name)
+    ensure_member_mode!(config, :keys_page)
 
-              if rows == [] do
-                {:halt, :done}
-              else
-                items =
-                  Enum.map(rows, fn [key, ts, origin_str] ->
-                    {key, {ts, String.to_atom(origin_str)}}
-                  end)
-
-                if length(rows) < @scan_chunk_size do
-                  {items, :done}
-                else
-                  [last_key | _] = List.last(rows)
-                  {items, {last_key, :next}}
-                end
-              end
-          end,
-          fn _ -> :ok end
-        )
-      end
-
-    Stream.concat(shard_streams)
+    page_results(
+      name,
+      prefix,
+      cursor,
+      limit,
+      config.num_shards,
+      @keys_first_chunk_sql,
+      @keys_next_chunk_sql,
+      &decode_keys_row/1
+    )
   end
 
   # ===========================================================================
@@ -910,17 +970,26 @@ defmodule EKV do
 
   Delivery is best-effort. Events may be lost if a dispatcher process
   crashes between receiving the dispatch and sending to subscribers.
+
+  In client mode, subscriptions are distributed via `:pg`, so member writes can
+  deliver events directly to client subscribers without backend affinity.
   """
   def subscribe(name, prefix \\ "") do
     config = get_config(name)
 
-    case Registry.register(config.registry, prefix, nil) do
-      {:ok, _} ->
-        :atomics.add(config.sub_count, 1, 1)
-        :ok
+    case mode(config) do
+      :client ->
+        EKV.ClientSubscriptions.subscribe(name, prefix)
 
-      {:error, {:already_registered, _}} ->
-        :ok
+      :member ->
+        case Registry.register(config.registry, prefix, nil) do
+          {:ok, _} ->
+            :atomics.add(config.sub_count, 1, 1)
+            :ok
+
+          {:error, {:already_registered, _}} ->
+            :ok
+        end
     end
   end
 
@@ -929,7 +998,12 @@ defmodule EKV do
   """
   def unsubscribe(name, prefix \\ "") do
     config = get_config(name)
-    Registry.unregister(config.registry, prefix)
+
+    case mode(config) do
+      :client -> EKV.ClientSubscriptions.unsubscribe(name, prefix)
+      :member -> Registry.unregister(config.registry, prefix)
+    end
+
     :ok
   end
 
@@ -938,9 +1012,12 @@ defmodule EKV do
 
   Uses SQLite's online backup API — safe to call while EKV is running.
   Returns `:ok` on success or `{:error, reason}` on failure.
+
+  Member mode only.
   """
   def backup(name, dest_dir) do
     config = get_config(name)
+    ensure_member_mode!(config, :backup)
     File.mkdir_p!(dest_dir)
 
     0..(config.num_shards - 1)
@@ -958,33 +1035,57 @@ defmodule EKV do
   @doc """
   Return cluster status information.
 
-  Returns a map with node_id, cluster_size, shards, data_dir, and connected peers.
+  Member mode returns node_id, cluster_size, shards, data_dir, connected peers,
+  and region metadata.
+
+  Client mode returns region metadata, routing preferences, and the currently
+  selected backend (if any).
   """
   def info(name) do
     config = get_config(name)
-    shard_state = :sys.get_state(Replica.shard_name(name, 0))
 
-    peers =
-      for {node, _pid} <- shard_state.remote_shards do
-        %{node: node, node_id: Map.get(shard_state.peer_node_ids, node)}
-      end
+    case mode(config) do
+      :client ->
+        %{
+          name: name,
+          mode: :client,
+          region: config.region,
+          region_routing: config.region_routing,
+          current_backend: EKV.ClientRouter.current_backend(name)
+        }
 
-    %{
-      name: name,
-      node_id: config.node_id,
-      cluster_size: config.cluster_size,
-      shards: config.num_shards,
-      data_dir: config.data_dir,
-      connected_peers: peers
-    }
+      :member ->
+        shard_state = :sys.get_state(Replica.shard_name(name, 0))
+
+        peers =
+          for {node, _pid} <- shard_state.remote_shards do
+            %{node: node, node_id: Map.get(shard_state.peer_node_ids, node)}
+          end
+
+        %{
+          name: name,
+          mode: :member,
+          region: config.region,
+          node_id: config.node_id,
+          cluster_size: config.cluster_size,
+          shards: config.num_shards,
+          data_dir: config.data_dir,
+          connected_peers: peers
+        }
+    end
   end
 
   @doc """
-  Block until this node can reach CAS quorum, or return an error on timeout.
+  Block until CAS quorum is reachable, or return an error on timeout.
 
-  This checks the same member-reachability predicate that CAS writes use for
-  early `:no_quorum` rejection. It is primarily useful for startup orchestration
-  and other cases where callers want a bounded wait before issuing CAS traffic.
+  In member mode, this checks the same member-reachability predicate that CAS
+  writes use for early `:no_quorum` rejection.
+
+  In client mode, this first waits for a backend route and then asks the
+  selected member to perform the quorum readiness check.
+
+  It is primarily useful for startup orchestration and other cases where callers
+  want a bounded wait before issuing CAS traffic.
 
   Returns:
 
@@ -993,17 +1094,23 @@ defmodule EKV do
   - `{:error, :cluster_overflow}` when more distinct `node_id`s are visible
     than `cluster_size` allows
 
-  Raises `ArgumentError` if this EKV instance is not configured for CAS.
+  Raises `ArgumentError` if the target member is not configured for CAS.
   """
   def await_quorum(name, timeout_ms) when is_integer(timeout_ms) and timeout_ms >= 0 do
     config = get_config(name)
 
-    if is_nil(config.cluster_size) do
-      raise ArgumentError,
-            "EKV: await_quorum/2 requires :cluster_size and :node_id to be configured"
-    else
-      call_timeout = timeout_ms + 1_000
-      GenServer.call(Replica.shard_name(name, 0), {:await_quorum, timeout_ms}, call_timeout)
+    case mode(config) do
+      :client ->
+        client_await_quorum(name, timeout_ms)
+
+      :member ->
+        if is_nil(config.cluster_size) do
+          raise ArgumentError,
+                "EKV: await_quorum/2 requires :cluster_size and :node_id to be configured"
+        else
+          call_timeout = timeout_ms + 1_000
+          GenServer.call(Replica.shard_name(name, 0), {:await_quorum, timeout_ms}, call_timeout)
+        end
     end
   end
 
@@ -1014,6 +1121,48 @@ defmodule EKV do
 
   def get_config(name) do
     :persistent_term.get({EKV, name})
+  end
+
+  # Invoked by a client-originated RPC; runs on the selected member node.
+  @doc false
+  def client_invoke(fun, args) when is_atom(fun) and is_list(args) do
+    try do
+      {:ok, apply(__MODULE__, fun, args)}
+    rescue
+      exception -> {:raise, exception}
+    catch
+      :exit, reason -> {:exit, reason}
+    end
+  end
+
+  # Runs on the client node; issues the cross-node erpc call to a member.
+  @doc false
+  def remote_invoke(node, fun, args, timeout) do
+    try do
+      case :erpc.call(node, __MODULE__, :client_invoke, [fun, args], timeout) do
+        {:ok, result} -> {:ok, result}
+        {:raise, exception} -> {:raise, exception}
+        {:exit, reason} -> {:exit, reason}
+      end
+    catch
+      :exit, _reason -> {:error, :unavailable}
+    end
+  end
+
+  @doc false
+  def client_sub_group(name, prefix), do: {:ekv_sub, name, prefix}
+
+  @doc false
+  def client_any_sub_group(name), do: {:ekv_sub_any, name}
+
+  @doc false
+  def client_subscribers?(name) do
+    case :pg.get_members(client_any_sub_group(name)) do
+      [] -> false
+      members when is_list(members) -> true
+    end
+  rescue
+    _ -> false
   end
 
   defp validate_cas_config!(%{cluster_size: nil}) do
@@ -1090,6 +1239,369 @@ defmodule EKV do
         raise ArgumentError,
               "EKV: :timeout must be a positive integer or :infinity, got: #{inspect(other)}"
     end
+  end
+
+  defp mode(config), do: Map.get(config, :mode, :member)
+
+  defp ensure_member_mode!(config, fun_name) do
+    if mode(config) == :client do
+      raise ArgumentError,
+            "EKV: #{fun_name} is only available on :member instances"
+    end
+  end
+
+  defp rpc_timeout_from_opts(opts, default \\ 10_000) do
+    case Keyword.get(opts, :timeout, default) do
+      :infinity -> :infinity
+      timeout when is_integer(timeout) -> timeout + @client_rpc_timeout_margin
+    end
+  end
+
+  # Runs on the client node; wraps a routed read and raises on transport failure.
+  defp client_read_call!(name, fun, args, timeout) do
+    case client_rpc(name, fun, args, timeout, true) do
+      {:ok, result} ->
+        result
+
+      {:raise, exception} ->
+        raise exception
+
+      {:exit, reason} ->
+        raise "EKV: client call exited: #{inspect(reason)}"
+
+      {:error, :unavailable} ->
+        raise "EKV: client backend unavailable"
+    end
+  end
+
+  # Runs on the client node; wraps a routed write and returns {:error, :unavailable} on transport failure.
+  defp client_write_call(name, fun, args, timeout) do
+    case client_rpc(name, fun, args, timeout, false) do
+      {:ok, result} -> result
+      {:raise, exception} -> raise exception
+      {:exit, reason} -> raise "EKV: client call exited: #{inspect(reason)}"
+      {:error, :unavailable} -> {:error, :unavailable}
+    end
+  end
+
+  # Runs on the client node; selects a member backend, performs the RPC, and optionally retries safe calls.
+  defp client_rpc(name, fun, args, timeout, retryable?) do
+    with {:ok, backend} <- EKV.ClientRouter.backend(name) do
+      case remote_invoke(backend, fun, args, timeout) do
+        {:ok, _result} = ok ->
+          ok
+
+        {:raise, _exception} = raised ->
+          raised
+
+        {:exit, _reason} = exited ->
+          exited
+
+        {:error, :unavailable} ->
+          EKV.ClientRouter.mark_backend_failed(name, backend)
+
+          if retryable? do
+            retry_client_rpc(name, backend, fun, args, timeout)
+          else
+            {:error, :unavailable}
+          end
+      end
+    else
+      {:error, :unavailable} -> {:error, :unavailable}
+    end
+  end
+
+  # Runs on the client node; retries a failed safe RPC against the next selected member.
+  defp retry_client_rpc(name, failed_backend, fun, args, timeout) do
+    with {:ok, backend} <- EKV.ClientRouter.backend(name),
+         false <- backend == failed_backend,
+         result <- remote_invoke(backend, fun, args, timeout) do
+      result
+    else
+      _ -> {:error, :unavailable}
+    end
+  end
+
+  # Runs on the client node; waits for a backend route and then asks that member to perform quorum readiness.
+  defp client_await_quorum(name, timeout_ms) do
+    started_at = System.monotonic_time(:millisecond)
+
+    with {:ok, backend} <- EKV.ClientRouter.await_backend(name, timeout_ms) do
+      elapsed = System.monotonic_time(:millisecond) - started_at
+      remaining = max(timeout_ms - elapsed, 0)
+
+      case remote_invoke(
+             backend,
+             :await_quorum,
+             [name, remaining],
+             remaining + @client_rpc_timeout_margin
+           ) do
+        {:ok, result} ->
+          result
+
+        {:raise, exception} ->
+          raise exception
+
+        {:exit, _reason} ->
+          {:error, :unavailable}
+
+        {:error, :unavailable} ->
+          {:error, :unavailable}
+      end
+    end
+  end
+
+  # Runs on a member node; builds the local shard-backed scan stream.
+  defp member_scan_stream(name, prefix) do
+    prefix_end = EKV.Store.next_binary_prefix(prefix)
+    config = get_config(name)
+
+    shard_streams =
+      for shard <- 0..(config.num_shards - 1) do
+        Stream.resource(
+          fn -> {prefix, :first} end,
+          fn
+            :done ->
+              {:halt, :done}
+
+            {cursor, phase} ->
+              {items, next_cursor} =
+                page_shard_rows(
+                  name,
+                  shard,
+                  prefix,
+                  prefix_end,
+                  cursor,
+                  phase,
+                  @scan_chunk_size,
+                  @scan_first_chunk_sql,
+                  @scan_next_chunk_sql,
+                  &decode_scan_row/1
+                )
+
+              next_state =
+                case next_cursor do
+                  {^shard, next_phase, next_key_cursor} -> {next_key_cursor, next_phase}
+                  _ -> :done
+                end
+
+              if items == [] do
+                {:halt, :done}
+              else
+                {items, next_state}
+              end
+          end,
+          fn _ -> :ok end
+        )
+      end
+
+    Stream.concat(shard_streams)
+  end
+
+  # Runs on a member node; builds the local shard-backed keys stream.
+  defp member_keys_stream(name, prefix) do
+    prefix_end = EKV.Store.next_binary_prefix(prefix)
+    config = get_config(name)
+
+    shard_streams =
+      for shard <- 0..(config.num_shards - 1) do
+        Stream.resource(
+          fn -> {prefix, :first} end,
+          fn
+            :done ->
+              {:halt, :done}
+
+            {cursor, phase} ->
+              {items, next_cursor} =
+                page_shard_rows(
+                  name,
+                  shard,
+                  prefix,
+                  prefix_end,
+                  cursor,
+                  phase,
+                  @scan_chunk_size,
+                  @keys_first_chunk_sql,
+                  @keys_next_chunk_sql,
+                  &decode_keys_row/1
+                )
+
+              next_state =
+                case next_cursor do
+                  {^shard, next_phase, next_key_cursor} -> {next_key_cursor, next_phase}
+                  _ -> :done
+                end
+
+              if items == [] do
+                {:halt, :done}
+              else
+                {items, next_state}
+              end
+          end,
+          fn _ -> :ok end
+        )
+      end
+
+    Stream.concat(shard_streams)
+  end
+
+  defp remote_page_stream(name, prefix, page_fun) do
+    # Runs on the client node; each stream step fetches one page from a member via RPC.
+    Stream.resource(
+      fn -> nil end,
+      fn
+        :done ->
+          {:halt, :done}
+
+        cursor ->
+          case client_rpc(name, page_fun, [name, prefix, cursor, @scan_chunk_size], 10_000, true) do
+            {:ok, {items, :done}} -> {items, :done}
+            {:ok, {items, next_cursor}} -> {items, next_cursor}
+            {:raise, exception} -> raise exception
+            {:exit, reason} -> raise "EKV: client call exited: #{inspect(reason)}"
+            {:error, :unavailable} -> raise "EKV: client backend unavailable"
+          end
+      end,
+      fn _ -> :ok end
+    )
+  end
+
+  # Runs on a member node; serves one paged scan/keys RPC across shards from an opaque cursor.
+  defp page_results(
+         name,
+         prefix,
+         cursor,
+         limit,
+         num_shards,
+         first_sql,
+         next_sql,
+         decoder
+       ) do
+    prefix_end = EKV.Store.next_binary_prefix(prefix)
+
+    page_cursor(
+      name,
+      prefix,
+      prefix_end,
+      cursor || {0, :first, prefix},
+      limit,
+      num_shards,
+      first_sql,
+      next_sql,
+      decoder
+    )
+  end
+
+  # Runs on a member node; stops once the cursor has advanced past the final shard.
+  defp page_cursor(
+         _name,
+         _prefix,
+         _prefix_end,
+         {shard, _phase, _cursor},
+         _limit,
+         num_shards,
+         _first_sql,
+         _next_sql,
+         _decoder
+       )
+       when shard >= num_shards do
+    {[], :done}
+  end
+
+  # Runs on a member node; advances shard-by-shard until it finds a non-empty page or reaches the end.
+  defp page_cursor(
+         name,
+         prefix,
+         prefix_end,
+         {shard, phase, key_cursor},
+         limit,
+         num_shards,
+         first_sql,
+         next_sql,
+         decoder
+       ) do
+    {items, next_cursor} =
+      page_shard_rows(
+        name,
+        shard,
+        prefix,
+        prefix_end,
+        key_cursor,
+        phase,
+        limit,
+        first_sql,
+        next_sql,
+        decoder
+      )
+
+    cond do
+      items != [] ->
+        {items, next_cursor}
+
+      shard + 1 >= num_shards ->
+        {[], :done}
+
+      true ->
+        page_cursor(
+          name,
+          prefix,
+          prefix_end,
+          {shard + 1, :first, prefix},
+          limit,
+          num_shards,
+          first_sql,
+          next_sql,
+          decoder
+        )
+    end
+  end
+
+  # Runs on a member node; reads one page from a single shard and returns the next shard/key cursor.
+  defp page_shard_rows(
+         name,
+         shard,
+         prefix,
+         prefix_end,
+         cursor,
+         phase,
+         limit,
+         first_sql,
+         next_sql,
+         decoder
+       ) do
+    now = System.system_time(:nanosecond)
+    {db, _} = read_conn(name, shard)
+
+    {sql, args} =
+      case phase do
+        :first -> {first_sql, [cursor, prefix_end, now, limit]}
+        :next -> {next_sql, [cursor, prefix_end, now, limit]}
+      end
+
+    {:ok, rows} = EKV.Sqlite3.fetch_all(db, sql, args)
+
+    if rows == [] do
+      {[], {shard + 1, :first, prefix}}
+    else
+      {items, {row_count, last_key}} =
+        Enum.map_reduce(rows, {0, nil}, fn [key | _] = row, {count, _last_key} ->
+          {decoder.(row), {count + 1, key}}
+        end)
+
+      if row_count < limit do
+        {items, {shard + 1, :first, prefix}}
+      else
+        {items, {shard, :next, last_key}}
+      end
+    end
+  end
+
+  defp decode_scan_row([key, value_binary, ts, origin_str]) do
+    {key, :erlang.binary_to_term(value_binary), {ts, String.to_atom(origin_str)}}
+  end
+
+  defp decode_keys_row([key, ts, origin_str]) do
+    {key, {ts, String.to_atom(origin_str)}}
   end
 
   defp read_conn(name, shard_index) do

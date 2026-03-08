@@ -2,7 +2,7 @@
 
 Eventually consistent durable KV store for Elixir with zero runtime dependencies.
 
-Data survives node restarts, node death, and network partitions. Replication is peer-to-peer across all connected Erlang nodes using delta sync via per-shard oplogs. Storage is backed by SQLite (vendored, compiled as a NIF) with zero runtime dependencies.
+Data survives node restarts, node death, and network partitions. Member nodes replicate peer-to-peer across all connected Erlang nodes using delta sync via per-shard oplogs. Storage is backed by SQLite (vendored, compiled as a NIF) with zero runtime dependencies.
 
 ## Installation
 
@@ -23,6 +23,20 @@ Add EKV to your supervision tree:
 ```elixir
 children = [
   {EKV, name: :my_kv, data_dir: "data/ekv/my_kv"}
+]
+```
+
+Or start a stateless client that routes to members by region preference:
+
+```elixir
+children = [
+  {EKV,
+   name: :my_kv_client,
+   mode: :client,
+   region: "ord",
+   region_routing: ["iad", "dfw", "lhr"],
+   wait_for_route: :timer.seconds(10),
+   wait_for_quorum: :timer.seconds(10)}
 ]
 ```
 
@@ -80,12 +94,30 @@ Values can be any Erlang term (stored via `:erlang.term_to_binary/1`). Keys are 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `:name` | *required* | Atom identifying this EKV instance |
-| `:data_dir` | *required* | Directory for SQLite database files |
-| `:shards` | `8` | Number of shards (each is an independent GenServer + SQLite db) |
-| `:tombstone_ttl` | `604_800_000` (7 days) | How long tombstones are retained in milliseconds |
-| `:gc_interval` | `300_000` (5 min) | GC tick interval in milliseconds |
+| `:mode` | `:member` | `:member` stores/replicates data and participates in CAS quorum. `:client` is stateless and routes requests to members. |
+| `:region` | `"default"` | Region label exposed by members and used by clients for routing preference. |
+| `:region_routing` | `nil` | Client mode only. Ordered list of preferred member regions. |
+| `:wait_for_route` | `false` | Client mode only. Optional startup gate. Blocks startup until the first reachable member in `:region_routing` order is selected. |
+| `:data_dir` | *required in `:member`* | Directory for SQLite database files |
+| `:shards` | `8` | Member mode only. Number of shards (each is an independent GenServer + SQLite db) |
+| `:tombstone_ttl` | `604_800_000` (7 days) | Member mode only. How long tombstones are retained in milliseconds |
+| `:gc_interval` | `300_000` (5 min) | Member mode only. GC tick interval in milliseconds |
+| `:wait_for_quorum` | `false` | Optional startup gate. In member mode, waits for this EKV member to reach CAS quorum. In client mode, waits for the selected backend member to report CAS quorum reachable. |
 | `:log` | `:info` | `:info`, `false` (silent), or `:verbose` |
-| `:partition_ttl_policy` | `:quarantine` | Policy when a peer identity reconnects after being disconnected longer than `tombstone_ttl`. `:quarantine` blocks replication with that peer until operator intervention. `:ignore` keeps legacy behavior. |
+| `:partition_ttl_policy` | `:quarantine` | Member mode only. Policy when a peer identity reconnects after being disconnected longer than `tombstone_ttl`. `:quarantine` blocks replication with that peer until operator intervention. `:ignore` keeps legacy behavior. |
+
+### Client mode
+
+Client mode keeps the EKV API but does not start SQLite, replication, GC, or
+blue-green machinery on that node.
+
+- Eventual reads become remote reads against the selected member.
+- `wait_for_route` can hold startup until a backend route is selected.
+- `wait_for_quorum` can additionally hold startup until that backend reports CAS quorum reachable.
+- `scan/2` and `keys/2` still return Elixir streams, but are backed by paged RPC.
+- `subscribe/2` works in client mode; client subscribers are delivered cluster-wide.
+- After backend failover, eventual reads may observe an older replica view.
+  Use `consistent: true` when freshness matters.
 
 ## How It Works
 

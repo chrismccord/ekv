@@ -14,29 +14,42 @@ defmodule EKV.Replica do
   keys that need stronger guarantees, an opt-in Compare-And-Swap (CAS) mode
   provides linearizable read-modify-write via CASPaxos consensus.
 
-  Peer discovery is fully self-contained: EKV uses :net_kernel.monitor_nodes/1
-  and Node.list/0 directly. It has no external topology dependency. Zero
+  Member-to-member replica discovery is fully self-contained: shards use
+  :net_kernel.monitor_nodes/1 and Node.list/0 directly for peer handshakes and
+  sync. Client routing is separate — client EKV instances discover ready
+  members through :pg region groups published by EKV.MemberPresence. Zero
   runtime deps. SQLite is vendored as a C NIF (c_src/sqlite3.c amalgamation).
 
 
   ## Supervision Tree
 
-      EKV.Supervisor (rest_for_one)
-      ├── EKV.SubTracker         atomics subscriber count + process monitors
-      ├── Registry               keys: :duplicate, listeners: [sub_tracker]
-      ├── EKV.SubDispatcher.Supervisor (one_for_one)
-      │   ├── EKV.SubDispatcher 0   async event fan-out per shard
-      │   ├── EKV.SubDispatcher 1
-      │   └── ...
-      ├── EKV.Replica.Supervisor (one_for_one)
-      │   ├── EKV.Replica 0     shard GenServer (writes + replication + SQLite)
-      │   ├── EKV.Replica 1
-      │   └── ...               N shards (default 8)
-      └── EKV.GC                periodic timer, sends :gc to each shard
+      Member mode:
+        EKV.Supervisor (rest_for_one)
+        ├── EKV.BlueGreenMarker?    marker cleanup / handoff bookkeeping
+        ├── EKV.SubTracker          atomics subscriber count + process monitors
+        ├── Registry                keys: :duplicate, listeners: [sub_tracker]
+        ├── EKV.SubDispatcher.Supervisor (one_for_one)
+        │   ├── EKV.SubDispatcher 0   async event fan-out per shard
+        │   ├── EKV.SubDispatcher 1
+        │   └── ...
+        ├── EKV.Replica.Supervisor (one_for_one)
+        │   ├── EKV.Replica 0     shard GenServer (writes + replication + SQLite)
+        │   ├── EKV.Replica 1
+        │   └── ...               N shards (default 8)
+        ├── EKV.QuorumGate?       optional startup barrier for CAS quorum
+        ├── EKV.MemberPresence    publishes ready member in :pg region group
+        └── EKV.GC                periodic timer, sends :gc to each shard
+
+      Client mode:
+        EKV.Supervisor (rest_for_one)
+        ├── EKV.ClientRouter         region-ordered backend selection
+        ├── EKV.RouteGate?           optional startup barrier for route selection
+        ├── EKV.QuorumGate?          optional startup barrier via selected member
+        └── EKV.ClientSubscriptions  local subscribe/unsubscribe bookkeeping
 
   rest_for_one: SubTracker crash restarts everything. Registry crash
   restarts Dispatchers + Replicas. Single Replica crash → only that shard
-  restarts. GC is downstream of Replicas.
+  restarts. QuorumGate, MemberPresence, and GC are downstream of Replicas.
 
 
   ## Storage: SQLite Only
@@ -441,9 +454,9 @@ defmodule EKV.Replica do
   auto-retry handles this transparently.
 
 
-  ## Peer Discovery and Tracking
+  ## Member Peer Discovery and Tracking
 
-  EKV manages its own peer mesh independently:
+  Replica shards manage their own member peer mesh independently:
 
       init/1:
         :net_kernel.monitor_nodes(true)
@@ -481,7 +494,7 @@ defmodule EKV.Replica do
 
   ## Peer Sync Protocol
 
-  When two nodes discover each other (init, nodeup), they exchange a
+  When two member nodes discover each other (init, nodeup), they exchange a
   handshake per shard. The handshake determines whether to send a delta
   (oplog slice) or a full state snapshot.
 
@@ -1176,6 +1189,7 @@ defmodule EKV.Replica do
   @impl true
   def handle_info({:ekv_handoff_request, ref, new_node, caller_pid}, state) do
     EKV.BlueGreenMarker.mark_handoff_performed(state.name)
+    EKV.MemberPresence.leave(state.name)
 
     # 1. Drain pending CAS ops
     for {_ref, op} <- state.pending_cas do
@@ -1209,8 +1223,9 @@ defmodule EKV.Replica do
      %{state | db: nil, stmts: nil, pending_cas: %{}, quorum_waiters: %{}, handoff_node: new_node}}
   end
 
-  # In handoff mode: drop all messages (replication, GC, nodeup/down, CAS)
-  # Readers stay alive for old VM reads. Peers discover new node via nodeup.
+  # In handoff mode: drop all messages (replication, GC, nodeup/down, CAS).
+  # Readers stay alive for old VM reads. Replica peers rediscover the incoming
+  # node via nodeup; new clients bind to the incoming member via MemberPresence.
   def handle_info(_msg, %{handoff_node: handoff_node} = state)
       when handoff_node != nil do
     {:noreply, state}
@@ -2870,7 +2885,7 @@ defmodule EKV.Replica do
 
   defp has_subscribers?(state) do
     config = EKV.get_config(state.name)
-    :atomics.get(config.sub_count, 1) > 0
+    :atomics.get(config.sub_count, 1) > 0 or EKV.client_subscribers?(state.name)
   end
 
   defp dispatch_events(_state, []), do: :ok

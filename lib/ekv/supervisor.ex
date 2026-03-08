@@ -27,12 +27,14 @@ defmodule EKV.Supervisor do
                                               3. PRAGMA wal_checkpoint(TRUNCATE)
                                               4. Close writer db
           receive {:ekv_handoff_ack}   <──  5. Send ack
-                                              6. Enter proxy mode
+                                              6. Leave MemberPresence
+                                                 route + enter proxy mode
 
         Start children:
           Replica.init opens SAME db files
-          Peers discover via nodeup            Proxy calls to m1b
-          CAS works immediately                Readers alive until shutdown
+          MemberPresence joins :pg             Proxy calls to m1b
+          Peers discover via nodeup            Readers alive until shutdown
+          CAS works immediately                New clients bind to m1b
 
   ### Marker File
 
@@ -59,10 +61,15 @@ defmodule EKV.Supervisor do
   - Quorum safety: same node_id → count_alive_node_ids counts as 1
   - kv_paxos durable: promise/accept state survives in SQLite
   - No data loss: WAL checkpoint flushes everything before close
+  - Client routing safety: incoming member is advertised only after startup;
+    outgoing member leaves its :pg route before proxy mode
   """
 
   @valid_opts [
     :name,
+    :mode,
+    :region,
+    :region_routing,
     :data_dir,
     :shards,
     :log,
@@ -74,7 +81,8 @@ defmodule EKV.Supervisor do
     :sync_chunk_size,
     :skip_stale_check,
     :partition_ttl_policy,
-    :wait_for_quorum
+    :wait_for_quorum,
+    :wait_for_route
   ]
 
   def start_link(opts) do
@@ -86,10 +94,25 @@ defmodule EKV.Supervisor do
   @impl true
   def init(opts) do
     name = Keyword.fetch!(opts, :name)
+    mode = Keyword.get(opts, :mode, :member)
+    region = Keyword.get(opts, :region, "default")
+    log = Keyword.get(opts, :log, :info)
+    validate_mode!(mode)
+    validate_region!(region, :region)
+
+    case mode do
+      :member ->
+        init_member(name, region, log, opts)
+
+      :client ->
+        init_client(name, region, log, opts)
+    end
+  end
+
+  defp init_member(name, region, log, opts) do
     data_dir = Keyword.fetch!(opts, :data_dir)
     num_shards = Keyword.get(opts, :shards, 8)
     blue_green = Keyword.get(opts, :blue_green, false)
-    log = Keyword.get(opts, :log, :info)
     tombstone_ttl = Keyword.get(opts, :tombstone_ttl, :timer.hours(24 * 7))
     gc_interval = Keyword.get(opts, :gc_interval, :timer.minutes(5))
     cluster_size = Keyword.get(opts, :cluster_size)
@@ -98,12 +121,13 @@ defmodule EKV.Supervisor do
     skip_stale_check = Keyword.get(opts, :skip_stale_check, false)
     partition_ttl_policy = Keyword.get(opts, :partition_ttl_policy, :quarantine)
     wait_for_quorum = Keyword.get(opts, :wait_for_quorum, false)
+    wait_for_route = Keyword.get(opts, :wait_for_route, false)
 
     validate_cas_config!(cluster_size, node_id)
     validate_partition_ttl_policy!(partition_ttl_policy)
     validate_wait_for_quorum!(wait_for_quorum, cluster_size)
+    validate_wait_for_route!(wait_for_route, :member)
 
-    # Normalize node_id to string early
     node_id =
       case node_id do
         nil -> nil
@@ -113,7 +137,6 @@ defmodule EKV.Supervisor do
 
     if blue_green, do: perform_handoff(name, data_dir, num_shards)
 
-    # Auto-persist node_id resolution
     effective_node_id =
       if cluster_size do
         persisted = EKV.Store.read_node_id(data_dir)
@@ -151,6 +174,8 @@ defmodule EKV.Supervisor do
     sub_count = :atomics.new(1, signed: true)
 
     config = %{
+      mode: :member,
+      region: region,
       num_shards: num_shards,
       data_dir: data_dir,
       log: log,
@@ -177,7 +202,44 @@ defmodule EKV.Supervisor do
         if(is_integer(wait_for_quorum),
           do: {EKV.QuorumGate, name: name, timeout: wait_for_quorum, log: log}
         ),
+        {EKV.MemberPresence, name: name, region: region},
         {EKV.GC, name: name}
+      ]
+      |> Enum.filter(& &1)
+
+    Supervisor.init(children, strategy: :rest_for_one)
+  end
+
+  defp init_client(name, region, log, opts) do
+    region_routing = Keyword.get(opts, :region_routing)
+    wait_for_route = Keyword.get(opts, :wait_for_route, false)
+    wait_for_quorum = Keyword.get(opts, :wait_for_quorum, false)
+
+    validate_client_opts!(opts, region_routing, wait_for_route, wait_for_quorum)
+
+    config = %{
+      mode: :client,
+      region: region,
+      region_routing: region_routing,
+      log: log,
+      cluster_size: nil,
+      node_id: nil,
+      num_shards: nil,
+      data_dir: nil
+    }
+
+    :persistent_term.put({EKV, name}, config)
+
+    children =
+      [
+        {EKV.ClientRouter, name: name},
+        if(is_integer(wait_for_route),
+          do: {EKV.RouteGate, name: name, timeout: wait_for_route, log: log}
+        ),
+        if(is_integer(wait_for_quorum),
+          do: {EKV.QuorumGate, name: name, timeout: wait_for_quorum, log: log}
+        ),
+        {EKV.ClientSubscriptions, name: name}
       ]
       |> Enum.filter(& &1)
 
@@ -238,6 +300,67 @@ defmodule EKV.Supervisor do
   defp validate_wait_for_quorum!(timeout, _cluster_size) do
     raise ArgumentError,
           "EKV: :wait_for_quorum must be false/nil or a non-negative timeout in ms, got: #{inspect(timeout)}"
+  end
+
+  defp validate_wait_for_route!(false, _mode), do: :ok
+  defp validate_wait_for_route!(nil, _mode), do: :ok
+
+  defp validate_wait_for_route!(timeout, _mode)
+       when is_integer(timeout) and timeout >= 0,
+       do: :ok
+
+  defp validate_wait_for_route!(timeout, _mode) do
+    raise ArgumentError,
+          "EKV: :wait_for_route must be false/nil or a non-negative timeout in ms, got: #{inspect(timeout)}"
+  end
+
+  defp validate_mode!(mode) when mode in [:member, :client], do: :ok
+
+  defp validate_mode!(mode) do
+    raise ArgumentError, "EKV: :mode must be :member or :client, got: #{inspect(mode)}"
+  end
+
+  defp validate_region!(region, _key) when is_binary(region) and byte_size(region) > 0, do: :ok
+
+  defp validate_region!(region, key) do
+    raise ArgumentError,
+          "EKV: #{inspect(key)} must be a non-empty string, got: #{inspect(region)}"
+  end
+
+  defp validate_client_opts!(opts, region_routing, wait_for_route, wait_for_quorum) do
+    validate_region_routing!(region_routing)
+    validate_wait_for_route!(wait_for_route, :client)
+    validate_wait_for_quorum!(wait_for_quorum, 1)
+
+    reject_client_opt!(opts, :blue_green, [false, nil])
+    reject_client_opt!(opts, :data_dir, [nil])
+    reject_client_opt!(opts, :cluster_size, [nil])
+    reject_client_opt!(opts, :node_id, [nil])
+    reject_client_opt!(opts, :shards, [nil])
+    reject_client_opt!(opts, :gc_interval, [nil])
+    reject_client_opt!(opts, :tombstone_ttl, [nil])
+    reject_client_opt!(opts, :sync_chunk_size, [nil])
+    reject_client_opt!(opts, :skip_stale_check, [nil])
+    reject_client_opt!(opts, :partition_ttl_policy, [nil])
+  end
+
+  defp validate_region_routing!(region_routing)
+       when is_list(region_routing) and region_routing != [] do
+    Enum.each(region_routing, &validate_region!(&1, :region_routing))
+  end
+
+  defp validate_region_routing!(region_routing) do
+    raise ArgumentError,
+          "EKV: :region_routing must be a non-empty list of non-empty strings, got: #{inspect(region_routing)}"
+  end
+
+  defp reject_client_opt!(opts, key, allowed_values) do
+    value = Keyword.get(opts, key)
+
+    unless value in allowed_values do
+      raise ArgumentError,
+            "EKV: #{inspect(key)} is not supported in :client mode, got: #{inspect(value)}"
+    end
   end
 
   # =====================================================================
