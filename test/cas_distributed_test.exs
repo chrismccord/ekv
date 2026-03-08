@@ -13,7 +13,8 @@ defmodule EKV.CASDistributedTest do
   defp start_cas_cluster(peers, ekv_name, opts \\ []) do
     cluster_size = Keyword.get(opts, :cluster_size, length(peers))
     shards = Keyword.get(opts, :shards, 2)
-    await_quorum? = Keyword.get(opts, :await_quorum, length(peers) == cluster_size)
+    quorum_size = div(cluster_size, 2) + 1
+    await_quorum? = Keyword.get(opts, :await_quorum, length(peers) >= quorum_size)
     shutdown_barrier = Keyword.get(opts, :shutdown_barrier, false)
 
     peers
@@ -75,7 +76,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(200)
 
       {:ok, _} = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "key1", "val1", [if_vsn: nil]])
 
@@ -93,7 +93,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(200)
 
       {:ok, _} = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "key1", "val1", [if_vsn: nil]])
 
@@ -118,7 +117,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(200)
 
       {:ok, _} = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "key1", "val1", [if_vsn: nil]])
       {_, vsn_a} = TestCluster.rpc!(node_a, EKV, :lookup, [ekv_name, "key1"])
@@ -140,7 +138,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(200)
 
       # Should return :ok (quorum = 2, both nodes reachable)
       assert {:ok, _} =
@@ -156,7 +153,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(200)
 
       {:ok, 1, _} =
         TestCluster.rpc!(node_a, EKV, :update, [ekv_name, "counter", &TestCluster.cas_increment/1])
@@ -257,7 +253,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(300)
 
       # Disconnect node C
       TestCluster.disconnect_nodes(node_a, node_c)
@@ -278,7 +273,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(300)
 
       # Isolate node A from both B and C
       TestCluster.disconnect_nodes(node_a, node_b)
@@ -299,7 +293,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(300)
 
       # Write via CAS
       {:ok, _} = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "key1", "val1", [if_vsn: nil]])
@@ -323,7 +316,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(300)
 
       # Disconnect one node
       TestCluster.disconnect_nodes(node_a, node_c)
@@ -489,7 +481,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(200)
 
       # Both try insert-if-absent concurrently
       task_a =
@@ -533,7 +524,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name, cluster_size: 3)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(500)
 
       for round <- 1..20 do
         key = "phantom/#{round}"
@@ -583,7 +573,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(200)
 
       # Sequential updates from different nodes
       {:ok, 1, _} =
@@ -610,7 +599,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(200)
 
       n_per_node = 5
 
@@ -647,7 +635,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(300)
 
       # All three nodes try insert-if-absent concurrently
       task_a =
@@ -672,13 +659,18 @@ defmodule EKV.CASDistributedTest do
       assert successes == 1,
              "Expected exactly 1 success, got #{successes}: #{inspect(results)}"
 
-      # All nodes should agree on the final value
-      TestCluster.assert_eventually(fn ->
-        val_a = TestCluster.rpc!(node_a, EKV, :get, [ekv_name, "tri/1"])
-        val_b = TestCluster.rpc!(node_b, EKV, :get, [ekv_name, "tri/1"])
-        val_c = TestCluster.rpc!(node_c, EKV, :get, [ekv_name, "tri/1"])
-        val_a != nil and val_a == val_b and val_b == val_c
-      end)
+      winner = TestCluster.rpc!(node_a, EKV, :get, [ekv_name, "tri/1", [consistent: true]])
+      assert winner in ["from_a", "from_b", "from_c"]
+
+      # All nodes should eventually converge to the committed winner.
+      TestCluster.assert_eventually(
+        fn ->
+          Enum.all?([node_a, node_b, node_c], fn node ->
+            TestCluster.rpc!(node, EKV, :get, [ekv_name, "tri/1"]) == winner
+          end)
+        end,
+        timeout: 10_000
+      )
     end
 
     test "CAS put and update on same key concurrently: consistent state" do
@@ -690,7 +682,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(200)
 
       # Node A does insert-if-absent
       {:ok, _} =
@@ -724,7 +715,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(300)
 
       # Isolate node C
       TestCluster.disconnect_nodes(node_a, node_c)
@@ -744,7 +734,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(300)
 
       # Isolate node C
       TestCluster.disconnect_nodes(node_a, node_c)
@@ -765,7 +754,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(300)
 
       # Write initial CAS values
       {:ok, _} =
@@ -814,7 +802,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(300)
 
       for cycle <- 1..3 do
         # Partition: isolate C
@@ -856,7 +843,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(300)
 
       # Isolate node C
       TestCluster.disconnect_nodes(node_a, node_c)
@@ -890,7 +876,6 @@ defmodule EKV.CASDistributedTest do
       ekv_name = unique_name(:cas)
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(300)
 
       # Kill node C
       :peer.stop(peer_c)
@@ -911,7 +896,6 @@ defmodule EKV.CASDistributedTest do
       ekv_name = unique_name(:cas)
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(300)
 
       # CAS write from node A
       {:ok, _} = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "key1", "durable", [if_vsn: nil]])
@@ -939,7 +923,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(200)
 
       # CAS write
       {:ok, _} = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "key1", "v1", [if_vsn: nil]])
@@ -978,7 +961,6 @@ defmodule EKV.CASDistributedTest do
       ekv_name = unique_name(:cas)
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(300)
 
       # Do initial CAS to establish state
       {:ok, _} =
@@ -1016,7 +998,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(200)
 
       # Do a CAS write (creates kv_paxos entries)
       {:ok, _} = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "key1", "v1", [if_vsn: nil]])
@@ -1045,7 +1026,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(200)
 
       n = 6
 
@@ -1070,7 +1050,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(300)
 
       # Sequential updates from 3 different nodes
       {:ok, 1, _} =
@@ -1108,7 +1087,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(200)
 
       # Create initial key with integer value (cas_increment expects integers)
       {:ok, 1, _} =
@@ -1176,7 +1154,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(200)
 
       # Interleaved updates — one will be preempted and must retry
       {:ok, 1, _} =
@@ -1203,7 +1180,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(200)
 
       n_per_key = 10
       n_keys = 10
@@ -1248,7 +1224,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(200)
 
       {:ok, _} =
         TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "ttl/1", "val", [if_vsn: nil, ttl: 1]])
@@ -1272,7 +1247,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name, shards: 4)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(200)
 
       # Write keys that hash to different shards
       for i <- 1..8 do
@@ -1297,7 +1271,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(200)
 
       # Create and then delete (creating a tombstone)
       {:ok, _} = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "tomb/1", "val", [if_vsn: nil]])
@@ -1328,7 +1301,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(200)
 
       # First CAS establishes ballot state
       {:ok, _} = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "dup/1", "v1", [if_vsn: nil]])
@@ -1353,7 +1325,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(200)
 
       # Subscribe on node B
       TestCluster.subscribe_on(node_b, ekv_name, "sub/", self())
@@ -1376,7 +1347,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(200)
 
       # Subscribe on acceptor node (B)
       TestCluster.subscribe_on(node_b, ekv_name, "asub/", self())
@@ -1400,7 +1370,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(200)
 
       # Write initial value via CAS
       {:ok, _} =
@@ -1433,7 +1402,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(200)
 
       # Write initial value
       {:ok, _} = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "nosub/1", "v1", [if_vsn: nil]])
@@ -1473,7 +1441,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(200)
 
       # Use a collecting subscriber on B to capture all events over a window
       TestCluster.start_collecting_subscriber_on(node_b, ekv_name, "nodup/", self(), 1000)
@@ -1505,7 +1472,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(200)
 
       # Test 10 rounds of concurrent insert-if-absent
       for i <- 1..10 do
@@ -1540,7 +1506,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(200)
 
       # Write 20 keys via CAS from node A
       for i <- 1..20 do
@@ -1569,7 +1534,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(300)
 
       # Write some keys
       {:ok, _} = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "k/1", "v1", [if_vsn: nil]])
@@ -1615,7 +1579,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(500)
 
       # CAS put from node 1
       {:ok, _} = TestCluster.rpc!(n1, EKV, :put, [ekv_name, "key/1", "val1", [if_vsn: nil]])
@@ -1636,7 +1599,6 @@ defmodule EKV.CASDistributedTest do
       ekv_name = unique_name(:cas5)
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(500)
 
       # Write before killing
       {:ok, _} = TestCluster.rpc!(n1, EKV, :put, [ekv_name, "survive/1", "v1", [if_vsn: nil]])
@@ -1664,7 +1626,6 @@ defmodule EKV.CASDistributedTest do
       ekv_name = unique_name(:cas5)
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(500)
 
       # Kill 3 nodes — only 2 alive, quorum=3
       :peer.stop(p3)
@@ -1686,7 +1647,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(500)
 
       # Partition: {n1, n2, n3} vs {n4, n5}
       for majority <- [n1, n2, n3], minority <- [n4, n5] do
@@ -1725,7 +1685,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(500)
 
       # All 5 nodes try insert-if-absent concurrently
       tasks =
@@ -1783,7 +1742,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(500)
 
       # Round-robin updates across all 5 nodes
       n = 10
@@ -1812,7 +1770,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(500)
 
       # Write initial values
       {:ok, _} = TestCluster.rpc!(n1, EKV, :put, [ekv_name, "heal5/1", "initial", [if_vsn: nil]])
@@ -1862,7 +1819,6 @@ defmodule EKV.CASDistributedTest do
       ekv_name = unique_name(:cas5)
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(500)
 
       # Kill node 5
       :peer.stop(p5)
@@ -1901,7 +1857,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(200)
 
       # Suspend B (acceptor) — messages will queue
       TestCluster.suspend_shards(node_b, ekv_name)
@@ -1936,7 +1891,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(300)
 
       # Suspend C — it won't process any messages
       TestCluster.suspend_shards(node_c, ekv_name)
@@ -1973,7 +1927,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(200)
 
       # Suspend B
       TestCluster.suspend_shards(node_b, ekv_name)
@@ -1997,7 +1950,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(300)
 
       # Suspend C (slow minority)
       TestCluster.suspend_shards(node_c, ekv_name)
@@ -2035,7 +1987,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(300)
 
       # Suspend B — forces A and C to compete for quorum via A↔C
       TestCluster.suspend_shards(node_b, ekv_name)
@@ -2087,7 +2038,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(300)
 
       # Rapid suspend/resume cycles with CAS operations
       for i <- 1..5 do
@@ -2131,7 +2081,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(300)
 
       # First, do a CAS write normally to establish ballot state
       {:ok, _} = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "delay/1", "v1", [if_vsn: nil]])
@@ -2175,7 +2124,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(300)
 
       # Background task that flaps C's shards
       flapper =
@@ -2222,7 +2170,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(500)
 
       # Suspend n4 and n5
       TestCluster.suspend_shards(n4, ekv_name)
@@ -2259,7 +2206,6 @@ defmodule EKV.CASDistributedTest do
 
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(300)
 
       # CAS from A
       {:ok, _} = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "freeze/1", "val", [if_vsn: nil]])

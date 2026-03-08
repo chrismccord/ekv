@@ -34,6 +34,8 @@ defmodule EKV.StressTest do
         node_id: node_id
       )
     end)
+
+    await_cluster_quorum(peers, ekv_name)
   end
 
   defp cleanup_data(peers, ekv_name) do
@@ -46,6 +48,17 @@ defmodule EKV.StressTest do
         _, _ -> :ok
       end
     end
+  end
+
+  defp await_cluster_quorum(peers, ekv_name, timeout \\ 3_000) do
+    Enum.each(peers, fn {_pid, node} ->
+      TestCluster.assert_eventually(
+        fn ->
+          TestCluster.rpc!(node, EKV, :await_quorum, [ekv_name, 0]) == :ok
+        end,
+        timeout: timeout
+      )
+    end)
   end
 
   defp partition(group_a, group_b) do
@@ -94,7 +107,6 @@ defmodule EKV.StressTest do
 
       start_stress_cluster(peers, ekv_name, shards: 1)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(500)
 
       key = "skew/cas_lww"
       shard_name = :"#{ekv_name}_ekv_replica_0"
@@ -177,7 +189,6 @@ defmodule EKV.StressTest do
 
       start_stress_cluster(peers, ekv_name, shards: 1)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(500)
 
       shard_name = :"#{ekv_name}_ekv_replica_0"
       conflict_key = "hwm/conflict"
@@ -270,7 +281,6 @@ defmodule EKV.StressTest do
 
       start_stress_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(500)
 
       majority = [n1, n2, n3]
       minority = [n4, n5]
@@ -326,7 +336,6 @@ defmodule EKV.StressTest do
 
       start_stress_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(500)
 
       # Three-way partition: {n1,n2}, {n3,n4}, {n5}
       group_a = [n1, n2]
@@ -405,14 +414,15 @@ defmodule EKV.StressTest do
 
       start_stress_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(500)
 
       key = "rolling/counter"
       versions = []
 
+      rounds = 5
+
       # Round i: exclude nodes i and (i+1) mod 5 from majority
       {_final_versions, _} =
-        Enum.reduce(0..4, {versions, nil}, fn i, {vsns, _prev_vsn} ->
+        Enum.reduce(0..(rounds - 1), {versions, nil}, fn i, {vsns, _prev_vsn} ->
           excluded_a = rem(i, 5)
           excluded_b = rem(i + 1, 5)
           minority = [Enum.at(nodes, excluded_a), Enum.at(nodes, excluded_b)]
@@ -451,13 +461,13 @@ defmodule EKV.StressTest do
           {vsns ++ [vsn], vsn}
         end)
 
-      # After 5 rounds: counter should be 5
+      # After all rounds: counter should equal rounds executed
       all_nodes = nodes
 
       TestCluster.assert_eventually(
         fn ->
           vals = Enum.map(all_nodes, fn n -> TestCluster.rpc!(n, EKV, :get, [ekv_name, key]) end)
-          Enum.all?(vals, &(&1 == 5))
+          Enum.all?(vals, &(&1 == rounds))
         end,
         timeout: 5000
       )
@@ -478,7 +488,6 @@ defmodule EKV.StressTest do
 
       start_stress_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(500)
 
       # CAS put from n1 (commits with quorum of n1 + some others)
       {:ok, _} =
@@ -524,7 +533,6 @@ defmodule EKV.StressTest do
 
       start_stress_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(500)
 
       # CAS put 5 keys from 5 different nodes
       for {node, i} <- Enum.with_index(nodes, 1) do
@@ -599,7 +607,6 @@ defmodule EKV.StressTest do
 
       start_stress_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(500)
 
       key = "counter/exact"
 
@@ -660,7 +667,6 @@ defmodule EKV.StressTest do
 
       start_stress_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(500)
 
       # Suspend n4, n5 (only 3 active: n1+n2+n3, exactly quorum)
       TestCluster.suspend_shards(n4, ekv_name)
@@ -703,7 +709,6 @@ defmodule EKV.StressTest do
 
       start_stress_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(500)
 
       # Track all values that get committed
       committed_ref = :atomics.new(20, signed: false)
@@ -783,7 +788,6 @@ defmodule EKV.StressTest do
 
       start_stress_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(500)
 
       key = "livelock/1"
 
@@ -825,7 +829,6 @@ defmodule EKV.StressTest do
 
       start_stress_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(500)
 
       key = "sustained/counter"
       duration_ms = 5_000
@@ -872,7 +875,6 @@ defmodule EKV.StressTest do
 
       start_stress_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(500)
 
       # Suspend n5 permanently
       TestCluster.suspend_shards(n5, ekv_name)
@@ -927,7 +929,6 @@ defmodule EKV.StressTest do
 
       start_stress_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(500)
 
       key = "mono/counter"
 
@@ -966,7 +967,6 @@ defmodule EKV.StressTest do
 
       start_stress_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(500)
 
       key = "vsn/heal"
 
@@ -1015,7 +1015,6 @@ defmodule EKV.StressTest do
 
       start_stress_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(500)
 
       key = "ballot/crash"
 
@@ -1077,7 +1076,6 @@ defmodule EKV.StressTest do
 
       start_stress_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(500)
 
       # CAS put from n1 (quorum n1+n2+n3)
       {:ok, _} =
@@ -1133,7 +1131,6 @@ defmodule EKV.StressTest do
       )
 
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(500)
 
       key = "gc/1"
 
@@ -1180,7 +1177,6 @@ defmodule EKV.StressTest do
 
       start_stress_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-      Process.sleep(500)
 
       key = "mix/1"
 

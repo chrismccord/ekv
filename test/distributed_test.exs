@@ -11,6 +11,8 @@ defmodule EKV.DistributedTest do
   end
 
   defp start_cluster(peers, ekv_name) do
+    num_shards = 2
+
     for {_pid, node} <- peers do
       data_dir = "/tmp/ekv_dist_test_#{node}_#{ekv_name}"
       TestCluster.rpc!(node, File, :rm_rf!, [data_dir])
@@ -19,12 +21,33 @@ defmodule EKV.DistributedTest do
         node,
         name: ekv_name,
         data_dir: data_dir,
-        shards: 2,
+        shards: num_shards,
         log: false,
         gc_interval: :timer.hours(1),
         tombstone_ttl: :timer.hours(24 * 7)
       )
     end
+
+    await_replica_discovery(peers, ekv_name, num_shards)
+  end
+
+  defp await_replica_discovery(peers, ekv_name, num_shards, timeout \\ 2_000) do
+    expected_nodes = peers |> Enum.map(&elem(&1, 1)) |> MapSet.new()
+
+    Enum.each(peers, fn {_pid, node} ->
+      Enum.each(0..(num_shards - 1), fn shard ->
+        shard_name = :"#{ekv_name}_ekv_replica_#{shard}"
+
+        TestCluster.assert_eventually(
+          fn ->
+            state = TestCluster.rpc!(node, :sys, :get_state, [shard_name])
+            remote_nodes = state.remote_shards |> Map.keys() |> MapSet.new()
+            MapSet.equal?(remote_nodes, MapSet.delete(expected_nodes, node))
+          end,
+          timeout: timeout
+        )
+      end)
+    end)
   end
 
   defp cleanup_data(peers, ekv_name) do
@@ -50,9 +73,6 @@ defmodule EKV.DistributedTest do
       start_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      # Wait for peer discovery
-      Process.sleep(200)
-
       # Put on node A
       TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "key1", "value1"])
 
@@ -71,8 +91,6 @@ defmodule EKV.DistributedTest do
 
       start_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-
-      Process.sleep(200)
 
       TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "key1", "value1"])
 
@@ -98,8 +116,6 @@ defmodule EKV.DistributedTest do
 
       start_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-
-      Process.sleep(200)
 
       value = %{users: [%{id: 1, name: "Alice"}, %{id: 2, name: "Bob"}], count: 2}
       TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "complex", value])
@@ -174,8 +190,6 @@ defmodule EKV.DistributedTest do
 
       start_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-
-      Process.sleep(200)
 
       # Put on node A, wait for replication to B
       TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "survive", "yes"])
@@ -272,8 +286,6 @@ defmodule EKV.DistributedTest do
 
       start_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-
-      Process.sleep(200)
 
       # Both nodes write the same key
       TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "race", "from_a"])
@@ -600,8 +612,6 @@ defmodule EKV.DistributedTest do
       start_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      Process.sleep(200)
-
       # Set up confirmed disconnect
       TestCluster.monitor_nodes_on(node_a, self())
       TestCluster.monitor_nodes_on(node_b, self())
@@ -651,8 +661,6 @@ defmodule EKV.DistributedTest do
 
       start_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-
-      Process.sleep(200)
 
       # Put key, wait for replication
       TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "lazarus", "alive_v1"])
@@ -995,8 +1003,6 @@ defmodule EKV.DistributedTest do
       start_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      Process.sleep(200)
-
       # Partition
       TestCluster.monitor_nodes_on(node_a, self())
       TestCluster.monitor_nodes_on(node_b, self())
@@ -1052,8 +1058,6 @@ defmodule EKV.DistributedTest do
 
       start_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-
-      Process.sleep(200)
 
       # Write data on A, wait for replication
       for i <- 1..5 do
@@ -1113,8 +1117,6 @@ defmodule EKV.DistributedTest do
 
       start_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-
-      Process.sleep(200)
 
       # Partition
       TestCluster.monitor_nodes_on(node_a, self())
@@ -1358,8 +1360,6 @@ defmodule EKV.DistributedTest do
 
       start_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-
-      Process.sleep(200)
 
       # Write initial data, verify replication
       for i <- 1..10 do
@@ -1735,8 +1735,6 @@ defmodule EKV.DistributedTest do
       start_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      Process.sleep(200)
-
       # Write some data
       for i <- 1..5 do
         TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "dup_connect/#{i}", "val_#{i}"])
@@ -1988,8 +1986,6 @@ defmodule EKV.DistributedTest do
       start_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      Process.sleep(200)
-
       # Subscribe on node B, forwarding events to test process
       TestCluster.subscribe_on(node_b, ekv_name, "sub_test/", self())
 
@@ -2015,8 +2011,6 @@ defmodule EKV.DistributedTest do
 
       start_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
-
-      Process.sleep(200)
 
       # Put on node A, wait for replication to B
       TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "del_sub/1", "original"])
@@ -2094,7 +2088,10 @@ defmodule EKV.DistributedTest do
   # =====================================================================
 
   defp start_cluster_3(peers, ekv_name) do
-    for {_pid, node} <- peers do
+    num_shards = 2
+
+    data_dirs =
+      for {_pid, node} <- peers do
       data_dir = "/tmp/ekv_dist_test_#{node}_#{ekv_name}"
       TestCluster.rpc!(node, File, :rm_rf!, [data_dir])
 
@@ -2102,7 +2099,7 @@ defmodule EKV.DistributedTest do
         node,
         name: ekv_name,
         data_dir: data_dir,
-        shards: 2,
+        shards: num_shards,
         log: false,
         gc_interval: :timer.hours(1),
         tombstone_ttl: :timer.hours(24 * 7)
@@ -2110,5 +2107,8 @@ defmodule EKV.DistributedTest do
 
       data_dir
     end
+
+    await_replica_discovery(peers, ekv_name, num_shards)
+    data_dirs
   end
 end

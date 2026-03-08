@@ -49,12 +49,18 @@ defmodule EKV.AdversarialVerificationTest do
   defp restart_cluster_ekv(peers, ekv_name, opts) do
     gc_interval = Keyword.get(opts, :gc_interval, 300)
     tombstone_ttl = Keyword.get(opts, :tombstone_ttl, 1_200)
+    sup_name = :"#{ekv_name}_ekv_sup"
+    shard_name = :"#{ekv_name}_ekv_replica_0"
 
     peers
     |> Enum.with_index(1)
     |> Enum.each(fn {{_pid, node}, node_id} ->
-      TestCluster.rpc!(node, TestCluster, :kill_registered, [:"#{ekv_name}_ekv_sup"])
-      Process.sleep(200)
+      TestCluster.rpc!(node, TestCluster, :kill_registered, [sup_name])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node, Process, :whereis, [sup_name]) == nil and
+          TestCluster.rpc!(node, Process, :whereis, [shard_name]) == nil
+      end)
 
       data_dir = "/tmp/ekv_adversarial_#{node}_#{ekv_name}"
 
@@ -69,7 +75,21 @@ defmodule EKV.AdversarialVerificationTest do
         cluster_size: length(peers),
         node_id: node_id
       )
+
+      TestCluster.assert_eventually(fn ->
+        is_pid(TestCluster.rpc!(node, Process, :whereis, [sup_name])) and
+          is_pid(TestCluster.rpc!(node, Process, :whereis, [shard_name]))
+      end)
     end)
+  end
+
+  defp assert_tombstone_purged(node, ekv_name, key, timeout \\ 2_000) do
+    TestCluster.assert_eventually(
+      fn ->
+        TestCluster.store_get(node, ekv_name, key) == nil
+      end,
+      timeout: timeout
+    )
   end
 
   test "long partition beyond tombstone_ttl quarantines peer instead of syncing unsafe state" do
@@ -79,9 +99,8 @@ defmodule EKV.AdversarialVerificationTest do
     [{_, n1}, {_, n2}] = peers
     ekv_name = unique_name(:ttl_partition)
 
-    start_cluster(peers, ekv_name, gc_interval: 300, tombstone_ttl: 1_200)
+    start_cluster(peers, ekv_name, gc_interval: 100, tombstone_ttl: 400)
     on_exit(fn -> cleanup_data(peers, ekv_name) end)
-    Process.sleep(700)
 
     key = "adversarial/zombie"
 
@@ -101,35 +120,17 @@ defmodule EKV.AdversarialVerificationTest do
         TestCluster.rpc!(n2, EKV, :get, [ekv_name, key]) == "alive"
     end)
 
-    # Let delete tombstone age out and be GC-purged on n1 while partitioned.
-    Process.sleep(4_000)
+    assert_tombstone_purged(n1, ekv_name, key)
 
     TestCluster.reconnect_nodes(n1, n2)
 
-    # Expect quarantine behavior on reconnect: do not sync potentially unsafe state.
-    deadline = System.monotonic_time(:millisecond) + 8_000
-
-    {converged?, last} =
-      Enum.reduce_while(1..200, {false, nil}, fn _, _acc ->
-        vals = %{
-          n1 => TestCluster.rpc!(n1, EKV, :get, [ekv_name, key]),
-          n2 => TestCluster.rpc!(n2, EKV, :get, [ekv_name, key])
-        }
-
-        if vals[n1] == nil and vals[n2] == "alive" do
-          {:halt, {true, vals}}
-        else
-          if System.monotonic_time(:millisecond) >= deadline do
-            {:halt, {false, vals}}
-          else
-            Process.sleep(40)
-            {:cont, {false, vals}}
-          end
-        end
-      end)
-
-    assert converged?,
-           "expected quarantine to preserve divergent views (n1=nil, n2=alive), got #{inspect(last)}"
+    TestCluster.assert_eventually(
+      fn ->
+        TestCluster.rpc!(n1, EKV, :get, [ekv_name, key]) == nil and
+          TestCluster.rpc!(n2, EKV, :get, [ekv_name, key]) == "alive"
+      end,
+      timeout: 3_000
+    )
 
     shard_name = :"#{ekv_name}_ekv_replica_0"
 
@@ -151,7 +152,6 @@ defmodule EKV.AdversarialVerificationTest do
 
     start_cluster(peers, ekv_name, gc_interval: 300, tombstone_ttl: 5_000)
     on_exit(fn -> cleanup_data(peers, ekv_name) end)
-    Process.sleep(700)
 
     key = "adversarial/short"
     :ok = TestCluster.rpc!(n1, EKV, :put, [ekv_name, key, "v1"])
@@ -178,9 +178,8 @@ defmodule EKV.AdversarialVerificationTest do
     [{_, n1}, {_, n2}] = peers
     ekv_name = unique_name(:ttl_partition_both_restart)
 
-    start_cluster(peers, ekv_name, gc_interval: 300, tombstone_ttl: 1_200)
+    start_cluster(peers, ekv_name, gc_interval: 100, tombstone_ttl: 400)
     on_exit(fn -> cleanup_data(peers, ekv_name) end)
-    Process.sleep(700)
 
     key = "adversarial/restart_quarantine"
 
@@ -199,39 +198,21 @@ defmodule EKV.AdversarialVerificationTest do
         TestCluster.rpc!(n2, EKV, :get, [ekv_name, key]) == "alive"
     end)
 
-    # Let tombstone age out while still partitioned.
-    Process.sleep(4_000)
+    assert_tombstone_purged(n1, ekv_name, key)
 
     # Restart both EKV supervisors while still partitioned.
-    restart_cluster_ekv(peers, ekv_name, gc_interval: 300, tombstone_ttl: 1_200)
-    Process.sleep(700)
+    restart_cluster_ekv(peers, ekv_name, gc_interval: 100, tombstone_ttl: 400)
 
     # Heal after both sides forgot in-memory state. Persisted down markers should still quarantine.
     TestCluster.reconnect_nodes(n1, n2)
 
-    deadline = System.monotonic_time(:millisecond) + 8_000
-
-    {preserved?, last} =
-      Enum.reduce_while(1..200, {false, nil}, fn _, _acc ->
-        vals = %{
-          n1 => TestCluster.rpc!(n1, EKV, :get, [ekv_name, key]),
-          n2 => TestCluster.rpc!(n2, EKV, :get, [ekv_name, key])
-        }
-
-        if vals[n1] == nil and vals[n2] == "alive" do
-          {:halt, {true, vals}}
-        else
-          if System.monotonic_time(:millisecond) >= deadline do
-            {:halt, {false, vals}}
-          else
-            Process.sleep(40)
-            {:cont, {false, vals}}
-          end
-        end
-      end)
-
-    assert preserved?,
-           "expected persisted quarantine to preserve divergent views after restart, got #{inspect(last)}"
+    TestCluster.assert_eventually(
+      fn ->
+        TestCluster.rpc!(n1, EKV, :get, [ekv_name, key]) == nil and
+          TestCluster.rpc!(n2, EKV, :get, [ekv_name, key]) == "alive"
+      end,
+      timeout: 3_000
+    )
 
     shard_name = :"#{ekv_name}_ekv_replica_0"
 

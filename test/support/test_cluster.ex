@@ -177,6 +177,11 @@ defmodule EKV.TestCluster do
     rpc!(node, __MODULE__, :do_scan_count, [name, prefix])
   end
 
+  @doc "Read raw kv row from a remote shard db, including tombstones"
+  def store_get(node, name, key) do
+    rpc!(node, __MODULE__, :do_store_get, [name, key])
+  end
+
   @doc "Materialize scan stream on remote node, return %{key => value} map"
   def scan_to_map(node, name, prefix) do
     rpc!(node, __MODULE__, :do_scan_to_map, [name, prefix])
@@ -188,6 +193,14 @@ defmodule EKV.TestCluster do
 
   def do_keys_count(name, prefix), do: EKV.keys(name, prefix) |> Enum.count()
   def do_scan_count(name, prefix), do: EKV.scan(name, prefix) |> Enum.count()
+
+  def do_store_get(name, key) do
+    config = EKV.get_config(name)
+    shard = EKV.Replica.shard_index_for(key, config.num_shards)
+    shard_name = EKV.Replica.shard_name(name, shard)
+    %{db: db} = :sys.get_state(shard_name)
+    EKV.Store.get(db, key)
+  end
 
   def do_scan_to_map(name, prefix),
     do: EKV.scan(name, prefix) |> Map.new(fn {k, v, _vsn} -> {k, v} end)
