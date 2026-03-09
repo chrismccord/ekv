@@ -256,7 +256,7 @@ defmodule EKV.Replica do
     - Local put/delete (timestamp is always "now", so almost always wins)
     - Remote replication receive (ekv_put / ekv_delete)
     - Bulk sync (ekv_sync entries)
-    - GC TTL expiry (converting expired entry to tombstone)
+    - GC TTL expiry bookkeeping / local `:expired` notification
 
   The tiebreaker (origin_node atom comparison) is deterministic across
   all nodes. Atom ordering matches SQLite TEXT ordering for node names
@@ -595,7 +595,8 @@ defmodule EKV.Replica do
       │          OR deleted_at > cutoff) AND key > cursor              │
       │        ORDER BY key LIMIT chunk_size                           │
       │                                                                │
-      │ Sends all live entries + recent tombstones (so the member      │
+      │ Sends all live entries + recent tombstones (expired rows       │
+      │ are skipped, so only still-visible state is reintroduced)      │
       │ learns about deletes that happened while it was away).         │
       │ Used for first contact and after long partitions.              │
       └────────────────────────────────────────────────────────────────┘
@@ -708,6 +709,7 @@ defmodule EKV.Replica do
         │
         Members have no HWM for this new node
           → full sync: send all live entries + recent tombstones
+            (expired rows skipped)
             (chunked, ~500 entries per message)
         │
         New node applies all entries via merge_remote_entry
@@ -771,7 +773,7 @@ defmodule EKV.Replica do
     - Remote put/delete (replication receives)
     - Sync entries (bulk, with batched events)
     - CAS commit (paxos_promote, with previous value for deletes)
-    - GC TTL expiry (delete events with previous value)
+    - GC TTL expiry (`:expired` events with previous value)
 
   Events are NOT dispatched for:
     - CAS accept (kv_paxos write only — no phantom events)
@@ -789,10 +791,10 @@ defmodule EKV.Replica do
 
   Read path: EKV.get checks expires_at lazily — returns nil if past.
 
-  GC converts expired entries into tombstones:
-    1. Find entries where expires_at < now AND deleted_at IS NULL
-    2. Set deleted_at = now, append to oplog (via write_entry NIF)
-    3. Broadcast {:ekv_delete, ...} so members tombstone it too
+  GC handles expiry differently by key mode:
+    1. LWW keys: write a tombstone, append to oplog, broadcast delete, emit `:expired`
+    2. CAS-managed keys: mark expired_at locally so `:expired` is emitted once,
+       do not broadcast a delete, and hard-delete long-expired rows later
 
 
   ## Garbage Collection (EKV.GC)
@@ -802,16 +804,23 @@ defmodule EKV.Replica do
 
   Each tick, six phases:
 
-      Phase 1: Expire TTL entries
-        expired entries → set deleted_at, write oplog, broadcast delete
-        (converts live-but-expired entries into proper tombstones)
+      Phase 1: Observe TTL expiry
+        LWW keys → tombstone + oplog + replicated delete + `:expired`
+        CAS-managed keys → mark expired_at locally, emit `:expired`
+        (reads/CAS already treat expired rows as absent; no replicated
+         delete for CAS-managed expiry)
 
       Phase 2: Purge old tombstones
         deleted_at < now - tombstone_ttl → hard delete from SQLite kv
         (tombstone_ttl default: 7 days — keeps tombstones long enough
          for partitioned nodes to learn about deletes on reconnect)
 
-      Phase 2b: Purge orphan kv_paxos rows (if CAS enabled)
+      Phase 2b: Purge long-expired CAS rows
+        expires_at < now - tombstone_ttl → hard delete from SQLite kv
+        (keeps expired rows around long enough for local `:expired`
+         notification without turning CAS TTL expiry into a replicated delete)
+
+      Phase 2c: Purge orphan kv_paxos rows (if CAS enabled)
         DELETE FROM kv_paxos WHERE key NOT IN (SELECT key FROM kv)
           AND accepted_counter = 0
         (cleans up paxos state for tombstone-purged keys, only if
@@ -1700,35 +1709,46 @@ defmodule EKV.Replica do
   # =====================================================================
 
   def handle_info({:gc, now, tombstone_cutoff}, state) do
-    %{db: db, stmts: stmts} = state
+    %{db: db} = state
 
-    # 1. Expire TTL entries → tombstones → broadcast deletes
+    # 1. Observe TTL expiry and emit :expired.
     expired = Store.find_expired(db, now)
 
     gc_events =
       Enum.reduce(expired, [], fn {key, value_binary, _timestamp, _origin_node, _expires_at},
                                   acc ->
-        origin = node()
+        if Store.cas_managed_key?(db, key) do
+          {:ok, applied} = Store.mark_expired(db, key, now)
 
-        {:ok, applied} =
-          Store.write_entry(
-            db,
-            stmts.kv_upsert,
-            stmts.oplog_insert,
-            key,
-            nil,
-            now,
-            origin,
-            nil,
-            now
-          )
-
-        if applied do
-          broadcast_to_members(state, {:ekv_delete, key, now, origin})
-          prev_value = if value_binary, do: :erlang.binary_to_term(value_binary)
-          [%EKV.Event{type: :delete, key: key, value: prev_value} | acc]
+          if applied do
+            prev_value = if value_binary, do: :erlang.binary_to_term(value_binary)
+            [%EKV.Event{type: :expired, key: key, value: prev_value} | acc]
+          else
+            acc
+          end
         else
-          acc
+          origin = node()
+
+          {:ok, applied} =
+            Store.write_entry(
+              db,
+              state.stmts.kv_upsert,
+              state.stmts.oplog_insert,
+              key,
+              nil,
+              now,
+              origin,
+              nil,
+              now
+            )
+
+          if applied do
+            broadcast_to_members(state, {:ekv_delete, key, now, origin})
+            prev_value = if value_binary, do: :erlang.binary_to_term(value_binary)
+            [%EKV.Event{type: :expired, key: key, value: prev_value} | acc]
+          else
+            acc
+          end
         end
       end)
 
@@ -1737,7 +1757,10 @@ defmodule EKV.Replica do
     # 2. Purge old tombstones from SQLite (no notification — already notified on delete)
     Store.purge_tombstones(db, tombstone_cutoff)
 
-    # 2b. Purge orphan kv_paxos rows (keys that were tombstone-purged)
+    # 2b. Purge long-expired rows from SQLite (no notification — already notified on expiry)
+    Store.purge_expired(db, tombstone_cutoff)
+
+    # 2c. Purge orphan kv_paxos rows (keys that were hard-deleted)
     if state.cluster_size, do: Store.purge_orphan_paxos(db)
 
     # 3. Prune HWMs for disconnected members (prevents unbounded oplog growth)

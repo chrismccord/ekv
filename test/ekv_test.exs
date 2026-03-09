@@ -632,7 +632,7 @@ defmodule EKVTest do
   end
 
   describe "GC expires TTL entries into tombstones" do
-    test "expired entries become tombstones after GC", %{name: name} do
+    test "expired LWW entries become tombstones after GC", %{name: name} do
       config = EKV.Supervisor.get_config(name)
       shard = EKV.Replica.shard_index_for("gc_ttl_key", config.num_shards)
       shard_name = EKV.Replica.shard_name(name, shard)
@@ -672,18 +672,18 @@ defmodule EKVTest do
       # Wait for GC to process (GenServer is sequential)
       :sys.get_state(shard_name)
 
-      # Entry should now be a tombstone (deleted_at set)
+      # Entry should now be a tombstone (deleted_at set).
       raw_after = EKV.Store.get(db, "gc_ttl_key")
       assert raw_after != nil
       {_, _, _, _, deleted_at_after} = raw_after
       assert is_integer(deleted_at_after)
 
-      # Oplog should have the delete entry
+      # LWW TTL expiry still appends a delete entry to the oplog.
       assert EKV.Store.max_seq(db) > seq_before_gc
     end
   end
 
-  describe "GC purges old tombstones" do
+  describe "GC handles expired LWW rows" do
     test "tombstones older than cutoff are hard-deleted", %{name: name} do
       config = EKV.Supervisor.get_config(name)
       shard = EKV.Replica.shard_index_for("gc_purge_key", config.num_shards)
@@ -733,6 +733,42 @@ defmodule EKVTest do
 
       # Public API also returns nil
       assert EKV.get(name, "gc_purge_key") == nil
+    end
+  end
+
+  describe "GC purges old tombstones" do
+    test "expired LWW rows eventually purge via tombstones, not lazy expiry", %{name: name} do
+      config = EKV.Supervisor.get_config(name)
+      shard = EKV.Replica.shard_index_for("gc_expired_purge_key", config.num_shards)
+      shard_name = EKV.Replica.shard_name(name, shard)
+      %{db: db, stmts: stmts} = :sys.get_state(shard_name)
+
+      now = System.system_time(:nanosecond)
+      expired_at = now - (config.tombstone_ttl * 1_000_000 + 1_000_000)
+      val = :erlang.term_to_binary("old_expired")
+
+      {:ok, true} =
+        EKV.Store.write_entry(
+          db,
+          stmts.kv_upsert,
+          stmts.oplog_insert,
+          "gc_expired_purge_key",
+          val,
+          expired_at - 1000,
+          :node_a,
+          expired_at
+        )
+
+      assert EKV.Store.get(db, "gc_expired_purge_key") != nil
+
+      tombstone_cutoff = now - config.tombstone_ttl * 1_000_000
+      send(shard_name, {:gc, now, tombstone_cutoff})
+      :sys.get_state(shard_name)
+
+      raw = EKV.Store.get(db, "gc_expired_purge_key")
+      assert raw != nil
+      {_, _, _, _, deleted_at_after} = raw
+      assert is_integer(deleted_at_after)
     end
   end
 
@@ -887,7 +923,7 @@ defmodule EKVTest do
   end
 
   describe "concurrent put during GC expiry" do
-    test "new write wins after GC tombstones an expired entry", %{name: name} do
+    test "new write wins after GC tombstones an expired LWW entry", %{name: name} do
       config = EKV.Supervisor.get_config(name)
       shard = EKV.Replica.shard_index_for("gc_race_key", config.num_shards)
       shard_name = EKV.Replica.shard_name(name, shard)
@@ -915,7 +951,7 @@ defmodule EKVTest do
       send(shard_name, {:gc, now, tombstone_cutoff})
       :sys.get_state(shard_name)
 
-      # Entry should be tombstoned now
+      # Entry should now be tombstoned.
       raw = EKV.Store.get(db, "gc_race_key")
       assert raw != nil
       {_, _, _, _, deleted_at} = raw
@@ -942,7 +978,9 @@ defmodule EKVTest do
   end
 
   describe "full state excludes purged tombstones" do
-    test "purged tombstones absent, recent tombstones present in full_state", %{name: name} do
+    test "purged tombstones absent, recent tombstones present, expired rows omitted", %{
+      name: name
+    } do
       config = EKV.Supervisor.get_config(name)
       shard = EKV.Replica.shard_index_for("fs_key_1", config.num_shards)
       shard_name = EKV.Replica.shard_name(name, shard)
@@ -997,6 +1035,19 @@ defmodule EKVTest do
           now - 1000
         )
 
+      # Expire entry 3 — it should remain logically absent and stay out of full sync.
+      {:ok, true} =
+        EKV.Store.write_entry(
+          db,
+          stmts.kv_upsert,
+          stmts.oplog_insert,
+          "fs_key_3",
+          :erlang.term_to_binary("expired"),
+          now - 500,
+          :node_a,
+          now - 500
+        )
+
       # Purge old tombstones (entry 1 is old, entry 2 is recent)
       cutoff = now - :timer.hours(24 * 7) * 1_000_000
       EKV.Store.purge_tombstones(db, cutoff)
@@ -1004,13 +1055,13 @@ defmodule EKVTest do
       # full_state should:
       # - NOT include entry 1 (purged)
       # - Include entry 2 (recent tombstone, deleted_at > cutoff)
-      # - Include entry 3 (live)
+      # - NOT include entry 3 (expired)
       entries = EKV.Store.full_state(db, cutoff)
       keys = Enum.map(entries, fn {key, _, _, _, _, _} -> key end)
 
       refute "fs_key_1" in keys
       assert "fs_key_2" in keys
-      assert "fs_key_3" in keys
+      refute "fs_key_3" in keys
     end
   end
 
@@ -1153,7 +1204,7 @@ defmodule EKVTest do
       refute_receive {:ekv, _, _}, 50
     end
 
-    test "GC TTL expiry generates delete event", %{name: name} do
+    test "GC TTL expiry generates expired event", %{name: name} do
       config = EKV.Supervisor.get_config(name)
       shard = EKV.Replica.shard_index_for("gc_sub_key", config.num_shards)
       shard_name = EKV.Replica.shard_name(name, shard)
@@ -1184,8 +1235,14 @@ defmodule EKVTest do
       :sys.get_state(shard_name)
       flush_dispatchers(name)
 
-      assert_receive {:ekv, [%EKV.Event{type: :delete, key: "gc_sub_key", value: "doomed"}],
+      assert_receive {:ekv, [%EKV.Event{type: :expired, key: "gc_sub_key", value: "doomed"}],
                       %{name: ^name}}
+
+      # A second GC pass should not re-emit the expiry event.
+      send(shard_name, {:gc, now + 1_000_000, tombstone_cutoff})
+      :sys.get_state(shard_name)
+      flush_dispatchers(name)
+      refute_receive {:ekv, _, _}, 100
     end
 
     test "bulk sync generates batched events", %{name: name} do
@@ -1846,6 +1903,122 @@ defmodule EKVTest do
 
       delta_keys = Enum.map(delta, fn {_, key, _, _, _, _, _} -> key end)
       for i <- 6..10, do: assert("delta_key_#{i}" in delta_keys)
+    end
+
+    test "oplog_since_chunk skips already-expired put entries", %{name: name} do
+      config = EKV.Supervisor.get_config(name)
+      shard = EKV.Replica.shard_index_for("delta_expired_key", config.num_shards)
+      shard_name = EKV.Replica.shard_name(name, shard)
+      %{db: db, stmts: stmts} = :sys.get_state(shard_name)
+
+      now = System.system_time(:nanosecond)
+      expired_at = now - 1_000_000
+
+      {:ok, true} =
+        EKV.Store.write_entry(
+          db,
+          stmts.kv_upsert,
+          stmts.oplog_insert,
+          "delta_expired_key",
+          :erlang.term_to_binary("old"),
+          now - 2_000_000,
+          :node_a,
+          expired_at
+        )
+
+      {:ok, true} =
+        EKV.Store.write_entry(
+          db,
+          stmts.kv_upsert,
+          stmts.oplog_insert,
+          "delta_live_key",
+          :erlang.term_to_binary("live"),
+          now - 1_000,
+          :node_a,
+          nil
+        )
+
+      raw = EKV.Store.oplog_since(db, 0)
+
+      assert Enum.map(raw, fn {_, key, _, _, _, _, _} -> key end) == [
+               "delta_expired_key",
+               "delta_live_key"
+             ]
+
+      filtered = EKV.Store.oplog_since_chunk(db, 0, 10)
+      assert Enum.map(filtered, fn {_, key, _, _, _, _, _} -> key end) == ["delta_live_key"]
+    end
+  end
+
+  describe "CAS TTL lazy expiry" do
+    setup do
+      name = :"ekv_cas_ttl_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+
+      {:ok, pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: data_dir,
+          shards: 2,
+          log: false,
+          cluster_size: 1,
+          node_id: 1,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      %{cas_name: name}
+    end
+
+    test "expired CAS entries are marked locally and not tombstoned", %{cas_name: name} do
+      config = EKV.Supervisor.get_config(name)
+      key = "cas_gc_ttl_key"
+      shard = EKV.Replica.shard_index_for(key, config.num_shards)
+      shard_name = EKV.Replica.shard_name(name, shard)
+      %{db: db} = :sys.get_state(shard_name)
+
+      {:ok, _} = EKV.put(name, key, "doomed", if_vsn: nil, ttl: 1)
+      Process.sleep(10)
+      assert EKV.get(name, key) == nil
+
+      seq_before_gc = EKV.Store.max_seq(db)
+      tombstone_cutoff = System.system_time(:nanosecond) - config.tombstone_ttl * 1_000_000
+      send(shard_name, {:gc, System.system_time(:nanosecond), tombstone_cutoff})
+      :sys.get_state(shard_name)
+
+      raw_after = EKV.Store.get(db, key)
+      assert raw_after != nil
+      {_, _, _, _, deleted_at_after} = raw_after
+      assert deleted_at_after == nil
+
+      {:ok, [[expired_after]]} =
+        EKV.Sqlite3.fetch_all(db, "SELECT expired_at FROM kv WHERE key = ?1", [key])
+
+      assert is_integer(expired_after)
+      assert EKV.Store.max_seq(db) == seq_before_gc
+    end
+
+    test "expired CAS rows older than cutoff are hard-deleted", %{cas_name: name} do
+      config = EKV.Supervisor.get_config(name)
+      key = "cas_gc_expired_purge_key"
+      shard = EKV.Replica.shard_index_for(key, config.num_shards)
+      shard_name = EKV.Replica.shard_name(name, shard)
+      %{db: db} = :sys.get_state(shard_name)
+
+      {:ok, _} = EKV.put(name, key, "old_expired", if_vsn: nil, ttl: 1)
+      Process.sleep(10)
+
+      future_cutoff = System.system_time(:nanosecond) + config.tombstone_ttl * 1_000_000
+      send(shard_name, {:gc, System.system_time(:nanosecond), future_cutoff})
+      :sys.get_state(shard_name)
+
+      assert EKV.Store.get(db, key) == nil
+      assert EKV.get(name, key) == nil
     end
   end
 
@@ -3745,6 +3918,21 @@ defmodule EKVTest do
       # Verify entries are ordered by key
       keys = Enum.map(all_entries, fn {k, _, _, _, _, _} -> k end)
       assert keys == Enum.sort(keys)
+    end
+
+    test "full_state_chunk skips expired rows", %{shard_name: shard_name, name: name} do
+      :ok = EKV.put(name, "chunk/live", "live")
+      :ok = EKV.put(name, "chunk/expired", "old", ttl: 1)
+      Process.sleep(10)
+
+      state = :sys.get_state(shard_name)
+      tombstone_cutoff = System.system_time(:nanosecond) - :timer.hours(24 * 7) * 1_000_000
+
+      entries = EKV.Store.full_state_chunk(state.db, tombstone_cutoff, nil, 10)
+      keys = Enum.map(entries, fn {k, _, _, _, _, _} -> k end)
+
+      assert "chunk/live" in keys
+      refute "chunk/expired" in keys
     end
 
     test "oplog_since_chunk paginates through oplog entries", %{

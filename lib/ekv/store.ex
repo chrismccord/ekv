@@ -9,7 +9,7 @@ defmodule EKV.Store do
 
   ## Tables
 
-  - `kv` — current state of all keys: key -> (value, timestamp, origin_node, expires_at, deleted_at)
+  - `kv` — current state of all keys: key -> (value, timestamp, origin_node, expires_at, deleted_at, expired_at)
   - `kv_oplog` — append-only log of all mutations, used for delta sync
   - `kv_member_hwm` — per-member high-water marks for oplog sync
   """
@@ -26,7 +26,7 @@ defmodule EKV.Store do
   ON CONFLICT(key) DO UPDATE SET
     value = excluded.value, timestamp = excluded.timestamp,
     origin_node = excluded.origin_node, expires_at = excluded.expires_at,
-    deleted_at = excluded.deleted_at
+    deleted_at = excluded.deleted_at, expired_at = NULL
   WHERE excluded.timestamp > kv.timestamp
     OR (excluded.timestamp = kv.timestamp AND excluded.origin_node > kv.origin_node)
   """
@@ -39,7 +39,7 @@ defmodule EKV.Store do
   ON CONFLICT(key) DO UPDATE SET
     value = excluded.value, timestamp = excluded.timestamp,
     origin_node = excluded.origin_node, expires_at = excluded.expires_at,
-    deleted_at = excluded.deleted_at
+    deleted_at = excluded.deleted_at, expired_at = NULL
   """
 
   @oplog_insert_sql """
@@ -87,7 +87,8 @@ defmodule EKV.Store do
         timestamp INTEGER NOT NULL,
         origin_node TEXT NOT NULL,
         expires_at INTEGER,
-        deleted_at INTEGER
+        deleted_at INTEGER,
+        expired_at INTEGER
       )
       """)
 
@@ -172,6 +173,17 @@ defmodule EKV.Store do
       EKV.Sqlite3.execute(
         db,
         "CREATE INDEX IF NOT EXISTS idx_kv_expires ON kv(expires_at) WHERE expires_at IS NOT NULL"
+      )
+
+    case EKV.Sqlite3.execute(db, "ALTER TABLE kv ADD COLUMN expired_at INTEGER") do
+      :ok -> :ok
+      {:error, _} -> :ok
+    end
+
+    :ok =
+      EKV.Sqlite3.execute(
+        db,
+        "CREATE INDEX IF NOT EXISTS idx_kv_expired_marker ON kv(expired_at) WHERE expired_at IS NOT NULL"
       )
 
     # Validate shard count — must never change after first open
@@ -452,11 +464,15 @@ defmodule EKV.Store do
 
   @find_expired_sql """
   SELECT key, value, timestamp, origin_node, expires_at
-  FROM kv WHERE expires_at IS NOT NULL AND expires_at < ?1 AND deleted_at IS NULL
+  FROM kv
+  WHERE expires_at IS NOT NULL
+    AND expires_at < ?1
+    AND deleted_at IS NULL
+    AND expired_at IS NULL
   """
 
   @doc """
-  Find entries with expired TTL that haven't been tombstoned yet
+  Find entries with expired TTL that have not yet emitted a local expiry event.
   """
   def find_expired(db, now) do
     {:ok, rows} = EKV.Sqlite3.fetch_all(db, @find_expired_sql, [now])
@@ -464,6 +480,47 @@ defmodule EKV.Store do
     Enum.map(rows, fn [key, value, timestamp, origin_node, expires_at] ->
       {key, value, timestamp, String.to_atom(origin_node), expires_at}
     end)
+  end
+
+  @doc """
+  Mark an expired row as locally observed so GC emits `:expired` once.
+  """
+  def mark_expired(db, key, now) do
+    {:ok, stmt} =
+      EKV.Sqlite3.prepare(db, """
+      UPDATE kv
+      SET expired_at = ?2
+      WHERE key = ?1
+        AND expires_at IS NOT NULL
+        AND expires_at < ?2
+        AND deleted_at IS NULL
+        AND expired_at IS NULL
+      """)
+
+    :ok = EKV.Sqlite3.bind(stmt, [key, now])
+    :done = EKV.Sqlite3.step(db, stmt)
+    :ok = EKV.Sqlite3.release(db, stmt)
+    {:ok, [[changes]]} = EKV.Sqlite3.fetch_all(db, "SELECT changes()", [])
+    {:ok, changes > 0}
+  end
+
+  @doc """
+  Hard-delete CAS-managed TTL-expired rows older than the retention cutoff.
+  """
+  def purge_expired(db, cutoff) do
+    {:ok, stmt} =
+      EKV.Sqlite3.prepare(db, """
+      DELETE FROM kv
+      WHERE expires_at IS NOT NULL
+        AND expires_at < ?1
+        AND deleted_at IS NULL
+        AND key IN (SELECT key FROM kv_paxos)
+      """)
+
+    :ok = EKV.Sqlite3.bind(stmt, [cutoff])
+    :done = EKV.Sqlite3.step(db, stmt)
+    :ok = EKV.Sqlite3.release(db, stmt)
+    :ok
   end
 
   @doc """
@@ -535,14 +592,17 @@ defmodule EKV.Store do
 
   @full_state_sql """
   SELECT key, value, timestamp, origin_node, expires_at, deleted_at
-  FROM kv WHERE deleted_at IS NULL OR deleted_at > ?1
+  FROM kv
+  WHERE (deleted_at IS NULL AND (expires_at IS NULL OR expires_at > ?2))
+     OR deleted_at > ?1
   """
 
   @doc """
   Get all live entries from SQLite for full sync (excludes old tombstones)
   """
   def full_state(db, tombstone_cutoff) do
-    {:ok, rows} = EKV.Sqlite3.fetch_all(db, @full_state_sql, [tombstone_cutoff])
+    now = System.system_time(:nanosecond)
+    {:ok, rows} = EKV.Sqlite3.fetch_all(db, @full_state_sql, [tombstone_cutoff, now])
 
     Enum.map(rows, fn [key, value, timestamp, origin_node, expires_at, deleted_at] ->
       {key, value, timestamp, String.to_atom(origin_node), expires_at, deleted_at}
@@ -555,14 +615,19 @@ defmodule EKV.Store do
 
   @full_state_first_chunk_sql """
   SELECT key, value, timestamp, origin_node, expires_at, deleted_at
-  FROM kv WHERE deleted_at IS NULL OR deleted_at > ?1
-  ORDER BY key LIMIT ?2
+  FROM kv
+  WHERE (deleted_at IS NULL AND (expires_at IS NULL OR expires_at > ?2))
+     OR deleted_at > ?1
+  ORDER BY key LIMIT ?3
   """
 
   @full_state_chunk_sql """
   SELECT key, value, timestamp, origin_node, expires_at, deleted_at
-  FROM kv WHERE (deleted_at IS NULL OR deleted_at > ?1) AND key > ?2
-  ORDER BY key LIMIT ?3
+  FROM kv
+  WHERE (((deleted_at IS NULL AND (expires_at IS NULL OR expires_at > ?3))
+     OR deleted_at > ?1))
+    AND key > ?2
+  ORDER BY key LIMIT ?4
   """
 
   @doc """
@@ -570,15 +635,19 @@ defmodule EKV.Store do
   Pass `nil` as `last_key` for the first chunk.
   """
   def full_state_chunk(db, tombstone_cutoff, nil, limit) do
+    now = System.system_time(:nanosecond)
+
     {:ok, rows} =
-      EKV.Sqlite3.fetch_all(db, @full_state_first_chunk_sql, [tombstone_cutoff, limit])
+      EKV.Sqlite3.fetch_all(db, @full_state_first_chunk_sql, [tombstone_cutoff, now, limit])
 
     map_full_state_rows(rows)
   end
 
   def full_state_chunk(db, tombstone_cutoff, last_key, limit) do
+    now = System.system_time(:nanosecond)
+
     {:ok, rows} =
-      EKV.Sqlite3.fetch_all(db, @full_state_chunk_sql, [tombstone_cutoff, last_key, limit])
+      EKV.Sqlite3.fetch_all(db, @full_state_chunk_sql, [tombstone_cutoff, last_key, now, limit])
 
     map_full_state_rows(rows)
   end
@@ -591,14 +660,18 @@ defmodule EKV.Store do
 
   @oplog_since_chunk_sql """
   SELECT seq, key, value, timestamp, origin_node, expires_at, is_delete
-  FROM kv_oplog WHERE seq > ?1 ORDER BY seq LIMIT ?2
+  FROM kv_oplog
+  WHERE seq > ?1
+    AND (is_delete = 1 OR expires_at IS NULL OR expires_at > ?2)
+  ORDER BY seq LIMIT ?3
   """
 
   @doc """
   Get a chunk of oplog entries since `seq`, ordered by seq with cursor pagination.
   """
   def oplog_since_chunk(db, seq, limit) do
-    {:ok, rows} = EKV.Sqlite3.fetch_all(db, @oplog_since_chunk_sql, [seq, limit])
+    now = System.system_time(:nanosecond)
+    {:ok, rows} = EKV.Sqlite3.fetch_all(db, @oplog_since_chunk_sql, [seq, now, limit])
 
     Enum.map(rows, fn [seq, key, value, timestamp, origin_node, expires_at, is_delete] ->
       {seq, key, value, timestamp, String.to_atom(origin_node), expires_at, is_delete == 1}

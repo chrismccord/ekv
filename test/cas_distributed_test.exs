@@ -1238,6 +1238,60 @@ defmodule EKV.CASDistributedTest do
       assert TestCluster.rpc!(node_a, EKV, :get, [ekv_name, "ttl/1"]) == "reborn"
     end
 
+    # Verifies that a member which observes TTL expiry after a remote CAS recreate
+    # cannot wipe the recreated value during heal/sync. The isolated member's GC
+    # must stay local-only for expiry and anti-entropy must skip the stale expired row.
+    test "isolated member GC after CAS recreate does not wipe recreated value on heal" do
+      peers = TestCluster.start_peers(3)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
+      ekv_name = unique_name(:cas)
+
+      start_cas_cluster(peers, ekv_name)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      key = "ttl_race/1"
+
+      {:ok, _} =
+        TestCluster.rpc!(node_a, EKV, :put, [ekv_name, key, "old", [if_vsn: nil, ttl: 1]])
+
+      Process.sleep(10)
+
+      TestCluster.disconnect_nodes(node_a, node_b)
+      TestCluster.disconnect_nodes(node_a, node_c)
+
+      assert TestCluster.rpc!(node_b, EKV, :get, [ekv_name, key]) == nil
+      assert TestCluster.rpc!(node_c, EKV, :get, [ekv_name, key]) == nil
+
+      {:ok, _} = TestCluster.rpc!(node_b, EKV, :put, [ekv_name, key, "reborn", [if_vsn: nil]])
+      assert TestCluster.rpc!(node_b, EKV, :get, [ekv_name, key]) == "reborn"
+      assert TestCluster.rpc!(node_c, EKV, :get, [ekv_name, key, [consistent: true]]) == "reborn"
+
+      Process.sleep(20)
+
+      shard = EKV.Replica.shard_index_for(key, 2)
+      shard_name = EKV.Replica.shard_name(ekv_name, shard)
+      now = System.system_time(:nanosecond)
+
+      TestCluster.rpc!(node_a, :erlang, :send, [shard_name, {:gc, now, 0}])
+      TestCluster.rpc!(node_a, :sys, :get_state, [shard_name])
+
+      TestCluster.reconnect_nodes(node_a, node_b)
+      TestCluster.reconnect_nodes(node_a, node_c)
+
+      TestCluster.assert_eventually(
+        fn ->
+          Enum.all?([node_a, node_b, node_c], fn node ->
+            TestCluster.rpc!(node, EKV, :get, [ekv_name, key]) == "reborn"
+          end)
+        end,
+        timeout: 5_000
+      )
+
+      assert TestCluster.rpc!(node_b, EKV, :get, [ekv_name, key, [consistent: true]]) == "reborn"
+    end
+
     test "CAS across multiple shards: each shard handles independently" do
       peers = TestCluster.start_peers(2)
       on_exit(fn -> TestCluster.stop_peers(peers) end)

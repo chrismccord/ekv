@@ -147,7 +147,7 @@ separate and use an EKV-instance-specific `:pg` scope.
 When a node connects (or reconnects), each shard pair exchanges a handshake. Based on high-water marks (HWMs), they decide:
 
 - **Delta sync** if the oplog still has entries since the member's last known position (efficient for brief disconnects).
-- **Full sync** if the oplog has been truncated past that point or the member is new (sends all live entries + recent tombstones).
+- **Full sync** if the oplog has been truncated past that point or the member is new (sends all live entries + recent tombstones; expired rows are omitted).
 
 ### Conflict resolution
 
@@ -214,8 +214,8 @@ Keep lock/ownership keyspaces CAS-write-only after transition.
 
 A periodic GC timer runs three phases per tick:
 
-1. **Expire TTL entries** -- converts expired entries to tombstones and broadcasts deletes
-2. **Purge old tombstones** -- hard-deletes tombstones older than `tombstone_ttl` from SQLite
+1. **Observe TTL expiry** -- emits `:expired` events; expired LWW rows become tombstones, expired CAS rows stay lazy/local
+2. **Purge old tombstones / long-expired CAS rows** -- hard-deletes data older than the retention window from SQLite
 3. **Truncate oplog** -- removes oplog entries below the minimum member HWM
 
 ### Stale database protection

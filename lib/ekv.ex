@@ -228,7 +228,7 @@ defmodule EKV do
   | `:shutdown_barrier` | `false` | Optional graceful-shutdown barrier. Keeps EKV serving during coordinated shutdown for up to the configured timeout so members can finish final writes and replication. |
   | `:allow_stale_startup` | `false` | Member mode only. Dangerous recovery override. If `true`, EKV trusts on-disk data even when stale-db detection would normally refuse startup. Intended only for explicit disaster recovery / full cold-cluster restore cases. |
   | `:tombstone_ttl` | `604_800_000` (7 days) | Member mode only. How long tombstones (deleted entries) are kept before being permanently purged, in milliseconds. See "Tombstone Lifetime" below. |
-  | `:gc_interval` | `300_000` (5 min) | Member mode only. How often garbage collection runs, in milliseconds. GC expires TTL entries, purges old tombstones, and truncates the replication oplog. |
+  | `:gc_interval` | `300_000` (5 min) | Member mode only. How often garbage collection runs, in milliseconds. GC emits `:expired` events for TTL expiry, tombstones expired LWW rows, lazily purges expired CAS rows, and truncates the replication oplog. |
   | `:log` | `:info` | Logging level. `:info` logs cluster events (connects, syncs). `false` disables logging. `:verbose` logs per-shard detail. |
   | `:partition_ttl_policy` | `:quarantine` | Member mode only. Policy for reconnects after downtime longer than `tombstone_ttl`. `:quarantine` blocks replication with that member identity until operator rebuild. `:ignore` disables that quarantine and allows reconnect/sync anyway. |
   | `:blue_green` | `false` | Member mode only. Enable blue-green deployment mode. See "Blue-Green Deployment" below. |
@@ -378,9 +378,9 @@ defmodule EKV do
     new VM open the database files. The old VM enters proxy mode, forwarding
     any remaining write requests to the new VM.
 
-  If the old VM is dead when the new VM starts, the handoff requests time out
-  after 5 seconds and the new VM opens the files directly. SQLite's WAL
-  recovery handles any incomplete writes.
+  If the marker points at a dead or unreachable old VM, EKV skips handoff and
+  opens the files directly. SQLite's WAL recovery handles any incomplete
+  writes.
 
   **Requirements:**
 
@@ -413,7 +413,8 @@ defmodule EKV do
     log hasn't been truncated, only the missed entries are sent.
 
   - **Full sync** — if this is the first connection or the node was away long
-    enough for the oplog to be truncated, a full state transfer is performed.
+    enough for the oplog to be truncated, a full state transfer is performed
+    (live entries + recent tombstones; expired rows are omitted).
 
   After the initial sync, every local write is replicated to all connected
   members in real time (fire-and-forget, async). Consistency is maintained by
@@ -425,11 +426,11 @@ defmodule EKV do
 
       EKV.put(:my_kv, "session/abc", token, ttl: :timer.minutes(30))
 
-  Expired entries are not returned by `get/2`, `scan/2`, or `keys/2`. They are
-  converted to tombstones by the periodic GC and then replicated as deletes,
-  so expiry is eventually consistent across nodes. The GC interval (default 5
-  minutes) determines the maximum delay before an expired entry is tombstoned
-  and its deletion broadcast.
+  Expired entries are not returned by `get/2`, `scan/2`, or `keys/2`.
+  Periodic GC emits `:expired` events for subscribers. For eventual/LWW keys,
+  GC also writes a tombstone that replicates to other members. For CAS-managed
+  keys, expiry stays local/lazy and long-expired rows are purged later instead
+  of becoming replicated deletes.
 
   ### Value Serialization Caveats
 
@@ -970,10 +971,11 @@ defmodule EKV do
 
   The subscriber receives messages of the form:
 
-      {:ekv, [%EKV.Event{type: :put | :delete, key: key, value: value}], %{name: name}}
+      {:ekv, [%EKV.Event{type: :put | :delete | :expired, key: key, value: value}], %{name: name}}
 
   - `:put` events contain the new value (decoded Elixir term).
   - `:delete` events contain the previous value before deletion (or `nil`).
+  - `:expired` events contain the last local value observed before TTL expiry.
 
   ## Prefix Matching
 
