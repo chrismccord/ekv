@@ -46,6 +46,34 @@ defmodule EKV.TestCluster do
     end)
   end
 
+  @doc "Stop EKV on a remote node by supervisor name"
+  def stop_ekv(node, name, timeout \\ 5_000) do
+    :erpc.call(node, __MODULE__, :do_stop_ekv, [name, timeout])
+  end
+
+  @doc false
+  def do_stop_ekv(name, timeout) do
+    sup_name = :"#{name}_ekv_sup"
+
+    case Process.whereis(sup_name) do
+      nil -> :ok
+      pid -> Supervisor.stop(pid, :shutdown, timeout)
+    end
+  end
+
+  @doc "True when no registered EKV names remain for the given instance"
+  def ekv_stopped?(node, name) do
+    prefix = "#{name}_ekv_"
+    :erpc.call(node, __MODULE__, :registered_prefix_clear?, [prefix])
+  end
+
+  @doc false
+  def registered_prefix_clear?(prefix) when is_binary(prefix) do
+    not Enum.any?(Process.registered(), fn name ->
+      Atom.to_string(name) |> String.starts_with?(prefix)
+    end)
+  end
+
   @doc "Wait for a condition to become true, with retries"
   def assert_eventually(fun, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, 2000)
@@ -72,11 +100,12 @@ defmodule EKV.TestCluster do
 
   @doc "Disconnect two peer nodes from each other"
   def disconnect_nodes(node_a, node_b) do
-    # Set wrong cookie BEFORE disconnect to prevent Erlang auto-reconnect.
-    # Without this, a send({name, node}, msg) on either side can silently
-    # re-establish the distribution connection, defeating the partition.
-    rpc!(node_a, :erlang, :set_cookie, [node_b, :partition])
-    rpc!(node_b, :erlang, :set_cookie, [node_a, :partition])
+    # Set MISMATCHED cookies BEFORE disconnect to prevent Erlang auto-reconnect.
+    # Both sides must disagree — if both used the same cookie (e.g. :partition),
+    # the handshake would succeed and the partition would silently heal when
+    # any process does send({name, node}, msg) before processing nodedown.
+    rpc!(node_a, :erlang, :set_cookie, [node_b, :partition_a])
+    rpc!(node_b, :erlang, :set_cookie, [node_a, :partition_b])
     rpc!(node_a, :erlang, :disconnect_node, [node_b])
   end
 
@@ -124,6 +153,15 @@ defmodule EKV.TestCluster do
     end)
   end
 
+  def start_collecting_subscriber_on(node, ekv_name, prefix, target_pid, collect_timeout) do
+    :erpc.call(node, __MODULE__, :start_collecting_subscriber, [
+      ekv_name,
+      prefix,
+      target_pid,
+      collect_timeout
+    ])
+  end
+
   @doc false
   def start_collecting_subscriber(ekv_name, prefix, target_pid, collect_timeout) do
     spawn(fn ->
@@ -152,12 +190,91 @@ defmodule EKV.TestCluster do
     end
   end
 
+  @doc "Materialize keys stream on remote node, return sorted list"
+  def keys_sorted(node, name, prefix) do
+    rpc!(node, __MODULE__, :do_keys_sorted, [name, prefix])
+  end
+
+  @doc "Count keys on remote node"
+  def keys_count(node, name, prefix) do
+    rpc!(node, __MODULE__, :do_keys_count, [name, prefix])
+  end
+
+  @doc "Count scan results on remote node"
+  def scan_count(node, name, prefix) do
+    rpc!(node, __MODULE__, :do_scan_count, [name, prefix])
+  end
+
+  @doc "Read raw kv row from a remote shard db, including tombstones"
+  def store_get(node, name, key) do
+    rpc!(node, __MODULE__, :do_store_get, [name, key])
+  end
+
+  @doc "Materialize scan stream on remote node, return %{key => value} map"
+  def scan_to_map(node, name, prefix) do
+    rpc!(node, __MODULE__, :do_scan_to_map, [name, prefix])
+  end
+
+  @doc false
+  def do_keys_sorted(name, prefix),
+    do: EKV.keys(name, prefix) |> Enum.map(fn {key, _vsn} -> key end) |> Enum.sort()
+
+  def do_keys_count(name, prefix), do: EKV.keys(name, prefix) |> Enum.count()
+  def do_scan_count(name, prefix), do: EKV.scan(name, prefix) |> Enum.count()
+
+  def do_store_get(name, key) do
+    config = EKV.Supervisor.get_config(name)
+    shard = EKV.Replica.shard_index_for(key, config.num_shards)
+    shard_name = EKV.Replica.shard_name(name, shard)
+    %{db: db} = :sys.get_state(shard_name)
+    EKV.Store.get(db, key)
+  end
+
+  def do_scan_to_map(name, prefix),
+    do: EKV.scan(name, prefix) |> Map.new(fn {k, v, _vsn} -> {k, v} end)
+
+  # CAS helpers — named functions that can be called across nodes
+  def cas_increment(nil), do: 1
+  def cas_increment(n), do: n + 1
+
+  def cas_upcase(v), do: String.upcase(v)
+
+  @doc "Kill a process by registered name (for cross-node RPC)"
+  def kill_registered(name) do
+    case Process.whereis(name) do
+      nil -> :ok
+      pid -> Process.exit(pid, :kill)
+    end
+  end
+
   @doc "Flush all EKV shard GenServers on a remote node"
   def flush_shards(node, name) do
-    num_shards = rpc!(node, EKV, :get_config, [name]).num_shards
+    num_shards = rpc!(node, EKV.Supervisor, :get_config, [name]).num_shards
 
     for shard <- 0..(num_shards - 1) do
       rpc!(node, :sys, :get_state, [:"#{name}_ekv_replica_#{shard}"])
+    end
+
+    :ok
+  end
+
+  @doc "Suspend all EKV shard GenServers on a remote node (simulates latency/freeze)"
+  def suspend_shards(node, name) do
+    num_shards = rpc!(node, EKV.Supervisor, :get_config, [name]).num_shards
+
+    for shard <- 0..(num_shards - 1) do
+      rpc!(node, :sys, :suspend, [:"#{name}_ekv_replica_#{shard}"])
+    end
+
+    :ok
+  end
+
+  @doc "Resume all EKV shard GenServers on a remote node"
+  def resume_shards(node, name) do
+    num_shards = rpc!(node, EKV.Supervisor, :get_config, [name]).num_shards
+
+    for shard <- 0..(num_shards - 1) do
+      rpc!(node, :sys, :resume, [:"#{name}_ekv_replica_#{shard}"])
     end
 
     :ok

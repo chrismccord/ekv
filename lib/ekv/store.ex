@@ -5,13 +5,26 @@ defmodule EKV.Store do
   Pure function module for SQLite operations. Called inside Replica GenServer.
 
   Each shard has its own SQLite database file at `#{data_dir}/shard_#{i}.db`.
-  Uses WAL mode for concurrent reads.
+  Uses WAL mode for concurrent reads. Store is responsible for:
+
+  - current committed KV state
+  - CAS accept/promote state (`kv_paxos`)
+  - delta/full sync source data (`kv_oplog`, `kv_member_hwm`)
+  - startup stale-db checks (`allow_stale_startup` override)
+  - local TTL-expiry bookkeeping via `expired_at`
 
   ## Tables
 
-  - `kv` — current state of all keys: key -> (value, timestamp, origin_node, expires_at, deleted_at)
-  - `kv_oplog` — append-only log of all mutations, used for delta sync
-  - `kv_peer_hwm` — per-peer high-water marks for oplog sync
+  - `kv` — current committed state of all keys:
+    `(value, timestamp, origin_node, expires_at, deleted_at, expired_at)`
+    `expired_at` is local-only bookkeeping so GC emits `:expired` once; it is
+    not a replicated tombstone marker.
+  - `kv_oplog` — append-only replication log for live puts and explicit deletes.
+    Already-expired rows are filtered out when delta sync is built.
+  - `kv_member_hwm` — per-member high-water marks for oplog sync/truncation.
+  - `kv_meta` — shard metadata such as `last_active_at`, persisted `node_id`,
+    and long-partition down-since markers.
+  - `kv_paxos` — durable CASPaxos acceptor state per key.
   """
 
   @get_sql """
@@ -26,9 +39,20 @@ defmodule EKV.Store do
   ON CONFLICT(key) DO UPDATE SET
     value = excluded.value, timestamp = excluded.timestamp,
     origin_node = excluded.origin_node, expires_at = excluded.expires_at,
-    deleted_at = excluded.deleted_at
+    deleted_at = excluded.deleted_at, expired_at = NULL
   WHERE excluded.timestamp > kv.timestamp
     OR (excluded.timestamp = kv.timestamp AND excluded.origin_node > kv.origin_node)
+  """
+
+  # Unconditional upsert — no LWW WHERE clause. Used by paxos_accept where
+  # Paxos ballots determine ordering, not timestamps.
+  @kv_force_upsert_sql """
+  INSERT INTO kv (key, value, timestamp, origin_node, expires_at, deleted_at)
+  VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+  ON CONFLICT(key) DO UPDATE SET
+    value = excluded.value, timestamp = excluded.timestamp,
+    origin_node = excluded.origin_node, expires_at = excluded.expires_at,
+    deleted_at = excluded.deleted_at, expired_at = NULL
   """
 
   @oplog_insert_sql """
@@ -36,13 +60,16 @@ defmodule EKV.Store do
   VALUES (?1, ?2, ?3, ?4, ?5, ?6)
   """
 
-  def open(data_dir, shard_index, tombstone_ttl, num_shards, gc_interval) do
+  def open(data_dir, shard_index, tombstone_ttl, num_shards, gc_interval, opts \\ []) do
+    allow_stale_startup = Keyword.get(opts, :allow_stale_startup, false)
     File.mkdir_p!(data_dir)
     path = Path.join(data_dir, "shard_#{shard_index}.db")
 
     # Check for stale db before opening. If the db exists and its last_active_at
-    # is older than the safe threshold, peers will have GC'd tombstones for entries
-    # deleted while we were away. Wipe and let full sync rebuild from scratch.
+    # is older than the safe threshold, other members will have GC'd tombstones for entries
+    # deleted while we were away. Fail startup by default so operators can
+    # explicitly choose whether to wipe/rebuild from members or trust the old
+    # on-disk data.
     #
     # Safety margin: last_active_at can lag real shutdown by up to gc_interval
     # (worst case: node crashes right before a GC tick). We subtract gc_interval
@@ -50,12 +77,12 @@ defmodule EKV.Store do
     # is always detected as stale, even in the worst case.
     stale_threshold = tombstone_ttl - gc_interval
 
-    if stale_db?(path, stale_threshold) do
-      File.rm(path)
-      File.rm(path <> "-wal")
-      File.rm(path <> "-shm")
+    with :ok <- maybe_reject_stale_db(path, stale_threshold, allow_stale_startup) do
+      do_open(path, num_shards, data_dir, shard_index)
     end
+  end
 
+  defp do_open(path, num_shards, data_dir, shard_index) do
     {:ok, db} = EKV.Sqlite3.open(path)
 
     # PRAGMAs
@@ -73,7 +100,8 @@ defmodule EKV.Store do
         timestamp INTEGER NOT NULL,
         origin_node TEXT NOT NULL,
         expires_at INTEGER,
-        deleted_at INTEGER
+        deleted_at INTEGER,
+        expired_at INTEGER
       )
       """)
 
@@ -92,8 +120,8 @@ defmodule EKV.Store do
 
     :ok =
       EKV.Sqlite3.execute(db, """
-      CREATE TABLE IF NOT EXISTS kv_peer_hwm (
-        peer_node TEXT NOT NULL PRIMARY KEY,
+      CREATE TABLE IF NOT EXISTS kv_member_hwm (
+        member_node TEXT NOT NULL PRIMARY KEY,
         last_seq INTEGER NOT NULL
       )
       """)
@@ -102,9 +130,51 @@ defmodule EKV.Store do
       EKV.Sqlite3.execute(db, """
       CREATE TABLE IF NOT EXISTS kv_meta (
         key TEXT NOT NULL PRIMARY KEY,
-        value INTEGER NOT NULL
+        value_int INTEGER,
+        value_text TEXT
       )
       """)
+
+    # Migration for existing databases with old kv_meta schema (single `value` column)
+    case EKV.Sqlite3.execute(db, "ALTER TABLE kv_meta ADD COLUMN value_int INTEGER") do
+      :ok -> :ok
+      {:error, _} -> :ok
+    end
+
+    case EKV.Sqlite3.execute(db, "ALTER TABLE kv_meta ADD COLUMN value_text TEXT") do
+      :ok -> :ok
+      {:error, _} -> :ok
+    end
+
+    :ok =
+      EKV.Sqlite3.execute(db, """
+      CREATE TABLE IF NOT EXISTS kv_paxos (
+        key TEXT NOT NULL PRIMARY KEY,
+        promised_counter INTEGER NOT NULL DEFAULT 0,
+        promised_node TEXT NOT NULL DEFAULT '',
+        accepted_counter INTEGER NOT NULL DEFAULT 0,
+        accepted_node TEXT NOT NULL DEFAULT '',
+        accepted_value BLOB,
+        accepted_timestamp INTEGER,
+        accepted_origin TEXT,
+        accepted_expires_at INTEGER,
+        accepted_deleted_at INTEGER
+      )
+      """)
+
+    # Migration for existing dev databases — add value columns if missing
+    for {col, type} <- [
+          {"accepted_value", "BLOB"},
+          {"accepted_timestamp", "INTEGER"},
+          {"accepted_origin", "TEXT"},
+          {"accepted_expires_at", "INTEGER"},
+          {"accepted_deleted_at", "INTEGER"}
+        ] do
+      case EKV.Sqlite3.execute(db, "ALTER TABLE kv_paxos ADD COLUMN #{col} #{type}") do
+        :ok -> :ok
+        {:error, _} -> :ok
+      end
+    end
 
     :ok =
       EKV.Sqlite3.execute(
@@ -116,6 +186,17 @@ defmodule EKV.Store do
       EKV.Sqlite3.execute(
         db,
         "CREATE INDEX IF NOT EXISTS idx_kv_expires ON kv(expires_at) WHERE expires_at IS NOT NULL"
+      )
+
+    case EKV.Sqlite3.execute(db, "ALTER TABLE kv ADD COLUMN expired_at INTEGER") do
+      :ok -> :ok
+      {:error, _} -> :ok
+    end
+
+    :ok =
+      EKV.Sqlite3.execute(
+        db,
+        "CREATE INDEX IF NOT EXISTS idx_kv_expired_marker ON kv(expired_at) WHERE expired_at IS NOT NULL"
       )
 
     # Validate shard count — must never change after first open
@@ -155,8 +236,9 @@ defmodule EKV.Store do
   """
   def prepare_cached_stmts(db) do
     {:ok, kv_stmt} = EKV.Sqlite3.prepare(db, @kv_upsert_sql)
+    {:ok, kv_force_stmt} = EKV.Sqlite3.prepare(db, @kv_force_upsert_sql)
     {:ok, oplog_stmt} = EKV.Sqlite3.prepare(db, @oplog_insert_sql)
-    %{kv_upsert: kv_stmt, oplog_insert: oplog_stmt}
+    %{kv_upsert: kv_stmt, kv_force_upsert: kv_force_stmt, oplog_insert: oplog_stmt}
   end
 
   @doc """
@@ -221,6 +303,20 @@ defmodule EKV.Store do
 
         :done ->
           nil
+      end
+
+    :ok = EKV.Sqlite3.release(db, stmt)
+    result
+  end
+
+  def max_timestamp(db) do
+    {:ok, stmt} = EKV.Sqlite3.prepare(db, "SELECT MAX(timestamp) FROM kv")
+
+    result =
+      case EKV.Sqlite3.step(db, stmt) do
+        {:row, [nil]} -> nil
+        {:row, [ts]} -> ts
+        :done -> nil
       end
 
     :ok = EKV.Sqlite3.release(db, stmt)
@@ -343,14 +439,14 @@ defmodule EKV.Store do
   end
 
   # =====================================================================
-  # Peer HWM
+  # Member HWM
   # =====================================================================
 
-  def get_hwm(db, peer_node) do
+  def get_hwm(db, member_node) do
     {:ok, stmt} =
-      EKV.Sqlite3.prepare(db, "SELECT last_seq FROM kv_peer_hwm WHERE peer_node = ?1")
+      EKV.Sqlite3.prepare(db, "SELECT last_seq FROM kv_member_hwm WHERE member_node = ?1")
 
-    :ok = EKV.Sqlite3.bind(stmt, [Atom.to_string(peer_node)])
+    :ok = EKV.Sqlite3.bind(stmt, [Atom.to_string(member_node)])
 
     result =
       case EKV.Sqlite3.step(db, stmt) do
@@ -362,14 +458,14 @@ defmodule EKV.Store do
     result
   end
 
-  def set_hwm(db, peer_node, seq) do
+  def set_hwm(db, member_node, seq) do
     {:ok, stmt} =
       EKV.Sqlite3.prepare(db, """
-      INSERT INTO kv_peer_hwm (peer_node, last_seq) VALUES (?1, ?2)
-      ON CONFLICT(peer_node) DO UPDATE SET last_seq = MAX(kv_peer_hwm.last_seq, excluded.last_seq)
+      INSERT INTO kv_member_hwm (member_node, last_seq) VALUES (?1, ?2)
+      ON CONFLICT(member_node) DO UPDATE SET last_seq = MAX(kv_member_hwm.last_seq, excluded.last_seq)
       """)
 
-    :ok = EKV.Sqlite3.bind(stmt, [Atom.to_string(peer_node), seq])
+    :ok = EKV.Sqlite3.bind(stmt, [Atom.to_string(member_node), seq])
     :done = EKV.Sqlite3.step(db, stmt)
     :ok = EKV.Sqlite3.release(db, stmt)
     :ok
@@ -381,11 +477,15 @@ defmodule EKV.Store do
 
   @find_expired_sql """
   SELECT key, value, timestamp, origin_node, expires_at
-  FROM kv WHERE expires_at IS NOT NULL AND expires_at < ?1 AND deleted_at IS NULL
+  FROM kv
+  WHERE expires_at IS NOT NULL
+    AND expires_at < ?1
+    AND deleted_at IS NULL
+    AND expired_at IS NULL
   """
 
   @doc """
-  Find entries with expired TTL that haven't been tombstoned yet
+  Find entries with expired TTL that have not yet emitted a local expiry event.
   """
   def find_expired(db, now) do
     {:ok, rows} = EKV.Sqlite3.fetch_all(db, @find_expired_sql, [now])
@@ -393,6 +493,47 @@ defmodule EKV.Store do
     Enum.map(rows, fn [key, value, timestamp, origin_node, expires_at] ->
       {key, value, timestamp, String.to_atom(origin_node), expires_at}
     end)
+  end
+
+  @doc """
+  Mark an expired row as locally observed so GC emits `:expired` once.
+  """
+  def mark_expired(db, key, now) do
+    {:ok, stmt} =
+      EKV.Sqlite3.prepare(db, """
+      UPDATE kv
+      SET expired_at = ?2
+      WHERE key = ?1
+        AND expires_at IS NOT NULL
+        AND expires_at < ?2
+        AND deleted_at IS NULL
+        AND expired_at IS NULL
+      """)
+
+    :ok = EKV.Sqlite3.bind(stmt, [key, now])
+    :done = EKV.Sqlite3.step(db, stmt)
+    :ok = EKV.Sqlite3.release(db, stmt)
+    {:ok, [[changes]]} = EKV.Sqlite3.fetch_all(db, "SELECT changes()", [])
+    {:ok, changes > 0}
+  end
+
+  @doc """
+  Hard-delete CAS-managed TTL-expired rows older than the retention cutoff.
+  """
+  def purge_expired(db, cutoff) do
+    {:ok, stmt} =
+      EKV.Sqlite3.prepare(db, """
+      DELETE FROM kv
+      WHERE expires_at IS NOT NULL
+        AND expires_at < ?1
+        AND deleted_at IS NULL
+        AND key IN (SELECT key FROM kv_paxos)
+      """)
+
+    :ok = EKV.Sqlite3.bind(stmt, [cutoff])
+    :done = EKV.Sqlite3.step(db, stmt)
+    :ok = EKV.Sqlite3.release(db, stmt)
+    :ok
   end
 
   @doc """
@@ -411,18 +552,18 @@ defmodule EKV.Store do
   end
 
   @doc """
-  Remove HWM entries for peers not currently connected.
-  Prevents dead peers from anchoring the oplog forever.
+  Remove HWM entries for members not currently connected.
+  Prevents dead members from anchoring the oplog forever.
   """
-  def prune_peer_hwms(db, connected_peers) do
-    connected_set = MapSet.new(connected_peers, &Atom.to_string/1)
-    {:ok, rows} = EKV.Sqlite3.fetch_all(db, "SELECT peer_node FROM kv_peer_hwm", [])
+  def prune_member_hwms(db, connected_members) do
+    connected_set = MapSet.new(connected_members, &Atom.to_string/1)
+    {:ok, rows} = EKV.Sqlite3.fetch_all(db, "SELECT member_node FROM kv_member_hwm", [])
 
-    for [peer_node] <- rows, not MapSet.member?(connected_set, peer_node) do
+    for [member_node] <- rows, not MapSet.member?(connected_set, member_node) do
       {:ok, stmt} =
-        EKV.Sqlite3.prepare(db, "DELETE FROM kv_peer_hwm WHERE peer_node = ?1")
+        EKV.Sqlite3.prepare(db, "DELETE FROM kv_member_hwm WHERE member_node = ?1")
 
-      :ok = EKV.Sqlite3.bind(stmt, [peer_node])
+      :ok = EKV.Sqlite3.bind(stmt, [member_node])
       :done = EKV.Sqlite3.step(db, stmt)
       :ok = EKV.Sqlite3.release(db, stmt)
     end
@@ -431,11 +572,11 @@ defmodule EKV.Store do
   end
 
   @doc """
-  Truncate oplog entries below the min of all peer HWMs
+  Truncate oplog entries below the min of all member HWMs
   """
   def truncate_oplog(db) do
     {:ok, stmt} =
-      EKV.Sqlite3.prepare(db, "SELECT MIN(last_seq) FROM kv_peer_hwm")
+      EKV.Sqlite3.prepare(db, "SELECT MIN(last_seq) FROM kv_member_hwm")
 
     min_hwm =
       case EKV.Sqlite3.step(db, stmt) do
@@ -464,17 +605,89 @@ defmodule EKV.Store do
 
   @full_state_sql """
   SELECT key, value, timestamp, origin_node, expires_at, deleted_at
-  FROM kv WHERE deleted_at IS NULL OR deleted_at > ?1
+  FROM kv
+  WHERE (deleted_at IS NULL AND (expires_at IS NULL OR expires_at > ?2))
+     OR deleted_at > ?1
   """
 
   @doc """
   Get all live entries from SQLite for full sync (excludes old tombstones)
   """
   def full_state(db, tombstone_cutoff) do
-    {:ok, rows} = EKV.Sqlite3.fetch_all(db, @full_state_sql, [tombstone_cutoff])
+    now = System.system_time(:nanosecond)
+    {:ok, rows} = EKV.Sqlite3.fetch_all(db, @full_state_sql, [tombstone_cutoff, now])
 
     Enum.map(rows, fn [key, value, timestamp, origin_node, expires_at, deleted_at] ->
       {key, value, timestamp, String.to_atom(origin_node), expires_at, deleted_at}
+    end)
+  end
+
+  # =====================================================================
+  # Chunked query functions (for cursor-based sync pagination)
+  # =====================================================================
+
+  @full_state_first_chunk_sql """
+  SELECT key, value, timestamp, origin_node, expires_at, deleted_at
+  FROM kv
+  WHERE (deleted_at IS NULL AND (expires_at IS NULL OR expires_at > ?2))
+     OR deleted_at > ?1
+  ORDER BY key LIMIT ?3
+  """
+
+  @full_state_chunk_sql """
+  SELECT key, value, timestamp, origin_node, expires_at, deleted_at
+  FROM kv
+  WHERE (((deleted_at IS NULL AND (expires_at IS NULL OR expires_at > ?3))
+     OR deleted_at > ?1))
+    AND key > ?2
+  ORDER BY key LIMIT ?4
+  """
+
+  @doc """
+  Get a chunk of live entries for full sync, ordered by key with cursor pagination.
+  Pass `nil` as `last_key` for the first chunk.
+  """
+  def full_state_chunk(db, tombstone_cutoff, nil, limit) do
+    now = System.system_time(:nanosecond)
+
+    {:ok, rows} =
+      EKV.Sqlite3.fetch_all(db, @full_state_first_chunk_sql, [tombstone_cutoff, now, limit])
+
+    map_full_state_rows(rows)
+  end
+
+  def full_state_chunk(db, tombstone_cutoff, last_key, limit) do
+    now = System.system_time(:nanosecond)
+
+    {:ok, rows} =
+      EKV.Sqlite3.fetch_all(db, @full_state_chunk_sql, [tombstone_cutoff, last_key, now, limit])
+
+    map_full_state_rows(rows)
+  end
+
+  defp map_full_state_rows(rows) do
+    Enum.map(rows, fn [key, value, timestamp, origin_node, expires_at, deleted_at] ->
+      {key, value, timestamp, String.to_atom(origin_node), expires_at, deleted_at}
+    end)
+  end
+
+  @oplog_since_chunk_sql """
+  SELECT seq, key, value, timestamp, origin_node, expires_at, is_delete
+  FROM kv_oplog
+  WHERE seq > ?1
+    AND (is_delete = 1 OR expires_at IS NULL OR expires_at > ?2)
+  ORDER BY seq LIMIT ?3
+  """
+
+  @doc """
+  Get a chunk of oplog entries since `seq`, ordered by seq with cursor pagination.
+  """
+  def oplog_since_chunk(db, seq, limit) do
+    now = System.system_time(:nanosecond)
+    {:ok, rows} = EKV.Sqlite3.fetch_all(db, @oplog_since_chunk_sql, [seq, now, limit])
+
+    Enum.map(rows, fn [seq, key, value, timestamp, origin_node, expires_at, is_delete] ->
+      {seq, key, value, timestamp, String.to_atom(origin_node), expires_at, is_delete == 1}
     end)
   end
 
@@ -483,8 +696,8 @@ defmodule EKV.Store do
 
     {:ok, stmt} =
       EKV.Sqlite3.prepare(db, """
-      INSERT INTO kv_meta (key, value) VALUES ('last_active_at', ?1)
-      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      INSERT INTO kv_meta (key, value_int) VALUES ('last_active_at', ?1)
+      ON CONFLICT(key) DO UPDATE SET value_int = excluded.value_int
       """)
 
     :ok = EKV.Sqlite3.bind(stmt, [now])
@@ -493,20 +706,44 @@ defmodule EKV.Store do
     :ok
   end
 
-  defp stale_db?(path, tombstone_ttl) do
+  defp maybe_reject_stale_db(_path, _stale_threshold_ms, true), do: :ok
+
+  defp maybe_reject_stale_db(path, stale_threshold_ms, false) do
+    case stale_db_info(path, stale_threshold_ms) do
+      nil -> :ok
+      info -> {:error, {:stale_db, info}}
+    end
+  end
+
+  defp stale_db_info(path, stale_threshold_ms) do
     if File.exists?(path) do
       case read_last_active(path) do
         nil ->
-          # No meta table or no row — legacy db, treat as stale
-          true
+          # No meta table or no row — stale/unknown db, treat as stale.
+          %{
+            path: path,
+            threshold_ms: stale_threshold_ms,
+            age_ms: nil,
+            reason: :missing_last_active_at
+          }
 
         last_active_at ->
           now = System.system_time(:nanosecond)
           age_ms = div(now - last_active_at, 1_000_000)
-          age_ms > tombstone_ttl
+
+          if age_ms > stale_threshold_ms do
+            %{
+              path: path,
+              threshold_ms: stale_threshold_ms,
+              age_ms: age_ms,
+              reason: :stale_last_active_at
+            }
+          else
+            nil
+          end
       end
     else
-      false
+      nil
     end
   end
 
@@ -515,7 +752,10 @@ defmodule EKV.Store do
       {:ok, db} ->
         result =
           try do
-            case EKV.Sqlite3.prepare(db, "SELECT value FROM kv_meta WHERE key = 'last_active_at'") do
+            case EKV.Sqlite3.prepare(
+                   db,
+                   "SELECT value_int FROM kv_meta WHERE key = 'last_active_at'"
+                 ) do
               {:ok, stmt} ->
                 val =
                   case EKV.Sqlite3.step(db, stmt) do
@@ -545,9 +785,216 @@ defmodule EKV.Store do
   # Shard count validation
   # =====================================================================
 
+  # =====================================================================
+  # Metadata
+  # =====================================================================
+
+  def get_meta(db, key) do
+    get_meta_int(db, key)
+  end
+
+  def set_meta(db, key, value) do
+    set_meta_int(db, key, value)
+  end
+
+  def get_meta_int(db, key) do
+    {:ok, stmt} = EKV.Sqlite3.prepare(db, "SELECT value_int FROM kv_meta WHERE key = ?1")
+    :ok = EKV.Sqlite3.bind(stmt, [key])
+
+    result =
+      case EKV.Sqlite3.step(db, stmt) do
+        {:row, [val]} -> val
+        :done -> nil
+      end
+
+    :ok = EKV.Sqlite3.release(db, stmt)
+    result
+  end
+
+  def set_meta_int(db, key, value) do
+    {:ok, stmt} =
+      EKV.Sqlite3.prepare(db, """
+      INSERT INTO kv_meta (key, value_int) VALUES (?1, ?2)
+      ON CONFLICT(key) DO UPDATE SET value_int = excluded.value_int
+      """)
+
+    :ok = EKV.Sqlite3.bind(stmt, [key, value])
+    :done = EKV.Sqlite3.step(db, stmt)
+    :ok = EKV.Sqlite3.release(db, stmt)
+    :ok
+  end
+
+  def set_meta_int_if_absent(db, key, value) do
+    case get_meta_int(db, key) do
+      nil ->
+        set_meta_int(db, key, value)
+        :inserted
+
+      _existing ->
+        :exists
+    end
+  end
+
+  def get_meta_text(db, key) do
+    {:ok, stmt} = EKV.Sqlite3.prepare(db, "SELECT value_text FROM kv_meta WHERE key = ?1")
+    :ok = EKV.Sqlite3.bind(stmt, [key])
+
+    result =
+      case EKV.Sqlite3.step(db, stmt) do
+        {:row, [val]} -> val
+        :done -> nil
+      end
+
+    :ok = EKV.Sqlite3.release(db, stmt)
+    result
+  end
+
+  def set_meta_text(db, key, value) do
+    {:ok, stmt} =
+      EKV.Sqlite3.prepare(db, """
+      INSERT INTO kv_meta (key, value_text) VALUES (?1, ?2)
+      ON CONFLICT(key) DO UPDATE SET value_text = excluded.value_text
+      """)
+
+    :ok = EKV.Sqlite3.bind(stmt, [key, value])
+    :done = EKV.Sqlite3.step(db, stmt)
+    :ok = EKV.Sqlite3.release(db, stmt)
+    :ok
+  end
+
+  def delete_meta_key(db, key) do
+    {:ok, stmt} = EKV.Sqlite3.prepare(db, "DELETE FROM kv_meta WHERE key = ?1")
+    :ok = EKV.Sqlite3.bind(stmt, [key])
+    :done = EKV.Sqlite3.step(db, stmt)
+    :ok = EKV.Sqlite3.release(db, stmt)
+    :ok
+  end
+
+  def member_down_marker_get(db, key), do: get_meta_int(db, key)
+  def member_down_marker_put(db, key, down_since_ms), do: set_meta_int(db, key, down_since_ms)
+
+  def member_down_marker_set_if_absent(db, key, down_since_ms),
+    do: set_meta_int_if_absent(db, key, down_since_ms)
+
+  def member_down_marker_clear(db, key), do: delete_meta_key(db, key)
+
+  def prune_member_down_name_markers(db, stale_before_ms, max_entries) do
+    {:ok, rows} =
+      EKV.Sqlite3.fetch_all(
+        db,
+        "SELECT key, value_int FROM kv_meta WHERE key LIKE 'member_down_at:name:%' ORDER BY value_int DESC",
+        []
+      )
+
+    keys_to_delete =
+      rows
+      |> Enum.with_index()
+      |> Enum.reduce([], fn {[key, down_since], idx}, acc ->
+        stale? = not is_integer(down_since) or down_since < stale_before_ms
+        over_cap? = idx >= max_entries
+        if stale? or over_cap?, do: [key | acc], else: acc
+      end)
+
+    Enum.each(keys_to_delete, &delete_meta_key(db, &1))
+    length(keys_to_delete)
+  end
+
+  def read_node_id(data_dir) do
+    path = Path.join(data_dir, "shard_0.db")
+
+    if File.exists?(path) do
+      case EKV.Sqlite3.open(path) do
+        {:ok, db} ->
+          result =
+            try do
+              get_meta_text(db, "node_id")
+            rescue
+              _ -> nil
+            end
+
+          EKV.Sqlite3.close(db)
+          result
+
+        _ ->
+          nil
+      end
+    end
+  end
+
+  def persist_node_id(db, node_id) do
+    case get_meta_text(db, "node_id") do
+      nil -> set_meta_text(db, "node_id", node_id)
+      _ -> :ok
+    end
+  end
+
+  # =====================================================================
+  # Paxos
+  # =====================================================================
+
+  def paxos_prepare(db, key, ballot_counter, ballot_node) do
+    EKV.Sqlite3.paxos_prepare(db, key, ballot_counter, ballot_node)
+  end
+
+  def paxos_accept(db, key, ballot_c, ballot_n, value_args) do
+    EKV.Sqlite3.paxos_accept(db, key, ballot_c, ballot_n, value_args)
+  end
+
+  def paxos_promote(db, kv_force_stmt, oplog_stmt, key, ballot_c, ballot_n) do
+    EKV.Sqlite3.paxos_promote(db, kv_force_stmt, oplog_stmt, key, ballot_c, ballot_n)
+  end
+
+  def cas_managed_key?(db, key) do
+    case EKV.Sqlite3.fetch_all(db, "SELECT 1 FROM kv_paxos WHERE key = ?1 LIMIT 1", [key]) do
+      {:ok, []} -> false
+      {:ok, _rows} -> true
+      _ -> false
+    end
+  end
+
+  @clear_paxos_accepted_sql """
+  UPDATE kv_paxos SET accepted_counter = 0, accepted_node = '',
+    accepted_value = NULL, accepted_timestamp = NULL, accepted_origin = NULL,
+    accepted_expires_at = NULL, accepted_deleted_at = NULL
+  WHERE key = ?1
+  """
+
+  @doc """
+  Clear accepted value columns in kv_paxos after a commit.
+  Called by the proposer after write_entry succeeds, so future prepares
+  read from kv (committed state) rather than stale accepted values.
+
+  Note: promised_counter is intentionally preserved — clearing it would allow
+  stale accepts from older ballots to succeed, and kv_force_upsert would then
+  unconditionally overwrite the committed value (CASPaxos violation).
+  """
+  def clear_paxos_accepted(db, key) do
+    {:ok, stmt} = EKV.Sqlite3.prepare(db, @clear_paxos_accepted_sql)
+    :ok = EKV.Sqlite3.bind(stmt, [key])
+    :done = EKV.Sqlite3.step(db, stmt)
+    :ok = EKV.Sqlite3.release(db, stmt)
+    :ok
+  end
+
+  @doc """
+  Remove kv_paxos rows for keys that no longer exist in kv.
+  Called during GC to prevent unbounded growth.
+  """
+  def purge_orphan_paxos(db) do
+    :ok =
+      EKV.Sqlite3.execute(
+        db,
+        "DELETE FROM kv_paxos WHERE key NOT IN (SELECT key FROM kv) AND accepted_counter = 0 AND promised_counter = 0"
+      )
+  end
+
+  # =====================================================================
+  # Shard count validation
+  # =====================================================================
+
   defp validate_num_shards(db, num_shards, data_dir, shard_index) do
     {:ok, stmt} =
-      EKV.Sqlite3.prepare(db, "SELECT value FROM kv_meta WHERE key = 'num_shards'")
+      EKV.Sqlite3.prepare(db, "SELECT value_int FROM kv_meta WHERE key = 'num_shards'")
 
     stored =
       case EKV.Sqlite3.step(db, stmt) do
@@ -562,7 +1009,7 @@ defmodule EKV.Store do
         # First open — persist the shard count
         {:ok, ins} =
           EKV.Sqlite3.prepare(db, """
-          INSERT INTO kv_meta (key, value) VALUES ('num_shards', ?1)
+          INSERT INTO kv_meta (key, value_int) VALUES ('num_shards', ?1)
           """)
 
         :ok = EKV.Sqlite3.bind(ins, [num_shards])

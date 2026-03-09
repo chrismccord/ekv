@@ -17,4 +17,13 @@ defmodule EKV.Sqlite3 do
   def read_entry(db, stmt, args), do: Sqlite3NIF.ekv_read_entry(db, stmt, args)
   def fetch_all(db, sql, args), do: Sqlite3NIF.ekv_fetch_all(db, sql, args)
   def backup(source_path, dest_path), do: Sqlite3NIF.ekv_backup(source_path, dest_path)
+
+  def paxos_prepare(db, key, ballot_counter, ballot_node),
+    do: Sqlite3NIF.ekv_paxos_prepare(db, key, ballot_counter, ballot_node)
+
+  def paxos_accept(db, key, ballot_c, ballot_n, value_args),
+    do: Sqlite3NIF.ekv_paxos_accept(db, key, ballot_c, ballot_n, value_args)
+
+  def paxos_promote(db, kv_force_stmt, oplog_stmt, key, ballot_c, ballot_n),
+    do: Sqlite3NIF.ekv_paxos_promote(db, kv_force_stmt, oplog_stmt, key, ballot_c, ballot_n)
 end

@@ -46,7 +46,7 @@ defmodule EKV.SubTracker do
         │────────────────────>│                        │                     │
         │                     │                        │                     │
         │               SQLite write                   │                     │
-        │               broadcast to peers             │                     │
+        │              broadcast to members            │                     │
         │                     │                        │                     │
         │                     │ send {:dispatch, evts} │                     │
         │                     │──────────────────────> │                     │

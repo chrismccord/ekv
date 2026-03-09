@@ -1,316 +1,357 @@
-# EKV — Eventually Consistent Durable KV Store
+# EKV Agent Context
 
-## What This Is
+This file is for AI agents working on EKV from a cold start.
+It is not user-facing documentation.
 
-EKV is a standalone Elixir library that provides an eventually consistent, durable key-value store backed by SQLite. Data survives node restarts, node death, and network partitions. Replication is peer-to-peer across all connected Erlang nodes using delta sync via per-shard oplogs.
+Use it as the shortest accurate map of:
+- current semantics
+- safety invariants
+- control-plane structure
+- where the sharp edges are
+- which tests to run before claiming a fix
 
-Zero runtime deps. SQLite is vendored as a C NIF (`c_src/sqlite3.c` amalgamation).
+Failure model in scope: non-malicious failures only.
+Assume crash, restart, network partition, message delay/reordering, and operator mistakes.
+Do not analyze Byzantine/malicious behavior unless explicitly asked.
 
-## Quick Reference
+## Read First
+1. `lib/ekv.ex`
+   Public API, return shapes, startup options, and user-visible semantics.
+2. `lib/ekv/replica.ex`
+   `_archdoc`, CASPaxos flow, sync/HWM logic, replication, GC, quorum, partition handling.
+3. `lib/ekv/store.ex`
+   SQLite schema, persisted metadata, stale-db checks, CAS/LWW persistence details.
+4. `lib/ekv/supervisor.ex`
+   Runtime mode split, scoped `:pg`, startup gates, blue-green handoff, persisted `node_id`.
+5. `README.md` and `OPERATORS.md`
+   Must stay aligned with real behavior.
 
-```elixir
-# Start
-{EKV, name: :my_kv, data_dir: "/data/ekv"}
+## Current Product Model
+- EKV is mixed-consistency.
+- Default operations are eventual/LWW.
+- CAS writes plus `consistent: true` reads provide per-key linearizable semantics when quorum is available.
+- Modes are per key, not per store:
+  - `LWW -> CAS` is allowed.
+  - `CAS -> LWW` writes are rejected with `{:error, :cas_managed_key}`.
+- Eventual reads on CAS-managed keys are still allowed.
+- `consistent: true` is a barrier read, not a fast-path heuristic.
 
-# API
-EKV.put(:my_kv, "user/1", %{name: "Alice"})
-EKV.put(:my_kv, "key", value, ttl: :timer.minutes(30))
-EKV.get(:my_kv, "user/1")          # => %{name: "Alice"} | nil
-EKV.delete(:my_kv, "user/1")
-EKV.scan(:my_kv, "user/")          # => %{"user/1" => val}
-EKV.keys(:my_kv, "user/")          # => ["user/1"] sorted
+## Runtime Modes
 
-# Subscribe to changes (matches at "/" boundaries, "" = all keys)
-EKV.subscribe(:my_kv, "user/")
-# => receive {:ekv, [%EKV.Event{type: :put, key: "user/1", value: val}], %{name: :my_kv}}
-EKV.unsubscribe(:my_kv, "user/")
+### `mode: :member`
+- Durable node.
+- Runs SQLite shards, replication, GC, CAS proposer/acceptor logic.
+- May run:
+  - `wait_for_quorum`
+  - `shutdown_barrier`
+  - `blue_green`
 
-# Isolation: start multiple EKV instances with different names.
-# Each is fully independent (own SQLite, peer mesh, oplog).
-```
+### `mode: :client`
+- Stateless node.
+- Does not run SQLite, replicas, GC, sync, or blue-green machinery.
+- Uses the same public API by routing to members.
+- Supports:
+  - `wait_for_route`
+  - `wait_for_quorum` (via selected member)
+  - `shutdown_barrier`
 
-## Commands
+Important:
+- Client mode rejects member-only options like `:blue_green`, `:cluster_size`, `:node_id`, `:data_dir`, `:shards`, `:partition_ttl_policy`.
 
+## CAS Configuration Reality
+- CAS requires `cluster_size`.
+- `node_id` is logically required for CAS identity, but current code auto-generates and persists one if `cluster_size` is set and `node_id` is omitted.
+- Persisted `node_id` on disk wins over a conflicting configured `node_id`.
+- Quorum math is by distinct logical `node_id`, not Erlang node name.
+
+## Public API Contracts That Must Not Drift
+
+### Eventual writes
+- `EKV.put/4` eventual path: `:ok` or `{:error, :cas_managed_key}`
+- `EKV.delete/3` eventual path: `:ok` or `{:error, :cas_managed_key}`
+
+### CAS writes
+- `EKV.put/4` CAS path:
+  - `{:ok, vsn}`
+  - `{:error, :conflict}`
+  - `{:error, :unconfirmed}`
+  - `{:error, :unavailable}` only when `resolve_unconfirmed: true` and the barrier resolution read cannot complete
+  - operational failures may also surface as `{:error, :no_quorum}`, `{:error, :quorum_timeout}`, `{:error, :cluster_overflow}`, `{:error, :shutting_down}`, `{:error, :cas_not_configured}`
+- `EKV.delete/3` CAS path:
+  - same error model as CAS put
+  - success shape is `{:ok, vsn}`
+- `EKV.update/4`:
+  - `{:ok, new_value, vsn}`
+  - same error model as CAS put/delete
+
+### Reads
+- `EKV.get/2` is eventual.
+- `EKV.lookup/2` is eventual and returns vsn.
+- `EKV.get(name, key, consistent: true)` is a barrier/linearizable read for the key.
+  - it returns `value | nil`
+  - it raises if the consistent read itself cannot complete
+
+### Streams
+- `EKV.scan/2` yields `{key, value, vsn}`
+- `EKV.keys/2` yields `{key, vsn}`
+- In client mode these are still local Elixir streams, backed by paged RPC.
+
+### `resolve_unconfirmed`
+- Current default is `false`.
+- If enabled on CAS writes, EKV does one internal barrier read on ambiguous accept-phase failure and resolves to:
+  - the original success if the committed state matches the attempted write
+  - `{:error, :conflict}` if it does not
+  - `{:error, :unavailable}` if resolution itself fails
+
+## Control Plane
+
+### Scoped `:pg` is mandatory
+- Do not use the default global `:pg` scope for EKV runtime behavior.
+- Each EKV instance owns its own `:pg` scope via `EKV.Supervisor.pg_scope(name)`.
+- All routing, distributed subscriptions, and shutdown coordination must use that scoped mesh.
+- This isolation matters because multiple EKV instances can coexist on the same cluster.
+
+### Member presence
+- Ready members advertise themselves in scoped `:pg` region groups:
+  - `{:ekv_members, name, region}`
+- This is pinned by `EKV.MemberPresence`.
+- New clients should discover members through this path, not by raw `Node.list/0`.
+
+### Client routing
+- `EKV.ClientRouter` is the client control plane.
+- Hot path:
+  - read cached backend from named ETS
+  - no per-op `GenServer.call`
+- Cold path:
+  - region-group membership comes from `:pg.monitor/2`
+  - waiters are event-driven, not polling
+  - failed/current-invalid backends are cooled down in ETS
+- Candidate selection:
+  - first available member in `region_routing` order
+  - stable ordering within a region
+  - cold-path validation RPC rejects stale/outgoing blue-green candidates by checking `EKV.MemberPresence.advertised?/1`
+- There is still a fallback path that probes connected nodes for member info if region groups are empty/stale.
+  - guard it carefully; not every node in `Node.list()` runs EKV.
+
+### Client subscription delivery
+- Member-local subscribers still use `Registry`.
+- Client subscribers join scoped `:pg` groups directly via `EKV.ClientSubscriptions`.
+- Members dispatch events to:
+  - local registry subscribers
+  - matching client `:pg` subscribers
+- There is also a coarse client “any subscribers exist” group used as a hot-path gate.
+
+### Shutdown barrier
+- `EKV.ShutdownBarrier` is an opt-in last child in both member and client trees.
+- It exists to help coordinated graceful shutdowns preserve quorum and allow final writes/replication to complete.
+- It uses scoped `:pg` groups:
+  - `{:ekv_shutdown_live, name}`
+  - `{:ekv_shutdown_terminal, name}`
+  - `{:ekv_shutdown_live_member, name, node_id}`
+  - `{:ekv_shutdown_terminal_member, name, node_id}`
+- Members count quorum by logical `node_id`.
+- Blue-green overlap must still count as one logical voter.
+- Outgoing proxy-mode blue-green members skip barrier waiting.
+
+## Startup Gates
+
+### `wait_for_route`
+- Client mode only.
+- Blocks startup until the first reachable member in `region_routing` order is selected.
+- This is about routing readiness, not quorum.
+
+### `wait_for_quorum`
+- Member mode:
+  - blocks startup until this member can reach CAS quorum
+- Client mode:
+  - first waits for a route
+  - then asks the selected member whether quorum is reachable
+- Do not reintroduce polling via `:sys.get_state`; the current gates are explicit processes.
+
+## Blue-Green Model
+- Valid only when old and new instances share the same filesystem volume.
+- Old and new must represent the same logical member (`node_id`).
+- Startup handoff:
+  - only attempts handoff if the outgoing marker node is reachable now
+  - stale/dead marker skips handoff
+- `EKV.BlueGreenMarker` exists only to clean the on-disk `current` marker on graceful non-handoff shutdown.
+- When outgoing member receives a real handoff:
+  - it marks handoff performed
+  - it leaves `MemberPresence`
+  - it enters proxy mode
+  - pending CAS waiters get `{:error, :shutting_down}`
+- New clients should route to the incoming node, but stale `:pg` visibility is possible briefly; the cold-path route validation RPC is what makes this reliable.
+
+## Safety Invariants
+
+### CASPaxos state separation
+- `paxos_accept` writes only to `kv_paxos`.
+- Accepted state is invisible to normal reads and scans.
+- Only `paxos_promote` writes committed CAS state into `kv` and `kv_oplog`.
+- No subscriber events on pure accept state.
+- This prevents phantom visibility.
+
+### Consistent read barrier
+- `consistent: true` must always go through the CAS read/repair path.
+- Recovery from accepted state must preserve the accepted row metadata exactly:
+  - `expires_at`
+  - `deleted_at`
+  - timestamp/origin tuple
+- Do not reconstruct accepted metadata from partial current-value state.
+
+### CAS error semantics
+- `:conflict` means definitive non-application for this attempt.
+- `:unconfirmed` means accept phase started and final outcome is ambiguous to the caller.
+- Do not “simplify” `:unconfirmed` into `:conflict`.
+- Automatic retries are acceptable for definite conflicts, not for ambiguous accept-phase outcomes.
+
+### Monotonic CAS timestamps
+- A CAS commit timestamp must be strictly greater than the current key timestamp.
+- This protects against older healed LWW state later overwriting a chosen CAS value.
+
+### CAS key ownership
+- Eventual writes must reject CAS-managed keys.
+- Reads may still be eventual or consistent.
+
+### Quorum and membership
+- Quorum is `floor(cluster_size / 2) + 1`.
+- Distinct logical `node_id`s drive quorum and overflow checks.
+- If visible logical members exceed `cluster_size`, CAS must fail with `{:error, :cluster_overflow}`.
+
+### Sync / HWM correctness
+- `kv_member_hwm` is monotonic.
+- Sender stores member HWM as sender snapshot `my_seq`, not remote sequence.
+- Delta sync is only valid when the member cursor is still inside the local oplog window.
+- Otherwise force full sync.
+- Chunked sync rules matter:
+  - intermediate chunks use seq `0`
+  - final chunk must send a non-zero terminal seq
+  - exact-multiple chunk sizes still require a final non-zero seq chunk
+
+### Long partition protection
+- Startup stale-db rejection:
+  - if idle age exceeds roughly `tombstone_ttl - gc_interval`, startup fails closed by default
+  - operator must either wipe that node's data dir or explicitly set `allow_stale_startup: true`
+- Live long partition protection:
+  - default `partition_ttl_policy: :quarantine`
+  - reconnect after downtime > `tombstone_ttl` blocks replication for that member pair
+- Down-since markers live in `kv_meta`, keyed by `node_id` when available, otherwise node name.
+
+## Common Failure Patterns
+- CAS returns `{:error, :no_quorum}` or `{:error, :quorum_timeout}`
+  - check distinct `node_id` reachability, not just connected Erlang nodes
+- CAS returns `{:error, :cluster_overflow}`
+  - too many logical members are visible for configured `cluster_size`
+- Eventual reads look stale after client failover
+  - this is expected; use `consistent: true` if fresh reads matter
+- Blue-green new client binds to outgoing node
+  - suspect stale region-group visibility or candidate validation
+- Post-heal divergence
+  - inspect HWM bounds, forced full sync path, quarantine logic, and monotonic CAS timestamps
+
+## Code Map
+- `lib/ekv.ex`
+  - public API
+  - client/member branching
+  - stream wrappers
+  - docs contract
+- `lib/ekv/supervisor.ex`
+  - runtime mode split
+  - per-instance scoped `:pg`
+  - persisted `node_id` resolution
+  - blue-green startup handoff
+- `lib/ekv/replica.ex`
+  - shard process
+  - LWW path
+  - CASPaxos prepare/accept/promote
+  - sync/HWM logic
+  - quarantine
+  - handoff/proxy mode
+- `lib/ekv/store.ex`
+  - schema and persistence primitives
+- `lib/ekv/client_router.ex`
+  - client route selection, ETS cache, waiters, cooldowns
+- `lib/ekv/member_presence.ex`
+  - member advertisement in scoped `:pg`
+- `lib/ekv/client_subscriptions.ex`
+  - client-side subscription bookkeeping
+- `lib/ekv/shutdown_barrier.ex`
+  - coordinated graceful shutdown logic
+- `lib/ekv/blue_green_marker.ex`
+  - stale marker cleanup for graceful non-handoff shutdown
+- `c_src/ekv_sqlite3_nif.c`
+  - combined SQLite transactional primitives, including CAS NIFs
+
+## Tests To Run
+
+### Baseline
 ```bash
-mix deps.get
-mix compile --warnings-as-errors
-mix test                           # 85 tests (50 unit + 35 distributed)
-mix test test/ekv_test.exs         # unit only
-mix test test/distributed_test.exs # distributed only
-
-# Benchmarks (from priv/bench/)
-cd priv/bench && bash run_local.sh        # single-node benchmarks
-cd priv/bench && bash run_distributed.sh  # 2-node replication benchmarks
+mix test
 ```
 
-## Architecture
-
-### Supervision Tree
-
-```
-EKV.Supervisor (rest_for_one)
-├── EKV.SubTracker              atomics subscriber count + process monitors
-├── Registry (keys: :duplicate, listeners: [sub_tracker])
-├── EKV.SubDispatcher.Supervisor (one_for_one)
-│   ├── EKV.SubDispatcher 0     async event fan-out per shard
-│   ├── EKV.SubDispatcher 1
-│   └── ...
-├── EKV.Replica.Supervisor (one_for_one)
-│   ├── EKV.Replica 0           shard GenServer (writes + replication + SQLite)
-│   ├── EKV.Replica 1
-│   └── ...                     N shards (default 8)
-└── EKV.GC                      periodic timer, sends :gc to each shard
-```
-
-`rest_for_one`: SubTracker crash restarts everything. Registry crash restarts Dispatchers + Replicas. Single Replica crash → only that shard restarts. GC is downstream of Replicas.
-
-### Modules
-
-| Module | Role |
-|--------|------|
-| `EKV` | Public API. `put/get/delete/scan/keys/subscribe/unsubscribe`. Reads go direct to SQLite via per-scheduler read connections (no GenServer hop). Writes route to shard via `GenServer.call`. |
-| `EKV.Event` | Struct for change notifications: `%EKV.Event{type: :put | :delete, key: key, value: value}`. |
-| `EKV.Replica` | Shard GenServer. Owns one SQLite writer db + N read connections. Handles writes, replication, peer sync, GC. Registered as `:"#{name}_ekv_replica_#{shard}"`. |
-| `EKV.Store` | Pure function module for all SQLite operations. Called inside Replica and from read connections. |
-| `EKV.SubTracker` | Registry listener + process monitor. Maintains atomics subscriber count. Handles cleanup on process death. |
-| `EKV.SubDispatcher` | Async event fan-out per shard. Receives `{:dispatch, events}` from Replica, does prefix-decomposition lookup via `Registry.lookup`, sends to matching subscribers. |
-| `EKV.GC` | Periodic timer. Sends `{:gc, now, tombstone_cutoff}` to each shard. |
-| `EKV.Supervisor` | Top-level supervisor. Stores config in `persistent_term` keyed by `{EKV, name}`. |
-| `EKV.Sqlite3` | Thin Elixir wrapper over the NIF (9 functions). |
-| `EKV.Sqlite3NIF` | NIF stubs with `@on_load`. |
-
-### Storage: SQLite Only
-
-Each shard has a single SQLite database (WAL mode, `synchronous=NORMAL`):
-- File: `#{data_dir}/shard_#{i}.db`
-- Tables: `kv` (current state, PK `key`), `kv_oplog` (append-only mutation log, AUTOINCREMENT seq), `kv_peer_hwm` (per-peer high-water marks), `kv_meta` (liveness tracking)
-- `kv` + `kv_oplog` writes are atomic (`BEGIN IMMEDIATE` / `COMMIT`)
-
-**Read connections**: Each shard opens `System.schedulers_online()` read connections stored as a tuple in `persistent_term` keyed by `{EKV, name, :readers, shard_index}`. Reads pick a connection by `rem(scheduler_id - 1, num_readers)` — zero contention, no pool, no GenServer hop. WAL mode ensures readers don't block the writer.
-
-### Sharding
-
-`shard = :erlang.phash2(key, num_shards)`
-
-Each shard is fully independent. Prefix scans fan out to all shards (prefix doesn't determine hash).
-
-**Shard count is immutable** — persisted in `kv_meta` on first open. Changing `shards:` after data exists raises `ArgumentError` at startup. Peer connections from nodes with mismatched shard counts are rejected with a logged error (without crashing the local shard).
-
-### Conflict Resolution: Last-Writer-Wins (LWW)
-
-LWW is pushed into SQL via `ON CONFLICT ... WHERE` clause:
-
-```sql
-ON CONFLICT(key) DO UPDATE SET ...
-WHERE excluded.timestamp > kv.timestamp
-  OR (excluded.timestamp = kv.timestamp AND excluded.origin_node > kv.origin_node)
-```
-
-`sqlite3_changes() == 0` after the upsert means LWW lost — the transaction is rolled back and no oplog entry is written. Equivalent to:
-
-```elixir
-lww_wins?(incoming_ts, incoming_origin, existing_ts, existing_origin)
-  incoming_ts > existing_ts
-  OR (incoming_ts == existing_ts AND incoming_origin > existing_origin)
-```
-
-- Nanosecond timestamps + origin_node atom as deterministic tiebreaker
-- Used in ALL write paths: local put/delete, remote replication, bulk sync, GC TTL expiry
-- Delete is just an entry with `deleted_at` set — same LWW applies
-
-### HWM Monotonicity
-
-`set_hwm` uses `MAX(kv_peer_hwm.last_seq, excluded.last_seq)` to ensure HWMs never regress. If sync messages arrive out of order (e.g. seq=100 then seq=50), the HWM stays at 100.
-
-### Peer Discovery & Replication
-
-Self-contained — uses `:net_kernel.monitor_nodes/1` and `Node.list/0` directly.
-
-**Tracking**: `state.remote_shards :: %{node() => pid()}` — confirmed live counterpart shard processes.
-
-**Steady-state messages** (fire-and-forget to all peers):
-- `{:ekv_put, key, value_binary, timestamp, origin_node, expires_at}`
-- `{:ekv_delete, key, timestamp, origin_node}`
-
-**Peer handshake** (on nodeup / init):
-- `{:ekv_peer_connect, pid, shard_index, num_shards, my_max_seq}`
-- `{:ekv_peer_connect_ack, pid, shard_index, num_shards, my_max_seq}`
-
-**Bulk sync** (after handshake):
-- `{:ekv_sync, from_node, shard_index, entries, sender_max_seq}`
-- entries: `[{key, value_binary, timestamp, origin_node, expires_at, deleted_at}]`
-
-### Delta Sync vs Full Sync
-
-| | Delta | Full |
-|---|---|---|
-| **Condition** | HWM exists for peer AND oplog not truncated past it | No HWM or oplog truncated |
-| **Query** | `SELECT * FROM kv_oplog WHERE seq > peer_hwm` | `SELECT * FROM kv WHERE deleted_at IS NULL OR deleted_at > cutoff` |
-| **Use case** | Brief disconnects | First contact, long partitions |
-
-### GC (3 phases per tick)
-
-1. **Expire TTL entries** → convert to tombstones, broadcast deletes
-2. **Purge old tombstones** → hard delete from SQLite where `deleted_at < now - tombstone_ttl`
-3. **Truncate oplog** → `DELETE FROM kv_oplog WHERE seq < MIN(all peer HWMs)`
-4. **Bump liveness** → `Store.touch_last_active(db)` updates `kv_meta.last_active_at`
-
-### Stale DB Protection
-
-On `Store.open/3`, if an existing db file's `last_active_at` is older than `tombstone_ttl`, the db is wiped (deleted). This prevents zombie resurrection of entries that were deleted while the node was away — peers will have GC'd those tombstones, so a stale db would never learn about them. After wipe, full sync from peers rebuilds from scratch.
-
-`last_active_at` is bumped on every GC tick and on initial open.
-
-### Config
-
-Stored in `persistent_term` keyed by `{EKV, name}`:
-
-```elixir
-%{
-  num_shards: 8,            # :shards option (default 8)
-  data_dir: "...",           # required
-  log: :info,                # :info (default), false (silent), :verbose (all shards)
-  tombstone_ttl: 604_800_000, # 7 days in ms (default)
-  gc_interval: 300_000,      # 5 minutes in ms (default)
-  registry: :"#{name}_ekv_registry",
-  sub_count: atomics_ref     # 1 cell: total subscriber count
-}
-```
-
-### Logging
-
-- `log/2` (normal), `log_verbose/2` (verbose only), `log_once/2` (shard 0 only) — helpers in Replica
-- All output uses `Logger.info` — `:verbose` is EKV's own flag, not Logger level
-
-## Custom SQLite NIF
-
-We vendor sqlite3.c (amalgamation) and wrote a minimal NIF instead of depending on exqlite. Zero runtime deps.
-
-### NIF API (10 functions)
-
-```
-EKV.Sqlite3.open(path)                              → {:ok, db}   | {:error, msg}
-EKV.Sqlite3.close(db)                               → :ok
-EKV.Sqlite3.execute(db, sql)                         → :ok          | {:error, msg}
-EKV.Sqlite3.prepare(db, sql)                         → {:ok, stmt}  | {:error, msg}
-EKV.Sqlite3.bind(stmt, args)                         → :ok          | {:error, msg}
-EKV.Sqlite3.step(db, stmt)                           → {:row, list} | :done | {:error, msg}
-EKV.Sqlite3.release(db, stmt)                        → :ok
-EKV.Sqlite3.write_entry(db, kv, oplog, kv_a, op_a)  → {:ok, true|false} | {:error, msg}
-EKV.Sqlite3.read_entry(db, stmt, args)               → {:ok, [cols]|nil} | {:error, msg}
-EKV.Sqlite3.fetch_all(db, sql, args)                → {:ok, [[col, ...]]} | {:error, msg}
-```
-
-`write_entry` does BEGIN IMMEDIATE + kv upsert (with SQL LWW) + oplog insert + COMMIT in a single dirty IO bounce. Returns `{:ok, false}` if LWW lost (rollback, no oplog).
-
-`read_entry` does reset + bind + step on a cached prepared statement in a single dirty IO bounce. Returns the row or nil.
-
-`fetch_all` does prepare + bind + step-all-rows + finalize in a single dirty IO bounce. Returns all rows as a list of lists. Used for multi-row queries (prefix scans, oplog reads, full state, expired entries).
-
-### C NIF design (c_src/ekv_sqlite3_nif.c, ~650 lines)
-
-Two resource types:
-- `connection_t` — wraps `sqlite3*` + `ErlNifMutex*`
-- `statement_t` — wraps `sqlite3_stmt*` + back-ref to `connection_t`
-
-Resource destructors handle cleanup. Statement holds connection alive via `enif_keep_resource`. All IO-touching NIFs use `ERL_NIF_DIRTY_JOB_IO_BOUND`. `bind` runs on normal scheduler.
-
-Single `bind/2` takes a list — dispatches per element on type (int64/double/text/null).
-
-### Build
-
-`Makefile` compiles `ekv_sqlite3_nif.c` + `sqlite3.c` into `ekv_sqlite3_nif.so`. Platform detection for Darwin vs Linux linker flags. Supports `CROSSCOMPILE` prefix for cc_precompiler.
-
-`mix.exs` uses `elixir_make` + `cc_precompiler` (both compile-time only). `make_force_build: true` in dev/test to skip precompiled downloads.
-
-### Precompilation for Hex
-
-See `RELEASE.md` for full workflow. Key: tag → CI builds for all targets → upload to GitHub release → `mix elixir_make.checksum --all` → include `checksum-ekv.exs` in hex package.
-
-## Test Infrastructure
-
-- Uses OTP `:peer` module for real Erlang nodes
-- `EKV.TestCluster` in `test/support/` — compiled to beam via `elixirc_paths(:test)`
-- `test_helper.exs` starts distribution with `Node.start/2`
-- Partition tests use 3 nodes, isolating 1 from the other 2 (erlang dist is fully meshed — 2-node partitions are unreliable because the test node bridges them)
-- Helper: `assert_eventually/2` for async convergence checks
-
-### Unit tests (50 in `test/ekv_test.exs`)
-
-Core: put/get, delete, TTL, prefix scan, restart rehydration, LWW conflicts (tiebreaker, atom ordering, delete vs put, resurrection, oplog not written on loss).
-
-Pathological: HWM monotonicity, oplog seq gaps on LWW loss, oplog truncation, GC TTL expiry into tombstones, GC tombstone purge, GC oplog truncation at min HWM, stale DB detection/wipe, shard count mismatch protection, concurrent put during GC, full_state excludes purged tombstones, delta sync correctness.
-
-Subscribe: put notification, delete notification (with previous value), delete missing key (nil value), prefix filtering, empty prefix matches all, LWW rejection no event, multiple subscribers with different prefixes, subscriber death cleanup, unsubscribe stops events, re-subscribe idempotency, overlapping prefixes dedup, unsubscribe one prefix keeps another, GC TTL expiry event, bulk sync batched events, remote put event, remote delete event, tombstone purge no event.
-
-### Distributed tests (35 in `test/distributed_test.exs`)
-
-Core: put/delete/complex value replication, late joiner sync, node restart persistence, empty storage re-sync, LWW concurrent puts, partition with disjoint/conflicting keys, delete vs put across partition, many-key partition convergence, rapid fire partition writes, delete-during-partition resurrection, prefix scan after partition, 3-way split, double partition cycles, node death + replacement with tombstones, write-during-heal race.
-
-Pathological (Jepsen-style): shard crash recovery, write during active sync (300 keys), GC during partition (tombstone survives sync), GC tombstone purge + late joiner, oplog truncation forces full sync, rapid partition/heal flapping (5 cycles), concurrent deletes both sides, put/delete interleaving, multi-shard consistency (4 shards), duplicate peer_connect handling, write during node shutdown (atomicity), large dataset full sync (5000 keys), three-way conflict resolution.
-
-Subscribe: replication triggers subscriber on remote node, distributed delete triggers subscriber with previous value, partition heal sync triggers subscriber events.
-
-## Key Design Decisions
-
-- **No cluster concept** — removed. If you want isolation, start multiple EKV instances with different names on the nodes that should form isolated replication groups.
-- **No connection pool** — one SQLite writer connection per shard GenServer + per-scheduler read connections. Writes serialized through GenServer, reads go direct.
-- **Values stored as `:erlang.term_to_binary/1`** — encoding in public EKV module, Replica/Store only see binaries.
-- **Tombstone TTL** (default 7 days) — keeps tombstones long enough for partitioned nodes to learn about deletes on reconnect. After TTL, tombstones are hard-deleted.
-- **Oplog truncation** — bounded by slowest peer's HWM. Peers that fall behind the oplog get full sync instead.
-
-## Benchmarks
-
-Separate Mix project in `priv/bench/`. Starts real Erlang nodes for distributed benchmarks.
-
+### If touching CAS protocol, CAS API semantics, or blue-green CAS continuity
 ```bash
-cd priv/bench
-bash run_local.sh                  # single-node: get/put/delete/scan/TTL/value-size/shard-scaling/subscribe/10k-scale
-bash run_distributed.sh            # 2-node: replication latency, bulk sync, partition/heal,
-                                   #         value size replication, busy app simulation, subscribe
-bash run_distributed.sh --shards 4 # override shard count
+mix test test/cas_distributed_test.exs
+mix test test/stress_test.exs
+mix test test/linearizability_pure_elixir_test.exs
 ```
 
-`run_distributed.sh` starts 2 replica nodes + 1 coordinator node, runs benchmarks, then cleans up. The coordinator drives writes via `:erpc` and measures end-to-end replication latency.
-
-Key modules: `Bench.Local` (single-node), `Bench.Distributed` (coordinator), `Bench.Replica` (helper functions loaded on replica nodes), `Bench.Helpers` (timing/reporting utilities).
-
-## File Layout
-
+### If touching sync, HWM, reconnect, quarantine, stale-db rejection
+```bash
+mix test test/distributed_test.exs
+mix test test/adversarial_verification_test.exs
+mix test test/ekv_test.exs
 ```
-lib/
-  ekv.ex                  Public API (put/get/delete/scan/keys/subscribe/unsubscribe)
-  ekv/
-    event.ex              Change notification struct (type, key, value)
-    application.ex        Empty app supervisor
-    supervisor.ex         Top-level rest_for_one supervisor, config in persistent_term
-    replica.ex            Shard GenServer (writes, replication, peer sync, GC, read connections)
-    replica/supervisor.ex One-for-one supervisor for N shard replicas
-    sub_tracker.ex        Registry listener + process monitor, atomics subscriber count
-    sub_dispatcher.ex     Async event fan-out per shard, prefix-decomposition lookup
-    sub_dispatcher/supervisor.ex  One-for-one supervisor for N dispatchers
-    store.ex              SQLite operations (open, CRUD, oplog, HWM, GC, liveness)
-    gc.ex                 Periodic GC timer
-    sqlite3.ex            Thin Elixir wrapper over NIF
-    sqlite3_nif.ex        NIF stubs (@on_load)
-c_src/
-    sqlite3.c             Vendored SQLite 3.47.2 amalgamation (~9MB)
-    sqlite3.h             Vendored SQLite header
-    ekv_sqlite3_nif.c     Custom NIF (~650 lines)
-Makefile                  elixir_make build rules
-mix.exs                   deps: elixir_make + cc_precompiler (both runtime: false)
-test/
-    ekv_test.exs          50 unit tests
-    distributed_test.exs  35 distributed tests (partition, sync, failover, Jepsen-style)
-    support/test_cluster.ex  Peer node helpers
-    test_helper.exs       Starts distribution
-priv/bench/
-    lib/bench/local.ex    Single-node benchmarks (12 suites)
-    lib/bench/distributed.ex  2-node replication benchmarks (7 suites)
-    lib/bench/replica.ex  Helper functions for replica nodes
-    lib/bench/helpers.ex  Timing, formatting, reporting utilities
-    run_local.sh          Run local benchmarks
-    run_distributed.sh    Run distributed benchmarks
-    RESULTS.md            Benchmark results archive
-RELEASE.md               Hex publish workflow with precompiled NIFs
+
+### If touching client mode, routing, subscriptions, scoped `:pg`, startup gates
+```bash
+mix test test/client_mode_distributed_test.exs
+mix test test/ekv_test.exs
 ```
+
+### If touching shutdown barrier
+```bash
+mix test test/cas_distributed_test.exs
+mix test test/client_mode_distributed_test.exs
+mix test test/ekv_test.exs
+```
+
+## Jepsen
+- `jepsen/` contains repeatable register/lock scenarios.
+- Use it for external linearizability/lock verification after safety-critical changes.
+- Typical commands:
+```bash
+cd jepsen
+./run_scenario.sh register-3n-partition-flap 1
+./run_scenario.sh lock-3n-partition-restart 1
+./run_scenario.sh lock-5n-partition-restart 1
+./run_lock_matrix.sh 1,2,3
+./run_preprod_gates.sh 1 3 smoke
+```
+- Do not commit generated artifacts under:
+  - `jepsen/results/`
+  - `jepsen/target/`
+  - `jepsen/store/`
+  - `.nrepl-port`
+
+## Bench
+- Local CLI bench:
+  - `bench/run_cas.sh`
+  - implementation in `bench/lib/bench/cas.ex`
+- Fly/Phoenix orchestrator:
+  - `bench/bench_web`
+  - use for multi-region tests and scenario selection
+
+## Workflow Rules For Agents
+- Keep `README.md`, `OPERATORS.md`, and API docs aligned with behavior changes.
+- Add or update adversarial/distributed tests for every safety bug fix.
+- Prefer the smallest coherent change in `replica.ex` or routing code when touching correctness-sensitive logic.
+- Do not reintroduce:
+  - default global `:pg` use
+  - per-op client routing through `GenServer.call`
+  - fake “consistent read” fast paths
+  - CAS/LWW mixing on CAS-managed keys
+- For flaky distributed tests, separate:
+  - “the chosen/committed value exists”
+  - “all eventual replicas have converged”
+- If a change affects correctness semantics, update Jepsen and the pure Elixir linearizability tests, not just unit tests.
