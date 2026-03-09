@@ -14,12 +14,35 @@ defmodule BenchWebWeb.BenchLive do
   ]
 
   @default_scenarios ~w(4 5 6 7 8 9)
+  @role_options [
+    {"Member", "member"},
+    {"Client", "client"},
+    {"Ignore", "ignore"}
+  ]
+
+  @wan_9_member_counts %{
+    "iad" => 2,
+    "dfw" => 2,
+    "ewr" => 1,
+    "sjc" => 2,
+    "lhr" => 1,
+    "fra" => 1
+  }
+
+  @region_preferences %{
+    "iad" => ~w(iad ewr dfw sjc yyz ord lhr ams fra cdg),
+    "ewr" => ~w(ewr iad dfw sjc yyz ord lhr ams fra cdg),
+    "dfw" => ~w(dfw iad ewr sjc ord lax sea lhr fra ams),
+    "sjc" => ~w(sjc dfw iad ewr lax sea ord lhr fra ams),
+    "lhr" => ~w(lhr fra ams cdg iad ewr dfw sjc),
+    "fra" => ~w(fra ams lhr cdg ewr iad dfw sjc),
+    "ams" => ~w(ams fra lhr cdg ewr iad dfw sjc),
+    "cdg" => ~w(cdg lhr fra ams ewr iad dfw sjc)
+  }
 
   @impl true
   def mount(_params, _session, socket) do
     summary = cluster_summary()
-    replicas = Enum.join(summary.replicas, ", ")
-    cluster_size = Integer.to_string(summary.replica_count)
     data_root = default_data_root()
     scenarios = @default_scenarios
     quick = true
@@ -34,10 +57,9 @@ defmodule BenchWebWeb.BenchLive do
       |> assign(:error, nil)
       |> assign(:current_phase, "Idle")
       |> assign(:scenario_options, @scenario_options)
+      |> assign(:role_options, @role_options)
       |> assign(:summary, summary)
-      |> assign(:last_autofill_replicas, replicas)
-      |> assign(:last_autofill_cluster_size, cluster_size)
-      |> assign(:form, default_form(replicas, cluster_size, data_root, scenarios, quick))
+      |> assign(:form, default_form(summary, data_root, scenarios, quick))
 
     if connected?(socket) do
       Process.send_after(self(), :refresh_cluster, 1_000)
@@ -48,7 +70,26 @@ defmodule BenchWebWeb.BenchLive do
 
   @impl true
   def handle_event("validate", %{"bench" => params}, socket) do
-    {:noreply, assign(socket, :form, to_form(params, as: :bench))}
+    summary = cluster_summary()
+    params = ensure_form_params(params, summary.nodes)
+
+    {:noreply,
+     socket
+     |> assign(:summary, summary)
+     |> assign(:form, to_form(params, as: :bench))}
+  end
+
+  @impl true
+  def handle_event("preset_wan_9", _params, socket) do
+    summary = cluster_summary()
+    params = current_form_params(socket.assigns.form)
+    params = ensure_form_params(params, summary.nodes)
+    params = Map.put(params, "roles", wan_9_role_map(summary.nodes))
+
+    {:noreply,
+     socket
+     |> assign(:summary, summary)
+     |> assign(:form, to_form(params, as: :bench))}
   end
 
   @impl true
@@ -58,9 +99,11 @@ defmodule BenchWebWeb.BenchLive do
 
   @impl true
   def handle_event("run", %{"bench" => params}, socket) do
+    summary = cluster_summary()
+    params = ensure_form_params(params, summary.nodes)
+
     with {:ok, shards} <- parse_shards(params["shards"]),
-         {:ok, replicas} <- parse_replicas(params["replicas"]),
-         {:ok, cluster_size} <- parse_cluster_size(params["cluster_size"], length(replicas)),
+         {:ok, {members, clients}} <- parse_topology(summary.nodes, params["roles"]),
          {:ok, data_root} <- parse_data_root(params["data_root"]),
          {:ok, scenarios} <- parse_scenarios(params["scenarios"]),
          {:ok, quick} <- parse_quick(params["quick"]) do
@@ -72,8 +115,8 @@ defmodule BenchWebWeb.BenchLive do
           BenchWeb.BenchRunner.run_cas_stream(
             [
               shards: shards,
-              replicas: replicas,
-              cluster_size: cluster_size,
+              members: members,
+              clients: clients,
               data_root: data_root,
               scenarios: scenarios,
               quick: quick
@@ -85,6 +128,7 @@ defmodule BenchWebWeb.BenchLive do
 
       {:noreply,
        socket
+       |> assign(:summary, summary)
        |> assign(:running, true)
        |> assign(:task_ref, task.ref)
        |> assign(:run_ref, run_ref)
@@ -95,35 +139,22 @@ defmodule BenchWebWeb.BenchLive do
     else
       {:error, reason} ->
         {:noreply,
-         socket |> assign(:form, to_form(params, as: :bench)) |> put_flash(:error, reason)}
+         socket
+         |> assign(:summary, summary)
+         |> assign(:form, to_form(params, as: :bench))
+         |> put_flash(:error, reason)}
     end
   end
 
   @impl true
   def handle_info(:refresh_cluster, socket) do
     summary = cluster_summary()
-    refreshed_replicas = Enum.join(summary.replicas, ", ")
-    shards = form_value(socket.assigns.form, :shards, "8")
-    replicas = form_value(socket.assigns.form, :replicas, "")
-    cluster_size = form_value(socket.assigns.form, :cluster_size, "3")
-    data_root = form_value(socket.assigns.form, :data_root, default_data_root())
-    quick = checkbox_checked?(socket.assigns.form, :quick)
-    scenarios = form_list_value(socket.assigns.form, :scenarios, @default_scenarios)
-    refreshed_cluster_size = Integer.to_string(summary.replica_count)
+    params = ensure_form_params(current_form_params(socket.assigns.form), summary.nodes)
 
     socket =
       socket
       |> assign(:summary, summary)
-      |> maybe_autofill_form(
-        shards,
-        replicas,
-        cluster_size,
-        data_root,
-        quick,
-        scenarios,
-        refreshed_replicas,
-        refreshed_cluster_size
-      )
+      |> assign(:form, to_form(params, as: :bench))
 
     if connected?(socket) do
       Process.send_after(self(), :refresh_cluster, 2_000)
@@ -193,6 +224,15 @@ defmodule BenchWebWeb.BenchLive do
 
   @impl true
   def render(assigns) do
+    counts = topology_counts(assigns.form, assigns.summary.nodes)
+
+    assigns =
+      assign(assigns,
+        selected_member_count: counts.member_count,
+        selected_client_count: counts.client_count,
+        selected_ignore_count: counts.ignore_count
+      )
+
     ~H"""
     <Layouts.flash_group flash={@flash} />
     <section class="min-h-screen bg-zinc-950 text-zinc-100">
@@ -203,16 +243,16 @@ defmodule BenchWebWeb.BenchLive do
               <p class="text-xs uppercase tracking-[0.24em] text-cyan-300/80">EKV CASPaxos Bench</p>
               <h1 class="mt-2 text-2xl font-semibold tracking-tight">Fly Orchestrator</h1>
               <p class="mt-2 text-sm text-zinc-400">
-                Run distributed CAS benchmarks from this node across connected Fly machines.
+                Start EKV members and clients on demand across connected Fly machines.
               </p>
             </div>
             <div class="rounded-xl border border-zinc-800 bg-zinc-900 px-4 py-3 text-xs text-zinc-300">
               <p>coordinator: <span class="text-zinc-100">{@summary.coordinator}</span></p>
               <p class="mt-1">
-                connected members: <span class="text-zinc-100">{@summary.connected_count}</span>
+                connected nodes: <span class="text-zinc-100">{@summary.connected_count}</span>
               </p>
               <p class="mt-1">
-                discovered replicas: <span class="text-zinc-100">{@summary.replica_count}</span>
+                discovered regions: <span class="text-zinc-100">{format_region_counts(@summary.region_counts)}</span>
               </p>
               <p class="mt-1">
                 phase: <span class="text-zinc-100">{@current_phase}</span>
@@ -240,29 +280,60 @@ defmodule BenchWebWeb.BenchLive do
               />
             </label>
 
-            <label class="grid gap-1">
-              <span class="text-xs font-medium uppercase tracking-[0.18em] text-zinc-400">
-                Replica nodes (comma or newline separated)
-              </span>
-              <textarea
-                rows="4"
-                name={@form[:replicas].name}
-                class="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 font-mono text-xs outline-none ring-cyan-500 transition focus:ring-2"
-              ><%= @form[:replicas].value %></textarea>
-            </label>
+            <div class="grid gap-2 rounded-lg border border-zinc-800 bg-zinc-900/40 p-3">
+              <div class="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <p class="text-xs font-medium uppercase tracking-[0.18em] text-zinc-400">
+                    Node Topology
+                  </p>
+                  <p class="mt-1 text-xs text-zinc-500">
+                    Members run durable EKV replicas. Clients route to members using region-aware defaults.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  phx-click="preset_wan_9"
+                  class="rounded-lg border border-cyan-800/60 bg-cyan-950/40 px-3 py-2 text-xs font-medium text-cyan-200 transition hover:border-cyan-700 hover:bg-cyan-900/40"
+                >
+                  Apply 9-member WAN preset
+                </button>
+              </div>
 
-            <label class="grid gap-1">
-              <span class="text-xs font-medium uppercase tracking-[0.18em] text-zinc-400">
-                Cluster size
-              </span>
-              <input
-                type="number"
-                min="3"
-                name={@form[:cluster_size].name}
-                value={@form[:cluster_size].value}
-                class="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm outline-none ring-cyan-500 transition focus:ring-2"
-              />
-            </label>
+              <div class="grid gap-2">
+                <%= for node <- @summary.nodes do %>
+                  <div class="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-zinc-800 bg-zinc-950/60 px-3 py-3">
+                    <div class="min-w-0 flex-1">
+                      <p class="truncate font-mono text-xs text-zinc-100">{node.name}</p>
+                      <p class="mt-1 text-[11px] uppercase tracking-[0.18em] text-cyan-300/80">
+                        {node.region}
+                      </p>
+                      <%= if role_value(@form, node.name) == "client" do %>
+                        <p class="mt-1 text-[11px] text-zinc-500">
+                          routes: {Enum.join(route_preview(@form, @summary.nodes, node.region), " -> ")}
+                        </p>
+                      <% end %>
+                    </div>
+
+                    <label class="grid gap-1 text-xs text-zinc-400">
+                      <span>Role</span>
+                      <select
+                        name={"bench[roles][#{node.name}]"}
+                        class="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 outline-none ring-cyan-500 transition focus:ring-2"
+                      >
+                        <%= for {label, value} <- @role_options do %>
+                          <option value={value} selected={role_value(@form, node.name) == value}>{label}</option>
+                        <% end %>
+                      </select>
+                    </label>
+                  </div>
+                <% end %>
+              </div>
+
+              <p class="text-xs text-zinc-500">
+                Selected: {@selected_member_count} members, {@selected_client_count} clients, {@selected_ignore_count} ignored.
+                Member quorum = {quorum_size(@selected_member_count)} when at least 3 members are selected.
+              </p>
+            </div>
 
             <label class="grid gap-1">
               <span class="text-xs font-medium uppercase tracking-[0.18em] text-zinc-400">
@@ -311,7 +382,7 @@ defmodule BenchWebWeb.BenchLive do
 
             <div class="flex items-center justify-between gap-4">
               <p class="text-xs text-zinc-500">
-                Cluster size must be between 3 and listed replicas. Select at least one scenario.
+                Members start with `wait_for_quorum`. Clients start with `wait_for_route` + `wait_for_quorum`.
               </p>
               <button
                 type="submit"
@@ -329,7 +400,7 @@ defmodule BenchWebWeb.BenchLive do
             </div>
 
             <p class="text-xs text-zinc-500">
-              Discovered: {Enum.join(@summary.replicas, ", ")}
+              Discovered nodes: {Enum.map_join(@summary.nodes, ", ", & &1.name)}
             </p>
           </.form>
 
@@ -351,18 +422,67 @@ defmodule BenchWebWeb.BenchLive do
     """
   end
 
-  defp default_form(replicas, cluster_size, data_root, scenarios, quick) do
+  defp default_form(summary, data_root, scenarios, quick) do
     to_form(
-      %{
-        "shards" => "8",
-        "replicas" => replicas,
-        "cluster_size" => cluster_size,
-        "data_root" => data_root,
-        "scenarios" => scenarios,
-        "quick" => if(quick, do: "true", else: "false")
-      },
+      ensure_form_params(
+        %{
+          "shards" => "8",
+          "data_root" => data_root,
+          "scenarios" => scenarios,
+          "quick" => if(quick, do: "true", else: "false")
+        },
+        summary.nodes
+      ),
       as: :bench
     )
+  end
+
+  defp current_form_params(form) do
+    form.params || %{}
+  end
+
+  defp ensure_form_params(params, nodes) do
+    params
+    |> Map.new(fn {key, value} -> {to_string(key), value} end)
+    |> Map.put_new("shards", "8")
+    |> Map.put_new("data_root", default_data_root())
+    |> Map.put_new("scenarios", @default_scenarios)
+    |> Map.put_new("quick", "true")
+    |> Map.update("roles", default_role_map(nodes), &ensure_role_map(&1, nodes))
+  end
+
+  defp ensure_role_map(raw_roles, nodes) when is_map(raw_roles) do
+    defaults = default_role_map(nodes)
+
+    Enum.reduce(nodes, defaults, fn node, acc ->
+      Map.put(acc, node.name, normalize_role(Map.get(raw_roles, node.name)))
+    end)
+  end
+
+  defp ensure_role_map(_raw_roles, nodes), do: default_role_map(nodes)
+
+  defp default_role_map(nodes) do
+    Map.new(nodes, fn node -> {node.name, "member"} end)
+  end
+
+  defp wan_9_role_map(nodes) do
+    selected_names =
+      nodes
+      |> Enum.group_by(& &1.region)
+      |> Enum.flat_map(fn {region, region_nodes} ->
+        count = Map.get(@wan_9_member_counts, region, 0)
+
+        region_nodes
+        |> Enum.sort_by(& &1.name)
+        |> Enum.take(count)
+        |> Enum.map(& &1.name)
+      end)
+      |> MapSet.new()
+
+    Map.new(nodes, fn node ->
+      role = if MapSet.member?(selected_names, node.name), do: "member", else: "client"
+      {node.name, role}
+    end)
   end
 
   defp parse_shards(nil), do: {:error, "shards is required"}
@@ -374,28 +494,31 @@ defmodule BenchWebWeb.BenchLive do
     end
   end
 
-  defp parse_replicas(raw) do
-    replicas =
-      raw
-      |> to_string()
-      |> String.split([",", "\n", "\t", " "], trim: true)
-      |> Enum.uniq()
+  defp parse_topology(nodes, raw_roles) do
+    roles = ensure_role_map(raw_roles || %{}, nodes)
 
-    if length(replicas) < 3 do
-      {:error, "at least 3 replicas are required"}
+    members =
+      nodes
+      |> Enum.filter(&(Map.get(roles, &1.name) == "member"))
+      |> Enum.map(fn node -> %{node: node.atom, region: node.region} end)
+
+    if length(members) < 3 do
+      {:error, "select at least 3 member nodes"}
     else
-      {:ok, replicas}
-    end
-  end
+      member_regions = members |> Enum.map(& &1.region) |> Enum.uniq()
 
-  defp parse_cluster_size(nil, _replica_count), do: {:error, "cluster_size is required"}
+      clients =
+        nodes
+        |> Enum.filter(&(Map.get(roles, &1.name) == "client"))
+        |> Enum.map(fn node ->
+          %{
+            node: node.atom,
+            region: node.region,
+            region_routing: default_region_routing(node.region, member_regions)
+          }
+        end)
 
-  defp parse_cluster_size(value, replica_count) do
-    case Integer.parse(to_string(value)) do
-      {n, ""} when n >= 3 and n <= replica_count -> {:ok, n}
-      {n, ""} when n < 3 -> {:error, "cluster_size must be at least 3"}
-      {n, ""} when n > replica_count -> {:error, "cluster_size cannot exceed replica count"}
-      _ -> {:error, "cluster_size must be an integer"}
+      {:ok, {members, clients}}
     end
   end
 
@@ -451,61 +574,97 @@ defmodule BenchWebWeb.BenchLive do
   defp parse_quick(value), do: {:ok, truthy?(value)}
 
   defp cluster_summary do
-    connected_peers = Node.list()
-
-    replicas =
-      [node() | connected_peers]
+    nodes =
+      [node() | Node.list()]
       |> Enum.uniq()
-      |> Enum.map(&to_string/1)
+      |> Enum.map(&fetch_node_metadata/1)
+      |> Enum.reject(&is_nil/1)
+      |> Enum.sort_by(fn node -> {node.region, node.name} end)
 
     %{
       coordinator: to_string(node()),
-      connected_count: length(connected_peers),
-      replica_count: length(replicas),
-      replicas: replicas
+      connected_count: max(length(nodes) - 1, 0),
+      region_counts: Enum.frequencies_by(nodes, & &1.region),
+      nodes: nodes
     }
   end
 
-  defp maybe_autofill_form(
-         socket,
-         shards,
-         current_replicas,
-         current_cluster_size,
-         data_root,
-         quick,
-         scenarios,
-         refreshed_replicas,
-         refreshed_cluster_size
-       ) do
-    if current_replicas == socket.assigns.last_autofill_replicas and
-         current_cluster_size == socket.assigns.last_autofill_cluster_size do
-      socket
-      |> assign(
-        :form,
-        to_form(
-          %{
-            "shards" => shards,
-            "replicas" => refreshed_replicas,
-            "cluster_size" => refreshed_cluster_size,
-            "data_root" => data_root,
-            "scenarios" => scenarios,
-            "quick" => if(quick, do: "true", else: "false")
-          },
-          as: :bench
-        )
-      )
-      |> assign(:last_autofill_replicas, refreshed_replicas)
-      |> assign(:last_autofill_cluster_size, refreshed_cluster_size)
-    else
-      socket
+  defp fetch_node_metadata(remote_node) when remote_node == node() do
+    metadata = Bench.Replica.node_metadata()
+    %{name: metadata.name, atom: metadata.node, region: metadata.region}
+  end
+
+  defp fetch_node_metadata(remote_node) do
+    try do
+      metadata = :erpc.call(remote_node, Bench.Replica, :node_metadata, [], 1_000)
+      %{name: metadata.name, atom: metadata.node, region: metadata.region}
+    catch
+      _, _ -> nil
     end
   end
 
-  defp form_value(form, field, default) do
-    case form[field].value do
-      nil -> default
-      value -> to_string(value)
-    end
+  defp role_value(form, node_name) do
+    form
+    |> current_form_params()
+    |> Map.get("roles", %{})
+    |> Map.get(node_name, "member")
+    |> normalize_role()
+  end
+
+  defp route_preview(form, nodes, client_region) do
+    roles = current_form_params(form) |> Map.get("roles", %{}) |> ensure_role_map(nodes)
+
+    member_regions =
+      nodes
+      |> Enum.filter(&(Map.get(roles, &1.name) == "member"))
+      |> Enum.map(& &1.region)
+      |> Enum.uniq()
+
+    default_region_routing(client_region, member_regions)
+  end
+
+  defp topology_counts(form, nodes) do
+    roles = current_form_params(form) |> Map.get("roles", %{}) |> ensure_role_map(nodes)
+
+    Enum.reduce(nodes, %{member_count: 0, client_count: 0, ignore_count: 0}, fn node, acc ->
+      case Map.get(roles, node.name, "member") do
+        "member" -> %{acc | member_count: acc.member_count + 1}
+        "client" -> %{acc | client_count: acc.client_count + 1}
+        "ignore" -> %{acc | ignore_count: acc.ignore_count + 1}
+      end
+    end)
+  end
+
+  defp normalize_role(role) when role in ["member", "client", "ignore"], do: role
+  defp normalize_role(_role), do: "member"
+
+  defp format_region_counts(region_counts) when map_size(region_counts) == 0, do: "none"
+
+  defp format_region_counts(region_counts) do
+    region_counts
+    |> Enum.sort_by(fn {region, _count} -> region end)
+    |> Enum.map_join(", ", fn {region, count} -> "#{region}(#{count})" end)
+  end
+
+  defp quorum_size(member_count) when member_count >= 3, do: div(member_count, 2) + 1
+  defp quorum_size(_member_count), do: 0
+
+  defp default_region_routing(client_region, member_regions) do
+    preferences = Map.get(@region_preferences, client_region, [client_region])
+
+    member_regions
+    |> Enum.uniq()
+    |> Enum.sort_by(fn region -> {preference_index(preferences, region), region} end)
+  end
+
+  defp preference_index(preferences, region) do
+    Enum.find_index(preferences, &(&1 == region)) || length(preferences) + 1
+  end
+
+  defp checkbox_checked?(form, field), do: truthy?(form[field].value)
+
+  defp scenario_checked?(form, scenario_id) do
+    scenario_id in form_list_value(form, :scenarios, @default_scenarios)
   end
 
   defp form_list_value(form, field, default) do
@@ -514,12 +673,6 @@ defmodule BenchWebWeb.BenchLive do
       value when is_list(value) -> Enum.map(value, &to_string/1)
       value -> [to_string(value)]
     end
-  end
-
-  defp checkbox_checked?(form, field), do: truthy?(form[field].value)
-
-  defp scenario_checked?(form, scenario_id) do
-    scenario_id in form_list_value(form, :scenarios, @default_scenarios)
   end
 
   defp truthy?(value) when value in [true, "true", "on", "1", 1], do: true

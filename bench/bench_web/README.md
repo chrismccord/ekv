@@ -12,8 +12,10 @@ mix phx.server
 
 Open http://localhost:4000 and run CAS benchmarks from the UI.
 The LiveView now streams run output in real time and lets you set
-`cluster_size` independently (bounded by listed replicas), choose `data_root`,
-toggle quick mode, and select which benchmark scenarios to run.
+member/client roles per discovered node, choose `data_root`, toggle quick mode,
+and select which benchmark scenarios to run.
+Use the `Apply 9-member WAN preset` button to stamp in a mixed topology with
+9 EKV members and the remaining nodes as clients.
 Defaults are tuned for faster feedback on scenarios `4..9`.
 `EKV.get(..., consistent: true)` in these scenarios is the barrier/linearizable
 path (accept+commit), so quorum read latency reflects full consensus cost.

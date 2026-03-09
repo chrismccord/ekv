@@ -14,6 +14,14 @@ defmodule Bench.Replica do
     {:ok, pid}
   end
 
+  def node_metadata do
+    %{
+      node: node(),
+      name: to_string(node()),
+      region: System.get_env("FLY_REGION") || "unknown"
+    }
+  end
+
   def stop_ekv(name) do
     sup_name = :"#{name}_ekv_sup"
 

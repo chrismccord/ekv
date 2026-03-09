@@ -13,14 +13,26 @@ defmodule Bench.CAS do
     IO.puts("\nEKV CAS Benchmarks")
     IO.puts("  coordinator : #{node()}")
     IO.puts("  cluster_size: #{ctx.cluster_size}")
-    IO.puts("  replicas    : #{Enum.map_join(ctx.replicas, ", ", &to_string/1)}")
+    IO.puts("  members     : #{Enum.map_join(ctx.members, ", ", &to_string/1)}")
+
+    if ctx.clients != [] do
+      IO.puts("  clients     : #{Enum.map_join(ctx.clients, ", ", &to_string/1)}")
+      IO.puts("  requesters  : #{Enum.map_join(ctx.request_nodes, ", ", &to_string/1)}")
+
+      Enum.each(ctx.client_specs, fn spec ->
+        IO.puts(
+          "    route #{spec.region} #{to_string(spec.node)} -> #{Enum.join(spec.region_routing, ", ")}"
+        )
+      end)
+    end
+
     IO.puts("  shards      : #{shards}")
     IO.puts("  data_root   : #{ctx.data_root}")
     IO.puts("  run_id      : #{ctx.run_id}")
     IO.puts("  mode        : #{if(ctx.quick, do: "quick", else: "full")}")
     IO.puts("  scenarios   : #{Enum.join(Enum.map(ctx.scenarios, &Integer.to_string/1), ", ")}")
 
-    Enum.each(ctx.replicas, &wait_for_connection/1)
+    Enum.each(ctx.request_nodes, &wait_for_connection/1)
     IO.puts("  status      : all nodes connected\n")
 
     Enum.each(ctx.scenarios, fn scenario ->
@@ -62,10 +74,10 @@ defmodule Bench.CAS do
 
       # Insert-if-absent (lookup + put if_vsn: nil)
       insert_samples =
-        collect_remote_samples(n, r1(ctx), fn i ->
+        collect_remote_samples(n, requester(ctx), fn i ->
           key = "cas_insert/#{i}"
-          nil = rpc(r1(ctx), Bench.Replica, :cas_lookup, [@name, key])
-          {:ok, _} = rpc(r1(ctx), Bench.Replica, :cas_put, [@name, key, %{i: i}, nil])
+          nil = rpc(requester(ctx), Bench.Replica, :cas_lookup, [@name, key])
+          {:ok, _} = rpc(requester(ctx), Bench.Replica, :cas_put, [@name, key, %{i: i}, nil])
         end)
 
       report_latency(
@@ -75,10 +87,12 @@ defmodule Bench.CAS do
 
       # Conditional update (lookup + put if_vsn: vsn)
       cond_samples =
-        collect_remote_samples(n, r1(ctx), fn i ->
+        collect_remote_samples(n, requester(ctx), fn i ->
           key = "cas_insert/#{i}"
-          {_val, vsn} = rpc(r1(ctx), Bench.Replica, :cas_lookup, [@name, key])
-          {:ok, _} = rpc(r1(ctx), Bench.Replica, :cas_put, [@name, key, %{i: i, v: 2}, vsn])
+          {_val, vsn} = rpc(requester(ctx), Bench.Replica, :cas_lookup, [@name, key])
+
+          {:ok, _} =
+            rpc(requester(ctx), Bench.Replica, :cas_put, [@name, key, %{i: i, v: 2}, vsn])
         end)
 
       report_latency(
@@ -88,9 +102,9 @@ defmodule Bench.CAS do
 
       # Consistent put (single call, no manual lookup)
       consistent_samples =
-        collect_remote_samples(n, r1(ctx), fn i ->
+        collect_remote_samples(n, requester(ctx), fn i ->
           key = "cas_cons/#{i}"
-          {:ok, _} = rpc(r1(ctx), Bench.Replica, :consistent_put, [@name, key, %{i: i}])
+          {:ok, _} = rpc(requester(ctx), Bench.Replica, :consistent_put, [@name, key, %{i: i}])
         end)
 
       report_latency(
@@ -166,9 +180,9 @@ defmodule Bench.CAS do
 
       # Different keys — no contention
       distinct_samples =
-        collect_remote_samples(n, r1(ctx), fn i ->
+        collect_remote_samples(n, requester(ctx), fn i ->
           {:ok, _, _} =
-            rpc(r1(ctx), Bench.Replica, :cas_update, [
+            rpc(requester(ctx), Bench.Replica, :cas_update, [
               @name,
               "upd/#{i}",
               &Bench.Replica.cas_increment/1
@@ -182,9 +196,9 @@ defmodule Bench.CAS do
 
       # Same key — sequential increments (ballot escalation, no concurrent conflict)
       same_key_samples =
-        collect_remote_samples(n, r1(ctx), fn _i ->
+        collect_remote_samples(n, requester(ctx), fn _i ->
           {:ok, _, _} =
-            rpc(r1(ctx), Bench.Replica, :cas_update, [
+            rpc(requester(ctx), Bench.Replica, :cas_update, [
               @name,
               "upd/hot",
               &Bench.Replica.cas_increment/1
@@ -195,9 +209,9 @@ defmodule Bench.CAS do
 
       # With TTL
       ttl_samples =
-        collect_remote_samples(n, r1(ctx), fn i ->
+        collect_remote_samples(n, requester(ctx), fn i ->
           {:ok, _, _} =
-            rpc(r1(ctx), Bench.Replica, :cas_update_with_ttl, [
+            rpc(requester(ctx), Bench.Replica, :cas_update_with_ttl, [
               @name,
               "upd_ttl/#{i}",
               &Bench.Replica.cas_increment/1,
@@ -217,7 +231,7 @@ defmodule Bench.CAS do
     header("4. Parallel CAS Throughput (concurrent callers)")
 
     with_remote_ekv(shards, ctx, "s4", fn ->
-      proposer_count = length(ctx.replicas)
+      requester_count = length(ctx.request_nodes)
       base_ops_per_node = if ctx.quick, do: 2_048, else: 4_096
       min_ops_per_worker = if ctx.quick, do: 8, else: 16
 
@@ -230,17 +244,17 @@ defmodule Bench.CAS do
 
       for workers_per_node <- worker_tiers do
         ops_per_node = max(base_ops_per_node, workers_per_node * min_ops_per_worker)
-        total = ops_per_node * proposer_count
+        total = ops_per_node * requester_count
 
         subheader(
-          "#{workers_per_node} workers/node across #{proposer_count} proposers, " <>
+          "#{workers_per_node} workers/node across #{requester_count} request nodes, " <>
             "#{format_number(ops_per_node)} ops/node (#{min_ops_per_worker} ops/worker floor) " <>
             "(#{format_number(total)} total updates)"
         )
 
         {wall_us, summaries} =
           time_us(fn ->
-            ctx.replicas
+            ctx.request_nodes
             |> Enum.with_index(1)
             |> Enum.map(fn {node, node_ix} ->
               Task.async(fn ->
@@ -265,7 +279,7 @@ defmodule Bench.CAS do
         end
 
         report_throughput(
-          "CAS updates from #{workers_per_node} workers/node across #{proposer_count} proposers",
+          "CAS updates from #{workers_per_node} workers/node across #{requester_count} request nodes",
           succeeded,
           wall_us
         )
@@ -281,15 +295,15 @@ defmodule Bench.CAS do
     header("5. Hot-Key Contention (update same counter)")
 
     with_remote_ekv(shards, ctx, "s5", fn ->
-      proposer_count = length(ctx.replicas)
+      requester_count = length(ctx.request_nodes)
       cases = if ctx.quick, do: [150, 600], else: [300, 1_500]
 
       for n <- cases do
-        per_node = div(n, proposer_count)
-        remainder = rem(n, proposer_count)
+        per_node = div(n, requester_count)
+        remainder = rem(n, requester_count)
 
         subheader(
-          "#{format_number(n)} increments across #{proposer_count} proposers " <>
+          "#{format_number(n)} increments across #{requester_count} request nodes " <>
             "(~#{per_node}/node, concurrent)"
         )
 
@@ -298,7 +312,7 @@ defmodule Bench.CAS do
         {wall_us, _} =
           time_us(fn ->
             all =
-              ctx.replicas
+              ctx.request_nodes
               |> Enum.with_index(1)
               |> Enum.map(fn {node, ix} ->
                 ops_for_node = per_node + if(ix <= remainder, do: 1, else: 0)
@@ -417,8 +431,8 @@ defmodule Bench.CAS do
       seed = if ctx.quick, do: 120, else: 200
       workers_per_node = if ctx.quick, do: 3, else: 4
       ops_per_worker = if ctx.quick, do: 80, else: 150
-      proposer_count = length(ctx.replicas)
-      workers = workers_per_node * proposer_count
+      requester_count = length(ctx.request_nodes)
+      workers = workers_per_node * requester_count
       ops = workers * ops_per_worker
 
       read_opts =
@@ -442,7 +456,7 @@ defmodule Bench.CAS do
         {wall_us, _} =
           time_us(fn ->
             tasks =
-              for node <- ctx.replicas, worker_ix <- 1..workers_per_node do
+              for node <- ctx.request_nodes, worker_ix <- 1..workers_per_node do
                 Task.async(fn ->
                   for op_ix <- 1..ops_per_worker do
                     key = "cfg/#{:rand.uniform(seed)}"
@@ -499,8 +513,8 @@ defmodule Bench.CAS do
 
       # Full lifecycle on single node
       single_samples =
-        collect_remote_samples(n, r1(ctx), fn i ->
-          rpc(r1(ctx), Bench.Replica, :session_lifecycle, [
+        collect_remote_samples(n, requester(ctx), fn i ->
+          rpc(requester(ctx), Bench.Replica, :session_lifecycle, [
             @name,
             "sess/#{i}"
           ])
@@ -510,32 +524,35 @@ defmodule Bench.CAS do
 
       # Lifecycle spanning 2 nodes: create on R1, read on R2, update on R2, delete on R1
       cross_samples =
-        collect_remote_samples(n, r1(ctx), fn i ->
+        collect_remote_samples(n, requester(ctx), fn i ->
           key = "xsess/#{i}"
           # Create on R1
           {:ok, _} =
-            rpc(r1(ctx), Bench.Replica, :consistent_put, [
+            rpc(requester(ctx), Bench.Replica, :consistent_put, [
               @name,
               key,
               %{user: i, created: true}
             ])
 
-          # Read on R2 (consistent — sees the write)
-          rpc(r2(ctx), Bench.Replica, :consistent_get, [@name, key])
+          # Read on node2 (consistent — sees the write)
+          rpc(cross_node(ctx), Bench.Replica, :consistent_get, [@name, key])
 
-          # Update on R2
+          # Update on node2
           {:ok, _, updated_vsn} =
-            rpc(r2(ctx), Bench.Replica, :cas_update, [
+            rpc(cross_node(ctx), Bench.Replica, :cas_update, [
               @name,
               key,
               &Bench.Replica.session_activate/1
             ])
 
-          # Delete on R1
-          {:ok, _} = rpc(r1(ctx), Bench.Replica, :cas_delete, [@name, key, updated_vsn])
+          # Delete on node1
+          {:ok, _} = rpc(requester(ctx), Bench.Replica, :cas_delete, [@name, key, updated_vsn])
         end)
 
-      report_latency("#{format_number(n)} cross-node lifecycles (R1→R2→R2→R1)", cross_samples)
+      report_latency(
+        "#{format_number(n)} cross-node lifecycles (node1→node2→node2→node1)",
+        cross_samples
+      )
     end)
   end
 
@@ -551,17 +568,17 @@ defmodule Bench.CAS do
 
       # LWW puts (single GenServer call, no quorum)
       lww_samples =
-        collect_remote_samples(n, r1(ctx), fn i ->
-          rpc(r1(ctx), Bench.Replica, :single_put, [@name, "cmp_lww/#{i}", %{i: i}])
+        collect_remote_samples(n, requester(ctx), fn i ->
+          rpc(requester(ctx), Bench.Replica, :single_put, [@name, "cmp_lww/#{i}", %{i: i}])
         end)
 
       report_latency("#{format_number(n)} LWW puts (fire-and-forget)", lww_samples)
 
       # CAS updates (prepare + accept + commit quorum)
       cas_samples =
-        collect_remote_samples(n, r1(ctx), fn i ->
+        collect_remote_samples(n, requester(ctx), fn i ->
           {:ok, _, _} =
-            rpc(r1(ctx), Bench.Replica, :cas_update, [
+            rpc(requester(ctx), Bench.Replica, :cas_update, [
               @name,
               "cmp_cas/#{i}",
               &Bench.Replica.cas_increment/1
@@ -631,31 +648,49 @@ defmodule Bench.CAS do
   end
 
   defp with_remote_ekv(shards, ctx, scope, fun) do
-    node_specs =
-      Enum.with_index(ctx.replicas, 1)
-      |> Enum.map(fn {node, node_id} ->
-        {node, node_id, run_data_dir(ctx, scope, node_id)}
+    member_specs =
+      Enum.with_index(ctx.member_specs, 1)
+      |> Enum.map(fn {spec, node_id} ->
+        Map.merge(spec, %{node_id: node_id, data_dir: run_data_dir(ctx, scope, node_id)})
       end)
 
     try do
-      Enum.each(node_specs, fn {node, node_id, data_dir} ->
+      Enum.each(member_specs, fn %{node: node, data_dir: data_dir} ->
         rpc(node, File, :rm_rf, [data_dir])
         rpc(node, File, :mkdir_p, [data_dir])
+      end)
 
-        start_ekv_on(node,
+      start_many_ekv(member_specs, fn spec ->
+        start_ekv_on(spec.node,
+          mode: :member,
           name: @name,
-          data_dir: data_dir,
+          data_dir: spec.data_dir,
+          region: spec.region,
           shards: shards,
           cluster_size: ctx.cluster_size,
-          node_id: node_id
+          node_id: spec.node_id,
+          wait_for_quorum: 30_000
         )
       end)
 
-      # Let members discover each other and exchange connect/ack
-      Process.sleep(500)
+      Enum.each(ctx.client_specs, fn spec ->
+        start_ekv_on(spec.node,
+          mode: :client,
+          name: @name,
+          region: spec.region,
+          region_routing: spec.region_routing,
+          wait_for_route: 30_000,
+          wait_for_quorum: 30_000
+        )
+      end)
+
       fun.()
     after
-      Enum.each(node_specs, fn {node, _node_id, data_dir} ->
+      Enum.each(ctx.client_specs, fn spec ->
+        stop_ekv_on(spec.node)
+      end)
+
+      Enum.each(member_specs, fn %{node: node, data_dir: data_dir} ->
         stop_ekv_on(node)
         rpc(node, File, :rm_rf, [data_dir])
       end)
@@ -663,8 +698,29 @@ defmodule Bench.CAS do
   end
 
   defp start_ekv_on(node, opts) do
-    full_opts = Keyword.merge([log: false, gc_interval: :timer.hours(1)], opts)
+    defaults =
+      case Keyword.get(opts, :mode, :member) do
+        :client -> [log: false]
+        _member -> [log: false, gc_interval: :timer.hours(1)]
+      end
+
+    full_opts = Keyword.merge(defaults, opts)
     rpc(node, Bench.Replica, :start_ekv, [full_opts])
+  end
+
+  defp start_many_ekv(specs, starter) do
+    specs
+    |> Task.async_stream(
+      fn spec -> starter.(spec) end,
+      ordered: false,
+      timeout: :infinity,
+      max_concurrency: length(specs)
+    )
+    |> Enum.each(fn
+      {:ok, {:ok, _pid}} -> :ok
+      {:ok, other} -> raise "unexpected EKV start result: #{inspect(other)}"
+      {:exit, reason} -> exit(reason)
+    end)
   end
 
   defp stop_ekv_on(node) do
@@ -680,42 +736,88 @@ defmodule Bench.CAS do
   end
 
   defp build_context(opts) do
-    replicas =
-      opts
-      |> Keyword.get(:replicas, @default_replicas)
-      |> Enum.map(&normalize_node/1)
-      |> Enum.uniq()
+    {member_specs, client_specs, cluster_size} =
+      case {Keyword.get(opts, :members), Keyword.get(opts, :clients)} do
+        {nil, nil} ->
+          replicas =
+            opts
+            |> Keyword.get(:replicas, @default_replicas)
+            |> Enum.map(&normalize_node/1)
+            |> Enum.uniq()
 
-    if length(replicas) < 3 do
-      raise ArgumentError, "Bench.CAS requires at least 3 replicas"
-    end
+          if length(replicas) < 3 do
+            raise ArgumentError, "Bench.CAS requires at least 3 member nodes"
+          end
 
-    cluster_size = Keyword.get(opts, :cluster_size, length(replicas))
+          legacy_cluster_size = Keyword.get(opts, :cluster_size, length(replicas))
 
-    cond do
-      cluster_size < 3 ->
-        raise ArgumentError, "Bench.CAS cluster_size must be >= 3"
+          cond do
+            legacy_cluster_size < 3 ->
+              raise ArgumentError, "Bench.CAS cluster_size must be >= 3"
 
-      cluster_size > length(replicas) ->
-        raise ArgumentError,
-              "Bench.CAS cluster_size (#{cluster_size}) exceeds replica count (#{length(replicas)})"
+            legacy_cluster_size > length(replicas) ->
+              raise ArgumentError,
+                    "Bench.CAS cluster_size (#{legacy_cluster_size}) exceeds replica count (#{length(replicas)})"
 
-      true ->
-        :ok
-    end
+            true ->
+              :ok
+          end
 
-    selected = Enum.take(replicas, cluster_size)
-    [replica1, replica2, replica3 | _] = selected
+          selected = Enum.take(replicas, legacy_cluster_size)
+
+          {
+            Enum.map(selected, fn node -> %{node: node, region: "default"} end),
+            [],
+            legacy_cluster_size
+          }
+
+        {members, clients} ->
+          member_specs = normalize_member_specs(members || [])
+          client_specs = normalize_client_specs(clients || [])
+
+          if length(member_specs) < 3 do
+            raise ArgumentError, "Bench.CAS requires at least 3 member nodes"
+          end
+
+          overlapping =
+            MapSet.intersection(
+              MapSet.new(Enum.map(member_specs, & &1.node)),
+              MapSet.new(Enum.map(client_specs, & &1.node))
+            )
+
+          if MapSet.size(overlapping) > 0 do
+            raise ArgumentError,
+                  "Bench.CAS member/client overlap: #{Enum.map_join(overlapping, ", ", &inspect/1)}"
+          end
+
+          cluster_size = Keyword.get(opts, :cluster_size, length(member_specs))
+
+          if cluster_size != length(member_specs) do
+            raise ArgumentError,
+                  "Bench.CAS cluster_size (#{cluster_size}) must equal member count (#{length(member_specs)}) when members are provided explicitly"
+          end
+
+          {member_specs, client_specs, cluster_size}
+      end
+
+    members = Enum.map(member_specs, & &1.node)
+    clients = Enum.map(client_specs, & &1.node)
+    request_nodes = members ++ clients
+    [member1, member2, member3 | _] = members
     scenarios = parse_scenarios(Keyword.get(opts, :scenarios, @all_scenarios))
     quick = Keyword.get(opts, :quick, false)
     run_id = Keyword.get(opts, :run_id, default_run_id())
     data_root = Keyword.get(opts, :data_root, default_data_root())
 
     %{
-      replica1: replica1,
-      replica2: replica2,
-      replica3: replica3,
-      replicas: selected,
+      member1: member1,
+      member2: member2,
+      member3: member3,
+      members: members,
+      clients: clients,
+      request_nodes: request_nodes,
+      member_specs: member_specs,
+      client_specs: client_specs,
       cluster_size: cluster_size,
       scenarios: scenarios,
       quick: quick,
@@ -766,8 +868,84 @@ defmodule Bench.CAS do
   defp normalize_node(node) when is_binary(node), do: String.to_atom(node)
   defp normalize_node(node), do: raise(ArgumentError, "invalid node #{inspect(node)}")
 
-  defp r1(%{replica1: node}), do: node
-  defp r2(%{replica2: node}), do: node
+  defp normalize_member_specs(specs) do
+    specs
+    |> Enum.map(fn
+      %{node: node, region: region} ->
+        %{node: normalize_node(node), region: normalize_region(region)}
+
+      spec when is_list(spec) ->
+        %{
+          node: normalize_node(Keyword.fetch!(spec, :node)),
+          region: normalize_region(Keyword.fetch!(spec, :region))
+        }
+
+      other ->
+        raise ArgumentError, "invalid member spec #{inspect(other)}"
+    end)
+    |> uniq_specs(:member)
+  end
+
+  defp normalize_client_specs(specs) do
+    specs
+    |> Enum.map(fn
+      %{node: node, region: region, region_routing: region_routing} ->
+        %{
+          node: normalize_node(node),
+          region: normalize_region(region),
+          region_routing: normalize_region_routing(region_routing)
+        }
+
+      spec when is_list(spec) ->
+        %{
+          node: normalize_node(Keyword.fetch!(spec, :node)),
+          region: normalize_region(Keyword.fetch!(spec, :region)),
+          region_routing: normalize_region_routing(Keyword.fetch!(spec, :region_routing))
+        }
+
+      other ->
+        raise ArgumentError, "invalid client spec #{inspect(other)}"
+    end)
+    |> uniq_specs(:client)
+  end
+
+  defp uniq_specs(specs, label) do
+    specs
+    |> Enum.uniq_by(& &1.node)
+    |> case do
+      [] -> []
+      uniq when length(uniq) == length(specs) -> uniq
+      _ -> raise ArgumentError, "duplicate #{label} nodes are not allowed"
+    end
+  end
+
+  defp normalize_region(region) do
+    region = region |> to_string() |> String.trim()
+
+    if region == "" do
+      raise ArgumentError, "region must be a non-empty string"
+    else
+      region
+    end
+  end
+
+  defp normalize_region_routing(region_routing) do
+    region_routing
+    |> List.wrap()
+    |> Enum.map(&normalize_region/1)
+    |> Enum.uniq()
+    |> case do
+      [] -> raise ArgumentError, "region_routing must include at least one region"
+      routes -> routes
+    end
+  end
+
+  defp r1(%{member1: node}), do: node
+  defp r2(%{member2: node}), do: node
+  defp requester(%{clients: [node | _]}), do: node
+  defp requester(%{member1: node}), do: node
+  defp cross_node(%{request_nodes: [_first, second | _]}), do: second
+  defp cross_node(%{member2: node}), do: node
 
   defp rpc(node, module, func, args) do
     :erpc.call(node, module, func, args, @default_remote_timeout_ms)

@@ -121,6 +121,11 @@ defmodule EKV.ClientRouter do
     {:noreply, mark_backend_failed_in_router(state, node)}
   end
 
+  def handle_info({:prime_member_visibility, backend}, %ClientRouter{} = state) do
+    prime_member_visibility(state.name, backend)
+    {:noreply, state}
+  end
+
   def handle_info({:nodedown, node}, %ClientRouter{} = state) do
     {:noreply, handle_nodedown(state, node)}
   end
@@ -213,14 +218,14 @@ defmodule EKV.ClientRouter do
     case pick_valid_backend(state, true) do
       {:ok, backend} ->
         put_backend(state.name, backend)
-        prime_member_visibility(state.name, backend)
+        send(self(), {:prime_member_visibility, backend})
         {{:ok, backend}, state}
 
       :error ->
         case pick_valid_backend(state, false) do
           {:ok, backend} ->
             put_backend(state.name, backend)
-            prime_member_visibility(state.name, backend)
+            send(self(), {:prime_member_visibility, backend})
             {{:ok, backend}, state}
 
           :error ->
@@ -270,7 +275,7 @@ defmodule EKV.ClientRouter do
         end
       end)
     catch
-      :exit, _reason -> :ok
+      _, _reason -> :ok
     end
   end
 
