@@ -133,15 +133,6 @@ defmodule EKV.ClientRouter do
 
   def handle_info(_msg, state), do: {:noreply, state}
 
-  @impl true
-  def terminate(_reason, state) do
-    Enum.each(state.waiters, fn {_mon_ref, waiter} ->
-      cleanup_waiter(waiter)
-    end)
-
-    :ok
-  end
-
   defp monitor_region_groups(name, region_routing) do
     scope = EKV.Supervisor.pg_scope(name)
 
