@@ -621,11 +621,14 @@ defmodule EKV do
             validate_cas_config!(config)
             value_binary = :erlang.term_to_binary(value)
 
-            GenServer.call(
-              Replica.shard_name(name, shard_index),
-              {:cas_put, key, value_binary, expected_vsn, opts},
-              timeout
-            )
+            result =
+              GenServer.call(
+                Replica.shard_name(name, shard_index),
+                {:cas_put, key, value_binary, expected_vsn, opts},
+                timeout
+              )
+
+            maybe_resolve_unconfirmed_write(result, name, key, opts, :cas_put)
 
           {:error, false} ->
             value_binary = :erlang.term_to_binary(value)
@@ -761,11 +764,14 @@ defmodule EKV do
           {:ok, expected_vsn} ->
             validate_cas_config!(config)
 
-            GenServer.call(
-              Replica.shard_name(name, shard_index),
-              {:cas_delete, key, expected_vsn, opts},
-              timeout
-            )
+            result =
+              GenServer.call(
+                Replica.shard_name(name, shard_index),
+                {:cas_delete, key, expected_vsn, opts},
+                timeout
+              )
+
+            maybe_resolve_unconfirmed_write(result, name, key, opts, :cas_delete)
 
           :error ->
             GenServer.call(Replica.shard_name(name, shard_index), {:delete, key})
@@ -829,11 +835,14 @@ defmodule EKV do
         validate_cas_config!(config)
         shard_index = Replica.shard_index_for(key, config.num_shards)
 
-        GenServer.call(
-          Replica.shard_name(name, shard_index),
-          {:update, key, fun, opts},
-          timeout
-        )
+        result =
+          GenServer.call(
+            Replica.shard_name(name, shard_index),
+            {:update, key, fun, opts},
+            timeout
+          )
+
+        maybe_resolve_unconfirmed_write(result, name, key, opts, :update)
     end
   end
 
@@ -1320,6 +1329,93 @@ defmodule EKV do
       {:raise, exception} -> raise exception
       {:exit, reason} -> raise "EKV: client call exited: #{inspect(reason)}"
       {:error, :unavailable} -> {:error, :unavailable}
+    end
+  end
+
+  defp maybe_resolve_unconfirmed_write({:error, :unconfirmed, reply_value}, name, key, opts, op)
+       when is_list(opts) do
+    if Keyword.get(opts, :resolve_unconfirmed, false) do
+      resolve_unconfirmed_write(name, key, opts, op, reply_value)
+    else
+      {:error, :unconfirmed}
+    end
+  end
+
+  defp maybe_resolve_unconfirmed_write({:error, :unconfirmed}, _name, _key, _opts, _op),
+    do: {:error, :unconfirmed}
+
+  defp maybe_resolve_unconfirmed_write(result, _name, _key, _opts, _op), do: result
+
+  defp resolve_unconfirmed_write(name, key, opts, op, reply_value) do
+    case resolved_current_row(name, key, opts) do
+      {:ok, row_state} -> resolve_unconfirmed_result(op, reply_value, row_state)
+      {:error, :unavailable} -> {:error, :unavailable}
+    end
+  rescue
+    _ -> {:error, :unavailable}
+  catch
+    :exit, _ -> {:error, :unavailable}
+  end
+
+  defp resolve_unconfirmed_result(:cas_put, {:ok, expected_vsn}, {:live, _value, expected_vsn}),
+    do: {:ok, expected_vsn}
+
+  defp resolve_unconfirmed_result(:cas_put, _reply_value, _row_state), do: {:error, :conflict}
+
+  defp resolve_unconfirmed_result(
+         :cas_delete,
+         {:ok, expected_vsn},
+         {:deleted, expected_vsn}
+       ),
+       do: {:ok, expected_vsn}
+
+  defp resolve_unconfirmed_result(:cas_delete, _reply_value, _row_state),
+    do: {:error, :conflict}
+
+  defp resolve_unconfirmed_result(
+         :update,
+         {:ok, _expected_value, expected_vsn},
+         {:live, value, expected_vsn}
+       ),
+       do: {:ok, value, expected_vsn}
+
+  defp resolve_unconfirmed_result(:update, _reply_value, _row_state), do: {:error, :conflict}
+
+  defp resolved_current_row(name, key, opts) do
+    config = EKV.Supervisor.get_config(name)
+    validate_cas_config!(config)
+    shard_index = Replica.shard_index_for(key, config.num_shards)
+    timeout = Keyword.get(opts, :timeout, 10_000)
+    cas_opts = Keyword.take(opts, [:retries, :backoff])
+
+    case GenServer.call(
+           Replica.shard_name(name, shard_index),
+           {:cas_read, key, cas_opts},
+           timeout
+         ) do
+      {:ok, _value} ->
+        {:ok, current_row_state(name, shard_index, key)}
+
+      {:ok, _value, _vsn} ->
+        {:ok, current_row_state(name, shard_index, key)}
+
+      {:error, _reason} ->
+        {:error, :unavailable}
+    end
+  end
+
+  defp current_row_state(name, shard_index, key) do
+    {db, get_stmt} = read_conn(name, shard_index)
+
+    case EKV.Store.get_cached(db, get_stmt, key) do
+      nil ->
+        :absent
+
+      {_value_binary, ts, origin, _expires_at, deleted_at} when is_integer(deleted_at) ->
+        {:deleted, {ts, origin}}
+
+      {value_binary, ts, origin, _expires_at, nil} ->
+        {:live, :erlang.binary_to_term(value_binary), {ts, origin}}
     end
   end
 

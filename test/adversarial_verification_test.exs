@@ -49,17 +49,14 @@ defmodule EKV.AdversarialVerificationTest do
   defp restart_cluster_ekv(peers, ekv_name, opts) do
     gc_interval = Keyword.get(opts, :gc_interval, 300)
     tombstone_ttl = Keyword.get(opts, :tombstone_ttl, 1_200)
-    sup_name = :"#{ekv_name}_ekv_sup"
-    shard_name = :"#{ekv_name}_ekv_replica_0"
 
     peers
     |> Enum.with_index(1)
     |> Enum.each(fn {{_pid, node}, node_id} ->
-      TestCluster.rpc!(node, TestCluster, :kill_registered, [sup_name])
+      TestCluster.stop_ekv(node, ekv_name)
 
       TestCluster.assert_eventually(fn ->
-        TestCluster.rpc!(node, Process, :whereis, [sup_name]) == nil and
-          TestCluster.rpc!(node, Process, :whereis, [shard_name]) == nil
+        TestCluster.ekv_stopped?(node, ekv_name)
       end)
 
       data_dir = "/tmp/ekv_adversarial_#{node}_#{ekv_name}"
@@ -77,8 +74,7 @@ defmodule EKV.AdversarialVerificationTest do
       )
 
       TestCluster.assert_eventually(fn ->
-        is_pid(TestCluster.rpc!(node, Process, :whereis, [sup_name])) and
-          is_pid(TestCluster.rpc!(node, Process, :whereis, [shard_name]))
+        not TestCluster.ekv_stopped?(node, ekv_name)
       end)
     end)
   end
@@ -266,7 +262,7 @@ defmodule EKV.AdversarialVerificationTest do
 
     send(
       shard_name,
-      {:continue_full_sync, fake_node, nil, tombstone_cutoff, my_seq, 0, config.sync_chunk_size}
+      {:continue_full_sync, fake_node, nil, tombstone_cutoff, my_seq, config.sync_chunk_size}
     )
 
     Process.sleep(200)
@@ -317,7 +313,7 @@ defmodule EKV.AdversarialVerificationTest do
     state = :sys.get_state(shard_name)
     my_seq = EKV.Store.max_seq(state.db)
 
-    send(shard_name, {:continue_delta_sync, fake_node, 0, my_seq, 0, config.sync_chunk_size})
+    send(shard_name, {:continue_delta_sync, fake_node, 0, my_seq, config.sync_chunk_size})
 
     Process.sleep(200)
     :sys.get_state(shard_name)

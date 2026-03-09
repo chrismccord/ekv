@@ -46,6 +46,34 @@ defmodule EKV.TestCluster do
     end)
   end
 
+  @doc "Stop EKV on a remote node by supervisor name"
+  def stop_ekv(node, name, timeout \\ 5_000) do
+    :erpc.call(node, __MODULE__, :do_stop_ekv, [name, timeout])
+  end
+
+  @doc false
+  def do_stop_ekv(name, timeout) do
+    sup_name = :"#{name}_ekv_sup"
+
+    case Process.whereis(sup_name) do
+      nil -> :ok
+      pid -> Supervisor.stop(pid, :shutdown, timeout)
+    end
+  end
+
+  @doc "True when no registered EKV names remain for the given instance"
+  def ekv_stopped?(node, name) do
+    prefix = "#{name}_ekv_"
+    :erpc.call(node, __MODULE__, :registered_prefix_clear?, [prefix])
+  end
+
+  @doc false
+  def registered_prefix_clear?(prefix) when is_binary(prefix) do
+    not Enum.any?(Process.registered(), fn name ->
+      Atom.to_string(name) |> String.starts_with?(prefix)
+    end)
+  end
+
   @doc "Wait for a condition to become true, with retries"
   def assert_eventually(fun, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, 2000)

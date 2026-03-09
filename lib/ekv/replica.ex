@@ -941,6 +941,7 @@ defmodule EKV.Replica do
 
   require Logger
 
+  alias EKV.Replica
   alias EKV.Store
 
   @member_down_id_prefix "member_down_at:id:"
@@ -984,10 +985,6 @@ defmodule EKV.Replica do
   def shard_index_for(key, num_shards) do
     :erlang.phash2(key, num_shards)
   end
-
-  # =====================================================================
-  # GenServer callbacks
-  # =====================================================================
 
   @impl true
   def init(opts) do
@@ -1046,7 +1043,7 @@ defmodule EKV.Replica do
     # Persist node_id to volume (idempotent — all shards store it)
     if config.node_id, do: Store.persist_node_id(db, config.node_id)
 
-    state = %__MODULE__{
+    state = %Replica{
       name: name,
       shard_index: shard_index,
       num_shards: num_shards,
@@ -1100,7 +1097,7 @@ defmodule EKV.Replica do
   end
 
   @impl true
-  def terminate(_reason, state) do
+  def terminate(_reason, %Replica{} = state) do
     for {rdb, get_stmt} <- state.readers do
       EKV.Sqlite3.release(rdb, get_stmt)
       Store.close(rdb)
@@ -1129,7 +1126,7 @@ defmodule EKV.Replica do
   # =====================================================================
 
   @impl true
-  def handle_call(request, _from, %{handoff_node: handoff_node} = state)
+  def handle_call(request, _from, %Replica{handoff_node: handoff_node} = state)
       when handoff_node != nil do
     shard_name = shard_name(state.name, state.shard_index)
 
@@ -1146,7 +1143,7 @@ defmodule EKV.Replica do
   # Write calls
   # =====================================================================
 
-  def handle_call({:put, key, value_binary, opts}, _from, state) do
+  def handle_call({:put, key, value_binary, opts}, _from, %Replica{} = state) do
     %{db: db, stmts: stmts} = state
     {now, state} = next_lww_ts(state)
     origin_node = node()
@@ -1182,9 +1179,9 @@ defmodule EKV.Replica do
     end
   end
 
-  def handle_call({:delete, key}, _from, state) do
+  def handle_call({:delete, key}, _from, %Replica{} = state) do
     %{db: db, stmts: stmts} = state
-    {now, state} = next_lww_ts(state)
+    {now, %Replica{} = state} = next_lww_ts(state)
     origin_node = node()
 
     if Store.cas_managed_key?(db, key) do
@@ -1218,30 +1215,30 @@ defmodule EKV.Replica do
   # CAS write calls
   # =====================================================================
 
-  def handle_call({:cas_put, key, value_binary, expected_vsn, opts}, from, state) do
+  def handle_call({:cas_put, key, value_binary, expected_vsn, opts}, from, %Replica{} = state) do
     operation = {:cas_put, expected_vsn, value_binary, opts}
     {:noreply, start_cas(state, key, operation, from)}
   end
 
-  def handle_call({:cas_delete, key, expected_vsn, opts}, from, state) do
+  def handle_call({:cas_delete, key, expected_vsn, opts}, from, %Replica{} = state) do
     operation = {:cas_delete, expected_vsn, opts}
     {:noreply, start_cas(state, key, operation, from)}
   end
 
-  def handle_call({:update, key, fun, opts}, from, state) do
+  def handle_call({:update, key, fun, opts}, from, %Replica{} = state) do
     retries = Keyword.get(opts, :retries, 5)
     operation = {:update, fun, opts, retries}
     {:noreply, start_cas(state, key, operation, from)}
   end
 
-  def handle_call({:cas_read, key, opts}, from, state) do
+  def handle_call({:cas_read, key, opts}, from, %Replica{} = state) do
     retries = Keyword.get(opts, :retries, 5)
     backoff = Keyword.get(opts, :backoff, {10, 60})
     operation = {:cas_read, [backoff: backoff], retries}
     {:noreply, start_cas(state, key, operation, from)}
   end
 
-  def handle_call({:await_quorum, timeout_ms}, from, state) do
+  def handle_call({:await_quorum, timeout_ms}, from, %Replica{} = state) do
     case quorum_status(state) do
       :ok ->
         {:reply, :ok, state}
@@ -1269,7 +1266,7 @@ defmodule EKV.Replica do
   # =====================================================================
 
   @impl true
-  def handle_info({:ekv_handoff_request, ref, new_node, caller_pid}, state) do
+  def handle_info({:ekv_handoff_request, ref, new_node, caller_pid}, %Replica{} = state) do
     EKV.BlueGreenMarker.mark_handoff_performed(state.name)
     EKV.MemberPresence.leave(state.name)
 
@@ -1279,7 +1276,7 @@ defmodule EKV.Replica do
       GenServer.reply(op.from, {:error, :shutting_down})
     end
 
-    state = fail_quorum_waiters(state, {:error, :shutting_down})
+    %Replica{} = state = fail_quorum_waiters(state, {:error, :shutting_down})
 
     # 2. Persist ballot counter
     if state.cluster_size && state.db do
@@ -1308,7 +1305,7 @@ defmodule EKV.Replica do
   # In handoff mode: drop all messages (replication, GC, nodeup/down, CAS).
   # Readers stay alive for old VM reads. Replica members rediscover the incoming
   # node via nodeup; new clients bind to the incoming member via MemberPresence.
-  def handle_info(_msg, %{handoff_node: handoff_node} = state)
+  def handle_info(_msg, %Replica{handoff_node: handoff_node} = state)
       when handoff_node != nil do
     {:noreply, state}
   end
@@ -1317,7 +1314,10 @@ defmodule EKV.Replica do
   # Replication receive
   # =====================================================================
 
-  def handle_info({:ekv_put, key, value_binary, timestamp, origin_node, expires_at}, state) do
+  def handle_info(
+        {:ekv_put, key, value_binary, timestamp, origin_node, expires_at},
+        %Replica{} = state
+      ) do
     {:ok, applied} =
       merge_remote_entry(state, key, value_binary, timestamp, origin_node, expires_at, nil)
 
@@ -1330,7 +1330,7 @@ defmodule EKV.Replica do
     {:noreply, state}
   end
 
-  def handle_info({:ekv_delete, key, timestamp, origin_node}, state) do
+  def handle_info({:ekv_delete, key, timestamp, origin_node}, %Replica{} = state) do
     prev_value = if has_subscribers?(state), do: read_previous_value(state, key)
 
     {:ok, applied} =
@@ -1350,7 +1350,7 @@ defmodule EKV.Replica do
   def handle_info(
         {:ekv_member_connect, remote_pid, remote_shard, remote_num_shards, remote_hwm,
          remote_node_id},
-        state
+        %Replica{} = state
       ) do
     {:noreply,
      do_member_connect(
@@ -1366,7 +1366,7 @@ defmodule EKV.Replica do
   def handle_info(
         {:ekv_member_connect_ack, remote_pid, remote_shard, remote_num_shards, remote_hwm,
          remote_node_id},
-        state
+        %Replica{} = state
       ) do
     {:noreply,
      do_member_connect_ack(
@@ -1379,7 +1379,7 @@ defmodule EKV.Replica do
      )}
   end
 
-  def handle_info({:ekv_sync, from_node, _shard, entries, their_seq}, state) do
+  def handle_info({:ekv_sync, from_node, _shard, entries, their_seq}, %Replica{} = state) do
     %{shard_index: shard, db: db, num_shards: num_shards} = state
 
     log_verbose(state, fn ->
@@ -1441,12 +1441,12 @@ defmodule EKV.Replica do
   # Node up/down
   # =====================================================================
 
-  def handle_info({:nodeup, remote_node}, state) do
+  def handle_info({:nodeup, remote_node}, %Replica{} = state) do
     case maybe_allow_member_reconnect(state, remote_node) do
-      {:quarantine, state} ->
+      {:quarantine, %Replica{} = state} ->
         {:noreply, state}
 
-      {:ok, state} ->
+      {:ok, %Replica{} = state} ->
         %{shard_index: shard, name: name, db: db} = state
         remote_hwm = Store.get_hwm(db, remote_node) || 0
 
@@ -1459,7 +1459,7 @@ defmodule EKV.Replica do
     end
   end
 
-  def handle_info({:nodedown, dead_node}, state) do
+  def handle_info({:nodedown, dead_node}, %Replica{} = state) do
     log_once(state, fn -> "#{log_prefix(state)} nodedown #{dead_node} (data preserved)" end)
 
     dead_node_id = Map.get(state.member_node_ids, dead_node)
@@ -1471,19 +1471,20 @@ defmodule EKV.Replica do
     }
 
     state = mark_member_down(state, dead_node, dead_node_id)
-
     # Check if any pending CAS ops lost quorum
-    state = fail_pending_cas_if_no_quorum(state)
-    state = maybe_reply_to_quorum_waiters(state)
+    new_state =
+      state
+      |> fail_pending_cas_if_no_quorum()
+      |> maybe_reply_to_quorum_waiters()
 
-    {:noreply, state}
+    {:noreply, new_state}
   end
 
   # =====================================================================
   # Process DOWN (remote shard died)
   # =====================================================================
 
-  def handle_info({:DOWN, _mref, :process, pid, _reason}, state) do
+  def handle_info({:DOWN, _mref, :process, pid, _reason}, %Replica{} = state) do
     remote_node = node(pid)
 
     if Map.get(state.remote_shards, remote_node) == pid do
@@ -1499,16 +1500,19 @@ defmodule EKV.Replica do
           member_node_ids: Map.delete(state.member_node_ids, remote_node)
       }
 
-      state = mark_member_down(state, remote_node, remote_node_id)
-      state = fail_pending_cas_if_no_quorum(state)
-      state = maybe_reply_to_quorum_waiters(state)
-      {:noreply, state}
+      new_state =
+        state
+        |> mark_member_down(remote_node, remote_node_id)
+        |> fail_pending_cas_if_no_quorum()
+        |> maybe_reply_to_quorum_waiters()
+
+      {:noreply, new_state}
     else
       {:noreply, state}
     end
   end
 
-  def handle_info({:await_quorum_timeout, ref}, state) do
+  def handle_info({:await_quorum_timeout, ref}, %Replica{} = state) do
     case Map.pop(state.quorum_waiters, ref) do
       {nil, _waiters} ->
         {:noreply, state}
@@ -1523,7 +1527,10 @@ defmodule EKV.Replica do
   # CAS Acceptor handlers (remote proposer sends to us)
   # =====================================================================
 
-  def handle_info({:ekv_prepare, ref, proposer_pid, key, ballot_c, ballot_n, _shard}, state) do
+  def handle_info(
+        {:ekv_prepare, ref, proposer_pid, key, ballot_c, ballot_n, _shard},
+        %Replica{} = state
+      ) do
     %{db: db} = state
 
     case Store.paxos_prepare(db, key, ballot_c, ballot_n) do
@@ -1539,7 +1546,7 @@ defmodule EKV.Replica do
 
   def handle_info(
         {:ekv_accept, ref, proposer_pid, key, ballot_c, ballot_n, entry_tuple, _shard},
-        state
+        %Replica{} = state
       ) do
     %{db: db} = state
 
@@ -1560,7 +1567,10 @@ defmodule EKV.Replica do
   end
 
   # CAS commit notification carries committed entry tuple.
-  def handle_info({:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple, _shard}, state) do
+  def handle_info(
+        {:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple, _shard},
+        %Replica{} = state
+      ) do
     {:noreply, apply_cas_commit(state, key, ballot_c, ballot_n, entry_tuple)}
   end
 
@@ -1568,7 +1578,10 @@ defmodule EKV.Replica do
   # CAS Proposer response handlers (responses from acceptors)
   # =====================================================================
 
-  def handle_info({:ekv_promise, ref, _pid, remote_node_id, acc_c, acc_n, kv_row}, state) do
+  def handle_info(
+        {:ekv_promise, ref, _pid, remote_node_id, acc_c, acc_n, kv_row},
+        %Replica{} = state
+      ) do
     case Map.get(state.pending_cas, ref) do
       nil ->
         {:noreply, state}
@@ -1584,8 +1597,7 @@ defmodule EKV.Replica do
           }
 
           if length(op.promises) >= op.quorum do
-            state = enter_accept_phase(ref, op, state)
-            {:noreply, state}
+            {:noreply, enter_accept_phase(state, ref, op)}
           else
             {:noreply, %{state | pending_cas: Map.put(state.pending_cas, ref, op)}}
           end
@@ -1596,7 +1608,7 @@ defmodule EKV.Replica do
     end
   end
 
-  def handle_info({:ekv_nack, ref, _pid, remote_node_id, _prom_c, _prom_n}, state) do
+  def handle_info({:ekv_nack, ref, _pid, remote_node_id, _prom_c, _prom_n}, %Replica{} = state) do
     case Map.get(state.pending_cas, ref) do
       nil ->
         {:noreply, state}
@@ -1611,8 +1623,7 @@ defmodule EKV.Replica do
 
           if max_possible_promises < op.quorum do
             # Can't reach quorum — fail or retry
-            state = handle_cas_failure(ref, op, state)
-            {:noreply, state}
+            {:noreply, handle_cas_failure(state, ref, op)}
           else
             {:noreply, %{state | pending_cas: Map.put(state.pending_cas, ref, op)}}
           end
@@ -1623,7 +1634,7 @@ defmodule EKV.Replica do
     end
   end
 
-  def handle_info({:ekv_accepted, ref, _pid, remote_node_id}, state) do
+  def handle_info({:ekv_accepted, ref, _pid, remote_node_id}, %Replica{} = state) do
     case Map.get(state.pending_cas, ref) do
       nil ->
         {:noreply, state}
@@ -1638,7 +1649,7 @@ defmodule EKV.Replica do
 
           if MapSet.size(accepts) >= op.quorum do
             # Accept quorum reached — commit
-            {:noreply, commit_cas(ref, op, state)}
+            {:noreply, commit_cas(state, ref, op)}
           else
             {:noreply, %{state | pending_cas: Map.put(state.pending_cas, ref, op)}}
           end
@@ -1649,7 +1660,7 @@ defmodule EKV.Replica do
     end
   end
 
-  def handle_info({:ekv_accept_nack, ref, _pid, remote_node_id}, state) do
+  def handle_info({:ekv_accept_nack, ref, _pid, remote_node_id}, %Replica{} = state) do
     case Map.get(state.pending_cas, ref) do
       nil ->
         {:noreply, state}
@@ -1667,8 +1678,7 @@ defmodule EKV.Replica do
           max_possible = alive_node_id_count(state) - op.accept_nacks
 
           if max_possible < op.quorum do
-            state = handle_cas_failure(ref, op, state)
-            {:noreply, state}
+            {:noreply, handle_cas_failure(state, ref, op)}
           else
             {:noreply, %{state | pending_cas: Map.put(state.pending_cas, ref, op)}}
           end
@@ -1680,7 +1690,7 @@ defmodule EKV.Replica do
   end
 
   # CAS timeout
-  def handle_info({:cas_timeout, ref}, state) do
+  def handle_info({:cas_timeout, ref}, %Replica{} = state) do
     case Map.pop(state.pending_cas, ref) do
       {nil, _} ->
         {:noreply, state}
@@ -1692,7 +1702,7 @@ defmodule EKV.Replica do
   end
 
   # CAS retry (for operations with retry budget)
-  def handle_info({:cas_retry, ref, key, operation}, state) do
+  def handle_info({:cas_retry, ref, key, operation}, %Replica{} = state) do
     # Re-check if we still have the pending op (might have been cleaned up)
     case Map.pop(state.pending_cas, ref) do
       {nil, _} ->
@@ -1708,7 +1718,7 @@ defmodule EKV.Replica do
   # GC
   # =====================================================================
 
-  def handle_info({:gc, now, tombstone_cutoff}, state) do
+  def handle_info({:gc, now, tombstone_cutoff}, %Replica{} = state) do
     %{db: db} = state
 
     # 1. Observe TTL expiry and emit :expired.
@@ -1782,22 +1792,9 @@ defmodule EKV.Replica do
   # Chunked sync continuations
   # =====================================================================
 
-  # Backward-compat continuation shape (includes obsolete remote_hwm field).
-  # Keep handling this shape so tests/older internal senders still work.
-  def handle_info(
-        {:continue_full_sync, remote_node, last_key, tombstone_cutoff, my_seq, _remote_hwm,
-         chunk_size},
-        state
-      ) do
-    handle_info(
-      {:continue_full_sync, remote_node, last_key, tombstone_cutoff, my_seq, chunk_size},
-      state
-    )
-  end
-
   def handle_info(
         {:continue_full_sync, remote_node, last_key, tombstone_cutoff, my_seq, chunk_size},
-        state
+        %Replica{} = state
       ) do
     if Map.has_key?(state.remote_shards, remote_node) do
       send_full_chunk(
@@ -1813,17 +1810,9 @@ defmodule EKV.Replica do
     {:noreply, state}
   end
 
-  # Backward-compat continuation shape (includes obsolete remote_hwm field).
-  def handle_info(
-        {:continue_delta_sync, remote_node, last_seq, my_seq, _remote_hwm, chunk_size},
-        state
-      ) do
-    handle_info({:continue_delta_sync, remote_node, last_seq, my_seq, chunk_size}, state)
-  end
-
   def handle_info(
         {:continue_delta_sync, remote_node, last_seq, my_seq, chunk_size},
-        state
+        %Replica{} = state
       ) do
     if Map.has_key?(state.remote_shards, remote_node) do
       send_delta_chunk(state, remote_node, last_seq, my_seq, chunk_size)
@@ -1832,7 +1821,7 @@ defmodule EKV.Replica do
     {:noreply, state}
   end
 
-  def handle_info(_msg, state) do
+  def handle_info(_msg, %Replica{} = state) do
     {:noreply, state}
   end
 
@@ -1841,7 +1830,7 @@ defmodule EKV.Replica do
   # =====================================================================
 
   defp do_member_connect(
-         state,
+         %Replica{} = state,
          remote_pid,
          remote_shard,
          remote_num_shards,
@@ -1861,14 +1850,16 @@ defmodule EKV.Replica do
       remote_node = node(remote_pid)
 
       case maybe_allow_member_reconnect(state, remote_node, remote_node_id) do
-        {:quarantine, state} ->
+        {:quarantine, %Replica{} = state} ->
           state
 
-        {:ok, state} ->
+        {:ok, %Replica{} = state} ->
           my_hwm_for_remote = Store.get_hwm(db, remote_node) || 0
 
-          state = track_remote_shard(state, remote_node, remote_pid)
-          state = track_member_node_id(state, remote_node, remote_node_id)
+          state =
+            state
+            |> track_remote_shard(remote_node, remote_pid)
+            |> track_member_node_id(remote_node, remote_node_id)
 
           if state.cluster_size do
             alive = alive_node_id_count(state)
@@ -1898,7 +1889,7 @@ defmodule EKV.Replica do
   end
 
   defp do_member_connect(
-         state,
+         %Replica{} = state,
          _remote_pid,
          _remote_shard,
          _remote_num_shards,
@@ -1909,7 +1900,7 @@ defmodule EKV.Replica do
   end
 
   defp do_member_connect_ack(
-         state,
+         %Replica{} = state,
          remote_pid,
          remote_shard,
          remote_num_shards,
@@ -1928,12 +1919,14 @@ defmodule EKV.Replica do
       remote_node = node(remote_pid)
 
       case maybe_allow_member_reconnect(state, remote_node, remote_node_id) do
-        {:quarantine, state} ->
+        {:quarantine, %Replica{} = state} ->
           state
 
-        {:ok, state} ->
-          state = track_remote_shard(state, remote_node, remote_pid)
-          state = track_member_node_id(state, remote_node, remote_node_id)
+        {:ok, %Replica{} = state} ->
+          state =
+            state
+            |> track_remote_shard(remote_node, remote_pid)
+            |> track_member_node_id(remote_node, remote_node_id)
 
           if state.cluster_size do
             alive = alive_node_id_count(state)
@@ -1959,7 +1952,7 @@ defmodule EKV.Replica do
   end
 
   defp do_member_connect_ack(
-         state,
+         %Replica{} = state,
          _remote_pid,
          _remote_shard,
          _remote_num_shards,
@@ -1970,7 +1963,7 @@ defmodule EKV.Replica do
   end
 
   defp merge_remote_entry(
-         state,
+         %Replica{} = state,
          key,
          value_binary,
          timestamp,
@@ -1993,7 +1986,7 @@ defmodule EKV.Replica do
     )
   end
 
-  defp send_sync_data(state, remote_node, remote_hwm) do
+  defp send_sync_data(%Replica{} = state, remote_node, remote_hwm) do
     %{db: db} = state
     config = EKV.Supervisor.get_config(state.name)
     tombstone_cutoff = System.system_time(:nanosecond) - config.tombstone_ttl * 1_000_000
@@ -2022,7 +2015,7 @@ defmodule EKV.Replica do
   end
 
   defp send_full_chunk(
-         state,
+         %Replica{} = state,
          remote_node,
          last_key,
          tombstone_cutoff,
@@ -2060,7 +2053,7 @@ defmodule EKV.Replica do
     end
   end
 
-  defp send_delta_chunk(state, remote_node, last_seq, my_seq, chunk_size) do
+  defp send_delta_chunk(%Replica{} = state, remote_node, last_seq, my_seq, chunk_size) do
     fetched = Store.oplog_since_chunk(state.db, last_seq, chunk_size + 1)
 
     case fetched do
@@ -2100,7 +2093,7 @@ defmodule EKV.Replica do
     end
   end
 
-  defp send_to_member(state, target_node, message) do
+  defp send_to_member(%Replica{} = state, target_node, message) do
     shard_name = shard_name(state.name, state.shard_index)
     send({shard_name, target_node}, message)
   end
@@ -2109,7 +2102,7 @@ defmodule EKV.Replica do
   # 1. New node: monitor and add
   # 2. Same pid: no-op
   # 3. Different pid (shard restarted): demonitor old, monitor new, update
-  defp track_remote_shard(state, remote_node, remote_pid) do
+  defp track_remote_shard(%Replica{} = state, remote_node, remote_pid) do
     case Map.get(state.remote_shards, remote_node) do
       nil ->
         Process.monitor(remote_pid)
@@ -2124,7 +2117,7 @@ defmodule EKV.Replica do
     end
   end
 
-  defp broadcast_to_members(state, message) do
+  defp broadcast_to_members(%Replica{} = state, message) do
     shard_name = shard_name(state.name, state.shard_index)
 
     for target_node <- Map.keys(state.remote_shards) do
@@ -2133,7 +2126,7 @@ defmodule EKV.Replica do
   end
 
   # Broadcast committed CAS entry to all members.
-  defp broadcast_cas_commit(state, key, ballot_c, ballot_n, entry_tuple) do
+  defp broadcast_cas_commit(%Replica{} = state, key, ballot_c, ballot_n, entry_tuple) do
     shard_name = shard_name(state.name, state.shard_index)
 
     for {target_node, _pid} <- state.remote_shards do
@@ -2148,7 +2141,7 @@ defmodule EKV.Replica do
   # CAS helpers
   # =====================================================================
 
-  defp start_cas(state, key, operation, from) do
+  defp start_cas(%Replica{} = state, key, operation, from) do
     %{db: db, cluster_size: cluster_size, node_id: node_id} = state
     quorum = div(cluster_size, 2) + 1
 
@@ -2180,7 +2173,7 @@ defmodule EKV.Replica do
 
       true ->
         # Generate ballot
-        {ballot_c, ballot_n, state} = next_ballot(state)
+        {ballot_c, ballot_n, %Replica{} = state} = next_ballot(state)
         ref = make_ref()
 
         # Local prepare (this node is always an acceptor)
@@ -2231,16 +2224,13 @@ defmodule EKV.Replica do
         cond do
           length(op.promises) >= quorum ->
             state = %{state | pending_cas: Map.put(state.pending_cas, ref, op)}
-            enter_accept_phase(ref, op, state)
+            enter_accept_phase(state, ref, op)
 
           local_nack > 0 and alive_count - local_nack < quorum ->
             # Can't reach quorum
             cancel_timer(timer)
-
-            handle_cas_failure(ref, op, %{
-              state
-              | pending_cas: Map.put(state.pending_cas, ref, op)
-            })
+            new_state = %{state | pending_cas: Map.put(state.pending_cas, ref, op)}
+            handle_cas_failure(new_state, ref, op)
 
           true ->
             %{state | pending_cas: Map.put(state.pending_cas, ref, op)}
@@ -2248,12 +2238,12 @@ defmodule EKV.Replica do
     end
   end
 
-  defp next_ballot(state) do
+  defp next_ballot(%Replica{} = state) do
     counter = max(System.system_time(:nanosecond), state.ballot_counter + 1)
     {counter, state.node_id, %{state | ballot_counter: counter}}
   end
 
-  defp enter_accept_phase(ref, op, state) do
+  defp enter_accept_phase(%Replica{} = state, ref, op) do
     cancel_timer(op.timer)
 
     # Find highest accepted ballot from promises
@@ -2298,7 +2288,7 @@ defmodule EKV.Replica do
         # accept is durably recorded. This avoids "assumed self-accept" races.
         case Store.paxos_accept(state.db, op.key, ballot_c, ballot_n, value_args) do
           {:ok, false} ->
-            handle_cas_failure(ref, op, state)
+            handle_cas_failure(state, ref, op)
 
           {:ok, true} ->
             # Send accept to all members.
@@ -2328,20 +2318,20 @@ defmodule EKV.Replica do
 
             # For cluster_size: 1 (no members), or if local accept already meets quorum.
             if MapSet.size(op.accepts) >= op.quorum do
-              commit_cas(ref, op, state)
+              commit_cas(state, ref, op)
             else
               %{state | pending_cas: Map.put(state.pending_cas, ref, op)}
             end
         end
 
       {:error, :conflict} ->
-        handle_cas_failure(ref, op, state)
+        handle_cas_failure(state, ref, op)
     end
   end
 
   # Commit CAS: promote already-accepted local ballot into kv + oplog.
   # Called only when actual accepts (including local) reach quorum.
-  defp commit_cas(ref, op, state) do
+  defp commit_cas(%Replica{} = state, ref, op) do
     %{db: db, stmts: stmts} = state
     {key, _value_binary, _timestamp, _origin_str, _expires_at, _deleted_at} = op.entry_tuple
     {ballot_c, ballot_n} = op.ballot
@@ -2363,7 +2353,7 @@ defmodule EKV.Replica do
 
       {:ok, :stale} ->
         # Local accepted ballot was superseded before commit.
-        handle_cas_failure(ref, op, state)
+        handle_cas_failure(state, ref, op)
     end
   end
 
@@ -2433,7 +2423,7 @@ defmodule EKV.Replica do
   # Ensure local eventual writes never reuse a timestamp on this shard. LWW
   # compares {timestamp, origin_node}, so same-origin timestamp reuse would make
   # later writes ambiguous or no-op under conflict resolution.
-  defp next_lww_ts(state) do
+  defp next_lww_ts(%Replica{} = state) do
     now = max(System.system_time(:nanosecond), state.lww_ts_counter + 1)
     {now, %{state | lww_ts_counter: now}}
   end
@@ -2511,7 +2501,7 @@ defmodule EKV.Replica do
     end
   end
 
-  defp handle_cas_failure(ref, op, state) do
+  defp handle_cas_failure(%Replica{} = state, ref, op) do
     cancel_timer(op.timer)
 
     case op.operation do
@@ -2578,84 +2568,12 @@ defmodule EKV.Replica do
   defp writes_operation?({:update, _, _, _}), do: true
   defp writes_operation?(_), do: false
 
-  defp reply_unconfirmed_or_resolve(op, state) do
-    if resolve_unconfirmed_enabled?(op.operation) do
-      resolve_unconfirmed_current_async(op, state)
-    else
-      GenServer.reply(op.from, {:error, :unconfirmed})
-    end
+  defp reply_unconfirmed_or_resolve(op, %Replica{} = state) do
+    GenServer.reply(op.from, {:error, :unconfirmed, op.reply_value})
+    state
   end
 
-  defp resolve_unconfirmed_enabled?({:cas_put, _, _, opts}),
-    do: Keyword.get(opts, :resolve_unconfirmed, false)
-
-  defp resolve_unconfirmed_enabled?({:cas_delete, _, opts}),
-    do: Keyword.get(opts, :resolve_unconfirmed, false)
-
-  defp resolve_unconfirmed_enabled?({:update, _, opts, _}),
-    do: Keyword.get(opts, :resolve_unconfirmed, false)
-
-  defp resolve_unconfirmed_enabled?(_), do: false
-
-  defp resolve_unconfirmed_opts({:cas_put, _, _, opts}),
-    do: Keyword.take(opts, [:retries, :backoff, :timeout])
-
-  defp resolve_unconfirmed_opts({:cas_delete, _, opts}),
-    do: Keyword.take(opts, [:retries, :backoff, :timeout])
-
-  defp resolve_unconfirmed_opts({:update, _, opts, _}),
-    do: Keyword.take(opts, [:retries, :backoff, :timeout])
-
-  defp resolve_unconfirmed_opts(_), do: []
-
-  defp expected_vsn_from_reply({:ok, {ts, origin}})
-       when is_integer(ts) and is_atom(origin),
-       do: {ts, origin}
-
-  defp expected_vsn_from_reply({:ok, _value, {ts, origin}})
-       when is_integer(ts) and is_atom(origin),
-       do: {ts, origin}
-
-  defp expected_vsn_from_reply(_), do: nil
-
-  defp resolve_unconfirmed_current_async(op, state) do
-    expected_vsn = expected_vsn_from_reply(op.reply_value)
-    from = op.from
-    reply_value = op.reply_value
-    key = op.key
-    shard = shard_name(state.name, state.shard_index)
-    opts = resolve_unconfirmed_opts(op.operation)
-    timeout = Keyword.get(opts, :timeout, 10_000)
-    cas_opts = Keyword.take(opts, [:retries, :backoff])
-
-    Task.start(fn ->
-      try do
-        result =
-          case GenServer.call(shard, {:cas_read, key, cas_opts}, timeout) do
-            {:ok, _value, resolved_vsn} ->
-              if resolved_vsn == expected_vsn do
-                reply_value
-              else
-                {:error, :conflict}
-              end
-
-            {:ok, _value} ->
-              {:error, :unavailable}
-
-            {:error, _reason} ->
-              {:error, :unavailable}
-          end
-
-        GenServer.reply(from, result)
-      rescue
-        _ -> GenServer.reply(from, {:error, :unavailable})
-      catch
-        :exit, _ -> GenServer.reply(from, {:error, :unavailable})
-      end
-    end)
-  end
-
-  defp apply_cas_commit(state, key, ballot_c, ballot_n, entry_tuple) do
+  defp apply_cas_commit(%Replica{} = state, key, ballot_c, ballot_n, entry_tuple) do
     %{db: db, stmts: stmts} = state
 
     case Store.paxos_promote(
@@ -2709,7 +2627,13 @@ defmodule EKV.Replica do
     end
   end
 
-  defp dispatch_promote_event(state, key, value_binary, deleted_at, prev_value_binary) do
+  defp dispatch_promote_event(
+         %Replica{} = state,
+         key,
+         value_binary,
+         deleted_at,
+         prev_value_binary
+       ) do
     if deleted_at != nil do
       prev = if prev_value_binary != nil, do: :erlang.binary_to_term(prev_value_binary)
       dispatch_events(state, [%EKV.Event{type: :delete, key: key, value: prev}])
@@ -2720,7 +2644,7 @@ defmodule EKV.Replica do
     end
   end
 
-  def alive_node_id_count(%__MODULE__{} = state) do
+  def alive_node_id_count(%Replica{} = state) do
     if state.cluster_size do
       # Our own node_id + distinct member node_ids
       member_ids =
@@ -2735,9 +2659,9 @@ defmodule EKV.Replica do
     end
   end
 
-  def quorum_status(%__MODULE__{cluster_size: nil}), do: {:error, :cas_not_configured}
+  def quorum_status(%Replica{cluster_size: nil}), do: {:error, :cas_not_configured}
 
-  def quorum_status(%__MODULE__{} = state) do
+  def quorum_status(%Replica{} = state) do
     quorum = div(state.cluster_size, 2) + 1
     alive_count = alive_node_id_count(state)
 
@@ -2748,11 +2672,11 @@ defmodule EKV.Replica do
     end
   end
 
-  defp maybe_reply_to_quorum_waiters(%__MODULE__{quorum_waiters: waiters} = state)
+  defp maybe_reply_to_quorum_waiters(%Replica{quorum_waiters: waiters} = state)
        when map_size(waiters) == 0,
        do: state
 
-  defp maybe_reply_to_quorum_waiters(state) do
+  defp maybe_reply_to_quorum_waiters(%Replica{} = state) do
     case quorum_status(state) do
       :ok ->
         reply_and_clear_quorum_waiters(state, :ok)
@@ -2765,15 +2689,15 @@ defmodule EKV.Replica do
     end
   end
 
-  defp fail_quorum_waiters(%__MODULE__{quorum_waiters: waiters} = state, _reason)
+  defp fail_quorum_waiters(%Replica{quorum_waiters: waiters} = state, _reason)
        when map_size(waiters) == 0,
        do: state
 
-  defp fail_quorum_waiters(state, reason) do
+  defp fail_quorum_waiters(%Replica{} = state, reason) do
     reply_and_clear_quorum_waiters(state, reason)
   end
 
-  defp reply_and_clear_quorum_waiters(state, reply) do
+  defp reply_and_clear_quorum_waiters(%Replica{} = state, reply) do
     Enum.each(state.quorum_waiters, fn {_ref, %{from: from, timer: timer}} ->
       cancel_timer(timer)
       GenServer.reply(from, reply)
@@ -2782,7 +2706,7 @@ defmodule EKV.Replica do
     %{state | quorum_waiters: %{}}
   end
 
-  defp fail_pending_cas_if_no_quorum(state) do
+  defp fail_pending_cas_if_no_quorum(%Replica{} = state) do
     if state.cluster_size == nil or map_size(state.pending_cas) == 0 do
       state
     else
@@ -2802,17 +2726,17 @@ defmodule EKV.Replica do
     end
   end
 
-  defp track_member_node_id(state, _remote_node, nil), do: state
+  defp track_member_node_id(%Replica{} = state, _remote_node, nil), do: state
 
-  defp track_member_node_id(state, remote_node, remote_node_id) do
+  defp track_member_node_id(%Replica{} = state, remote_node, remote_node_id) do
     %{state | member_node_ids: Map.put(state.member_node_ids, remote_node, remote_node_id)}
   end
 
-  defp mark_member_down(state, remote_node, nil) do
+  defp mark_member_down(%Replica{} = state, remote_node, nil) do
     remember_member_down_marker(state, member_down_name_key(remote_node))
   end
 
-  defp mark_member_down(state, remote_node, remote_node_id) do
+  defp mark_member_down(%Replica{} = state, remote_node, remote_node_id) do
     if node_id_connected?(state, remote_node_id) do
       # Blue/green overlap: same cluster member identity is still connected.
       clear_member_down_marker(state, member_down_name_key(remote_node))
@@ -2826,11 +2750,11 @@ defmodule EKV.Replica do
   defp maybe_allow_member_reconnect(state, remote_node, remote_node_id \\ nil)
 
   defp maybe_allow_member_reconnect(
-         %{partition_ttl_policy: :ignore} = state,
+         %Replica{partition_ttl_policy: :ignore} = state,
          remote_node,
          remote_node_id
        ) do
-    state = clear_member_down_markers(state, remote_node, remote_node_id)
+    %Replica{} = state = clear_member_down_markers(state, remote_node, remote_node_id)
 
     state = %{
       state
@@ -2840,8 +2764,9 @@ defmodule EKV.Replica do
     {:ok, state}
   end
 
-  defp maybe_allow_member_reconnect(state, remote_node, remote_node_id) do
-    {state, down_since_ms} = resolve_member_down_since(state, remote_node, remote_node_id)
+  defp maybe_allow_member_reconnect(%Replica{} = state, remote_node, remote_node_id) do
+    {%Replica{} = state, down_since_ms} =
+      resolve_member_down_since(state, remote_node, remote_node_id)
 
     age_ms =
       if is_integer(down_since_ms), do: max(0, System.system_time(:millisecond) - down_since_ms)
@@ -2872,7 +2797,7 @@ defmodule EKV.Replica do
         {:quarantine, state}
 
       true ->
-        state = clear_member_down_markers(state, remote_node, remote_node_id)
+        %Replica{} = state = clear_member_down_markers(state, remote_node, remote_node_id)
 
         state = %{
           state
@@ -2883,16 +2808,16 @@ defmodule EKV.Replica do
     end
   end
 
-  defp resolve_member_down_since(state, remote_node, nil) do
+  defp resolve_member_down_since(%Replica{} = state, remote_node, nil) do
     read_member_down_marker(state, member_down_name_key(remote_node))
   end
 
-  defp resolve_member_down_since(state, remote_node, remote_node_id) do
+  defp resolve_member_down_since(%Replica{} = state, remote_node, remote_node_id) do
     id_key = member_down_id_key(remote_node_id)
     name_key = member_down_name_key(remote_node)
 
-    {state, id_down_since} = read_member_down_marker(state, id_key)
-    {state, name_down_since} = read_member_down_marker(state, name_key)
+    {%Replica{} = state, id_down_since} = read_member_down_marker(state, id_key)
+    {%Replica{} = state, name_down_since} = read_member_down_marker(state, name_key)
 
     if is_integer(name_down_since) do
       merged_down_since =
@@ -2905,15 +2830,15 @@ defmodule EKV.Replica do
           do: state,
           else: put_member_down_marker(state, id_key, merged_down_since)
 
-      state = clear_member_down_marker(state, name_key)
+      %Replica{} = state = clear_member_down_marker(state, name_key)
       {state, merged_down_since}
     else
       {state, id_down_since}
     end
   end
 
-  defp remember_member_down_marker(state, marker_key) do
-    {state, existing_down_since} = read_member_down_marker(state, marker_key)
+  defp remember_member_down_marker(%Replica{} = state, marker_key) do
+    {%Replica{} = state, existing_down_since} = read_member_down_marker(state, marker_key)
 
     if is_integer(existing_down_since) do
       state
@@ -2922,7 +2847,7 @@ defmodule EKV.Replica do
     end
   end
 
-  defp read_member_down_marker(state, marker_key) do
+  defp read_member_down_marker(%Replica{} = state, marker_key) do
     case Map.fetch(state.member_down_at, marker_key) do
       {:ok, down_since} ->
         {state, down_since}
@@ -2939,17 +2864,17 @@ defmodule EKV.Replica do
     end
   end
 
-  defp put_member_down_marker(state, marker_key, down_since) do
+  defp put_member_down_marker(%Replica{} = state, marker_key, down_since) do
     Store.member_down_marker_put(state.db, marker_key, down_since)
     %{state | member_down_at: Map.put(state.member_down_at, marker_key, down_since)}
   end
 
-  defp clear_member_down_marker(state, marker_key) do
+  defp clear_member_down_marker(%Replica{} = state, marker_key) do
     Store.member_down_marker_clear(state.db, marker_key)
     %{state | member_down_at: Map.delete(state.member_down_at, marker_key)}
   end
 
-  defp clear_member_down_markers(state, remote_node, remote_node_id) do
+  defp clear_member_down_markers(%Replica{} = state, remote_node, remote_node_id) do
     remote_node
     |> member_down_marker_keys(remote_node_id)
     |> Enum.uniq()
@@ -2969,13 +2894,13 @@ defmodule EKV.Replica do
   defp member_down_name_key(remote_node),
     do: @member_down_name_prefix <> Atom.to_string(remote_node)
 
-  defp node_id_connected?(state, remote_node_id) do
+  defp node_id_connected?(%Replica{} = state, remote_node_id) do
     Enum.any?(state.member_node_ids, fn {member_node, member_node_id} ->
       member_node_id == remote_node_id and Map.has_key?(state.remote_shards, member_node)
     end)
   end
 
-  defp prune_stale_member_down_name_markers(state) do
+  defp prune_stale_member_down_name_markers(%Replica{} = state) do
     retention_ms = max(@member_down_name_min_retention_ms, state.tombstone_ttl * 4)
     stale_before_ms = System.system_time(:millisecond) - retention_ms
 
@@ -2993,25 +2918,25 @@ defmodule EKV.Replica do
   # Subscriber dispatch helpers
   # =====================================================================
 
-  defp has_subscribers?(state) do
+  defp has_subscribers?(%Replica{} = state) do
     config = EKV.Supervisor.get_config(state.name)
     :atomics.get(config.sub_count, 1) > 0 or EKV.Supervisor.client_subscribers?(state.name)
   end
 
-  defp dispatch_events(_state, []), do: :ok
+  defp dispatch_events(%Replica{} = _state, []), do: :ok
 
-  defp dispatch_events(state, events) do
+  defp dispatch_events(%Replica{} = state, events) do
     send(EKV.SubDispatcher.dispatcher_name(state.name, state.shard_index), {:dispatch, events})
     :ok
   end
 
-  defp read_conn(state) do
+  defp read_conn(%Replica{} = state) do
     readers = :persistent_term.get({EKV, state.name, :readers, state.shard_index})
     sid = :erlang.system_info(:scheduler_id)
     elem(readers, rem(sid - 1, tuple_size(readers)))
   end
 
-  defp read_previous_value(state, key) do
+  defp read_previous_value(%Replica{} = state, key) do
     {db, get_stmt} = read_conn(state)
 
     case Store.get_cached(db, get_stmt, key) do
@@ -3030,29 +2955,29 @@ defmodule EKV.Replica do
   # Logging helpers
   # =====================================================================
 
-  defp log(state, message_fn) when is_function(message_fn, 0) do
+  defp log(%Replica{} = state, message_fn) when is_function(message_fn, 0) do
     case EKV.Supervisor.get_config(state.name) do
       %{log: false} -> :ok
       _ -> Logger.info(message_fn)
     end
   end
 
-  defp log_verbose(state, message_fn) when is_function(message_fn, 0) do
+  defp log_verbose(%Replica{} = state, message_fn) when is_function(message_fn, 0) do
     case EKV.Supervisor.get_config(state.name) do
       %{log: :verbose} -> Logger.info(message_fn)
       _ -> :ok
     end
   end
 
-  defp log_once(state, message_fn) do
+  defp log_once(%Replica{} = state, message_fn) do
     if state.shard_index == 0, do: log(state, message_fn)
   end
 
-  defp log_prefix(state) do
+  defp log_prefix(%Replica{} = state) do
     "[EKV #{inspect(state.name)}]"
   end
 
-  defp log_prefix_shard(state) do
+  defp log_prefix_shard(%Replica{} = state) do
     "[EKV #{inspect(state.name)}/#{state.shard_index}]"
   end
 end

@@ -3983,7 +3983,7 @@ defmodule EKVTest do
 
       send(
         shard_name,
-        {:continue_full_sync, fake_node, nil, tombstone_cutoff, my_seq, 0, config.sync_chunk_size}
+        {:continue_full_sync, fake_node, nil, tombstone_cutoff, my_seq, config.sync_chunk_size}
       )
 
       Process.sleep(200)
@@ -4016,7 +4016,7 @@ defmodule EKVTest do
       my_seq = EKV.Store.max_seq(state.db)
 
       # Trigger delta sync starting from seq 0
-      send(shard_name, {:continue_delta_sync, fake_node, 0, my_seq, 0, config.sync_chunk_size})
+      send(shard_name, {:continue_delta_sync, fake_node, 0, my_seq, config.sync_chunk_size})
 
       Process.sleep(200)
       :sys.get_state(shard_name)
@@ -4051,7 +4051,7 @@ defmodule EKVTest do
 
       send(
         shard_name,
-        {:continue_full_sync, fake_node, nil, tombstone_cutoff, my_seq, 0, config.sync_chunk_size}
+        {:continue_full_sync, fake_node, nil, tombstone_cutoff, my_seq, config.sync_chunk_size}
       )
 
       # Resume to process just the first chunk (sends chunk + queues next continuation)
@@ -4103,7 +4103,7 @@ defmodule EKVTest do
 
       send(
         shard_name,
-        {:continue_full_sync, fake_node, nil, tombstone_cutoff, my_seq, 0, config.sync_chunk_size}
+        {:continue_full_sync, fake_node, nil, tombstone_cutoff, my_seq, config.sync_chunk_size}
       )
 
       :sys.resume(shard_name)
@@ -4145,7 +4145,7 @@ defmodule EKVTest do
 
       send(
         shard_name,
-        {:continue_full_sync, fake_node, nil, tombstone_cutoff, my_seq, 0, config.sync_chunk_size}
+        {:continue_full_sync, fake_node, nil, tombstone_cutoff, my_seq, config.sync_chunk_size}
       )
 
       Process.sleep(200)
