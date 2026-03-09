@@ -2,11 +2,65 @@ defmodule EKV.Supervisor do
   @moduledoc false
   use Supervisor
 
+  require Logger
+
   _archdoc = ~S"""
-  Top-level supervisor. Builds config map and stores it in `persistent_term`.
+  Top-level EKV supervisor.
+
+  Builds config map and stores it in `:persistent_term`.
   Each EKV instance also owns its own `:pg` scope (`:"#{name}_ekv_pg_scope"`),
   so subscriptions, member routing, and shutdown coordination stay isolated
   from other EKV instances and from unrelated default-scope `:pg` traffic.
+
+  `EKV.Supervisor` is also where runtime mode splits happen:
+
+  - `:member` mode starts durable storage/replication/CAS children
+  - `:client` mode starts only routing/subscription/readiness children
+
+  Member mode child order:
+
+      :pg scope
+      BlueGreenMarker?
+      SubTracker
+      Registry
+      SubDispatcher.Supervisor
+      Replica.Supervisor
+      QuorumGate?
+      MemberPresence
+      GC
+      ShutdownBarrier?
+
+  Client mode child order:
+
+      :pg scope
+      ClientRouter
+      RouteGate?
+      QuorumGate?
+      ClientSubscriptions
+      ShutdownBarrier?
+
+  This ordering matters:
+
+  - `RouteGate` / `QuorumGate` block startup before the instance is considered
+    ready
+  - `MemberPresence` is started only after member readiness, so new clients do
+    not route to an unready member
+  - `ShutdownBarrier` is last so supervisor shutdown reaches it first while the
+    rest of EKV is still alive
+
+  ## Startup Safety
+
+  Member mode opens shard databases fail-closed by default. If on-disk state is
+  older than the tombstone safety window, startup is rejected unless
+  `allow_stale_startup: true` is explicitly set.
+
+  Optional startup gates:
+
+  - `wait_for_quorum` — member mode, and client mode via the selected backend
+  - `wait_for_route` — client mode only
+
+  These are readiness aids only. They do not guarantee the route or quorum will
+  remain available after startup completes.
 
   ## Blue-Green Deployment (Synchronized Handoff)
 
@@ -29,22 +83,22 @@ defmodule EKV.Supervisor do
                                               2. Persist ballot_counter
                                               3. PRAGMA wal_checkpoint(TRUNCATE)
                                               4. Close writer db
-          receive {:ekv_handoff_ack}   <──  5. Send ack
+          receive {:ekv_handoff_ack}   <──    5. Send ack
                                               6. Leave MemberPresence
                                                  route + enter proxy mode
 
         Start children:
           Replica.init opens SAME db files
           MemberPresence joins :pg             Proxy calls to m1b
-          Peers discover via nodeup            Readers alive until shutdown
+          Members discover via nodeup          Readers alive until shutdown
           CAS works immediately                New clients bind to m1b
 
   ### Marker File
 
   The `current` marker is a single line: `"node_name\n"`. Written atomically
   via write-to-tmp + `File.rename!/2`. Read on every startup to discover the
-  old node for handoff. On graceful shutdown without a completed handoff, the
-  old VM clears its own marker.
+  old node for handoff. On graceful shutdown without a completed handoff,
+  `BlueGreenMarker` clears the old VM's marker.
 
   ### Handoff Resolution (`perform_handoff/3`)
 
@@ -67,8 +121,8 @@ defmodule EKV.Supervisor do
   - Client routing safety: incoming member is advertised only after startup;
     outgoing member leaves its :pg route before proxy mode
   - Shutdown safety: graceful coordinated shutdown keeps members serving until
-    other members have also entered terminal state, or timeout; outgoing proxy-mode
-    blue-green members skip this wait
+    other members have also entered terminal state, or timeout; outgoing
+    proxy-mode blue-green members skip this wait
 
   ## Graceful Shutdown Barrier
 
@@ -204,8 +258,6 @@ defmodule EKV.Supervisor do
 
         cond do
           persisted != nil and node_id != nil and persisted != node_id ->
-            require Logger
-
             Logger.warning(
               "[EKV #{name}] configured node_id #{inspect(node_id)} differs from " <>
                 "persisted #{inspect(persisted)} (volume identity) — using persisted"
@@ -221,8 +273,6 @@ defmodule EKV.Supervisor do
 
           true ->
             generated = :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
-
-            require Logger
             Logger.info("[EKV #{name}] generated node_id: #{generated}")
             generated
         end
@@ -490,7 +540,6 @@ defmodule EKV.Supervisor do
         old_node = String.to_atom(old_node_str)
 
         if handoff_reachable?(old_node) do
-          require Logger
           Logger.info("[EKV #{name}] handoff: requesting from #{old_node}")
 
           0..(num_shards - 1)
@@ -511,7 +560,6 @@ defmodule EKV.Supervisor do
           )
           |> Stream.run()
         else
-          require Logger
           Logger.info("[EKV #{name}] handoff: stale marker #{old_node}, skipping handoff")
         end
 
