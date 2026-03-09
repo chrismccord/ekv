@@ -784,8 +784,11 @@ defmodule EKVTest do
     end
   end
 
-  describe "stale DB detection and wipe" do
-    test "stale database is wiped on reopen", %{name: name, data_dir: data_dir} do
+  describe "stale DB detection" do
+    test "stale database refuses startup by default and survives with explicit override", %{
+      name: name,
+      data_dir: data_dir
+    } do
       # Write some data
       :ok = EKV.put(name, "stale_test", "alive")
       assert EKV.get(name, "stale_test") == "alive"
@@ -816,7 +819,7 @@ defmodule EKVTest do
       Supervisor.stop(ekv_sup, :shutdown)
       Process.sleep(50)
 
-      {:ok, _pid} =
+      result =
         EKV.start_link(
           name: name,
           data_dir: data_dir,
@@ -826,8 +829,22 @@ defmodule EKVTest do
           tombstone_ttl: :timer.hours(24 * 7)
         )
 
-      # DB should have been wiped — data gone
-      assert EKV.get(name, "stale_test") == nil
+      assert {:error, _reason} = result
+      assert inspect(result) =~ ":stale_db"
+      assert File.exists?(db_path)
+
+      {:ok, _pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: data_dir,
+          shards: 2,
+          log: false,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7),
+          allow_stale_startup: true
+        )
+
+      assert EKV.get(name, "stale_test") == "alive"
     end
   end
 
@@ -4533,7 +4550,7 @@ defmodule EKVTest do
           log: false,
           gc_interval: :timer.hours(1),
           tombstone_ttl: :timer.hours(24 * 7),
-          skip_stale_check: true
+          allow_stale_startup: true
         )
 
       # Verify all data is present in backup
@@ -4760,11 +4777,11 @@ defmodule EKVTest do
   end
 
   # =====================================================================
-  # skip_stale_check
+  # allow_stale_startup
   # =====================================================================
 
-  describe "skip_stale_check" do
-    test "data survives when stale DB check is skipped" do
+  describe "allow_stale_startup" do
+    test "data survives when stale DB startup is explicitly allowed" do
       name = :"ekv_skip_stale_#{System.unique_integer([:positive])}"
       data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
       Process.flag(:trap_exit, true)
@@ -4789,7 +4806,7 @@ defmodule EKVTest do
       # Manually set last_active_at to an ancient time (triggers stale check)
       db_path = Path.join(data_dir, "shard_0.db")
       {:ok, db} = EKV.Sqlite3.open(db_path)
-      ancient = System.system_time(:millisecond) - :timer.hours(24 * 30)
+      ancient = System.system_time(:nanosecond) - :timer.hours(24 * 30) * 1_000_000
 
       {:ok, stmt} =
         EKV.Sqlite3.prepare(
@@ -4802,7 +4819,7 @@ defmodule EKVTest do
       :ok = EKV.Sqlite3.release(db, stmt)
       EKV.Sqlite3.close(db)
 
-      # Restart with skip_stale_check: true — data should survive
+      # Restart with allow_stale_startup: true — data should survive
       {:ok, _pid2} =
         EKV.start_link(
           name: name,
@@ -4811,10 +4828,46 @@ defmodule EKVTest do
           log: false,
           gc_interval: :timer.hours(1),
           tombstone_ttl: :timer.hours(24 * 7),
-          skip_stale_check: true
+          allow_stale_startup: true
         )
 
       assert EKV.get(name, "stale/key") == "stale_val"
+    end
+
+    test "rejects non-boolean allow_stale_startup" do
+      name = :"ekv_allow_stale_bad_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+      on_exit(fn -> File.rm_rf!(data_dir) end)
+
+      old = Process.flag(:trap_exit, true)
+      on_exit(fn -> Process.flag(:trap_exit, old) end)
+
+      assert {:error, {%ArgumentError{} = error, _stack}} =
+               EKV.start_link(
+                 name: name,
+                 data_dir: data_dir,
+                 shards: 1,
+                 allow_stale_startup: :yes
+               )
+
+      assert Exception.message(error) =~ ":allow_stale_startup must be boolean"
+    end
+
+    test "client mode rejects allow_stale_startup" do
+      name = :"ekv_allow_stale_client_#{System.unique_integer([:positive])}"
+
+      old = Process.flag(:trap_exit, true)
+      on_exit(fn -> Process.flag(:trap_exit, old) end)
+
+      assert {:error, {%ArgumentError{} = error, _stack}} =
+               EKV.start_link(
+                 name: name,
+                 mode: :client,
+                 region_routing: ["iad"],
+                 allow_stale_startup: true
+               )
+
+      assert Exception.message(error) =~ ":allow_stale_startup is not supported in :client mode"
     end
   end
 end

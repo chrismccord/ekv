@@ -223,10 +223,11 @@ defmodule EKV do
   | `:node_id` | `nil` | Member mode only. Stable logical member identity used by CAS ballots. Required for CAS operations. Should remain stable for each logical cluster member. |
   | `:wait_for_quorum` | `false` | Optional startup gate. In member mode, blocks startup until this EKV member can reach CAS quorum. In client mode, blocks startup until the selected backend member reports CAS quorum reachable. |
   | `:shutdown_barrier` | `false` | Optional graceful-shutdown barrier. Keeps EKV serving during coordinated shutdown for up to the configured timeout so peers can finish final writes and replication. |
+  | `:allow_stale_startup` | `false` | Member mode only. Dangerous recovery override. If `true`, EKV trusts on-disk data even when stale-db detection would normally refuse startup. Intended only for explicit disaster recovery / full cold-cluster restore cases. |
   | `:tombstone_ttl` | `604_800_000` (7 days) | Member mode only. How long tombstones (deleted entries) are kept before being permanently purged, in milliseconds. See "Tombstone Lifetime" below. |
   | `:gc_interval` | `300_000` (5 min) | Member mode only. How often garbage collection runs, in milliseconds. GC expires TTL entries, purges old tombstones, and truncates the replication oplog. |
   | `:log` | `:info` | Logging level. `:info` logs cluster events (connects, syncs). `false` disables logging. `:verbose` logs per-shard detail. |
-  | `:partition_ttl_policy` | `:quarantine` | Member mode only. Policy for reconnects after downtime longer than `tombstone_ttl`. `:quarantine` blocks replication with that peer identity until operator rebuild. `:ignore` keeps legacy behavior. |
+  | `:partition_ttl_policy` | `:quarantine` | Member mode only. Policy for reconnects after downtime longer than `tombstone_ttl`. `:quarantine` blocks replication with that peer identity until operator rebuild. `:ignore` disables that quarantine and allows reconnect/sync anyway. |
   | `:blue_green` | `false` | Member mode only. Enable blue-green deployment mode. See "Blue-Green Deployment" below. |
 
   ### Client Mode
@@ -320,9 +321,11 @@ defmodule EKV do
   If a node is offline for longer than the tombstone TTL, it may miss deletes
   that have already been purged from other nodes. EKV handles this with
   **stale database detection**: on startup, if the database's last activity
-  timestamp is older than the tombstone TTL, the database is automatically
-  wiped and rebuilt via full sync from a peer. This prevents "zombie" keys
-  from reappearing.
+  timestamp is older than the tombstone TTL safety window, EKV refuses startup
+  by default instead of trusting that on-disk state. This prevents "zombie"
+  keys from reappearing. Operators can then either wipe that node's data dir
+  so it rebuilds from peers, or explicitly set `allow_stale_startup: true`
+  when they intentionally want to trust the old on-disk cluster state.
 
   Reduce `tombstone_ttl` if storage is tight and your nodes are rarely offline
   for long. Increase it if nodes may be offline for extended maintenance

@@ -94,7 +94,7 @@ Start a temporary EKV instance pointing at the backup directory:
   name: :backup_check,
   data_dir: "/backups/ekv/2026-03-01",
   shards: 8,                      # must match original
-  skip_stale_check: true,         # backup is old by definition
+  allow_stale_startup: true,      # backup is old by definition
   gc_interval: :timer.hours(999)  # don't GC during verification
 )
 
@@ -118,17 +118,18 @@ If the backup is younger than `tombstone_ttl` (default 7 days):
 
 ### Restoring an Old Backup to the Entire Cluster
 
-If the backup is older than `tombstone_ttl`, stale DB detection would wipe
-it on startup. Restore all nodes simultaneously with the check disabled:
+If the backup is older than `tombstone_ttl`, stale DB detection will fail
+startup by default. Restore all nodes simultaneously with explicit stale
+startup allowed:
 
 1. Stop all nodes
 2. Copy backup files to each node's `data_dir`
-3. Restart all nodes with `skip_stale_check: true`:
+3. Restart all nodes with `allow_stale_startup: true`:
    ```elixir
-   {EKV, name: :my_kv, data_dir: "/var/data/ekv", skip_stale_check: true}
+   {EKV, name: :my_kv, data_dir: "/var/data/ekv", allow_stale_startup: true}
    ```
 4. Verify data is present on all nodes
-5. Remove `skip_stale_check: true` and do a rolling restart
+5. Remove `allow_stale_startup: true` and do a rolling restart
 
 **Warning:** Entries deleted between the backup timestamp and now will
 reappear ("zombie resurrection"). This is expected when restoring old backups.
@@ -270,8 +271,9 @@ Nodes automatically reconnect and sync:
   - Default (`partition_ttl_policy: :quarantine`): EKV blocks replication for
     that peer identity to prevent zombie resurrection. This is intentional.
     Operator action is required (rebuild one side, then reconnect).
-  - Legacy mode (`partition_ttl_policy: :ignore`): EKV allows reconnect/sync
-    without quarantine.
+  - `partition_ttl_policy: :ignore`: EKV allows reconnect/sync without
+    quarantine. This trades safety for availability and can resurrect state
+    that would otherwise have been protected by quarantine.
 
 For automatic-sync cases, no operator action is needed. Monitor convergence:
 
@@ -295,25 +297,37 @@ does not clear long-partition history.
 
 On startup, each shard checks how long ago it was last active. If the gap
 exceeds `tombstone_ttl - gc_interval` (≈6 days 23 hours 55 minutes with
-defaults), the database is considered stale and is **deleted**.
+defaults), the database is considered stale and EKV **refuses startup** by
+default.
 
 This prevents a node that was offline for weeks from reintroducing entries
-that peers already garbage-collected.
+that peers already garbage-collected. It also avoids silent cluster-wide data
+loss if an entire cold cluster is restarted after the TTL window.
 
-### When a Wipe Happens
+### When a Stale Startup Is Rejected
 
-A wiped shard rebuilds from scratch via full sync from peers. This is safe
-and automatic — no data is lost cluster-wide (the stale node's data was, by
-definition, outdated).
+A stale shard will not auto-delete itself anymore. Startup fails closed until
+an operator chooses one of these paths:
 
-**Symptoms:** On startup after a long offline period, logs will show the
-shard being wiped and a full sync starting. Initial reads on that node
-return nil until sync completes.
+1. Single stale node rejoining fresh peers:
+   - wipe that node's EKV data dir
+   - restart it
+   - let it full-sync from healthy peers
 
-### Disabling the Check
+2. Full cold-cluster restart where the old on-disk data is intentional:
+   - restart all nodes with `allow_stale_startup: true`
+   - verify the recovered state
+   - remove the override and do a rolling restart
 
-Use `skip_stale_check: true` only for disaster recovery (see above). Do not
-leave it enabled in production — it defeats zombie resurrection protection.
+**Symptoms:** On startup after a long offline period, logs will show stale-db
+startup being refused with the detected age/threshold and recovery options.
+
+### Allowing Stale Startup
+
+Use `allow_stale_startup: true` only when the operator intentionally wants to
+trust old on-disk state, typically during full-cluster disaster recovery. Do
+not leave it enabled in normal production — it defeats zombie resurrection
+protection.
 
 ## Garbage Collection Tuning
 

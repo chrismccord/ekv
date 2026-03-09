@@ -835,10 +835,12 @@ defmodule EKV.Replica do
   ## Stale DB Protection
 
   On Store.open, if an existing db file's last_active_at is older than
-  tombstone_ttl - gc_interval, the db is wiped (deleted and recreated).
-  This prevents zombie resurrection: peers will have GC'd tombstones for
-  entries deleted while the node was away, so a stale db would never learn
-  about them. After wipe, full sync from peers rebuilds from scratch.
+  tombstone_ttl - gc_interval, startup is refused by default. This prevents
+  zombie resurrection: peers will have GC'd tombstones for entries deleted
+  while the node was away, so a stale db would never learn about them.
+  Operators must then either wipe that node's data dir so it rebuilds from
+  peers, or explicitly allow stale startup when intentionally trusting the
+  old on-disk cluster state.
 
 
   ## GenServer State
@@ -981,11 +983,19 @@ defmodule EKV.Replica do
 
     config = EKV.get_config(name)
 
-    {:ok, db} =
-      Store.open(data_dir, shard_index, config.tombstone_ttl, num_shards, config.gc_interval,
-        skip_stale_check: config[:skip_stale_check] || false
-      )
+    case Store.open(data_dir, shard_index, config.tombstone_ttl, num_shards, config.gc_interval,
+           allow_stale_startup: config[:allow_stale_startup] || false
+         ) do
+      {:ok, db} ->
+        init_with_open_db(db, name, shard_index, num_shards, data_dir, config)
 
+      {:error, {:stale_db, info} = reason} ->
+        maybe_log_stale_db_failure(config, name, shard_index, info)
+        {:stop, reason}
+    end
+  end
+
+  defp init_with_open_db(db, name, shard_index, num_shards, data_dir, config) do
     # Open per-scheduler read connections
     db_path = Path.join(data_dir, "shard_#{shard_index}.db")
     num_readers = System.schedulers_online()
@@ -1047,6 +1057,24 @@ defmodule EKV.Replica do
     end
 
     {:ok, state}
+  end
+
+  defp maybe_log_stale_db_failure(config, name, shard_index, info) do
+    if config.log do
+      detail =
+        case info.age_ms do
+          nil -> "missing last_active_at metadata"
+          age_ms -> "age=#{age_ms}ms exceeds threshold=#{info.threshold_ms}ms"
+        end
+
+      require Logger
+
+      Logger.error(
+        "[EKV #{name}] shard #{shard_index} refusing stale database startup at #{info.path}: " <>
+          "#{detail}. Wipe the data dir to rebuild from peers, or set " <>
+          "`allow_stale_startup: true` to trust the on-disk data."
+      )
+    end
   end
 
   @impl true

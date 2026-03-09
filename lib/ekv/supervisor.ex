@@ -108,7 +108,7 @@ defmodule EKV.Supervisor do
     :cluster_size,
     :node_id,
     :sync_chunk_size,
-    :skip_stale_check,
+    :allow_stale_startup,
     :partition_ttl_policy,
     :wait_for_quorum,
     :wait_for_route,
@@ -155,7 +155,7 @@ defmodule EKV.Supervisor do
     cluster_size = Keyword.get(opts, :cluster_size)
     node_id = Keyword.get(opts, :node_id)
     sync_chunk_size = Keyword.get(opts, :sync_chunk_size, 500)
-    skip_stale_check = Keyword.get(opts, :skip_stale_check, false)
+    allow_stale_startup = Keyword.get(opts, :allow_stale_startup, false)
     partition_ttl_policy = Keyword.get(opts, :partition_ttl_policy, :quarantine)
     wait_for_quorum = Keyword.get(opts, :wait_for_quorum, false)
     wait_for_route = Keyword.get(opts, :wait_for_route, false)
@@ -166,6 +166,7 @@ defmodule EKV.Supervisor do
     validate_wait_for_quorum!(wait_for_quorum, cluster_size)
     validate_wait_for_route!(wait_for_route, :member)
     validate_shutdown_barrier!(shutdown_barrier)
+    validate_allow_stale_startup!(allow_stale_startup)
 
     node_id =
       case node_id do
@@ -225,7 +226,7 @@ defmodule EKV.Supervisor do
       cluster_size: cluster_size,
       node_id: effective_node_id,
       sync_chunk_size: sync_chunk_size,
-      skip_stale_check: skip_stale_check,
+      allow_stale_startup: allow_stale_startup,
       partition_ttl_policy: partition_ttl_policy
     }
 
@@ -415,8 +416,16 @@ defmodule EKV.Supervisor do
     reject_client_opt!(opts, :gc_interval, [nil])
     reject_client_opt!(opts, :tombstone_ttl, [nil])
     reject_client_opt!(opts, :sync_chunk_size, [nil])
-    reject_client_opt!(opts, :skip_stale_check, [nil])
+    reject_client_opt!(opts, :allow_stale_startup, [nil, false])
     reject_client_opt!(opts, :partition_ttl_policy, [nil])
+  end
+
+  defp validate_allow_stale_startup!(value) when is_boolean(value), do: :ok
+  defp validate_allow_stale_startup!(nil), do: :ok
+
+  defp validate_allow_stale_startup!(value) do
+    raise ArgumentError,
+          "EKV: :allow_stale_startup must be boolean, got: #{inspect(value)}"
   end
 
   defp validate_region_routing!(region_routing)

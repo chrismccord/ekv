@@ -106,9 +106,10 @@ Values can be any Erlang term (stored via `:erlang.term_to_binary/1`). Keys are 
 | `:gc_interval` | `300_000` (5 min) | Member mode only. GC tick interval in milliseconds |
 | `:wait_for_quorum` | `false` | Optional startup gate. In member mode, waits for this EKV member to reach CAS quorum. In client mode, waits for the selected backend member to report CAS quorum reachable. |
 | `:shutdown_barrier` | `false` | Optional graceful-shutdown barrier. Keeps EKV serving during coordinated shutdown for up to the configured timeout so peers can finish final writes and replication. |
+| `:allow_stale_startup` | `false` | Member mode only. Dangerous recovery override. If `true`, EKV trusts on-disk data even when stale-db detection would normally refuse startup. Intended only for explicit disaster recovery / full cold-cluster restore cases. |
 | `:blue_green` | `false` | Member mode only. Enable blue-green deployment handoff for shared-volume replacement nodes. |
 | `:log` | `:info` | `:info`, `false` (silent), or `:verbose` |
-| `:partition_ttl_policy` | `:quarantine` | Member mode only. Policy when a peer identity reconnects after being disconnected longer than `tombstone_ttl`. `:quarantine` blocks replication with that peer until operator intervention. `:ignore` keeps legacy behavior. |
+| `:partition_ttl_policy` | `:quarantine` | Member mode only. Policy when a peer identity reconnects after being disconnected longer than `tombstone_ttl`. `:quarantine` blocks replication with that peer until operator intervention. `:ignore` disables that quarantine and allows reconnect/sync anyway. |
 
 ### Client mode
 
@@ -218,7 +219,7 @@ A periodic GC timer runs three phases per tick:
 
 ### Stale database protection
 
-If a node goes away longer than `tombstone_ttl` and comes back with an old database on disk, peers will have already GC'd the tombstones for entries deleted during the absence. EKV detects this by checking a `last_active_at` timestamp stored in the database. If the database is staler than `tombstone_ttl`, it's wiped on startup and rebuilt from scratch via full sync.
+If a node goes away longer than `tombstone_ttl` and comes back with an old database on disk, peers will have already GC'd the tombstones for entries deleted during the absence. EKV detects this by checking a `last_active_at` timestamp stored in the database. If the database is too stale, EKV fails startup by default instead of trusting that on-disk state. Operators can then wipe that node's data dir so it rebuilds from peers, or explicitly set `allow_stale_startup: true` when they intend to trust the old on-disk cluster state.
 
 ### Long live-partition protection
 

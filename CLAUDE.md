@@ -229,8 +229,9 @@ Important:
   - exact-multiple chunk sizes still require a final non-zero seq chunk
 
 ### Long partition protection
-- Startup stale-db wipe:
-  - if idle age exceeds roughly `tombstone_ttl - gc_interval`, wipe and rebuild from full sync
+- Startup stale-db rejection:
+  - if idle age exceeds roughly `tombstone_ttl - gc_interval`, startup fails closed by default
+  - operator must either wipe that node's data dir or explicitly set `allow_stale_startup: true`
 - Live long partition protection:
   - default `partition_ttl_policy: :quarantine`
   - reconnect after downtime > `tombstone_ttl` blocks replication for that peer pair
@@ -295,7 +296,7 @@ mix test test/stress_test.exs
 mix test test/linearizability_pure_elixir_test.exs
 ```
 
-### If touching sync, HWM, reconnect, quarantine, stale-db wipe
+### If touching sync, HWM, reconnect, quarantine, stale-db rejection
 ```bash
 mix test test/distributed_test.exs
 mix test test/adversarial_verification_test.exs

@@ -48,13 +48,15 @@ defmodule EKV.Store do
   """
 
   def open(data_dir, shard_index, tombstone_ttl, num_shards, gc_interval, opts \\ []) do
-    skip_stale_check = Keyword.get(opts, :skip_stale_check, false)
+    allow_stale_startup = Keyword.get(opts, :allow_stale_startup, false)
     File.mkdir_p!(data_dir)
     path = Path.join(data_dir, "shard_#{shard_index}.db")
 
     # Check for stale db before opening. If the db exists and its last_active_at
     # is older than the safe threshold, peers will have GC'd tombstones for entries
-    # deleted while we were away. Wipe and let full sync rebuild from scratch.
+    # deleted while we were away. Fail startup by default so operators can
+    # explicitly choose whether to wipe/rebuild from peers or trust the old
+    # on-disk data.
     #
     # Safety margin: last_active_at can lag real shutdown by up to gc_interval
     # (worst case: node crashes right before a GC tick). We subtract gc_interval
@@ -62,12 +64,12 @@ defmodule EKV.Store do
     # is always detected as stale, even in the worst case.
     stale_threshold = tombstone_ttl - gc_interval
 
-    if not skip_stale_check and stale_db?(path, stale_threshold) do
-      File.rm(path)
-      File.rm(path <> "-wal")
-      File.rm(path <> "-shm")
+    with :ok <- maybe_reject_stale_db(path, stale_threshold, allow_stale_startup) do
+      do_open(path, num_shards, data_dir, shard_index)
     end
+  end
 
+  defp do_open(path, num_shards, data_dir, shard_index) do
     {:ok, db} = EKV.Sqlite3.open(path)
 
     # PRAGMAs
@@ -604,20 +606,44 @@ defmodule EKV.Store do
     :ok
   end
 
-  defp stale_db?(path, tombstone_ttl) do
+  defp maybe_reject_stale_db(_path, _stale_threshold_ms, true), do: :ok
+
+  defp maybe_reject_stale_db(path, stale_threshold_ms, false) do
+    case stale_db_info(path, stale_threshold_ms) do
+      nil -> :ok
+      info -> {:error, {:stale_db, info}}
+    end
+  end
+
+  defp stale_db_info(path, stale_threshold_ms) do
     if File.exists?(path) do
       case read_last_active(path) do
         nil ->
-          # No meta table or no row — legacy db, treat as stale
-          true
+          # No meta table or no row — stale/unknown db, treat as stale.
+          %{
+            path: path,
+            threshold_ms: stale_threshold_ms,
+            age_ms: nil,
+            reason: :missing_last_active_at
+          }
 
         last_active_at ->
           now = System.system_time(:nanosecond)
           age_ms = div(now - last_active_at, 1_000_000)
-          age_ms > tombstone_ttl
+
+          if age_ms > stale_threshold_ms do
+            %{
+              path: path,
+              threshold_ms: stale_threshold_ms,
+              age_ms: age_ms,
+              reason: :stale_last_active_at
+            }
+          else
+            nil
+          end
       end
     else
-      false
+      nil
     end
   end
 
