@@ -5,6 +5,8 @@ defmodule EKV.ShutdownBarrier do
 
   require Logger
 
+  alias EKV.ShutdownBarrier
+
   @coordination_grace_ms 250
   @poll_interval_ms 50
   @shutdown_margin_ms 1_000
@@ -54,7 +56,7 @@ defmodule EKV.ShutdownBarrier do
     log = Keyword.get(opts, :log, :info)
     config = EKV.Supervisor.get_config(name)
 
-    state = %__MODULE__{
+    state = %ShutdownBarrier{
       name: name,
       mode: config.mode,
       timeout: timeout,
@@ -68,10 +70,10 @@ defmodule EKV.ShutdownBarrier do
   end
 
   @impl true
-  def handle_info(_msg, state), do: {:noreply, state}
+  def handle_info(_msg, %ShutdownBarrier{} = state), do: {:noreply, state}
 
   @impl true
-  def terminate(reason, state) do
+  def terminate(reason, %ShutdownBarrier{} = state) do
     if graceful_shutdown?(reason) do
       maybe_log(state, :info, "shutdown barrier entered terminal state")
       join_terminal_groups(state)
@@ -86,7 +88,7 @@ defmodule EKV.ShutdownBarrier do
     :ok
   end
 
-  defp join_live_groups(state) do
+  defp join_live_groups(%ShutdownBarrier{} = state) do
     scope = EKV.Supervisor.pg_scope(state.name)
     :ok = :pg.join(scope, live_all_group(state.name), self())
 
@@ -97,7 +99,7 @@ defmodule EKV.ShutdownBarrier do
     :ok
   end
 
-  defp join_terminal_groups(state) do
+  defp join_terminal_groups(%ShutdownBarrier{} = state) do
     scope = EKV.Supervisor.pg_scope(state.name)
     :ok = :pg.join(scope, terminal_all_group(state.name), self())
 
@@ -108,7 +110,7 @@ defmodule EKV.ShutdownBarrier do
     :ok
   end
 
-  defp should_wait?(%__MODULE__{mode: :member} = state, snapshot) do
+  defp should_wait?(%ShutdownBarrier{mode: :member} = state, snapshot) do
     cond do
       proxy_mode?(state.name) ->
         false
@@ -124,12 +126,12 @@ defmodule EKV.ShutdownBarrier do
     end
   end
 
-  defp should_wait?(%__MODULE__{} = state, snapshot) do
+  defp should_wait?(%ShutdownBarrier{} = state, snapshot) do
     coordinated_shutdown_detected?(state, snapshot) or
       coordinated_shutdown_within_grace?(state, snapshot)
   end
 
-  defp coordinated_shutdown_detected?(state, snapshot) do
+  defp coordinated_shutdown_detected?(%ShutdownBarrier{} = state, snapshot) do
     terminal = current_terminal_set(state.name)
 
     Enum.any?(snapshot, fn pid ->
@@ -137,20 +139,20 @@ defmodule EKV.ShutdownBarrier do
     end)
   end
 
-  defp coordinated_shutdown_within_grace?(state, snapshot) do
+  defp coordinated_shutdown_within_grace?(%ShutdownBarrier{} = state, snapshot) do
     deadline = now_ms() + @coordination_grace_ms
     wait_until(deadline, fn -> coordinated_shutdown_detected?(state, snapshot) end)
   end
 
   defp quorum_sensitive_wait?(
-         %__MODULE__{cluster_size: cluster_size, mode: :member} = state,
+         %ShutdownBarrier{cluster_size: cluster_size, mode: :member} = state,
          snapshot
        )
        when is_integer(cluster_size) do
     nonterminal_snapshot_remaining?(state.name, snapshot) and exiting_breaks_quorum?(state)
   end
 
-  defp quorum_sensitive_wait?(_state, _snapshot), do: false
+  defp quorum_sensitive_wait?(%ShutdownBarrier{} = _state, _snapshot), do: false
 
   defp nonterminal_snapshot_remaining?(name, snapshot) do
     live = current_live_set(name)
@@ -161,12 +163,12 @@ defmodule EKV.ShutdownBarrier do
     end)
   end
 
-  defp exiting_breaks_quorum?(%__MODULE__{cluster_size: cluster_size} = state) do
+  defp exiting_breaks_quorum?(%ShutdownBarrier{cluster_size: cluster_size} = state) do
     remaining_members = live_member_count_after_exit(state)
     remaining_members < quorum_size(cluster_size)
   end
 
-  defp live_member_count_after_exit(%__MODULE__{} = state) do
+  defp live_member_count_after_exit(%ShutdownBarrier{} = state) do
     identities = live_member_identities(state.name)
 
     if logical_identity_survives_exit?(state) do
@@ -176,7 +178,7 @@ defmodule EKV.ShutdownBarrier do
     end
   end
 
-  defp logical_identity_survives_exit?(%__MODULE__{
+  defp logical_identity_survives_exit?(%ShutdownBarrier{
          mode: :member,
          name: name,
          member_identity: id
@@ -185,7 +187,7 @@ defmodule EKV.ShutdownBarrier do
     |> Enum.any?(&(&1 != self()))
   end
 
-  defp logical_identity_survives_exit?(_state), do: false
+  defp logical_identity_survives_exit?(%ShutdownBarrier{} = _state), do: false
 
   defp live_member_identities(name) do
     :pg.which_groups(EKV.Supervisor.pg_scope(name))
@@ -204,7 +206,7 @@ defmodule EKV.ShutdownBarrier do
     _ -> MapSet.new()
   end
 
-  defp wait_for_snapshot(state, snapshot) do
+  defp wait_for_snapshot(%ShutdownBarrier{} = state, snapshot) do
     deadline = now_ms() + state.timeout
 
     wait_until(deadline, fn ->

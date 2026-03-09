@@ -5,13 +5,26 @@ defmodule EKV.Store do
   Pure function module for SQLite operations. Called inside Replica GenServer.
 
   Each shard has its own SQLite database file at `#{data_dir}/shard_#{i}.db`.
-  Uses WAL mode for concurrent reads.
+  Uses WAL mode for concurrent reads. Store is responsible for:
+
+  - current committed KV state
+  - CAS accept/promote state (`kv_paxos`)
+  - delta/full sync source data (`kv_oplog`, `kv_member_hwm`)
+  - startup stale-db checks (`allow_stale_startup` override)
+  - local TTL-expiry bookkeeping via `expired_at`
 
   ## Tables
 
-  - `kv` — current state of all keys: key -> (value, timestamp, origin_node, expires_at, deleted_at, expired_at)
-  - `kv_oplog` — append-only log of all mutations, used for delta sync
-  - `kv_member_hwm` — per-member high-water marks for oplog sync
+  - `kv` — current committed state of all keys:
+    `(value, timestamp, origin_node, expires_at, deleted_at, expired_at)`
+    `expired_at` is local-only bookkeeping so GC emits `:expired` once; it is
+    not a replicated tombstone marker.
+  - `kv_oplog` — append-only replication log for live puts and explicit deletes.
+    Already-expired rows are filtered out when delta sync is built.
+  - `kv_member_hwm` — per-member high-water marks for oplog sync/truncation.
+  - `kv_meta` — shard metadata such as `last_active_at`, persisted `node_id`,
+    and long-partition down-since markers.
+  - `kv_paxos` — durable CASPaxos acceptor state per key.
   """
 
   @get_sql """
