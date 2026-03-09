@@ -17,14 +17,18 @@ defmodule EKV.Replica do
   Member-to-member replica discovery is fully self-contained: shards use
   :net_kernel.monitor_nodes/1 and Node.list/0 directly for peer handshakes and
   sync. Client routing is separate — client EKV instances discover ready
-  members through :pg region groups published by EKV.MemberPresence. Zero
-  runtime deps. SQLite is vendored as a C NIF (c_src/sqlite3.c amalgamation).
+  members through :pg region groups published by EKV.MemberPresence. Each EKV
+  instance owns its own scoped :pg mesh, isolating routing, subscriptions, and
+  shutdown coordination from other EKV instances and unrelated default-scope
+  :pg traffic. Zero runtime deps. SQLite is vendored as a C NIF
+  (c_src/sqlite3.c amalgamation).
 
 
   ## Supervision Tree
 
       Member mode:
         EKV.Supervisor (rest_for_one)
+        ├── :pg scope               instance-local routing/subscription mesh
         ├── EKV.BlueGreenMarker?    marker cleanup / handoff bookkeeping
         ├── EKV.SubTracker          atomics subscriber count + process monitors
         ├── Registry                keys: :duplicate, listeners: [sub_tracker]
@@ -43,6 +47,7 @@ defmodule EKV.Replica do
 
       Client mode:
         EKV.Supervisor (rest_for_one)
+        ├── :pg scope                 instance-local routing/subscription mesh
         ├── EKV.ClientRouter         region-ordered backend selection
         ├── EKV.RouteGate?           optional startup barrier for route selection
         ├── EKV.QuorumGate?          optional startup barrier via selected member
@@ -61,7 +66,7 @@ defmodule EKV.Replica do
   `EKV.ShutdownBarrier` is the last child in the tree, so it receives shutdown
   first and can block while the rest of EKV is still serving traffic.
 
-  Coordination is via `:pg`:
+  Coordination is via the EKV instance's scoped `:pg` mesh:
 
     - `{:ekv_shutdown_live, name}` / `{:ekv_shutdown_terminal, name}`
       track all EKV instances for this logical store

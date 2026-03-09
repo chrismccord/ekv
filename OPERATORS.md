@@ -8,6 +8,8 @@ Scenario-based guide for operating EKV in production.
 EKV.info(:my_kv)
 # => %{
 #   name: :my_kv,
+#   mode: :member,
+#   region: "iad",
 #   node_id: "a1b2c3d4e5f6",
 #   cluster_size: 3,
 #   shards: 8,
@@ -20,12 +22,55 @@ EKV.info(:my_kv)
 ```
 
 Verify:
-- `connected_peers` length equals `cluster_size - 1`
+- In steady state, `connected_peers` length equals `cluster_size - 1`
 - Each peer has a non-nil `node_id`
-- `node_id` values are distinct
+- In steady state, peer `node_id` values are distinct
+
+During blue-green overlap, two Erlang nodes may temporarily share the same
+logical `node_id`. In that case, dedupe by `node_id` and reason about logical
+members rather than raw peer count.
 
 If a partition or maintenance event is active, `connected_peers` may be lower
 temporarily. Treat this as healthy only if it matches an expected outage.
+
+## Startup Readiness
+
+### wait_for_quorum
+
+Use `wait_for_quorum: timeout_ms` when callers must be able to perform CAS
+operations immediately after EKV starts.
+
+Member mode:
+
+```elixir
+{EKV, name: :my_kv, data_dir: "/var/data/ekv",
+ cluster_size: 3, wait_for_quorum: 30_000}
+```
+
+Client mode:
+
+```elixir
+{EKV, name: :my_kv, mode: :client,
+ region_routing: ["iad", "dfw"], wait_for_quorum: 30_000}
+```
+
+- Member mode blocks startup until that EKV member can reach CAS quorum.
+- Client mode blocks startup until the selected backend member reports quorum.
+- This is only a startup gate. Quorum can still be lost later during runtime.
+- In client mode, `wait_for_quorum` implicitly waits for route selection first.
+
+Use it when downstream supervisors perform CAS writes during their own init.
+Leave it disabled if the workload is LWW-only and startup should not wait for
+quorum.
+
+### wait_for_route (Client Mode)
+
+Use `wait_for_route: timeout_ms` on clients when startup should wait for a
+usable backend route before the app continues.
+
+- The client picks the first reachable member in `region_routing` order.
+- The chosen backend stays sticky until failure.
+- `wait_for_route` is about routing readiness, not quorum.
 
 ## Backups
 
@@ -55,7 +100,7 @@ Start a temporary EKV instance pointing at the backup directory:
 
 # Spot-check keys
 EKV.get(:backup_check, "important/key")
-EKV.keys(:backup_check, "users/") |> length()
+EKV.keys(:backup_check, "users/") |> Enum.count()
 
 # Clean up
 Supervisor.stop(:backup_check_ekv_sup)
@@ -136,9 +181,10 @@ are reachable simultaneously, you may trigger a cluster overflow error
 
 ### Accidental Scale-Up
 
-If more machines are running than `cluster_size` allows, CAS operations
-(`:if_vsn`, `EKV.update/3`) return `{:error, :cluster_overflow}`. Regular
-LWW operations (`put`, `get`, `delete` without `:if_vsn`) continue working.
+If more distinct logical members are reachable than `cluster_size` allows, CAS
+operations (`if_vsn`, `consistent: true`, `EKV.update/3`) return
+`{:error, :cluster_overflow}`. Regular LWW operations (`put`, `get`, `delete`
+without CAS options) continue working.
 
 **Symptom:**
 ```elixir
@@ -149,7 +195,13 @@ EKV.put(:my_kv, "key", "val", if_vsn: nil)
 **Diagnosis:**
 ```elixir
 info = EKV.info(:my_kv)
-IO.puts("#{length(info.connected_peers) + 1} nodes, cluster_size=#{info.cluster_size}")
+
+logical_members =
+  [info.node_id | Enum.map(info.connected_peers, & &1.node_id)]
+  |> Enum.uniq()
+  |> length()
+
+IO.puts("#{logical_members} logical members, cluster_size=#{info.cluster_size}")
 ```
 
 **Fix:** Remove the extra machine(s). CAS resumes immediately.
@@ -169,6 +221,33 @@ from peers populates its data.
 2. Wait for one GC cycle (`gc_interval`, default 5 min) — the removed node's
    HWM is pruned, allowing oplog truncation to proceed
 3. Optionally update `cluster_size` on remaining nodes and rolling restart
+
+## Client Mode
+
+Client mode is for app nodes that need the EKV API but should **not** become
+replicas or CAS voters.
+
+```elixir
+{EKV, name: :my_kv, mode: :client,
+ region: "ord", region_routing: ["iad", "dfw", "lhr"]}
+```
+
+- Clients do not store data locally.
+- Clients do not increase replication fan-out or quorum size.
+- Reads and writes are forwarded to a selected member.
+- Eventual reads in client mode are remote reads, not local SQLite reads.
+
+Use member mode for the durable replica set. Use client mode for horizontally
+scaled app nodes that should route into that replica set.
+
+Startup guidance:
+
+- LWW-only clients usually want `wait_for_route`
+- CAS-heavy clients usually want `wait_for_route` and/or `wait_for_quorum`
+
+If a client fails over to a different backend member, eventual reads may lose
+session-style read-your-writes. Use `consistent: true` when fresh CAS-backed
+reads are required.
 
 ## Network Partitions
 
@@ -301,9 +380,8 @@ data_dir/
 └── ...
 ```
 
-If the old VM is dead, handoff requests time out after 5 seconds and the new
-VM opens the files directly. SQLite's WAL recovery handles any incomplete
-writes.
+If the old VM is dead or the marker is stale, EKV skips handoff and opens the
+files directly. SQLite's WAL recovery handles any incomplete writes.
 
 ### Requirements
 
@@ -326,6 +404,26 @@ If the new deploy is bad, start the old version again. The marker will point
 to the new VM's node name, so a handoff is attempted. If the new VM is still
 alive, it performs a clean handoff back. If it's already dead, the old VM
 opens the files directly with WAL recovery.
+
+## Graceful Shutdown Barrier
+
+Use `shutdown_barrier: timeout_ms` when coordinated graceful shutdowns should
+keep members serving for a short window while peers flush final writes.
+
+```elixir
+{EKV, name: :my_kv, data_dir: "/var/data/ekv",
+ cluster_size: 3, shutdown_barrier: 15_000}
+```
+
+- Members stay up during graceful shutdown until peers also enter terminal
+  state or the timeout expires.
+- Clients participate in the coordination signal but do not count toward
+  quorum.
+- Blue-green outgoing members skip the wait after successful handoff/proxy.
+
+Use this for rolling deploys or coordinated stops where other nodes may still
+be finishing CAS writes. It does **not** help for crashes, `kill -9`, or bad
+local supervisor ordering.
 
 ## Shard Count
 
@@ -361,7 +459,11 @@ the mismatched node.
 |-------|---------|--------|
 | `{:error, :conflict}` | Version mismatch — value changed between `fetch` and `put` | Retry with `EKV.update/3` (auto-retries 5x) or re-fetch and retry manually |
 | `{:error, :no_quorum}` | Not enough peers reachable for consensus | Check connectivity; wait for partition to heal; verify `cluster_size` matches actual cluster |
+| `{:error, :quorum_timeout}` | Quorum may exist, but consensus did not finish before the call timeout | Check cluster latency / load; increase timeout if needed; verify peers are healthy |
+| `{:error, :unconfirmed}` | CAS write entered accept phase but final outcome was ambiguous to the caller | Resolve with `EKV.get(name, key, consistent: true)` or use `resolve_unconfirmed: true` |
 | `{:error, :cluster_overflow}` | More distinct node_ids reachable than `cluster_size` | Remove extra nodes or increase `cluster_size` on all nodes |
+| `{:error, :cas_managed_key}` | Eventual `put`/`delete` was attempted on a CAS-managed key | Use CAS write APIs for that key; do not mix CAS -> LWW writes |
+| `{:error, :unavailable}` | Client backend or ambiguity-resolution read was unavailable | Check member availability/routing; retry after route recovers |
 | `{:error, :cas_not_configured}` | `cluster_size` not set | Add `cluster_size` to config |
 
 ## Monitoring Checklist

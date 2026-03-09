@@ -1,6 +1,6 @@
 # EKV
 
-Eventually consistent durable KV store for Elixir with zero runtime dependencies.
+Eventually consistent durable KV store for Elixir with opt-in per-key linearizable CAS, with zero runtime dependencies.
 
 Data survives node restarts, node death, and network partitions. Member nodes replicate peer-to-peer across all connected Erlang nodes using delta sync via per-shard oplogs. Storage is backed by SQLite (vendored, compiled as a NIF) with zero runtime dependencies.
 
@@ -99,10 +99,14 @@ Values can be any Erlang term (stored via `:erlang.term_to_binary/1`). Keys are 
 | `:region_routing` | `nil` | Client mode only. Ordered list of preferred member regions. |
 | `:wait_for_route` | `false` | Client mode only. Optional startup gate. Blocks startup until the first reachable member in `:region_routing` order is selected. |
 | `:data_dir` | *required in `:member`* | Directory for SQLite database files |
+| `:cluster_size` | `nil` | Member mode only. Required for CAS (`if_vsn`, `consistent: true`, `update/4`). Total number of logical voting members. |
+| `:node_id` | `nil` | Member mode only. Required for CAS. Stable logical member id used in ballots, quorum accounting, and blue-green overlap. |
 | `:shards` | `8` | Member mode only. Number of shards (each is an independent GenServer + SQLite db) |
 | `:tombstone_ttl` | `604_800_000` (7 days) | Member mode only. How long tombstones are retained in milliseconds |
 | `:gc_interval` | `300_000` (5 min) | Member mode only. GC tick interval in milliseconds |
 | `:wait_for_quorum` | `false` | Optional startup gate. In member mode, waits for this EKV member to reach CAS quorum. In client mode, waits for the selected backend member to report CAS quorum reachable. |
+| `:shutdown_barrier` | `false` | Optional graceful-shutdown barrier. Keeps EKV serving during coordinated shutdown for up to the configured timeout so peers can finish final writes and replication. |
+| `:blue_green` | `false` | Member mode only. Enable blue-green deployment handoff for shared-volume replacement nodes. |
 | `:log` | `:info` | `:info`, `false` (silent), or `:verbose` |
 | `:partition_ttl_policy` | `:quarantine` | Member mode only. Policy when a peer identity reconnects after being disconnected longer than `tombstone_ttl`. `:quarantine` blocks replication with that peer until operator intervention. `:ignore` keeps legacy behavior. |
 
@@ -116,6 +120,9 @@ blue-green machinery on that node.
 - `wait_for_quorum` can additionally hold startup until that backend reports CAS quorum reachable.
 - `scan/2` and `keys/2` still return Elixir streams, but are backed by paged RPC.
 - `subscribe/2` works in client mode; client subscribers are delivered cluster-wide.
+- Routing, subscriptions, and shutdown coordination use an EKV-instance-specific
+  `:pg` scope, so multiple EKV instances can share a cluster without mixing
+  control traffic.
 - After backend failover, eventual reads may observe an older replica view.
   Use `consistent: true` when freshness matters.
 
@@ -129,7 +136,10 @@ Data survives restarts automatically since SQLite is the source of truth.
 
 ### Replication
 
-Every write is broadcast to the counterpart shard on all connected peers. Peer discovery is self-contained by monitoring nodes going up an ddown.
+Every write is broadcast to the counterpart shard on all connected peers. Member
+peer discovery is self-contained by monitoring connected Erlang nodes going up
+and down. Client routing, client subscriptions, and shutdown coordination are
+separate and use an EKV-instance-specific `:pg` scope.
 
 *Note: Node connection is left up to the user, ie either explicit `Node.connect/1`/`sys.config`, or using a library like `DNSCluster`, or `libcluster`.
 
@@ -231,7 +241,11 @@ the retained set per shard to avoid unbounded growth over long periods.
 
 ## Multiple instances
 
-Each EKV instance (identified by `:name`) is fully independent -- its own SQLite files, shard GenServers, and peer mesh. To isolate replication between groups of nodes, start separate EKV instances with different names on the nodes that should form each group.
+Each EKV instance (identified by `:name`) is fully independent -- its own
+SQLite files, shard GenServers, member peer mesh, and scoped `:pg` control
+plane for routing, subscriptions, and shutdown coordination. To isolate
+replication between groups of nodes, start separate EKV instances with
+different names on the nodes that should form each group.
 
 ```elixir
 # Only nodes in the US region start this:
