@@ -6,7 +6,7 @@ usage() {
 Bootstrap a Fly app for EKV benchmarks.
 
 Usage:
-  priv/bench/setup_fly.sh --app APP_NAME [options]
+  bench/setup_fly.sh --app APP_NAME [options]
 
 Options:
   --app NAME                 Fly app name (required)
@@ -16,11 +16,11 @@ Options:
   --volume-name NAME         Volume name/mount source (default: ekv_data)
   --volume-size-gb N         Volume size in GB (default: 1)
   --machines-per-region N    Target volumes per region (default: 1)
-  --config PATH              fly.toml output path (default: priv/bench/fly.toml)
+  --config PATH              fly.toml output path (default: bench/fly.toml)
   -h, --help                 Show this help
 
 Example:
-  priv/bench/setup_fly.sh \
+  bench/setup_fly.sh \
     --app ekv-bench-prod \
     --org personal \
     --regions iad,ord,sjc,ams

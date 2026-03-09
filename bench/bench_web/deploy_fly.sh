@@ -4,7 +4,7 @@ set -euo pipefail
 APP_NAME="ekv-bench"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-CONFIG_PATH="priv/bench_web/fly.toml"
+CONFIG_PATH="bench/bench_web/fly.toml"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -18,7 +18,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     *)
       echo "Unknown option: $1" >&2
-      echo "Usage: priv/bench_web/deploy_fly.sh [--app APP] [--config CONFIG]" >&2
+      echo "Usage: bench/bench_web/deploy_fly.sh [--app APP] [--config CONFIG]" >&2
       exit 1
       ;;
   esac

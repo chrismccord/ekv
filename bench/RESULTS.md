@@ -7,7 +7,7 @@
 Command run:
 
 ```bash
-cd /Users/chris/oss/ekv/priv/bench
+cd /Users/chris/oss/ekv/bench
 ./run_local.sh
 ```
 

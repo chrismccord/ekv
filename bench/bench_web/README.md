@@ -5,7 +5,7 @@ Phoenix LiveView orchestrator for distributed EKV CAS benchmarks.
 ## Local development
 
 ```bash
-cd priv/bench_web
+cd bench/bench_web
 mix setup
 mix phx.server
 ```
@@ -22,13 +22,13 @@ path (accept+commit), so quorum read latency reflects full consensus cost.
 
 This app is built from the monorepo root because it depends on local path deps:
 
-- `priv/bench_web -> ../bench`
-- `priv/bench -> ../../` (EKV library)
+- `bench/bench_web -> ..`
+- `bench -> ../` (EKV library)
 
 From repository root:
 
 ```bash
-priv/bench_web/deploy_fly.sh --app ekv-bench
+bench/bench_web/deploy_fly.sh --app ekv-bench
 ```
 
 `deploy_fly.sh` ensures `SECRET_KEY_BASE` and `RELEASE_COOKIE` exist before deploy.

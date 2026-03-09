@@ -18,10 +18,10 @@ RUN mix local.hex --force && mix local.rebar --force
 
 # Copy the monorepo so local path deps (bench -> ekv) resolve during build.
 COPY . .
-RUN rm -rf /app/_build /app/deps /app/priv/bench/_build /app/priv/bench/deps /app/priv/bench_web/_build /app/priv/bench_web/deps
+RUN rm -rf /app/_build /app/deps /app/bench/_build /app/bench/deps /app/bench/bench_web/_build /app/bench/bench_web/deps
 RUN rm -f /app/priv/ekv_sqlite3_nif.so
 
-WORKDIR /app/priv/bench_web
+WORKDIR /app/bench/bench_web
 
 RUN mix deps.get --only prod
 RUN mix deps.compile

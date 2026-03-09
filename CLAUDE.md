@@ -336,10 +336,10 @@ cd jepsen
 
 ## Bench
 - Local CLI bench:
-  - `priv/bench/run_cas.sh`
-  - implementation in `priv/bench/lib/bench/cas.ex`
+  - `bench/run_cas.sh`
+  - implementation in `bench/lib/bench/cas.ex`
 - Fly/Phoenix orchestrator:
-  - `priv/bench_web`
+  - `bench/bench_web`
   - use for multi-region tests and scenario selection
 
 ## Workflow Rules For Agents

@@ -17,6 +17,6 @@ defmodule Bench.MixProject do
   end
 
   defp deps do
-    [{:ekv, path: "../../"}]
+    [{:ekv, path: "../"}]
   end
 end
