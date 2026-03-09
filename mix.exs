@@ -50,7 +50,7 @@ defmodule EKV.MixProject do
     """
     Eventually consistent durable KV store for Elixir with zero runtime dependencies.
     Data survives node restarts, node death, and network partitions.
-    Peer-to-peer replication across Erlang nodes with delta sync.
+    Direct member replication across Erlang nodes with delta sync.
     """
   end
 

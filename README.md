@@ -2,7 +2,7 @@
 
 Eventually consistent durable KV store for Elixir with opt-in per-key linearizable CAS, with zero runtime dependencies.
 
-Data survives node restarts, node death, and network partitions. Member nodes replicate peer-to-peer across all connected Erlang nodes using delta sync via per-shard oplogs. Storage is backed by SQLite (vendored, compiled as a NIF) with zero runtime dependencies.
+Data survives node restarts, node death, and network partitions. Member nodes replicate directly across all connected Erlang nodes using delta sync via per-shard oplogs. Storage is backed by SQLite (vendored, compiled as a NIF) with zero runtime dependencies.
 
 ## Installation
 
@@ -105,11 +105,11 @@ Values can be any Erlang term (stored via `:erlang.term_to_binary/1`). Keys are 
 | `:tombstone_ttl` | `604_800_000` (7 days) | Member mode only. How long tombstones are retained in milliseconds |
 | `:gc_interval` | `300_000` (5 min) | Member mode only. GC tick interval in milliseconds |
 | `:wait_for_quorum` | `false` | Optional startup gate. In member mode, waits for this EKV member to reach CAS quorum. In client mode, waits for the selected backend member to report CAS quorum reachable. |
-| `:shutdown_barrier` | `false` | Optional graceful-shutdown barrier. Keeps EKV serving during coordinated shutdown for up to the configured timeout so peers can finish final writes and replication. |
+| `:shutdown_barrier` | `false` | Optional graceful-shutdown barrier. Keeps EKV serving during coordinated shutdown for up to the configured timeout so members can finish final writes and replication. |
 | `:allow_stale_startup` | `false` | Member mode only. Dangerous recovery override. If `true`, EKV trusts on-disk data even when stale-db detection would normally refuse startup. Intended only for explicit disaster recovery / full cold-cluster restore cases. |
 | `:blue_green` | `false` | Member mode only. Enable blue-green deployment handoff for shared-volume replacement nodes. |
 | `:log` | `:info` | `:info`, `false` (silent), or `:verbose` |
-| `:partition_ttl_policy` | `:quarantine` | Member mode only. Policy when a peer identity reconnects after being disconnected longer than `tombstone_ttl`. `:quarantine` blocks replication with that peer until operator intervention. `:ignore` disables that quarantine and allows reconnect/sync anyway. |
+| `:partition_ttl_policy` | `:quarantine` | Member mode only. Policy when a member identity reconnects after being disconnected longer than `tombstone_ttl`. `:quarantine` blocks replication with that member until operator intervention. `:ignore` disables that quarantine and allows reconnect/sync anyway. |
 
 ### Client mode
 
@@ -137,8 +137,8 @@ Data survives restarts automatically since SQLite is the source of truth.
 
 ### Replication
 
-Every write is broadcast to the counterpart shard on all connected peers. Member
-peer discovery is self-contained by monitoring connected Erlang nodes going up
+Every write is broadcast to the counterpart shard on all connected members. Member
+discovery is self-contained by monitoring connected Erlang nodes going up
 and down. Client routing, client subscriptions, and shutdown coordination are
 separate and use an EKV-instance-specific `:pg` scope.
 
@@ -146,8 +146,8 @@ separate and use an EKV-instance-specific `:pg` scope.
 
 When a node connects (or reconnects), each shard pair exchanges a handshake. Based on high-water marks (HWMs), they decide:
 
-- **Delta sync** if the oplog still has entries since the peer's last known position (efficient for brief disconnects).
-- **Full sync** if the oplog has been truncated past that point or the peer is new (sends all live entries + recent tombstones).
+- **Delta sync** if the oplog still has entries since the member's last known position (efficient for brief disconnects).
+- **Full sync** if the oplog has been truncated past that point or the member is new (sends all live entries + recent tombstones).
 
 ### Conflict resolution
 
@@ -155,7 +155,7 @@ Last-Writer-Wins with nanosecond timestamps. Ties are broken deterministically b
 
 A delete is just an entry with `deleted_at` set. Same LWW rules apply -- a put with a higher timestamp beats a delete, and vice versa.
 
-### Consistency Modes - LWW vs CAS (Compare-and-Swap)
+### Consistency Modes - LWW vs CAS (Compare-And-Swap)
 
 EKV supports two write modes:
 
@@ -216,11 +216,11 @@ A periodic GC timer runs three phases per tick:
 
 1. **Expire TTL entries** -- converts expired entries to tombstones and broadcasts deletes
 2. **Purge old tombstones** -- hard-deletes tombstones older than `tombstone_ttl` from SQLite
-3. **Truncate oplog** -- removes oplog entries below the minimum peer HWM
+3. **Truncate oplog** -- removes oplog entries below the minimum member HWM
 
 ### Stale database protection
 
-If a node goes away longer than `tombstone_ttl` and comes back with an old database on disk, peers will have already GC'd the tombstones for entries deleted during the absence. EKV detects this by checking a `last_active_at` timestamp stored in the database. If the database is too stale, EKV fails startup by default instead of trusting that on-disk state. Operators can then wipe that node's data dir so it rebuilds from peers, or explicitly set `allow_stale_startup: true` when they intend to trust the old on-disk cluster state.
+If a node goes away longer than `tombstone_ttl` and comes back with an old database on disk, other members will have already GC'd the tombstones for entries deleted during the absence. EKV detects this by checking a `last_active_at` timestamp stored in the database. If the database is too stale, EKV fails startup by default instead of trusting that on-disk state. Operators can then wipe that node's data dir so it rebuilds from members, or explicitly set `allow_stale_startup: true` when they intend to trust the old on-disk cluster state.
 
 ### Long live-partition protection
 
@@ -229,9 +229,9 @@ A different edge case is when nodes stay up but are partitioned longer than
 reconnect.
 
 With the default `partition_ttl_policy: :quarantine`, EKV detects reconnects
-after a downtime longer than `tombstone_ttl` and quarantines that peer pair
+after a downtime longer than `tombstone_ttl` and quarantines that member pair
 instead of syncing potentially unsafe state. Replication stays blocked for
-that peer until an operator rebuilds one side.
+that member until an operator rebuilds one side.
 
 Down-since markers are persisted in `kv_meta`, keyed by `node_id` when
 available (fallback: node name), so restart does not clear quarantine history.
@@ -244,7 +244,7 @@ the retained set per shard to avoid unbounded growth over long periods.
 ## Multiple instances
 
 Each EKV instance (identified by `:name`) is fully independent -- its own
-SQLite files, shard GenServers, member peer mesh, and scoped `:pg` control
+SQLite files, shard GenServers, member mesh, and scoped `:pg` control
 plane for routing, subscriptions, and shutdown coordination. To isolate
 replication between groups of nodes, start separate EKV instances with
 different names on the nodes that should form each group.

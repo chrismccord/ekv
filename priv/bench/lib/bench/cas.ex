@@ -651,7 +651,7 @@ defmodule Bench.CAS do
         )
       end)
 
-      # Let peers discover each other and exchange connect/ack
+      # Let members discover each other and exchange connect/ack
       Process.sleep(500)
       fun.()
     after

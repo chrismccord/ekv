@@ -15,12 +15,12 @@ defmodule EKV.Replica do
   provides linearizable read-modify-write via CASPaxos consensus.
 
   Member-to-member replica discovery is fully self-contained: shards use
-  :net_kernel.monitor_nodes/1 and Node.list/0 directly for peer handshakes and
+  `:net_kernel.monitor_nodes/1` and `Node.list/0` directly for member handshakes and
   sync. Client routing is separate — client EKV instances discover ready
-  members through :pg region groups published by EKV.MemberPresence. Each EKV
+  members through :pg region groups published by `EKV.MemberPresence`. Each EKV
   instance owns its own scoped :pg mesh, isolating routing, subscriptions, and
   shutdown coordination from other EKV instances and unrelated default-scope
-  :pg traffic. Zero runtime deps. SQLite is vendored as a C NIF
+  `:pg` traffic. Zero runtime deps. SQLite is vendored as a C NIF
   (c_src/sqlite3.c amalgamation).
 
 
@@ -77,7 +77,7 @@ defmodule EKV.Replica do
   Members count quorum by logical `node_id`, not Erlang node name, so
   blue-green overlap still counts as one voter. A member waits only when
   coordinated shutdown is in progress or exiting would risk dropping the live
-  voting set below quorum while peers are still non-terminal. Clients
+  voting set below quorum while other members are still non-terminal. Clients
   participate in terminal coordination but never count toward quorum.
 
   A blue-green outgoing member that has already entered proxy mode skips the
@@ -95,7 +95,7 @@ defmodule EKV.Replica do
       │ Tables:                                                      │
       │   kv          — current state, PK (key)                      │
       │   kv_oplog    — append-only mutation log, AUTOINCREMENT seq  │
-      │   kv_peer_hwm — per-peer high-water marks for delta sync     │
+      │   kv_member_hwm — per-member high-water marks for delta sync   │
       │   kv_meta     — liveness + ballot counter + down markers     │
       │   kv_paxos    — CAS consensus state per key (opt-in)         │
       │                                                              │
@@ -109,15 +109,15 @@ defmodule EKV.Replica do
 
   Connections per shard:
     - 1 writer connection (owned by the Replica GenServer)
-    - System.schedulers_online() reader connections
+    - `System.schedulers_online()` reader connections
 
-  Reader connections are stored as a tuple of {db, get_stmt} in
-  persistent_term keyed by {EKV, name, :readers, shard_index}. Reads
-  pick a connection by rem(scheduler_id - 1, num_readers) — zero
+  Reader connections are stored as a tuple of `{db, get_stmt}` in
+  persistent_term keyed by `{EKV, name, :readers, shard_index}`. Reads
+  pick a connection by `rem(scheduler_id - 1, num_readers)` — zero
   contention, no pool, no GenServer hop. WAL mode ensures readers
   don't block the writer.
 
-  Values are stored as :erlang.term_to_binary/1 blobs. Encoding happens
+  Values are stored as `:erlang.term_to_binary/1` blobs. Encoding happens
   in the public EKV module; Replica and Store only see binaries.
 
 
@@ -163,7 +163,7 @@ defmodule EKV.Replica do
 
   ## Sharding
 
-  Shard assignment: :erlang.phash2(key, num_shards)
+  Shard assignment: `:erlang.phash2(key, num_shards)`
 
   Each shard is a completely independent GenServer with its own SQLite db
   file. Shards on different nodes with the same index are counterparts —
@@ -179,32 +179,32 @@ defmodule EKV.Replica do
 
   ## Write Path (LWW)
 
-      Client                  Replica (shard i)             Peers
-        │                          │                          │
-        │ GenServer.call           │                          │
-        │  {:put, key,             │                          │
-        │   value_binary, opts}    │                          │
-        │─────────────────────────>│                          │
-        │                          │                          │
+      Client                  Replica (shard i)              Peers
+        │                          │                           │
+        │ GenServer.call           │                           │
+        │  {:put, key,             │                           │
+        │   value_binary, opts}    │                           │
+        │─────────────────────────>│                           │
+        │                          │                           │
         │                    write_entry NIF (1 dirty bounce): │
-        │                      BEGIN IMMEDIATE                │
-        │                      kv upsert (LWW WHERE clause)  │
-        │                      sqlite3_changes() == 0?        │
-        │                        → ROLLBACK (LWW lost)        │
-        │                        → oplog INSERT + COMMIT      │
-        │                          │                          │
-        │                          │ {:ekv_put, key,          │
-        │                          │  value_binary, ts,       │
-        │                          │  origin_node, expires_at}│
-        │                          │─────────────────────────>│
-        │                          │  (fire-and-forget to     │
-        │                          │   each known peer)       │
-        │                          │                          │
-        │<─────────────────────────│                          │
-        │         :ok              │                          │
+        │                      BEGIN IMMEDIATE                 │
+        │                      kv upsert (LWW WHERE clause)    │
+        │                      sqlite3_changes() == 0?         │
+        │                        → ROLLBACK (LWW lost)         │
+        │                        → oplog INSERT + COMMIT       │
+        │                          │                           │
+        │                          │ {:ekv_put, key,           │
+        │                          │  value_binary, ts,        │
+        │                          │  origin_node, expires_at} │
+        │                          │──────────────────────────>│
+        │                          │  (fire-and-forget to      │
+        │                          │   each known member)      │
+        │                          │                           │
+        │<─────────────────────────│                           │
+        │         :ok              │                           │
 
   Delete is identical but sets deleted_at = now and value = nil.
-  Broadcast message: {:ekv_delete, key, ts, origin_node}.
+  Broadcast message: `{:ekv_delete, key, ts, origin_node}`.
 
   On the receiving side, merge_remote_entry calls the same write_entry
   NIF with the remote's timestamp — LWW decides whether to apply.
@@ -231,7 +231,9 @@ defmodule EKV.Replica do
 
   ## Conflict Resolution: Last-Writer-Wins (LWW)
 
-  Every entry carries a nanosecond timestamp and origin_node atom.
+  Every entry carries a nanosecond timestamp and origin_node atom. For
+  successive local writes on the same shard, EKV does not reuse a timestamp, so
+  a key will not see the same `{timestamp, origin_node}` from that shard twice.
 
   LWW is pushed into SQL via ON CONFLICT ... WHERE:
 
@@ -267,12 +269,14 @@ defmodule EKV.Replica do
   ## Compare-And-Swap (CAS) via CASPaxos
 
   EKV is eventually consistent by default. For keys that need atomic
-  read-modify-write, CAS provides per-key linearizability via a
-  simplified CASPaxos protocol. CAS is opt-in: requires cluster_size
-  and node_id config. Both LWW and CAS writes coexist — different keys
-  can use different consistency models in the same EKV instance.
+  read-modify-write, CAS provides per-key linearizability via a CASPaxos-based
+  protocol. CAS is opt-in: requires `cluster_size` and `node_id` config. Both LWW
+  and CAS writes coexist — different keys can use different consistency models
+  in the same EKV instance.
 
   ### Why CASPaxos?
+
+  [CASPaxos Paper](https://arxiv.org/pdf/1802.07000)
 
   Classic Paxos replicates a log. CASPaxos is simpler — it's a
   single-decree consensus protocol for values, not logs. Each key is
@@ -280,16 +284,16 @@ defmodule EKV.Replica do
 
       1. Prepare (read phase): learn the current value + get promises
       2. Accept (write phase): propose a new value to acceptors
-      3. Commit: write to kv + oplog, broadcast to all peers
+      3. Commit: write to kv + oplog, broadcast to all members
 
   No log replication, no leader election, no view changes. Any node
   can be a proposer for any key at any time.
 
   ### Ballot Numbers
 
-  Each CAS operation gets a unique ballot {counter, node_id}. Counters
-  are monotonically increasing per-shard (max(system_time_ns, prev+1))
-  and persisted in kv_meta to survive restarts. The {counter, node_id}
+  Each CAS operation gets a unique ballot `{counter, node_id}`. Counters
+  are monotonically increasing per-shard `(max(system_time_ns, prev + 1))`
+  and persisted in kv_meta to survive restarts. The `{counter, node_id}`
   tuple is compared lexicographically — higher counter wins, ties broken
   by node_id.
 
@@ -323,12 +327,12 @@ defmodule EKV.Replica do
         │ {:ekv_prepare, ref, pid,  │                      │
         │  key, ballot_c, ballot_n} │                      │
         │──────────────────────────>│                      │
-        │──────────────────────────────────────────────────>│
+        │─────────────────────────────────────────────────>│
         │                           │                      │
         │ {:ekv_promise, ref, ...   │                      │
         │  acc_c, acc_n, kv_row}    │                      │
         │<──────────────────────────│                      │
-        │<──────────────────────────────────────────────────│
+        │<─────────────────────────────────────────────────│
         │                           │                      │
         │  quorum promises reached  │                      │
         │  pick highest accepted    │                      │
@@ -343,14 +347,14 @@ defmodule EKV.Replica do
         │ {:ekv_accept, ref, pid,   │                      │
         │  key, ballot, entry}      │                      │
         │──────────────────────────>│                      │
-        │──────────────────────────────────────────────────>│
+        │─────────────────────────────────────────────────>│
         │                           │                      │
         │  acceptors write to       │                      │
         │  kv_paxos ONLY (not kv)   │                      │
         │                           │                      │
         │ {:ekv_accepted, ref, ...} │                      │
         │<──────────────────────────│                      │
-        │<──────────────────────────────────────────────────│
+        │<─────────────────────────────────────────────────│
         │                           │                      │
         │  quorum accepts reached   │                      │
         │                           │                      │
@@ -359,9 +363,9 @@ defmodule EKV.Replica do
         │  local: paxos_promote     │                      │
         │   (kv_paxos -> kv+oplog)  │                      │
         │                           │                      │
-        │ {:ekv_cas_committed, ...} │  (to all peers)      │
+        │ {:ekv_cas_committed, ...} │  (to all members)    │
         │──────────────────────────>│                      │
-        │──────────────────────────────────────────────────>│
+        │─────────────────────────────────────────────────>│
         │                           │                      │
         │  receivers: paxos_promote │                      │
         │  or paxos_accept+promote  │                      │
@@ -389,8 +393,8 @@ defmodule EKV.Replica do
 
   After commit, the proposer sends:
 
-    - {:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple, shard}
-      → sent to all peers
+    - `{:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple, shard}`
+      → sent to all members
       → receiver first tries paxos_promote
       → if stale/missing accepted state, receiver can paxos_accept(entry_tuple)
         then paxos_promote (ballot-guarded)
@@ -400,7 +404,7 @@ defmodule EKV.Replica do
   Single NIF dirty bounce:
     1. BEGIN IMMEDIATE
     2. Read kv_paxos for the key
-    3. Verify ballot matches (if stale → return {:ok, :stale})
+    3. Verify ballot matches (if stale → return `{:ok, :stale}`)
     4. Read previous value from kv (for subscriber events)
     5. Force-upsert to kv (no LWW — Paxos ballots determine ordering)
     6. Insert to oplog
@@ -411,54 +415,54 @@ defmodule EKV.Replica do
 
   ### Quorum and Failure Handling
 
-  Quorum: floor(cluster_size / 2) + 1
+  Quorum: `floor(cluster_size / 2) + 1`
 
   Before starting CAS, the proposer checks that enough node_ids are
-  reachable. count_alive_node_ids tracks distinct node_ids (not Erlang
+  reachable. `alive_node_id_count/1` tracks distinct node ids (not Erlang
   nodes — multiple Erlang nodes may share a node_id in blue-green).
 
   Failure modes:
     - Nack in prepare: ballot too low. If can't reach quorum → fail.
     - Nack in accept: ballot superseded. If can't reach quorum → fail.
-    - Timeout (5s): no response from enough peers → {:error, :quorum_timeout}
-    - Node death during CAS: fail_pending_cas_if_no_quorum checks all
+    - Timeout (5s): no response from enough members → `{:error, :quorum_timeout}`
+    - Node death during CAS: `fail_pending_cas_if_no_quorum/1` checks all
       pending ops and fails those that can no longer reach quorum.
 
   Caller-visible CAS write outcomes (put if_vsn/delete if_vsn/update):
 
-    - :ok
+    - `:ok`
       CAS reached commit and value was applied to kv + oplog.
 
-    - {:error, :conflict}
+    - `{:error, :conflict}`
       The write was rejected before a deciding accept phase.
       Typical paths:
         - prepare phase loses quorum (nacks/no quorum) and retries are exhausted
         - compare-and-swap predicate fails while applying operation
           (for example stale if_vsn) before accept messages are sent
 
-    - {:error, :unconfirmed}
+    - `{:error, :unconfirmed}`
       The write reached accept phase, so some acceptors may have accepted
       it, but the proposer could not confirm final outcome.
       Typical paths:
         - accept phase loses quorum after accept messages were sent
         - local accepted ballot is superseded before commit can promote
 
-  In code, this mapping is phase-based: failures in :accept for write ops are
-  returned as :unconfirmed; other CAS write failures are :conflict.
+  In code, this mapping is phase-based: failures in accept phase for write ops are
+  returned as `:unconfirmed`. Other CAS write failures are returned as `:conflict`.
 
-  Operational rule: on :unconfirmed, issue a barrier read
-  (EKV.get(name, key, consistent: true)) to resolve committed state before
+  Operational rule: on `:unconfirmed`, issue a barrier read
+  (`EKV.get(name, key, consistent: true)`) to resolve committed state before
   taking follow-up actions.
 
   Optional API behavior: CAS write calls can pass `resolve_unconfirmed: true`.
-  In that mode, when a write fails in :accept, EKV performs one internal
+  In that mode, when a write fails in accept phase, EKV performs one internal
   barrier read and maps the result to current-state outcomes:
     - returns the original `{:ok, ...}` if resolved VSN matches the attempted write
     - returns `{:error, :conflict}` if current VSN differs
     - returns `{:error, :unavailable}` if the resolution read cannot complete
 
   For EKV.update (read-modify-write), retries happen only for definite
-  conflicts. Ambiguous accept outcomes return :unconfirmed by default,
+  conflicts. Ambiguous accept outcomes return `:unconfirmed` by default,
   or the resolved current-state mapping above when
   `resolve_unconfirmed: true` is set.
 
@@ -482,85 +486,87 @@ defmodule EKV.Replica do
 
   CAS operations are serialized per-shard through the GenServer. Two
   concurrent CAS operations on the same key from different nodes will
-  compete via ballot ordering — the higher ballot wins. update() with
+  compete via ballot ordering — the higher ballot wins. `update()` with
   auto-retry handles this transparently.
 
 
-  ## Member Peer Discovery and Tracking
+  ## Member Discovery and Tracking
 
-  Replica shards manage their own member peer mesh independently:
+  Replica shards manage their own member mesh independently:
 
-      init/1:
+      `init/1`:
         :net_kernel.monitor_nodes(true)
-        for node <- Node.list(), send ekv_peer_connect
+        for node <- Node.list(), send {:ekv_member_connect, ...}
 
       nodeup:
-        attempt ekv_peer_connect (gated by long-partition quarantine)
+        attempt :ekv_member_connect (gated by long-partition quarantine)
 
       nodedown:
-        remove from remote_shards + peer_node_ids
-        persist peer down marker (node_id key if known, fallback name key)
+        remove from remote_shards + member_node_ids
+        persist member down marker (node_id key if known, fallback name key)
         fail any pending CAS ops that lost quorum
 
       DOWN (monitored remote shard pid):
-        remove from remote_shards + peer_node_ids
-        persist peer down marker (node_id key if known, fallback name key)
+        remove from remote_shards + member_node_ids
+        persist member down marker (node_id key if known, fallback name key)
         fail any pending CAS ops that lost quorum
 
   remote_shards :: %{node() => pid()} tracks confirmed live counterpart
   shard processes. A node enters this map only after a successful
-  peer_connect / peer_connect_ack handshake where its pid is monitored.
+  member_connect / member_connect_ack handshake where its pid is monitored.
 
-  peer_node_ids :: %{node() => string()} maps Erlang nodes to their
+  member_node_ids :: %{node() => string()} maps Erlang nodes to their
   configured node_id. Used for CAS quorum counting (distinct node_ids,
   not Erlang nodes, determine quorum).
 
   Long-partition tracking is persisted in kv_meta:
-    - peer_down_at:id:<node_id>    (preferred, stable identity)
-    - peer_down_at:name:<node>     (fallback when node_id unknown)
+    - member_down_at:id:<node_id>    (preferred, stable identity)
+    - member_down_at:name:<node>     (fallback when node_id unknown)
 
   On reconnect handshake, if downtime > tombstone_ttl and policy is
-  :quarantine, replication is blocked for that peer. Down markers are
+  `:quarantine`, replication is blocked for that member. Down markers are
   cleared only after a successful non-quarantined reconnect.
 
 
-  ## Peer Sync Protocol
+  ## Member Sync Protocol
 
   When two member nodes discover each other (init, nodeup), they exchange a
-  handshake per shard. The handshake determines whether to send a delta
-  (oplog slice) or a full state snapshot.
+  handshake per shard. The handshake attempts to reach a registered process
+  on any `:nodeup` it sees. This safely noops on non-member nodes.
+  The handshake determines whether to send a delta (oplog slice) or
+  a full state snapshot.
 
       Node A (shard i)                        Node B (shard i)
-        │                                         │
-        │  {:ekv_peer_connect,                    │
-        │   pid_a, i, num_shards, hwm_a, nid_a}  │
-        │────────────────────────────────────────>│
-        │                                         │
+        │                                           │
+        │  {:ekv_member_connect,                    │
+        │   pid_a, i, num_shards, hwm_a, nid_a}     │
+        │──────────────────────────────────────────>│
+        │                                           │
         │                          validate num_shards match
         │                          monitor pid_a
         │                          add A to remote_shards
         │                          track A's node_id
-        │                                         │
-        │  {:ekv_peer_connect_ack,                │
-        │   pid_b, i, num_shards, hwm_b, nid_b}  │
-        │<────────────────────────────────────────│
-        │                                         │
+        │                                           │
+        │  {:ekv_member_connect_ack,                │
+        │   pid_b, i, num_shards, hwm_b, nid_b}     │
+        │<──────────────────────────────────────────│
+        │                                           │
         │                          send_sync_data(A, hwm_a):
         │                            if hwm_a exists & oplog not truncated:
         │                              delta sync (chunked)
         │                            else:
         │                              full sync (chunked)
-        │                                         │
-        │  {:ekv_sync, node_b, i, chunk, seq}     │
-        │<────────────────────────────────────────│
-        │  {:ekv_sync, node_b, i, chunk, seq}     │
-        │<────────────────────────────────────────│
-        │  ...                                    │
-        │                                         │
-        │  (A does the same for B)                │
-        │────────────────────────────────────────>│
-        │  {:ekv_sync, node_a, i, chunk, seq}     │
-        │                                         │
+        │                                           │
+        │  {:ekv_sync, node_b, i, chunk, seq}       │
+        │<──────────────────────────────────────────│
+        │  {:ekv_sync, node_b, i, chunk, seq}       │
+        │<──────────────────────────────────────────│
+        │  ...                                      │
+        │                                           │
+        │  (A does the same for B)                  │
+        │──────────────────────────────────────────>│
+        │  {:ekv_sync, node_a, i, chunk, seq}       │
+        │                                           │
 
   Both sides send data. This is symmetric — each side sends what the
   other is missing based on HWMs.
@@ -568,45 +574,45 @@ defmodule EKV.Replica do
 
   ## Delta Sync vs Full Sync
 
-      ┌─────────────────────────────────────────────────────────────┐
-      │ Delta Sync                                                  │
+      ┌────────────────────────────────────────────────────────────────┐
+      │ Delta Sync                                                     │
       │ Condition: remote_hwm is within [local_min_seq, local_max_seq] │
-      │                                                             │
-      │ Query: SELECT * FROM kv_oplog WHERE seq > peer_hwm          │
-      │        ORDER BY seq LIMIT chunk_size                        │
-      │                                                             │
-      │ Sends only mutations since the last sync. Efficient for     │
-      │ brief disconnects where the oplog hasn't been truncated.    │
-      └─────────────────────────────────────────────────────────────┘
+      │                                                                │
+      │ Query: SELECT * FROM kv_oplog WHERE seq > member_hwm           │
+      │        ORDER BY seq LIMIT chunk_size                           │
+      │                                                                │
+      │ Sends only mutations since the last sync. Efficient for        │
+      │ brief disconnects where the oplog hasn't been truncated.       │
+      └────────────────────────────────────────────────────────────────┘
 
-      ┌─────────────────────────────────────────────────────────────┐
-      │ Full Sync                                                   │
-      │ Condition: no HWM for this peer, OR oplog truncated past    │
-      │            the peer's HWM (min_seq > peer_hwm), OR          │
-      │            peer_hwm > local_max_seq                         │
-      │                                                             │
-      │ Query: SELECT * FROM kv WHERE (deleted_at IS NULL           │
-      │          OR deleted_at > cutoff) AND key > cursor            │
-      │        ORDER BY key LIMIT chunk_size                        │
-      │                                                             │
-      │ Sends all live entries + recent tombstones (so the peer     │
-      │ learns about deletes that happened while it was away).      │
-      │ Used for first contact and after long partitions.           │
-      └─────────────────────────────────────────────────────────────┘
+      ┌────────────────────────────────────────────────────────────────┐
+      │ Full Sync                                                      │
+      │ Condition: no HWM for this member, OR oplog truncated past     │
+      │            the member's HWM (min_seq > member_hwm), OR         │
+      │            member_hwm > local_max_seq                          │
+      │                                                                │
+      │ Query: SELECT * FROM kv WHERE (deleted_at IS NULL              │
+      │          OR deleted_at > cutoff) AND key > cursor              │
+      │        ORDER BY key LIMIT chunk_size                           │
+      │                                                                │
+      │ Sends all live entries + recent tombstones (so the member      │
+      │ learns about deletes that happened while it was away).         │
+      │ Used for first contact and after long partitions.              │
+      └────────────────────────────────────────────────────────────────┘
 
   After receiving sync data, the receiver applies each entry through
   merge_remote_entry (LWW check), then records the sender's advertised
-  max_seq as the new inbound HWM for that peer.
+  max_seq as the new inbound HWM for that member.
 
 
   ## Chunked Sync
 
   Both full and delta sync use cursor-based pagination to avoid loading
-  the entire dataset into memory. Default chunk size: 500 entries
-  (configurable via :sync_chunk_size).
+  the entire dataset into memory. Default chunk size is 500 entries
+  (configurable via `:sync_chunk_size`).
 
   The sender sends one chunk, then yields to other messages via
-  send(self(), {:continue_full_sync, ...}) before sending the next.
+  `send(self(), {:continue_full_sync, ...})` before sending the next.
   This prevents the shard GenServer from blocking — CAS messages,
   regular writes, and other sync operations can interleave between
   chunks.
@@ -615,23 +621,23 @@ defmodule EKV.Replica do
         │
         │ send_full_chunk(cursor=nil)
         │   query chunk 1 (500 entries)
-        │   send {:ekv_sync, entries, seq=0}  ──> peer
+        │   send {:ekv_sync, entries, seq=0}  ──> member
         │   send(self(), {:continue_full_sync, cursor="last_key"})
         │   return {:noreply, state}
         │
         │ ... process other messages ...
         │
         │ handle_info(:continue_full_sync)
-        │   check peer still in remote_shards (abort if gone)
+        │   check member still in remote_shards (abort if gone)
         │   query chunk 2 (500 entries)
-        │   send {:ekv_sync, entries, seq=0}  ──> peer
+        │   send {:ekv_sync, entries, seq=0}  ──> member
         │   send(self(), {:continue_full_sync, cursor="last_key"})
         │
         │ ... process other messages ...
         │
         │ handle_info(:continue_full_sync)
         │   query chunk 3 (< 500 entries = final)
-        │   send {:ekv_sync, entries, seq=my_seq}  ──> peer
+        │   send {:ekv_sync, entries, seq=my_seq}  ──> member
         │
 
   HWM safety: intermediate chunks send seq=0 in the sync message.
@@ -640,7 +646,7 @@ defmodule EKV.Replica do
   harmless and prevents regression on out-of-order arrival.
 
   Continuation handlers check remote_shards before each chunk. If the
-  peer disconnected mid-sync, the continuation silently stops.
+  member disconnected mid-sync, the continuation silently stops.
 
   Safety under concurrent activity:
     - Write between chunks: LWW is idempotent. Duplicates resolved.
@@ -651,11 +657,11 @@ defmodule EKV.Replica do
 
   ## High-Water Marks (HWM)
 
-  Each shard's SQLite db has a kv_peer_hwm table:
+  Each shard's SQLite db has a kv_member_hwm table:
 
-      peer_node TEXT PRIMARY KEY  →  last_seq INTEGER
+      member_node TEXT PRIMARY KEY  →  last_seq INTEGER
 
-  This records: "the last oplog seq from peer X that I have applied."
+  This records: "the last oplog seq from member X that I have applied."
   During handshake, each side advertises this inbound HWM so the sender
   can delta-sync from the receiver's cursor in sender sequence space.
 
@@ -677,9 +683,9 @@ defmodule EKV.Replica do
           Store.open  →  SQLite db still on disk
           open read connections
           restore ballot_counter from kv_meta
-          monitor_nodes + send ekv_peer_connect
+          monitor_nodes + send ekv_member_connect
         │
-        Peer responds with ekv_peer_connect_ack
+        Member responds with ekv_member_connect_ack
           delta sync catches up missed mutations
         │
         Fully operational
@@ -698,14 +704,14 @@ defmodule EKV.Replica do
         Replica.init:
           Store.open  →  creates fresh empty SQLite db
           open read connections
-          monitor_nodes + send ekv_peer_connect
+          monitor_nodes + send ekv_member_connect
         │
-        Peers have no HWM for this new node
+        Members have no HWM for this new node
           → full sync: send all live entries + recent tombstones
             (chunked, ~500 entries per message)
         │
         New node applies all entries via merge_remote_entry
-        Records HWMs for all peers
+        Records HWMs for all members
         │
         Fully caught up
 
@@ -716,7 +722,7 @@ defmodule EKV.Replica do
 
       During partition:
         - A and B replicate to each other normally
-        - C writes to local SQLite only (no peers in remote_shards)
+        - C writes to local SQLite only (no members in remote_shards)
         - No data is lost on either side
         - nodedown fires, C removed from A/B's remote_shards
         - CAS operations on C fail with {:error, :no_quorum}
@@ -725,10 +731,10 @@ defmodule EKV.Replica do
 
       Heal:
         - nodeup fires on both sides
-        - ekv_peer_connect / ekv_peer_connect_ack exchanged
+        - ekv_member_connect / ekv_member_connect_ack exchanged
         - Reconnect gate checks persisted down marker age:
             * age <= tombstone_ttl: proceed to sync
-            * age > tombstone_ttl: quarantine peer pair (no sync)
+            * age > tombstone_ttl: quarantine member pair (no sync)
         - If sync proceeds:
             * send_sync_data: if HWMs still valid → delta sync (chunked)
                              if oplog truncated  → full sync (chunked)
@@ -786,7 +792,7 @@ defmodule EKV.Replica do
   GC converts expired entries into tombstones:
     1. Find entries where expires_at < now AND deleted_at IS NULL
     2. Set deleted_at = now, append to oplog (via write_entry NIF)
-    3. Broadcast {:ekv_delete, ...} so peers tombstone it too
+    3. Broadcast {:ekv_delete, ...} so members tombstone it too
 
 
   ## Garbage Collection (EKV.GC)
@@ -811,15 +817,15 @@ defmodule EKV.Replica do
         (cleans up paxos state for tombstone-purged keys, only if
          no in-flight accept is pending)
 
-      Phase 3: Prune stale peer HWMs
-        Remove kv_peer_hwm rows for peers not currently connected.
-        Prevents dead/decommissioned peers from anchoring the oplog
-        forever. Disconnected peers get full sync on reconnect.
+      Phase 3: Prune stale member HWMs
+        Remove kv_member_hwm rows for members not currently connected.
+        Prevents dead/decommissioned members from anchoring the oplog
+        forever. Disconnected members get full sync on reconnect.
 
       Phase 4: Truncate oplog
-        DELETE FROM kv_oplog WHERE seq < MIN(all peer HWMs)
+        DELETE FROM kv_oplog WHERE seq < MIN(all member HWMs)
         (keeps oplog bounded; entries below the slowest connected
-         peer's HWM are no longer needed for delta sync)
+         member's HWM are no longer needed for delta sync)
 
       Phase 5: Bump liveness
         touch_last_active updates kv_meta.last_active_at.
@@ -827,7 +833,7 @@ defmodule EKV.Replica do
 
       Phase 6: Prune fallback name-based down markers
         Delete old / over-cap kv_meta keys:
-          peer_down_at:name:*
+          member_down_at:name:*
         (bounds marker growth under node-name churn; primary id-based
          markers remain until successful reconnect or operator action)
 
@@ -836,10 +842,10 @@ defmodule EKV.Replica do
 
   On Store.open, if an existing db file's last_active_at is older than
   tombstone_ttl - gc_interval, startup is refused by default. This prevents
-  zombie resurrection: peers will have GC'd tombstones for entries deleted
+  zombie resurrection: other members will have GC'd tombstones for entries deleted
   while the node was away, so a stale db would never learn about them.
   Operators must then either wipe that node's data dir so it rebuilds from
-  peers, or explicitly allow stale startup when intentionally trusting the
+  members, or explicitly allow stale startup when intentionally trusting the
   old on-disk cluster state.
 
 
@@ -859,15 +865,15 @@ defmodule EKV.Replica do
         readers:        [{db, stmt}],   # per-scheduler read connections
         tombstone_ttl:  integer,        # ms
         partition_ttl_policy: :quarantine | :ignore,
-        remote_shards:  %{node => pid}, # confirmed live peer shards
-        peer_down_at:   %{marker_key => down_since_ms}, # cached kv_meta markers
-        quarantined_peers: MapSet.t(node()),            # blocked peers
+        remote_shards:  %{node => pid}, # confirmed live member shards
+        member_down_at:   %{marker_key => down_since_ms}, # cached kv_meta markers
+        quarantined_members: MapSet.t(node()),         # blocked members
         # CAS fields (nil if CAS not configured):
         node_id:        string | nil,   # this node's CAS identity
         cluster_size:   integer | nil,  # total CAS participants
         lww_ts_counter: integer,        # monotonic local LWW timestamp floor
         ballot_counter: integer,        # monotonic, persisted in kv_meta
-        peer_node_ids:  %{node => string},  # Erlang node → CAS node_id
+        member_node_ids:  %{node => string},  # Erlang node → CAS node_id
         pending_cas:    %{ref => op},   # in-flight CAS operations
         quorum_waiters: %{ref => waiter} # pending await_quorum callers
       }
@@ -879,9 +885,9 @@ defmodule EKV.Replica do
     {:ekv_put, key, value_binary, timestamp, origin_node, expires_at}
     {:ekv_delete, key, timestamp, origin_node}
 
-  Peer handshake (on nodeup / init):
-    {:ekv_peer_connect, pid, shard_index, num_shards, my_hwm_for_remote, node_id}
-    {:ekv_peer_connect_ack, pid, shard_index, num_shards, my_hwm_for_remote, node_id}
+  Member handshake (on nodeup / init):
+    {:ekv_member_connect, pid, shard_index, num_shards, my_hwm_for_remote, node_id}
+    {:ekv_member_connect_ack, pid, shard_index, num_shards, my_hwm_for_remote, node_id}
 
   Chunked sync (after handshake, multiple messages per sync):
     {:ekv_sync, from_node, shard_index, entries, sender_seq}
@@ -893,7 +899,7 @@ defmodule EKV.Replica do
     {:continue_full_sync, node, last_key, cutoff, my_seq, chunk_size}
     {:continue_delta_sync, node, last_seq, my_seq, chunk_size}
 
-  CAS proposer → peers:
+  CAS proposer → members:
     {:ekv_prepare, ref, proposer_pid, key, ballot_c, ballot_n, shard}
     {:ekv_accept, ref, proposer_pid, key, ballot_c, ballot_n, entry_tuple, shard}
     {:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple, shard}
@@ -915,11 +921,11 @@ defmodule EKV.Replica do
   Subscriber dispatch (shard → SubDispatcher):
     {:dispatch, [%EKV.Event{}]}
 
-  All peer messages are sent to the counterpart shard by registered name:
+  All member messages are sent to the counterpart shard by registered name:
     send({:"#{name}_ekv_replica_#{shard}", target_node}, message)
 
   There is no gossip or re-broadcast. Replication is direct: the node
-  that performs a write sends to all known peers exactly once.
+  that performs a write sends to all known members exactly once.
   """
 
   use GenServer
@@ -928,10 +934,10 @@ defmodule EKV.Replica do
 
   alias EKV.Store
 
-  @peer_down_id_prefix "peer_down_at:id:"
-  @peer_down_name_prefix "peer_down_at:name:"
-  @peer_down_name_min_retention_ms :timer.hours(24 * 30)
-  @peer_down_name_max_entries 4096
+  @member_down_id_prefix "member_down_at:id:"
+  @member_down_name_prefix "member_down_at:name:"
+  @member_down_name_min_retention_ms :timer.hours(24 * 30)
+  @member_down_name_max_entries 4096
 
   defstruct [
     :name,
@@ -945,14 +951,14 @@ defmodule EKV.Replica do
     readers: [],
     remote_shards: %{},
     # Marker key -> down_since_ms (wall clock cache for kv_meta)
-    peer_down_at: %{},
-    quarantined_peers: MapSet.new(),
+    member_down_at: %{},
+    quarantined_members: MapSet.new(),
     # CAS fields
     node_id: nil,
     cluster_size: nil,
     lww_ts_counter: 0,
     ballot_counter: 0,
-    peer_node_ids: %{},
+    member_node_ids: %{},
     pending_cas: %{},
     quorum_waiters: %{},
     handoff_node: nil
@@ -1051,7 +1057,7 @@ defmodule EKV.Replica do
 
     log_once(state, fn -> "#{log_prefix(state)} started (shards=#{num_shards})" end)
 
-    # Discover peers on all known nodes
+    # Discover members on all known nodes
     registered_name = shard_name(name, shard_index)
 
     for remote_node <- Node.list() do
@@ -1059,7 +1065,7 @@ defmodule EKV.Replica do
 
       send(
         {registered_name, remote_node},
-        {:ekv_peer_connect, self(), shard_index, num_shards, remote_hwm, config.node_id}
+        {:ekv_member_connect, self(), shard_index, num_shards, remote_hwm, config.node_id}
       )
     end
 
@@ -1078,7 +1084,7 @@ defmodule EKV.Replica do
 
       Logger.error(
         "[EKV #{name}] shard #{shard_index} refusing stale database startup at #{info.path}: " <>
-          "#{detail}. Wipe the data dir to rebuild from peers, or set " <>
+          "#{detail}. Wipe the data dir to rebuild from members, or set " <>
           "`allow_stale_startup: true` to trust the on-disk data."
       )
     end
@@ -1156,7 +1162,7 @@ defmodule EKV.Replica do
         )
 
       if applied do
-        broadcast_to_peers(state, {:ekv_put, key, value_binary, now, origin_node, expires_at})
+        broadcast_to_members(state, {:ekv_put, key, value_binary, now, origin_node, expires_at})
 
         dispatch_events(state, [
           %EKV.Event{type: :put, key: key, value: :erlang.binary_to_term(value_binary)}
@@ -1191,7 +1197,7 @@ defmodule EKV.Replica do
         )
 
       if applied do
-        broadcast_to_peers(state, {:ekv_delete, key, now, origin_node})
+        broadcast_to_members(state, {:ekv_delete, key, now, origin_node})
         dispatch_events(state, [%EKV.Event{type: :delete, key: key, value: prev_value}])
       end
 
@@ -1291,7 +1297,7 @@ defmodule EKV.Replica do
   end
 
   # In handoff mode: drop all messages (replication, GC, nodeup/down, CAS).
-  # Readers stay alive for old VM reads. Replica peers rediscover the incoming
+  # Readers stay alive for old VM reads. Replica members rediscover the incoming
   # node via nodeup; new clients bind to the incoming member via MemberPresence.
   def handle_info(_msg, %{handoff_node: handoff_node} = state)
       when handoff_node != nil do
@@ -1329,16 +1335,16 @@ defmodule EKV.Replica do
   end
 
   # =====================================================================
-  # Peer sync protocol
+  # Member sync protocol
   # =====================================================================
 
   def handle_info(
-        {:ekv_peer_connect, remote_pid, remote_shard, remote_num_shards, remote_hwm,
+        {:ekv_member_connect, remote_pid, remote_shard, remote_num_shards, remote_hwm,
          remote_node_id},
         state
       ) do
     {:noreply,
-     do_peer_connect(
+     do_member_connect(
        state,
        remote_pid,
        remote_shard,
@@ -1349,12 +1355,12 @@ defmodule EKV.Replica do
   end
 
   def handle_info(
-        {:ekv_peer_connect_ack, remote_pid, remote_shard, remote_num_shards, remote_hwm,
+        {:ekv_member_connect_ack, remote_pid, remote_shard, remote_num_shards, remote_hwm,
          remote_node_id},
         state
       ) do
     {:noreply,
-     do_peer_connect_ack(
+     do_member_connect_ack(
        state,
        remote_pid,
        remote_shard,
@@ -1427,7 +1433,7 @@ defmodule EKV.Replica do
   # =====================================================================
 
   def handle_info({:nodeup, remote_node}, state) do
-    case maybe_allow_peer_reconnect(state, remote_node) do
+    case maybe_allow_member_reconnect(state, remote_node) do
       {:quarantine, state} ->
         {:noreply, state}
 
@@ -1437,7 +1443,7 @@ defmodule EKV.Replica do
 
         send(
           {shard_name(name, shard), remote_node},
-          {:ekv_peer_connect, self(), shard, state.num_shards, remote_hwm, state.node_id}
+          {:ekv_member_connect, self(), shard, state.num_shards, remote_hwm, state.node_id}
         )
 
         {:noreply, state}
@@ -1447,15 +1453,15 @@ defmodule EKV.Replica do
   def handle_info({:nodedown, dead_node}, state) do
     log_once(state, fn -> "#{log_prefix(state)} nodedown #{dead_node} (data preserved)" end)
 
-    dead_node_id = Map.get(state.peer_node_ids, dead_node)
+    dead_node_id = Map.get(state.member_node_ids, dead_node)
 
     state = %{
       state
       | remote_shards: Map.delete(state.remote_shards, dead_node),
-        peer_node_ids: Map.delete(state.peer_node_ids, dead_node)
+        member_node_ids: Map.delete(state.member_node_ids, dead_node)
     }
 
-    state = mark_peer_down(state, dead_node, dead_node_id)
+    state = mark_member_down(state, dead_node, dead_node_id)
 
     # Check if any pending CAS ops lost quorum
     state = fail_pending_cas_if_no_quorum(state)
@@ -1476,15 +1482,15 @@ defmodule EKV.Replica do
         "#{log_prefix_shard(state)} remote_shard_down #{remote_node} (data preserved)"
       end)
 
-      remote_node_id = Map.get(state.peer_node_ids, remote_node)
+      remote_node_id = Map.get(state.member_node_ids, remote_node)
 
       state = %{
         state
         | remote_shards: Map.delete(state.remote_shards, remote_node),
-          peer_node_ids: Map.delete(state.peer_node_ids, remote_node)
+          member_node_ids: Map.delete(state.member_node_ids, remote_node)
       }
 
-      state = mark_peer_down(state, remote_node, remote_node_id)
+      state = mark_member_down(state, remote_node, remote_node_id)
       state = fail_pending_cas_if_no_quorum(state)
       state = maybe_reply_to_quorum_waiters(state)
       {:noreply, state}
@@ -1718,7 +1724,7 @@ defmodule EKV.Replica do
           )
 
         if applied do
-          broadcast_to_peers(state, {:ekv_delete, key, now, origin})
+          broadcast_to_members(state, {:ekv_delete, key, now, origin})
           prev_value = if value_binary, do: :erlang.binary_to_term(value_binary)
           [%EKV.Event{type: :delete, key: key, value: prev_value} | acc]
         else
@@ -1744,7 +1750,7 @@ defmodule EKV.Replica do
     Store.touch_last_active(db)
 
     # 6. Bounded cleanup for fallback name-based down markers.
-    prune_stale_peer_down_name_markers(state)
+    prune_stale_member_down_name_markers(state)
 
     {:noreply, state}
   end
@@ -1811,7 +1817,7 @@ defmodule EKV.Replica do
   # Internal helpers
   # =====================================================================
 
-  defp do_peer_connect(
+  defp do_member_connect(
          state,
          remote_pid,
          remote_shard,
@@ -1822,7 +1828,7 @@ defmodule EKV.Replica do
        when remote_shard == state.shard_index do
     if remote_num_shards != state.num_shards do
       Logger.error(
-        "#{log_prefix(state)} rejecting peer_connect from #{node(remote_pid)}: " <>
+        "#{log_prefix(state)} rejecting member_connect from #{node(remote_pid)}: " <>
           "shard count mismatch (local=#{state.num_shards}, remote=#{remote_num_shards})"
       )
 
@@ -1831,7 +1837,7 @@ defmodule EKV.Replica do
       %{db: db} = state
       remote_node = node(remote_pid)
 
-      case maybe_allow_peer_reconnect(state, remote_node, remote_node_id) do
+      case maybe_allow_member_reconnect(state, remote_node, remote_node_id) do
         {:quarantine, state} ->
           state
 
@@ -1839,7 +1845,7 @@ defmodule EKV.Replica do
           my_hwm_for_remote = Store.get_hwm(db, remote_node) || 0
 
           state = track_remote_shard(state, remote_node, remote_pid)
-          state = track_peer_node_id(state, remote_node, remote_node_id)
+          state = track_member_node_id(state, remote_node, remote_node_id)
 
           if state.cluster_size do
             alive = alive_node_id_count(state)
@@ -1847,20 +1853,20 @@ defmodule EKV.Replica do
             if alive > state.cluster_size do
               Logger.error(
                 "#{log_prefix(state)} cluster overflow: #{alive} distinct node_ids, " <>
-                  "cluster_size=#{state.cluster_size}. New peer #{remote_node} " <>
+                  "cluster_size=#{state.cluster_size}. New member #{remote_node} " <>
                   "has node_id=#{inspect(remote_node_id)}"
               )
             end
           end
 
-          send_to_peer(
+          send_to_member(
             state,
             remote_node,
-            {:ekv_peer_connect_ack, self(), state.shard_index, state.num_shards,
+            {:ekv_member_connect_ack, self(), state.shard_index, state.num_shards,
              my_hwm_for_remote, state.node_id}
           )
 
-          log_once(state, fn -> "#{log_prefix(state)} ekv_peer_connect from #{remote_node}" end)
+          log_once(state, fn -> "#{log_prefix(state)} ekv_member_connect from #{remote_node}" end)
           send_sync_data(state, remote_node, remote_hwm)
 
           maybe_reply_to_quorum_waiters(state)
@@ -1868,7 +1874,7 @@ defmodule EKV.Replica do
     end
   end
 
-  defp do_peer_connect(
+  defp do_member_connect(
          state,
          _remote_pid,
          _remote_shard,
@@ -1879,7 +1885,7 @@ defmodule EKV.Replica do
     state
   end
 
-  defp do_peer_connect_ack(
+  defp do_member_connect_ack(
          state,
          remote_pid,
          remote_shard,
@@ -1890,7 +1896,7 @@ defmodule EKV.Replica do
        when remote_shard == state.shard_index do
     if remote_num_shards != state.num_shards do
       Logger.error(
-        "#{log_prefix(state)} rejecting peer_connect_ack from #{node(remote_pid)}: " <>
+        "#{log_prefix(state)} rejecting member_connect_ack from #{node(remote_pid)}: " <>
           "shard count mismatch (local=#{state.num_shards}, remote=#{remote_num_shards})"
       )
 
@@ -1898,13 +1904,13 @@ defmodule EKV.Replica do
     else
       remote_node = node(remote_pid)
 
-      case maybe_allow_peer_reconnect(state, remote_node, remote_node_id) do
+      case maybe_allow_member_reconnect(state, remote_node, remote_node_id) do
         {:quarantine, state} ->
           state
 
         {:ok, state} ->
           state = track_remote_shard(state, remote_node, remote_pid)
-          state = track_peer_node_id(state, remote_node, remote_node_id)
+          state = track_member_node_id(state, remote_node, remote_node_id)
 
           if state.cluster_size do
             alive = alive_node_id_count(state)
@@ -1912,14 +1918,14 @@ defmodule EKV.Replica do
             if alive > state.cluster_size do
               Logger.error(
                 "#{log_prefix(state)} cluster overflow: #{alive} distinct node_ids, " <>
-                  "cluster_size=#{state.cluster_size}. New peer #{remote_node} " <>
+                  "cluster_size=#{state.cluster_size}. New member #{remote_node} " <>
                   "has node_id=#{inspect(remote_node_id)}"
               )
             end
           end
 
           log_once(state, fn ->
-            "#{log_prefix(state)} ekv_peer_connect_ack from #{remote_node}"
+            "#{log_prefix(state)} ekv_member_connect_ack from #{remote_node}"
           end)
 
           send_sync_data(state, remote_node, remote_hwm)
@@ -1929,7 +1935,7 @@ defmodule EKV.Replica do
     end
   end
 
-  defp do_peer_connect_ack(
+  defp do_member_connect_ack(
          state,
          _remote_pid,
          _remote_shard,
@@ -2012,7 +2018,7 @@ defmodule EKV.Replica do
         final? = not has_more?
         seq_to_send = if final?, do: my_seq, else: 0
 
-        send_to_peer(
+        send_to_member(
           state,
           remote_node,
           {:ekv_sync, node(), state.shard_index, entries, seq_to_send}
@@ -2052,7 +2058,7 @@ defmodule EKV.Replica do
         final? = not has_more?
         seq_to_send = if final?, do: my_seq, else: 0
 
-        send_to_peer(
+        send_to_member(
           state,
           remote_node,
           {:ekv_sync, node(), state.shard_index, entries, seq_to_send}
@@ -2071,7 +2077,7 @@ defmodule EKV.Replica do
     end
   end
 
-  defp send_to_peer(state, target_node, message) do
+  defp send_to_member(state, target_node, message) do
     shard_name = shard_name(state.name, state.shard_index)
     send({shard_name, target_node}, message)
   end
@@ -2095,7 +2101,7 @@ defmodule EKV.Replica do
     end
   end
 
-  defp broadcast_to_peers(state, message) do
+  defp broadcast_to_members(state, message) do
     shard_name = shard_name(state.name, state.shard_index)
 
     for target_node <- Map.keys(state.remote_shards) do
@@ -2103,7 +2109,7 @@ defmodule EKV.Replica do
     end
   end
 
-  # Broadcast committed CAS entry to all peers.
+  # Broadcast committed CAS entry to all members.
   defp broadcast_cas_commit(state, key, ballot_c, ballot_n, entry_tuple) do
     shard_name = shard_name(state.name, state.shard_index)
 
@@ -2129,7 +2135,7 @@ defmodule EKV.Replica do
     cond do
       alive_count > cluster_size ->
         all_ids =
-          [state.node_id | Map.values(state.peer_node_ids) |> Enum.reject(&is_nil/1)]
+          [state.node_id | Map.values(state.member_node_ids) |> Enum.reject(&is_nil/1)]
           |> Enum.uniq()
 
         Logger.error(
@@ -2166,9 +2172,9 @@ defmodule EKV.Replica do
               {[], 1}
           end
 
-        # Send prepare to all peers
+        # Send prepare to all members
         for {remote_node, _pid} <- state.remote_shards do
-          send_to_peer(
+          send_to_member(
             state,
             remote_node,
             {:ekv_prepare, ref, self(), key, ballot_c, ballot_n, state.shard_index}
@@ -2272,9 +2278,9 @@ defmodule EKV.Replica do
             handle_cas_failure(ref, op, state)
 
           {:ok, true} ->
-            # Send accept to all peers.
+            # Send accept to all members.
             for {remote_node, _pid} <- state.remote_shards do
-              send_to_peer(
+              send_to_member(
                 state,
                 remote_node,
                 {:ekv_accept, ref, self(), op.key, ballot_c, ballot_n, new_entry_tuple,
@@ -2297,7 +2303,7 @@ defmodule EKV.Replica do
                 events: events
             }
 
-            # For cluster_size: 1 (no peers), or if local accept already meets quorum.
+            # For cluster_size: 1 (no members), or if local accept already meets quorum.
             if MapSet.size(op.accepts) >= op.quorum do
               commit_cas(ref, op, state)
             else
@@ -2693,14 +2699,14 @@ defmodule EKV.Replica do
 
   def alive_node_id_count(%__MODULE__{} = state) do
     if state.cluster_size do
-      # Our own node_id + distinct peer node_ids
-      peer_ids =
-        state.peer_node_ids
+      # Our own node_id + distinct member node_ids
+      member_ids =
+        state.member_node_ids
         |> Map.values()
         |> Enum.reject(&is_nil/1)
         |> MapSet.new()
 
-      MapSet.size(MapSet.put(peer_ids, state.node_id))
+      MapSet.size(MapSet.put(member_ids, state.node_id))
     else
       1
     end
@@ -2773,61 +2779,65 @@ defmodule EKV.Replica do
     end
   end
 
-  defp track_peer_node_id(state, _remote_node, nil), do: state
+  defp track_member_node_id(state, _remote_node, nil), do: state
 
-  defp track_peer_node_id(state, remote_node, remote_node_id) do
-    %{state | peer_node_ids: Map.put(state.peer_node_ids, remote_node, remote_node_id)}
+  defp track_member_node_id(state, remote_node, remote_node_id) do
+    %{state | member_node_ids: Map.put(state.member_node_ids, remote_node, remote_node_id)}
   end
 
-  defp mark_peer_down(state, remote_node, nil) do
-    remember_peer_down_marker(state, peer_down_name_key(remote_node))
+  defp mark_member_down(state, remote_node, nil) do
+    remember_member_down_marker(state, member_down_name_key(remote_node))
   end
 
-  defp mark_peer_down(state, remote_node, remote_node_id) do
+  defp mark_member_down(state, remote_node, remote_node_id) do
     if node_id_connected?(state, remote_node_id) do
       # Blue/green overlap: same cluster member identity is still connected.
-      clear_peer_down_marker(state, peer_down_name_key(remote_node))
+      clear_member_down_marker(state, member_down_name_key(remote_node))
     else
       state
-      |> clear_peer_down_marker(peer_down_name_key(remote_node))
-      |> remember_peer_down_marker(peer_down_id_key(remote_node_id))
+      |> clear_member_down_marker(member_down_name_key(remote_node))
+      |> remember_member_down_marker(member_down_id_key(remote_node_id))
     end
   end
 
-  defp maybe_allow_peer_reconnect(state, remote_node, remote_node_id \\ nil)
+  defp maybe_allow_member_reconnect(state, remote_node, remote_node_id \\ nil)
 
-  defp maybe_allow_peer_reconnect(
+  defp maybe_allow_member_reconnect(
          %{partition_ttl_policy: :ignore} = state,
          remote_node,
          remote_node_id
        ) do
-    state = clear_peer_down_markers(state, remote_node, remote_node_id)
+    state = clear_member_down_markers(state, remote_node, remote_node_id)
 
     state = %{
       state
-      | quarantined_peers: MapSet.delete(state.quarantined_peers, remote_node)
+      | quarantined_members: MapSet.delete(state.quarantined_members, remote_node)
     }
 
     {:ok, state}
   end
 
-  defp maybe_allow_peer_reconnect(state, remote_node, remote_node_id) do
-    {state, down_since_ms} = resolve_peer_down_since(state, remote_node, remote_node_id)
+  defp maybe_allow_member_reconnect(state, remote_node, remote_node_id) do
+    {state, down_since_ms} = resolve_member_down_since(state, remote_node, remote_node_id)
 
     age_ms =
       if is_integer(down_since_ms), do: max(0, System.system_time(:millisecond) - down_since_ms)
 
     cond do
       is_nil(down_since_ms) ->
-        state = %{state | quarantined_peers: MapSet.delete(state.quarantined_peers, remote_node)}
+        state = %{
+          state
+          | quarantined_members: MapSet.delete(state.quarantined_members, remote_node)
+        }
+
         {:ok, state}
 
       is_integer(down_since_ms) and age_ms > state.tombstone_ttl ->
         state = %{
           state
-          | quarantined_peers: MapSet.put(state.quarantined_peers, remote_node),
+          | quarantined_members: MapSet.put(state.quarantined_members, remote_node),
             remote_shards: Map.delete(state.remote_shards, remote_node),
-            peer_node_ids: Map.delete(state.peer_node_ids, remote_node)
+            member_node_ids: Map.delete(state.member_node_ids, remote_node)
         }
 
         log_once(state, fn ->
@@ -2839,27 +2849,27 @@ defmodule EKV.Replica do
         {:quarantine, state}
 
       true ->
-        state = clear_peer_down_markers(state, remote_node, remote_node_id)
+        state = clear_member_down_markers(state, remote_node, remote_node_id)
 
         state = %{
           state
-          | quarantined_peers: MapSet.delete(state.quarantined_peers, remote_node)
+          | quarantined_members: MapSet.delete(state.quarantined_members, remote_node)
         }
 
         {:ok, state}
     end
   end
 
-  defp resolve_peer_down_since(state, remote_node, nil) do
-    read_peer_down_marker(state, peer_down_name_key(remote_node))
+  defp resolve_member_down_since(state, remote_node, nil) do
+    read_member_down_marker(state, member_down_name_key(remote_node))
   end
 
-  defp resolve_peer_down_since(state, remote_node, remote_node_id) do
-    id_key = peer_down_id_key(remote_node_id)
-    name_key = peer_down_name_key(remote_node)
+  defp resolve_member_down_since(state, remote_node, remote_node_id) do
+    id_key = member_down_id_key(remote_node_id)
+    name_key = member_down_name_key(remote_node)
 
-    {state, id_down_since} = read_peer_down_marker(state, id_key)
-    {state, name_down_since} = read_peer_down_marker(state, name_key)
+    {state, id_down_since} = read_member_down_marker(state, id_key)
+    {state, name_down_since} = read_member_down_marker(state, name_key)
 
     if is_integer(name_down_since) do
       merged_down_since =
@@ -2870,84 +2880,86 @@ defmodule EKV.Replica do
       state =
         if id_down_since == merged_down_since,
           do: state,
-          else: put_peer_down_marker(state, id_key, merged_down_since)
+          else: put_member_down_marker(state, id_key, merged_down_since)
 
-      state = clear_peer_down_marker(state, name_key)
+      state = clear_member_down_marker(state, name_key)
       {state, merged_down_since}
     else
       {state, id_down_since}
     end
   end
 
-  defp remember_peer_down_marker(state, marker_key) do
-    {state, existing_down_since} = read_peer_down_marker(state, marker_key)
+  defp remember_member_down_marker(state, marker_key) do
+    {state, existing_down_since} = read_member_down_marker(state, marker_key)
 
     if is_integer(existing_down_since) do
       state
     else
-      put_peer_down_marker(state, marker_key, System.system_time(:millisecond))
+      put_member_down_marker(state, marker_key, System.system_time(:millisecond))
     end
   end
 
-  defp read_peer_down_marker(state, marker_key) do
-    case Map.fetch(state.peer_down_at, marker_key) do
+  defp read_member_down_marker(state, marker_key) do
+    case Map.fetch(state.member_down_at, marker_key) do
       {:ok, down_since} ->
         {state, down_since}
 
       :error ->
-        down_since = Store.peer_down_marker_get(state.db, marker_key)
+        down_since = Store.member_down_marker_get(state.db, marker_key)
 
         state =
           if is_integer(down_since),
-            do: %{state | peer_down_at: Map.put(state.peer_down_at, marker_key, down_since)},
+            do: %{state | member_down_at: Map.put(state.member_down_at, marker_key, down_since)},
             else: state
 
         {state, down_since}
     end
   end
 
-  defp put_peer_down_marker(state, marker_key, down_since) do
-    Store.peer_down_marker_put(state.db, marker_key, down_since)
-    %{state | peer_down_at: Map.put(state.peer_down_at, marker_key, down_since)}
+  defp put_member_down_marker(state, marker_key, down_since) do
+    Store.member_down_marker_put(state.db, marker_key, down_since)
+    %{state | member_down_at: Map.put(state.member_down_at, marker_key, down_since)}
   end
 
-  defp clear_peer_down_marker(state, marker_key) do
-    Store.peer_down_marker_clear(state.db, marker_key)
-    %{state | peer_down_at: Map.delete(state.peer_down_at, marker_key)}
+  defp clear_member_down_marker(state, marker_key) do
+    Store.member_down_marker_clear(state.db, marker_key)
+    %{state | member_down_at: Map.delete(state.member_down_at, marker_key)}
   end
 
-  defp clear_peer_down_markers(state, remote_node, remote_node_id) do
+  defp clear_member_down_markers(state, remote_node, remote_node_id) do
     remote_node
-    |> peer_down_marker_keys(remote_node_id)
+    |> member_down_marker_keys(remote_node_id)
     |> Enum.uniq()
     |> Enum.reduce(state, fn marker_key, acc ->
-      clear_peer_down_marker(acc, marker_key)
+      clear_member_down_marker(acc, marker_key)
     end)
   end
 
-  defp peer_down_marker_keys(remote_node, nil), do: [peer_down_name_key(remote_node)]
+  defp member_down_marker_keys(remote_node, nil), do: [member_down_name_key(remote_node)]
 
-  defp peer_down_marker_keys(remote_node, remote_node_id) do
-    [peer_down_id_key(remote_node_id), peer_down_name_key(remote_node)]
+  defp member_down_marker_keys(remote_node, remote_node_id) do
+    [member_down_id_key(remote_node_id), member_down_name_key(remote_node)]
   end
 
-  defp peer_down_id_key(remote_node_id), do: @peer_down_id_prefix <> to_string(remote_node_id)
-  defp peer_down_name_key(remote_node), do: @peer_down_name_prefix <> Atom.to_string(remote_node)
+  defp member_down_id_key(remote_node_id), do: @member_down_id_prefix <> to_string(remote_node_id)
+
+  defp member_down_name_key(remote_node),
+    do: @member_down_name_prefix <> Atom.to_string(remote_node)
 
   defp node_id_connected?(state, remote_node_id) do
-    Enum.any?(state.peer_node_ids, fn {peer_node, peer_node_id} ->
-      peer_node_id == remote_node_id and Map.has_key?(state.remote_shards, peer_node)
+    Enum.any?(state.member_node_ids, fn {member_node, member_node_id} ->
+      member_node_id == remote_node_id and Map.has_key?(state.remote_shards, member_node)
     end)
   end
 
-  defp prune_stale_peer_down_name_markers(state) do
-    retention_ms = max(@peer_down_name_min_retention_ms, state.tombstone_ttl * 4)
+  defp prune_stale_member_down_name_markers(state) do
+    retention_ms = max(@member_down_name_min_retention_ms, state.tombstone_ttl * 4)
     stale_before_ms = System.system_time(:millisecond) - retention_ms
 
-    Store.prune_peer_down_name_markers(
+    Store.prune_member_down_name_markers(
       state.db,
       stale_before_ms,
-      @peer_down_name_max_entries
+      @member_down_name_max_entries
     )
   end
 

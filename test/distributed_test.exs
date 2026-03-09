@@ -207,7 +207,7 @@ defmodule EKV.DistributedTest do
   end
 
   describe "node comes back with empty storage" do
-    test "data is re-synced from surviving peer" do
+    test "data is re-synced from surviving member" do
       # Start 2 nodes, both have data
       peers = TestCluster.start_peers(2)
       [{peer_a, node_a}, {peer_b, node_b}] = peers
@@ -1382,7 +1382,7 @@ defmodule EKV.DistributedTest do
         TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "oplog_trunc/#{i}", "val_#{i}"])
       end
 
-      # Force oplog truncation on A: advance all peer HWMs to max_seq,
+      # Force oplog truncation on A: advance all member HWMs to max_seq,
       # truncate, then delete B's HWM row so reconnect triggers full sync.
       config = TestCluster.rpc!(node_a, EKV.Supervisor, :get_config, [ekv_name])
 
@@ -1406,15 +1406,15 @@ defmodule EKV.DistributedTest do
 
       TestCluster.flush_shards(node_a, ekv_name)
 
-      # Delete B's HWM row so reconnect sees peer_hwm=nil → full sync
+      # Delete B's HWM row so reconnect sees member_hwm=nil → full sync
       for shard <- 0..(config.num_shards - 1) do
         shard_name = :"#{ekv_name}_ekv_replica_#{shard}"
         %{db: db} = TestCluster.rpc!(node_a, :sys, :get_state, [shard_name])
-        peer_str = TestCluster.rpc!(node_a, Atom, :to_string, [node_b])
+        member_str = TestCluster.rpc!(node_a, Atom, :to_string, [node_b])
 
         TestCluster.rpc!(node_a, EKV.Sqlite3, :execute, [
           db,
-          "DELETE FROM kv_peer_hwm WHERE peer_node = '#{peer_str}'"
+          "DELETE FROM kv_member_hwm WHERE member_node = '#{member_str}'"
         ])
       end
 
@@ -1723,9 +1723,9 @@ defmodule EKV.DistributedTest do
     end
   end
 
-  describe "duplicate peer_connect handling" do
+  describe "duplicate member_connect handling" do
     @tag timeout: 60_000
-    test "duplicate peer_connect does not crash or cause duplicates" do
+    test "duplicate member_connect does not crash or cause duplicates" do
       peers = TestCluster.start_peers(2)
       on_exit(fn -> TestCluster.stop_peers(peers) end)
 
@@ -1744,7 +1744,7 @@ defmodule EKV.DistributedTest do
         TestCluster.rpc!(node_b, EKV, :get, [ekv_name, "dup_connect/5"]) == "val_5"
       end)
 
-      # Manually send a second peer_connect from A to B
+      # Manually send a second member_connect from A to B
       config = TestCluster.rpc!(node_a, EKV.Supervisor, :get_config, [ekv_name])
 
       for shard <- 0..(config.num_shards - 1) do
@@ -1755,7 +1755,7 @@ defmodule EKV.DistributedTest do
 
         TestCluster.rpc!(node_b, :erlang, :send, [
           shard_name,
-          {:ekv_peer_connect, a_pid, shard, config.num_shards, my_seq}
+          {:ekv_member_connect, a_pid, shard, config.num_shards, my_seq}
         ])
       end
 

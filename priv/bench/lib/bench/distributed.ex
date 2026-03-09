@@ -34,7 +34,7 @@ defmodule Bench.Distributed do
   # ---------------------------------------------------------------------------
 
   defp replication_latency(shards) do
-    header("1. Replication Latency (put → visible on peer)")
+    header("1. Replication Latency (put -> visible on member)")
 
     with_remote_ekv(shards, fn ->
       n = 1_000
@@ -44,9 +44,18 @@ defmodule Bench.Distributed do
         key = "warm/#{:rand.uniform(10_000)}"
         ref = make_ref()
         send(watcher, {:watch, key, ref})
-        receive do {:watching, ^ref} -> :ok end
+
+        receive do
+          {:watching, ^ref} -> :ok
+        end
+
         :erpc.call(@replica1, Bench.Replica, :single_put, [@name, key, :warmup])
-        receive do {:found, ^ref} -> :ok after 10_000 -> raise "warmup timeout" end
+
+        receive do
+          {:found, ^ref} -> :ok
+        after
+          10_000 -> raise "warmup timeout"
+        end
       end)
 
       samples =
@@ -54,12 +63,20 @@ defmodule Bench.Distributed do
           key = "rep/#{i}"
           ref = make_ref()
           send(watcher, {:watch, key, ref})
-          receive do {:watching, ^ref} -> :ok end
+
+          receive do
+            {:watching, ^ref} -> :ok
+          end
 
           {us, _} =
             time_us(fn ->
               :erpc.call(@replica1, Bench.Replica, :single_put, [@name, key, %{i: i}])
-              receive do {:found, ^ref} -> :ok after 10_000 -> raise "replication timeout" end
+
+              receive do
+                {:found, ^ref} -> :ok
+              after
+                10_000 -> raise "replication timeout"
+              end
             end)
 
           us
@@ -72,11 +89,11 @@ defmodule Bench.Distributed do
   end
 
   # ---------------------------------------------------------------------------
-  # 2. Bulk sync: new peer catches up with existing data
+  # 2. Bulk sync: new member catches up with existing data
   # ---------------------------------------------------------------------------
 
   defp bulk_sync(shards) do
-    header("2. Bulk Sync (new peer catches up)")
+    header("2. Bulk Sync (new member catches up)")
 
     for n <- [1_000, 10_000] do
       subheader("#{format_number(n)} keys")
@@ -127,25 +144,41 @@ defmodule Bench.Distributed do
 
       {wall_us, _} =
         time_us(fn ->
-          t1 = Task.async(fn -> :erpc.call(@replica1, Bench.Replica, :bulk_put, [@name, n, "r1/"]) end)
-          t2 = Task.async(fn -> :erpc.call(@replica2, Bench.Replica, :bulk_put, [@name, n, "r2/"]) end)
+          t1 =
+            Task.async(fn ->
+              :erpc.call(@replica1, Bench.Replica, :bulk_put, [@name, n, "r1/"])
+            end)
+
+          t2 =
+            Task.async(fn ->
+              :erpc.call(@replica2, Bench.Replica, :bulk_put, [@name, n, "r2/"])
+            end)
+
           Task.await(t1, 30_000)
           Task.await(t2, 30_000)
 
           # Wait for convergence
           poll_until(
             fn ->
-              c1 = :erpc.call(@replica1, Bench.Replica, :count_keys, [@name, "r1/"]) +
-                   :erpc.call(@replica1, Bench.Replica, :count_keys, [@name, "r2/"])
-              c2 = :erpc.call(@replica2, Bench.Replica, :count_keys, [@name, "r1/"]) +
-                   :erpc.call(@replica2, Bench.Replica, :count_keys, [@name, "r2/"])
+              c1 =
+                :erpc.call(@replica1, Bench.Replica, :count_keys, [@name, "r1/"]) +
+                  :erpc.call(@replica1, Bench.Replica, :count_keys, [@name, "r2/"])
+
+              c2 =
+                :erpc.call(@replica2, Bench.Replica, :count_keys, [@name, "r1/"]) +
+                  :erpc.call(@replica2, Bench.Replica, :count_keys, [@name, "r2/"])
+
               c1 == total and c2 == total
             end,
             30_000
           )
         end)
 
-      report_throughput("#{format_number(total)} keys (#{format_number(n)} per node), both converged", total, wall_us)
+      report_throughput(
+        "#{format_number(total)} keys (#{format_number(n)} per node), both converged",
+        total,
+        wall_us
+      )
     end)
   end
 
@@ -163,7 +196,9 @@ defmodule Bench.Distributed do
         :erpc.call(@replica1, Bench.Replica, :bulk_put, [@name, n, "delsync#{n}/"])
 
         poll_until(
-          fn -> :erpc.call(@replica2, Bench.Replica, :count_keys, [@name, "delsync#{n}/"]) == n end,
+          fn ->
+            :erpc.call(@replica2, Bench.Replica, :count_keys, [@name, "delsync#{n}/"]) == n
+          end,
           15_000
         )
 
@@ -172,7 +207,9 @@ defmodule Bench.Distributed do
             :erpc.call(@replica1, Bench.Replica, :bulk_delete, [@name, n, "delsync#{n}/"])
 
             poll_until(
-              fn -> :erpc.call(@replica2, Bench.Replica, :count_keys, [@name, "delsync#{n}/"]) == 0 end,
+              fn ->
+                :erpc.call(@replica2, Bench.Replica, :count_keys, [@name, "delsync#{n}/"]) == 0
+              end,
               15_000
             )
           end)
@@ -196,7 +233,11 @@ defmodule Bench.Distributed do
 
       # Write initial data on both sides
       :erpc.call(@replica1, Bench.Replica, :bulk_put, [@name, n, "pre/"])
-      poll_until(fn -> :erpc.call(@replica2, Bench.Replica, :count_keys, [@name, "pre/"]) == n end, 15_000)
+
+      poll_until(
+        fn -> :erpc.call(@replica2, Bench.Replica, :count_keys, [@name, "pre/"]) == n end,
+        15_000
+      )
 
       # Partition: disconnect replica2 from replica1
       IO.puts("\n  Partitioning replica2 from replica1...")
@@ -205,8 +246,17 @@ defmodule Bench.Distributed do
 
       # Write on both sides during partition
       writes_per_side = 1_000
-      t1 = Task.async(fn -> :erpc.call(@replica1, Bench.Replica, :bulk_put, [@name, writes_per_side, "part_r1/"]) end)
-      t2 = Task.async(fn -> :erpc.call(@replica2, Bench.Replica, :bulk_put, [@name, writes_per_side, "part_r2/"]) end)
+
+      t1 =
+        Task.async(fn ->
+          :erpc.call(@replica1, Bench.Replica, :bulk_put, [@name, writes_per_side, "part_r1/"])
+        end)
+
+      t2 =
+        Task.async(fn ->
+          :erpc.call(@replica2, Bench.Replica, :bulk_put, [@name, writes_per_side, "part_r2/"])
+        end)
+
       Task.await(t1, 15_000)
       Task.await(t2, 15_000)
 
@@ -218,6 +268,7 @@ defmodule Bench.Distributed do
 
       # Heal partition and measure convergence time
       IO.puts("  Healing partition...")
+
       {heal_us, _} =
         time_us(fn ->
           :erpc.call(@replica2, Node, :connect, [@replica1])
@@ -236,7 +287,10 @@ defmodule Bench.Distributed do
           )
         end)
 
-      report_sync("convergence after heal (#{format_number(writes_per_side * 2)} keys to sync)", heal_us)
+      report_sync(
+        "convergence after heal (#{format_number(writes_per_side * 2)} keys to sync)",
+        heal_us
+      )
     end)
   end
 
@@ -259,12 +313,20 @@ defmodule Bench.Distributed do
             key = "vsz#{size}/#{i}"
             ref = make_ref()
             send(watcher, {:watch, key, ref})
-            receive do {:watching, ^ref} -> :ok end
+
+            receive do
+              {:watching, ^ref} -> :ok
+            end
 
             {us, _} =
               time_us(fn ->
                 :erpc.call(@replica1, Bench.Replica, :single_put, [@name, key, value])
-                receive do {:found, ^ref} -> :ok after 10_000 -> raise "replication timeout" end
+
+                receive do
+                  {:found, ^ref} -> :ok
+                after
+                  10_000 -> raise "replication timeout"
+                end
               end)
 
             us
@@ -289,7 +351,8 @@ defmodule Bench.Distributed do
       workers = 10
       keys_per_worker = 200
       churn_rounds = 5
-      total_keys = workers * keys_per_worker * 2  # both replicas
+      # both replicas
+      total_keys = workers * keys_per_worker * 2
 
       IO.puts("  workers/node  : #{workers}")
       IO.puts("  keys/worker   : #{keys_per_worker}")
@@ -301,12 +364,16 @@ defmodule Bench.Distributed do
           # Phase 1: Initial load on both replicas
           {load_us, _} =
             time_us(fn ->
-              t1 = Task.async(fn ->
-                run_workers(@replica1, workers, keys_per_worker, "r1")
-              end)
-              t2 = Task.async(fn ->
-                run_workers(@replica2, workers, keys_per_worker, "r2")
-              end)
+              t1 =
+                Task.async(fn ->
+                  run_workers(@replica1, workers, keys_per_worker, "r1")
+                end)
+
+              t2 =
+                Task.async(fn ->
+                  run_workers(@replica2, workers, keys_per_worker, "r2")
+                end)
+
               Task.await(t1, 30_000)
               Task.await(t2, 30_000)
 
@@ -329,12 +396,16 @@ defmodule Bench.Distributed do
               time_us(fn ->
                 churn_n = div(keys_per_worker, 2)
 
-                t1 = Task.async(fn ->
-                  run_churn(@replica1, workers, churn_n, "r1", round)
-                end)
-                t2 = Task.async(fn ->
-                  run_churn(@replica2, workers, churn_n, "r2", round)
-                end)
+                t1 =
+                  Task.async(fn ->
+                    run_churn(@replica1, workers, churn_n, "r1", round)
+                  end)
+
+                t2 =
+                  Task.async(fn ->
+                    run_churn(@replica2, workers, churn_n, "r2", round)
+                  end)
+
                 Task.await(t1, 30_000)
                 Task.await(t2, 30_000)
 
@@ -349,8 +420,14 @@ defmodule Bench.Distributed do
                 )
               end)
 
-            ops = workers * div(keys_per_worker, 2) * 2 * 2  # delete + put, both nodes
-            report_throughput("churn round #{round} (#{format_number(ops)} ops + converge)", ops, churn_us)
+            # delete + put, both nodes
+            ops = workers * div(keys_per_worker, 2) * 2 * 2
+
+            report_throughput(
+              "churn round #{round} (#{format_number(ops)} ops + converge)",
+              ops,
+              churn_us
+            )
           end
 
           # Phase 3: Read verification
@@ -365,7 +442,11 @@ defmodule Bench.Distributed do
                   prefix = if(:rand.uniform(2) == 1, do: "r1", else: "r2")
                   worker_i = :rand.uniform(workers)
                   node = if(:rand.uniform(2) == 1, do: @replica1, else: @replica2)
-                  :erpc.call(node, Bench.Replica, :single_get, [@name, "#{prefix}/w#{worker_i}/#{key_i}"])
+
+                  :erpc.call(node, Bench.Replica, :single_get, [
+                    @name,
+                    "#{prefix}/w#{worker_i}/#{key_i}"
+                  ])
                 end,
                 max_concurrency: 20,
                 ordered: false
@@ -396,7 +477,8 @@ defmodule Bench.Distributed do
       n = 1_000
 
       # Start a subscriber on replica2 that forwards event signals to coordinator
-      sub = :erpc.call(@replica2, Bench.Replica, :start_event_subscriber, [@name, "sub_lat/", self()])
+      sub =
+        :erpc.call(@replica2, Bench.Replica, :start_event_subscriber, [@name, "sub_lat/", self()])
 
       Process.sleep(100)
 
@@ -404,7 +486,12 @@ defmodule Bench.Distributed do
       warmup(50, fn ->
         key = "sub_lat/warm/#{:rand.uniform(10_000)}"
         :erpc.call(@replica1, Bench.Replica, :single_put, [@name, key, :warmup])
-        receive do {:sub_event, _, _} -> :ok after 5_000 -> :ok end
+
+        receive do
+          {:sub_event, _, _} -> :ok
+        after
+          5_000 -> :ok
+        end
       end)
 
       # Drain any leftover warmup events
@@ -440,7 +527,11 @@ defmodule Bench.Distributed do
 
     n = 2_000
 
-    for {label, sub_count} <- [{"0 subscribers", 0}, {"10 subscribers", 10}, {"100 subscribers", 100}] do
+    for {label, sub_count} <- [
+          {"0 subscribers", 0},
+          {"10 subscribers", 10},
+          {"100 subscribers", 100}
+        ] do
       with_remote_ekv(shards, fn ->
         # Spawn drain subscribers on replica2
         subs =
@@ -456,7 +547,9 @@ defmodule Bench.Distributed do
             :erpc.call(@replica1, Bench.Replica, :bulk_put, [@name, n, "sub_dist/"])
 
             poll_until(
-              fn -> :erpc.call(@replica2, Bench.Replica, :count_keys, [@name, "sub_dist/"]) == n end,
+              fn ->
+                :erpc.call(@replica2, Bench.Replica, :count_keys, [@name, "sub_dist/"]) == n
+              end,
               30_000
             )
           end)
@@ -521,7 +614,7 @@ defmodule Bench.Distributed do
     try do
       start_ekv_on(@replica1, name: @name, data_dir: data_dir1, shards: shards)
       start_ekv_on(@replica2, name: @name, data_dir: data_dir2, shards: shards)
-      # Let peers discover each other
+      # Let members discover each other
       Process.sleep(500)
       fun.()
     after

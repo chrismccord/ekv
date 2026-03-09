@@ -1,6 +1,22 @@
 defmodule EKV.MemberPresence do
   @moduledoc false
 
+  _archdoc = ~S"""
+  Publishes a ready EKV member into the EKV instance's scoped `:pg` mesh so
+  clients can discover it by region.
+
+  - decouples client routing discoverability from replica shard processes
+  - advertises only after member startup is complete
+  - stops advertising during blue-green handoff before the old node enters proxy mode
+
+  Design:
+  - one long-lived process per member EKV instance
+  - joins `{:ekv_members, name, region}` in the instance-local `:pg` scope
+  - `ClientRouter` monitors those groups to build its regional candidate set
+  - `advertised?/1` is the cold-path validation check used to reject stale
+    blue-green candidates before caching them as a backend
+  """
+
   use GenServer
 
   @probe_timeout 500
@@ -25,9 +41,7 @@ defmodule EKV.MemberPresence do
   def member_nodes(name) do
     [node() | Node.list()]
     |> Enum.uniq()
-    |> Enum.filter(fn remote_node ->
-      remote_member_running?(remote_node, name)
-    end)
+    |> Enum.filter(fn remote_node -> remote_member_running?(remote_node, name) end)
   end
 
   def member_running?(name) do
@@ -60,12 +74,6 @@ defmodule EKV.MemberPresence do
   @impl true
   def handle_call(:leave, _from, state) do
     {:reply, :ok, leave_groups(state)}
-  end
-
-  @impl true
-  def terminate(_reason, state) do
-    leave_groups(state)
-    :ok
   end
 
   defp join_groups(state) do

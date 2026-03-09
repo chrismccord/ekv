@@ -3,6 +3,8 @@ defmodule EKV.ClientSubscriptions do
 
   use GenServer
 
+  alias EKV.ClientSubscriptions
+
   defstruct [:name, subscriptions: %{}]
 
   def start_link(opts) do
@@ -20,11 +22,11 @@ defmodule EKV.ClientSubscriptions do
 
   @impl true
   def init(opts) do
-    {:ok, %__MODULE__{name: Keyword.fetch!(opts, :name)}}
+    {:ok, %ClientSubscriptions{name: Keyword.fetch!(opts, :name)}}
   end
 
   @impl true
-  def handle_call({:subscribe, pid, prefix}, _from, %__MODULE__{} = state) do
+  def handle_call({:subscribe, pid, prefix}, _from, %ClientSubscriptions{} = state) do
     entry = Map.get(state.subscriptions, pid, %{monitor: nil, prefixes: MapSet.new()})
 
     if MapSet.member?(entry.prefixes, prefix) do
@@ -53,7 +55,7 @@ defmodule EKV.ClientSubscriptions do
     end
   end
 
-  def handle_call({:unsubscribe, pid, prefix}, _from, %__MODULE__{} = state) do
+  def handle_call({:unsubscribe, pid, prefix}, _from, %ClientSubscriptions{} = state) do
     case Map.get(state.subscriptions, pid) do
       nil ->
         {:reply, :ok, state}
@@ -86,7 +88,7 @@ defmodule EKV.ClientSubscriptions do
   end
 
   @impl true
-  def handle_info({:DOWN, monitor, :process, pid, _reason}, %__MODULE__{} = state) do
+  def handle_info({:DOWN, monitor, :process, pid, _reason}, %ClientSubscriptions{} = state) do
     state =
       case Map.get(state.subscriptions, pid) do
         %{monitor: ^monitor} ->
@@ -99,7 +101,7 @@ defmodule EKV.ClientSubscriptions do
     {:noreply, state}
   end
 
-  def handle_info(_msg, state), do: {:noreply, state}
+  def handle_info(_msg, %ClientSubscriptions{} = state), do: {:noreply, state}
 
   defp ensure_monitor(%{monitor: nil} = entry, pid),
     do: %{entry | monitor: Process.monitor(pid)}

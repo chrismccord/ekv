@@ -219,9 +219,9 @@ Important:
 - If visible logical members exceed `cluster_size`, CAS must fail with `{:error, :cluster_overflow}`.
 
 ### Sync / HWM correctness
-- `kv_peer_hwm` is monotonic.
-- Sender stores peer HWM as sender snapshot `my_seq`, not remote sequence.
-- Delta sync is only valid when the peer cursor is still inside the local oplog window.
+- `kv_member_hwm` is monotonic.
+- Sender stores member HWM as sender snapshot `my_seq`, not remote sequence.
+- Delta sync is only valid when the member cursor is still inside the local oplog window.
 - Otherwise force full sync.
 - Chunked sync rules matter:
   - intermediate chunks use seq `0`
@@ -234,7 +234,7 @@ Important:
   - operator must either wipe that node's data dir or explicitly set `allow_stale_startup: true`
 - Live long partition protection:
   - default `partition_ttl_policy: :quarantine`
-  - reconnect after downtime > `tombstone_ttl` blocks replication for that peer pair
+  - reconnect after downtime > `tombstone_ttl` blocks replication for that member pair
 - Down-since markers live in `kv_meta`, keyed by `node_id` when available, otherwise node name.
 
 ## Common Failure Patterns

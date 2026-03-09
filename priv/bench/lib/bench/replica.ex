@@ -62,7 +62,7 @@ defmodule Bench.Replica do
   end
 
   def count_all_keys(name) do
-    config = EKV.get_config(name)
+    config = EKV.Supervisor.get_config(name)
     now = System.system_time(:nanosecond)
 
     for shard <- 0..(config.num_shards - 1) do
@@ -102,7 +102,7 @@ defmodule Bench.Replica do
   end
 
   def flush_shards(name) do
-    config = EKV.get_config(name)
+    config = EKV.Supervisor.get_config(name)
 
     for shard <- 0..(config.num_shards - 1) do
       shard_name = :"#{name}_ekv_replica_#{shard}"

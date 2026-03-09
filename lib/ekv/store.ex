@@ -11,7 +11,7 @@ defmodule EKV.Store do
 
   - `kv` — current state of all keys: key -> (value, timestamp, origin_node, expires_at, deleted_at)
   - `kv_oplog` — append-only log of all mutations, used for delta sync
-  - `kv_peer_hwm` — per-peer high-water marks for oplog sync
+  - `kv_member_hwm` — per-member high-water marks for oplog sync
   """
 
   @get_sql """
@@ -53,9 +53,9 @@ defmodule EKV.Store do
     path = Path.join(data_dir, "shard_#{shard_index}.db")
 
     # Check for stale db before opening. If the db exists and its last_active_at
-    # is older than the safe threshold, peers will have GC'd tombstones for entries
+    # is older than the safe threshold, other members will have GC'd tombstones for entries
     # deleted while we were away. Fail startup by default so operators can
-    # explicitly choose whether to wipe/rebuild from peers or trust the old
+    # explicitly choose whether to wipe/rebuild from members or trust the old
     # on-disk data.
     #
     # Safety margin: last_active_at can lag real shutdown by up to gc_interval
@@ -106,8 +106,8 @@ defmodule EKV.Store do
 
     :ok =
       EKV.Sqlite3.execute(db, """
-      CREATE TABLE IF NOT EXISTS kv_peer_hwm (
-        peer_node TEXT NOT NULL PRIMARY KEY,
+      CREATE TABLE IF NOT EXISTS kv_member_hwm (
+        member_node TEXT NOT NULL PRIMARY KEY,
         last_seq INTEGER NOT NULL
       )
       """)
@@ -414,14 +414,14 @@ defmodule EKV.Store do
   end
 
   # =====================================================================
-  # Peer HWM
+  # Member HWM
   # =====================================================================
 
-  def get_hwm(db, peer_node) do
+  def get_hwm(db, member_node) do
     {:ok, stmt} =
-      EKV.Sqlite3.prepare(db, "SELECT last_seq FROM kv_peer_hwm WHERE peer_node = ?1")
+      EKV.Sqlite3.prepare(db, "SELECT last_seq FROM kv_member_hwm WHERE member_node = ?1")
 
-    :ok = EKV.Sqlite3.bind(stmt, [Atom.to_string(peer_node)])
+    :ok = EKV.Sqlite3.bind(stmt, [Atom.to_string(member_node)])
 
     result =
       case EKV.Sqlite3.step(db, stmt) do
@@ -433,14 +433,14 @@ defmodule EKV.Store do
     result
   end
 
-  def set_hwm(db, peer_node, seq) do
+  def set_hwm(db, member_node, seq) do
     {:ok, stmt} =
       EKV.Sqlite3.prepare(db, """
-      INSERT INTO kv_peer_hwm (peer_node, last_seq) VALUES (?1, ?2)
-      ON CONFLICT(peer_node) DO UPDATE SET last_seq = MAX(kv_peer_hwm.last_seq, excluded.last_seq)
+      INSERT INTO kv_member_hwm (member_node, last_seq) VALUES (?1, ?2)
+      ON CONFLICT(member_node) DO UPDATE SET last_seq = MAX(kv_member_hwm.last_seq, excluded.last_seq)
       """)
 
-    :ok = EKV.Sqlite3.bind(stmt, [Atom.to_string(peer_node), seq])
+    :ok = EKV.Sqlite3.bind(stmt, [Atom.to_string(member_node), seq])
     :done = EKV.Sqlite3.step(db, stmt)
     :ok = EKV.Sqlite3.release(db, stmt)
     :ok
@@ -487,13 +487,13 @@ defmodule EKV.Store do
   """
   def prune_member_hwms(db, connected_members) do
     connected_set = MapSet.new(connected_members, &Atom.to_string/1)
-    {:ok, rows} = EKV.Sqlite3.fetch_all(db, "SELECT peer_node FROM kv_peer_hwm", [])
+    {:ok, rows} = EKV.Sqlite3.fetch_all(db, "SELECT member_node FROM kv_member_hwm", [])
 
-    for [peer_node] <- rows, not MapSet.member?(connected_set, peer_node) do
+    for [member_node] <- rows, not MapSet.member?(connected_set, member_node) do
       {:ok, stmt} =
-        EKV.Sqlite3.prepare(db, "DELETE FROM kv_peer_hwm WHERE peer_node = ?1")
+        EKV.Sqlite3.prepare(db, "DELETE FROM kv_member_hwm WHERE member_node = ?1")
 
-      :ok = EKV.Sqlite3.bind(stmt, [peer_node])
+      :ok = EKV.Sqlite3.bind(stmt, [member_node])
       :done = EKV.Sqlite3.step(db, stmt)
       :ok = EKV.Sqlite3.release(db, stmt)
     end
@@ -502,11 +502,11 @@ defmodule EKV.Store do
   end
 
   @doc """
-  Truncate oplog entries below the min of all peer HWMs
+  Truncate oplog entries below the min of all member HWMs
   """
   def truncate_oplog(db) do
     {:ok, stmt} =
-      EKV.Sqlite3.prepare(db, "SELECT MIN(last_seq) FROM kv_peer_hwm")
+      EKV.Sqlite3.prepare(db, "SELECT MIN(last_seq) FROM kv_member_hwm")
 
     min_hwm =
       case EKV.Sqlite3.step(db, stmt) do
@@ -784,19 +784,19 @@ defmodule EKV.Store do
     :ok
   end
 
-  def peer_down_marker_get(db, key), do: get_meta_int(db, key)
-  def peer_down_marker_put(db, key, down_since_ms), do: set_meta_int(db, key, down_since_ms)
+  def member_down_marker_get(db, key), do: get_meta_int(db, key)
+  def member_down_marker_put(db, key, down_since_ms), do: set_meta_int(db, key, down_since_ms)
 
-  def peer_down_marker_set_if_absent(db, key, down_since_ms),
+  def member_down_marker_set_if_absent(db, key, down_since_ms),
     do: set_meta_int_if_absent(db, key, down_since_ms)
 
-  def peer_down_marker_clear(db, key), do: delete_meta_key(db, key)
+  def member_down_marker_clear(db, key), do: delete_meta_key(db, key)
 
-  def prune_peer_down_name_markers(db, stale_before_ms, max_entries) do
+  def prune_member_down_name_markers(db, stale_before_ms, max_entries) do
     {:ok, rows} =
       EKV.Sqlite3.fetch_all(
         db,
-        "SELECT key, value_int FROM kv_meta WHERE key LIKE 'peer_down_at:name:%' ORDER BY value_int DESC",
+        "SELECT key, value_int FROM kv_meta WHERE key LIKE 'member_down_at:name:%' ORDER BY value_int DESC",
         []
       )
 

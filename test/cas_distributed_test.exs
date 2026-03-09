@@ -2605,7 +2605,7 @@ defmodule EKV.CASDistributedTest do
       # Data still there (WAL recovery)
       assert TestCluster.rpc!(n1b, EKV, :get, [ekv_name, "dead/1"]) == "val"
 
-      # CAS works after peers connect
+      # CAS works after members reconnect
       TestCluster.assert_eventually(fn ->
         try do
           match?(
@@ -2682,7 +2682,7 @@ defmodule EKV.CASDistributedTest do
       end)
     end
 
-    test "peer replication continues after handoff" do
+    test "member replication continues after handoff" do
       peers = TestCluster.start_peers(4)
       on_exit(fn -> TestCluster.stop_peers(peers) end)
 
@@ -2716,11 +2716,11 @@ defmodule EKV.CASDistributedTest do
       Process.sleep(200)
 
       # Write on n2
-      :ok = TestCluster.rpc!(n2, EKV, :put, [ekv_name, "peer/1", "from_n2"])
+      :ok = TestCluster.rpc!(n2, EKV, :put, [ekv_name, "member/1", "from_n2"])
 
-      # Value appears on n1b (peers reconnect + replicate)
+      # Value appears on n1b (members reconnect + replicate)
       TestCluster.assert_eventually(fn ->
-        TestCluster.rpc!(n1b, EKV, :get, [ekv_name, "peer/1"]) == "from_n2"
+        TestCluster.rpc!(n1b, EKV, :get, [ekv_name, "member/1"]) == "from_n2"
       end)
     end
 
@@ -2812,8 +2812,11 @@ defmodule EKV.CASDistributedTest do
 
       # count_alive_node_ids should be 3 (not 4)
       shard_state = TestCluster.rpc!(n2, :sys, :get_state, [:"#{ekv_name}_ekv_replica_0"])
-      peer_ids = Map.values(shard_state.peer_node_ids) |> Enum.reject(&is_nil/1) |> MapSet.new()
-      all_ids = MapSet.put(peer_ids, shard_state.node_id) |> MapSet.size()
+
+      member_ids =
+        Map.values(shard_state.member_node_ids) |> Enum.reject(&is_nil/1) |> MapSet.new()
+
+      all_ids = MapSet.put(member_ids, shard_state.node_id) |> MapSet.size()
       assert all_ids <= 3
     end
 
@@ -2906,7 +2909,7 @@ defmodule EKV.CASDistributedTest do
         TestCluster.rpc!(n2, EKV, :get, [ekv_name, "cycle/2"]) == "from_n1b"
       end)
 
-      # Stop n1b's EKV and restart on same node (simulates n1b→n1c reusing peer)
+      # Stop n1b's EKV and restart on same node (simulates n1b→n1c reusing member identity)
       TestCluster.rpc!(n1b, TestCluster, :kill_registered, [:"#{ekv_name}_ekv_sup"])
       Process.sleep(200)
 

@@ -209,7 +209,7 @@ defmodule BenchWebWeb.BenchLive do
             <div class="rounded-xl border border-zinc-800 bg-zinc-900 px-4 py-3 text-xs text-zinc-300">
               <p>coordinator: <span class="text-zinc-100">{@summary.coordinator}</span></p>
               <p class="mt-1">
-                connected peers: <span class="text-zinc-100">{@summary.connected_count}</span>
+                connected members: <span class="text-zinc-100">{@summary.connected_count}</span>
               </p>
               <p class="mt-1">
                 discovered replicas: <span class="text-zinc-100">{@summary.replica_count}</span>

@@ -517,19 +517,19 @@ defmodule EKVTest do
       shard_name = EKV.Replica.shard_name(name, shard)
       %{db: db} = :sys.get_state(shard_name)
 
-      peer = :fake_peer@host
+      member = :fake_member@host
 
       # Set HWM to 100
-      :ok = EKV.Store.set_hwm(db, peer, 100)
-      assert EKV.Store.get_hwm(db, peer) == 100
+      :ok = EKV.Store.set_hwm(db, member, 100)
+      assert EKV.Store.get_hwm(db, member) == 100
 
       # Try to set HWM to 50 — should stay at 100
-      :ok = EKV.Store.set_hwm(db, peer, 50)
-      assert EKV.Store.get_hwm(db, peer) == 100
+      :ok = EKV.Store.set_hwm(db, member, 50)
+      assert EKV.Store.get_hwm(db, member) == 100
 
       # Set HWM to 200 — should advance
-      :ok = EKV.Store.set_hwm(db, peer, 200)
-      assert EKV.Store.get_hwm(db, peer) == 200
+      :ok = EKV.Store.set_hwm(db, member, 200)
+      assert EKV.Store.get_hwm(db, member) == 200
     end
   end
 
@@ -613,9 +613,9 @@ defmodule EKVTest do
       max = EKV.Store.max_seq(db)
       assert max >= 10
 
-      # Set HWMs for 2 fake peers — min is at seq 5
-      :ok = EKV.Store.set_hwm(db, :peer_a@host, 5)
-      :ok = EKV.Store.set_hwm(db, :peer_b@host, 10)
+      # Set HWMs for 2 fake members — min is at seq 5
+      :ok = EKV.Store.set_hwm(db, :member_a@host, 5)
+      :ok = EKV.Store.set_hwm(db, :member_b@host, 10)
 
       # Truncate oplog
       :ok = EKV.Store.truncate_oplog(db)
@@ -760,13 +760,13 @@ defmodule EKVTest do
           )
       end
 
-      # Set HWMs for 2 fake peers at seq 5 and seq 10
-      :ok = EKV.Store.set_hwm(db, :gc_peer_a@host, 5)
-      :ok = EKV.Store.set_hwm(db, :gc_peer_b@host, 10)
+      # Set HWMs for 2 fake members at seq 5 and seq 10
+      :ok = EKV.Store.set_hwm(db, :gc_member_a@host, 5)
+      :ok = EKV.Store.set_hwm(db, :gc_member_b@host, 10)
 
-      # Add fake peers to remote_shards so their HWMs survive GC pruning
+      # Add fake members to remote_shards so their HWMs survive GC pruning
       :sys.replace_state(shard_name, fn state ->
-        %{state | remote_shards: %{gc_peer_a@host: self(), gc_peer_b@host: self()}}
+        %{state | remote_shards: %{gc_member_a@host: self(), gc_member_b@host: self()}}
       end)
 
       # Trigger GC — this will truncate oplog at min(5, 10) = 5
@@ -2935,7 +2935,7 @@ defmodule EKVTest do
 
   describe "deferred local accept" do
     test "CAS failure does not leave phantom write in local SQLite" do
-      # Setup: single node with cluster_size: 3, inject fake peers
+      # Setup: single node with cluster_size: 3, inject fake members
       # so the shard THINKS it has quorum. Then control the Paxos
       # messages to force: prepare succeeds → accept fails.
       # With the bug (local accept before quorum), the value is in
@@ -2962,11 +2962,11 @@ defmodule EKVTest do
 
       shard_name = :"#{name}_ekv_replica_0"
 
-      # Inject fake peers so the shard thinks alive_count = 3 (quorum = 2)
+      # Inject fake members so the shard thinks alive_count = 3 (quorum = 2)
       :sys.replace_state(shard_name, fn state ->
         %{
           state
-          | peer_node_ids: %{:fake_b@localhost => "2", :fake_c@localhost => "3"},
+          | member_node_ids: %{:fake_b@localhost => "2", :fake_c@localhost => "3"},
             remote_shards: %{:fake_b@localhost => self(), :fake_c@localhost => self()}
         }
       end)
@@ -2991,7 +2991,7 @@ defmodule EKVTest do
       send(shard_name, {:ekv_promise, ref, self(), "2", 0, "", nil})
       Process.sleep(50)
 
-      # Send accept nacks from both fake peers — quorum can't be reached
+      # Send accept nacks from both fake members — quorum can't be reached
       send(shard_name, {:ekv_accept_nack, ref, self(), "2"})
       send(shard_name, {:ekv_accept_nack, ref, self(), "3"})
 
@@ -3032,7 +3032,7 @@ defmodule EKVTest do
       :sys.replace_state(shard_name, fn state ->
         %{
           state
-          | peer_node_ids: %{:fake_b@localhost => "2", :fake_c@localhost => "3"},
+          | member_node_ids: %{:fake_b@localhost => "2", :fake_c@localhost => "3"},
             remote_shards: %{:fake_b@localhost => self(), :fake_c@localhost => self()}
         }
       end)
@@ -3083,11 +3083,11 @@ defmodule EKVTest do
 
       shard_name = :"#{name}_ekv_replica_0"
 
-      # Inject fake peers
+      # Inject fake members
       :sys.replace_state(shard_name, fn state ->
         %{
           state
-          | peer_node_ids: %{:fake_b@localhost => "2", :fake_c@localhost => "3"},
+          | member_node_ids: %{:fake_b@localhost => "2", :fake_c@localhost => "3"},
             remote_shards: %{:fake_b@localhost => self(), :fake_c@localhost => self()}
         }
       end)
@@ -3393,7 +3393,7 @@ defmodule EKVTest do
 
       shard_name = :"#{name}_ekv_replica_0"
 
-      # Inject fake peers via :sys.replace_state so the shard thinks it has remote nodes.
+      # Inject fake members via :sys.replace_state so the shard thinks it has remote nodes.
       # We use self() as a fake pid — messages come back to the test process.
       fake_node_a = :"fake_a@127.0.0.1"
       fake_node_b = :"fake_b@127.0.0.1"
@@ -3402,7 +3402,7 @@ defmodule EKVTest do
         %{
           state
           | remote_shards: %{fake_node_a => self(), fake_node_b => self()},
-            peer_node_ids: %{fake_node_a => "2", fake_node_b => "3"}
+            member_node_ids: %{fake_node_a => "2", fake_node_b => "3"}
         }
       end)
 
@@ -3841,7 +3841,7 @@ defmodule EKVTest do
       assert sync_count == 3
     end
 
-    test "peer disconnect aborts ongoing chunked sync", %{shard_name: shard_name, name: name} do
+    test "member disconnect aborts ongoing chunked sync", %{shard_name: shard_name, name: name} do
       # Write enough for multiple chunks
       for i <- 1..30 do
         :ok = EKV.put(name, "abort/#{String.pad_leading("#{i}", 3, "0")}", "val_#{i}")
@@ -3858,7 +3858,7 @@ defmodule EKVTest do
       state = :sys.get_state(shard_name)
       my_seq = EKV.Store.max_seq(state.db)
 
-      # Suspend the shard, inject the first continue message, then remove the peer
+      # Suspend the shard, inject the first continue message, then remove the member
       :sys.suspend(shard_name)
 
       send(
@@ -3870,7 +3870,7 @@ defmodule EKVTest do
       :sys.resume(shard_name)
       :sys.get_state(shard_name)
 
-      # Now remove the peer before the next continuation runs
+      # Now remove the member before the next continuation runs
       :sys.replace_state(shard_name, fn state ->
         %{state | remote_shards: %{}}
       end)
@@ -4010,7 +4010,7 @@ defmodule EKVTest do
 
       shard_name = :"#{name}_ekv_replica_0"
 
-      # Inject fake peers
+      # Inject fake members
       fake_node_a = :"order_a@127.0.0.1"
       fake_node_b = :"order_b@127.0.0.1"
 
@@ -4018,7 +4018,7 @@ defmodule EKVTest do
         %{
           state
           | remote_shards: %{fake_node_a => self(), fake_node_b => self()},
-            peer_node_ids: %{fake_node_a => "2", fake_node_b => "3"}
+            member_node_ids: %{fake_node_a => "2", fake_node_b => "3"}
         }
       end)
 
@@ -4152,7 +4152,7 @@ defmodule EKVTest do
       send(shard_name, {:ekv_prepare, ref_a, self(), key, 100, "2", 0})
       assert_receive {:ekv_promise, ^ref_a, _, _, _, _, _}, 1000
 
-      # Simulate peer 2 promise for A (quorum: need 2 out of 3)
+      # Simulate member 2 promise for A (quorum: need 2 out of 3)
       # We respond on behalf of fake node
 
       # Proposer B prepares with higher ballot 200 — preempts A
@@ -4193,7 +4193,7 @@ defmodule EKVTest do
       send(shard_name, {:ekv_prepare, ref, self(), key, 100, "2", 0})
       assert_receive {:ekv_promise, ^ref, _, _, _, _, _}, 1000
 
-      # While CAS is "in progress" (waiting for peer promises), deliver a sync message
+      # While CAS is "in progress" (waiting for member promises), deliver a sync message
       # with a DIFFERENT key — should process normally
       now = System.system_time(:nanosecond)
       origin = node()
@@ -4248,12 +4248,12 @@ defmodule EKVTest do
       # Shard should be back (supervisor restarts it)
       assert Process.whereis(shard_name) != nil
 
-      # Re-inject fake peers so the shard thinks it has remotes
+      # Re-inject fake members so the shard thinks it has remotes
       :sys.replace_state(shard_name, fn state ->
         %{
           state
           | remote_shards: %{:"order_a@127.0.0.1" => self(), :"order_b@127.0.0.1" => self()},
-            peer_node_ids: %{:"order_a@127.0.0.1" => "2", :"order_b@127.0.0.1" => "3"}
+            member_node_ids: %{:"order_a@127.0.0.1" => "2", :"order_b@127.0.0.1" => "3"}
         }
       end)
 
@@ -4476,11 +4476,11 @@ defmodule EKVTest do
 
       shard_name = :"#{name}_ekv_replica_0"
 
-      # Inject 3 distinct peer node_ids — total 4 (self + 3), exceeds cluster_size=2
+      # Inject 3 distinct member node_ids — total 4 (self + 3), exceeds cluster_size=2
       :sys.replace_state(shard_name, fn state ->
         %{
           state
-          | peer_node_ids: %{
+          | member_node_ids: %{
               :fake_a@localhost => "2",
               :fake_b@localhost => "3",
               :fake_c@localhost => "4"

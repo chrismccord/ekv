@@ -92,7 +92,7 @@ defmodule EKV.AdversarialVerificationTest do
     )
   end
 
-  test "long partition beyond tombstone_ttl quarantines peer instead of syncing unsafe state" do
+  test "long partition beyond tombstone_ttl quarantines member instead of syncing unsafe state" do
     peers = TestCluster.start_peers(2)
     on_exit(fn -> TestCluster.stop_peers(peers) end)
 

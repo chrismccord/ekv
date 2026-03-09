@@ -67,7 +67,7 @@ defmodule EKV.Supervisor do
   - Client routing safety: incoming member is advertised only after startup;
     outgoing member leaves its :pg route before proxy mode
   - Shutdown safety: graceful coordinated shutdown keeps members serving until
-    peers have also entered terminal state, or timeout; outgoing proxy-mode
+    other members have also entered terminal state, or timeout; outgoing proxy-mode
     blue-green members skip this wait
 
   ## Graceful Shutdown Barrier
@@ -88,7 +88,7 @@ defmodule EKV.Supervisor do
 
   - coordinated shutdown is already in progress, or
   - exiting now would drop live logical members below quorum while other
-    snapshotted peers are still non-terminal
+    snapshotted members are still non-terminal
 
   Client mode participates in terminal coordination, but it does not count
   toward quorum. Forced exits (`kill -9`, VM crash) bypass the barrier.

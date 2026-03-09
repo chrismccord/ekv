@@ -23,12 +23,12 @@ EKV.info(:my_kv)
 
 Verify:
 - In steady state, `connected_members` length equals `cluster_size - 1`
-- Each peer has a non-nil `node_id`
-- In steady state, peer `node_id` values are distinct
+- Each member has a non-nil `node_id`
+- In steady state, member `node_id` values are distinct
 
 During blue-green overlap, two Erlang nodes may temporarily share the same
 logical `node_id`. In that case, dedupe by `node_id` and reason about logical
-members rather than raw peer count.
+members rather than raw node count.
 
 If a partition or maintenance event is active, `connected_members` may be lower
 temporarily. Treat this as healthy only if it matches an expected outage.
@@ -114,7 +114,7 @@ If the backup is younger than `tombstone_ttl` (default 7 days):
 
 1. Stop the node
 2. Replace `data_dir` contents with backup files
-3. Restart normally — delta sync from peers catches up
+3. Restart normally — delta sync from members catches up
 
 ### Restoring an Old Backup to the Entire Cluster
 
@@ -214,7 +214,7 @@ IO.puts("#{logical_members} logical members, cluster_size=#{info.cluster_size}")
 3. Start the new node(s) with the same `cluster_size`
 
 The new node auto-generates a `node_id` and joins the cluster. Full sync
-from peers populates its data.
+from members populates its data.
 
 ### Intentional Scale-Down
 
@@ -269,7 +269,7 @@ Nodes automatically reconnect and sync:
 
 - **Very long live partition** (downtime > `tombstone_ttl`):
   - Default (`partition_ttl_policy: :quarantine`): EKV blocks replication for
-    that peer identity to prevent zombie resurrection. This is intentional.
+    that member identity to prevent zombie resurrection. This is intentional.
     Operator action is required (rebuild one side, then reconnect).
   - `partition_ttl_policy: :ignore`: EKV allows reconnect/sync without
     quarantine. This trades safety for availability and can resurrect state
@@ -301,17 +301,17 @@ defaults), the database is considered stale and EKV **refuses startup** by
 default.
 
 This prevents a node that was offline for weeks from reintroducing entries
-that peers already garbage-collected. It also avoids silent cluster-wide data
+that other members already garbage-collected. It also avoids silent cluster-wide data
 loss if an entire cold cluster is restarted after the TTL window.
 
 ### When a Stale Startup Is Rejected
 
 Startup fails closed until an operator chooses one of these paths:
 
-1. Single stale node rejoining fresh peers:
+1. Single stale node rejoining fresh members:
    - wipe that node's EKV data dir
    - restart it
-   - let it full-sync from healthy peers
+   - let it full-sync from healthy members
 
 2. Full cold-cluster restart where the old on-disk data is intentional:
    - restart all nodes with `allow_stale_startup: true`
@@ -421,14 +421,14 @@ opens the files directly with WAL recovery.
 ## Graceful Shutdown Barrier
 
 Use `shutdown_barrier: timeout_ms` when coordinated graceful shutdowns should
-keep members serving for a short window while peers flush final writes.
+keep members serving for a short window while other members flush final writes.
 
 ```elixir
 {EKV, name: :my_kv, data_dir: "/var/data/ekv",
  cluster_size: 3, shutdown_barrier: 15_000}
 ```
 
-- Members stay up during graceful shutdown until peers also enter terminal
+- Members stay up during graceful shutdown until other members also enter terminal
   state or the timeout expires.
 - Clients participate in the coordination signal but do not count toward
   quorum.
@@ -457,7 +457,7 @@ The shard count is persisted to `kv_meta` on first open. Changing `:shards`
 after data exists raises `ArgumentError` at startup.
 
 There is **no built-in resharding or automatic shard-count migration**.
-Raw shard backups are tied to the original shard count, and peer full sync
+Raw shard backups are tied to the original shard count, and member full sync
 also requires matching shard counts.
 
 If you need a different shard count and want to preserve data:
@@ -470,9 +470,9 @@ If you delete the data directory and restart with a new shard count, that is
 effectively a fresh empty store unless some separate migration process
 represents the data.
 
-### Shard Count Mismatch Between Peers
+### Shard Count Mismatch Between Members
 
-If a peer connects with a different shard count, EKV logs an error and
+If a member connects with a different shard count, EKV logs an error and
 rejects the connection. It does **not** crash. Fix the config and restart
 the mismatched node.
 
@@ -481,8 +481,8 @@ the mismatched node.
 | Error | Meaning | Action |
 |-------|---------|--------|
 | `{:error, :conflict}` | Version mismatch — value changed between `fetch` and `put` | Retry with `EKV.update/3` (auto-retries 5x) or re-fetch and retry manually |
-| `{:error, :no_quorum}` | Not enough peers reachable for consensus | Check connectivity; wait for partition to heal; verify `cluster_size` matches actual cluster |
-| `{:error, :quorum_timeout}` | Quorum may exist, but consensus did not finish before the call timeout | Check cluster latency / load; increase timeout if needed; verify peers are healthy |
+| `{:error, :no_quorum}` | Not enough members reachable for consensus | Check connectivity; wait for partition to heal; verify `cluster_size` matches actual cluster |
+| `{:error, :quorum_timeout}` | Quorum may exist, but consensus did not finish before the call timeout | Check cluster latency / load; increase timeout if needed; verify members are healthy |
 | `{:error, :unconfirmed}` | CAS write entered accept phase but final outcome was ambiguous to the caller | Resolve with `EKV.get(name, key, consistent: true)` or use `resolve_unconfirmed: true` |
 | `{:error, :cluster_overflow}` | More distinct node_ids reachable than `cluster_size` | Remove extra nodes or increase `cluster_size` on all nodes |
 | `{:error, :cas_managed_key}` | Eventual `put`/`delete` was attempted on a CAS-managed key | Use CAS write APIs for that key; do not mix CAS -> LWW writes |

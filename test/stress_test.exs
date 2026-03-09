@@ -179,7 +179,7 @@ defmodule EKV.StressTest do
     end
 
     # Intention: verify repeated partition/heal cycles do not miss writes due to
-    # incorrect delta-sync cursor bookkeeping across peers.
+    # incorrect delta-sync cursor bookkeeping across members.
     test "second heal still replicates writes after prior conflicting skewed merge" do
       peers = TestCluster.start_peers(2)
       on_exit(fn -> TestCluster.stop_peers(peers) end)
@@ -1026,7 +1026,7 @@ defmodule EKV.StressTest do
       TestCluster.rpc!(n1, TestCluster, :kill_registered, [:"#{ekv_name}_ekv_replica_0"])
       Process.sleep(500)
 
-      # Wait for shard to restart and reconnect peers
+      # Wait for shard to restart and reconnect members
       TestCluster.assert_eventually(
         fn ->
           try do
@@ -1255,7 +1255,7 @@ defmodule EKV.StressTest do
   end
 
   # =====================================================================
-  # 7. Fault Injection (local single-shard with injected fake peers)
+  # 7. Fault Injection (local single-shard with injected fake members)
   # =====================================================================
 
   describe "fault injection" do
@@ -1282,23 +1282,23 @@ defmodule EKV.StressTest do
 
       shard_name = :"#{name}_ekv_replica_0"
 
-      # Inject 4 fake peers — all pointing to self() so we receive their messages
+      # Inject 4 fake members — all pointing to self() so we receive their messages
       fake_nodes = [
-        :"fi_peer2@127.0.0.1",
-        :"fi_peer3@127.0.0.1",
-        :"fi_peer4@127.0.0.1",
-        :"fi_peer5@127.0.0.1"
+        :"fi_member2@127.0.0.1",
+        :"fi_member3@127.0.0.1",
+        :"fi_member4@127.0.0.1",
+        :"fi_member5@127.0.0.1"
       ]
 
       :sys.replace_state(shard_name, fn state ->
         %{
           state
           | remote_shards: Map.new(fake_nodes, fn n -> {n, self()} end),
-            peer_node_ids: %{
-              :"fi_peer2@127.0.0.1" => "2",
-              :"fi_peer3@127.0.0.1" => "3",
-              :"fi_peer4@127.0.0.1" => "4",
-              :"fi_peer5@127.0.0.1" => "5"
+            member_node_ids: %{
+              :"fi_member2@127.0.0.1" => "2",
+              :"fi_member3@127.0.0.1" => "3",
+              :"fi_member4@127.0.0.1" => "4",
+              :"fi_member5@127.0.0.1" => "5"
             }
         }
       end)

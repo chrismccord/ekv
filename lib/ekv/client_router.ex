@@ -1,7 +1,32 @@
 defmodule EKV.ClientRouter do
   @moduledoc false
 
+  _archdoc = ~S"""
+  Client-side backend selector for `mode: :client`.
+
+  - keeps the hot path cheap by caching the selected backend in ETS
+  - discovers candidate members from the EKV instance's scoped `:pg` region groups
+  - applies region-order routing and short cooldowns after transport failures
+  - coordinates cold-path waits for `wait_for_route`
+
+  Design:
+  - `backend/1` is the optimized hot path:
+    - read `current_backend` from ETS
+    - if missing, ask the GenServer to select one
+  - the GenServer is the cold path:
+    - monitors `:pg` group membership per preferred region
+    - updates in-memory `members_by_region`
+    - handles failure notifications and route waiters
+  - candidate selection is local and deterministic:
+    - first configured region with available members
+    - stable node-name ordering within the region
+  - `Node.list/0` + RPC probing is only a fallback path when `:pg` has not
+    converged yet; it is not the primary discovery mechanism
+  """
+
   use GenServer
+
+  alias EKV.ClientRouter
 
   @cooldown_ms 1_000
   @await_timeout_margin 1_000
@@ -63,7 +88,7 @@ defmodule EKV.ClientRouter do
     {monitors, members_by_region} = monitor_region_groups(name, config.region_routing)
 
     {:ok,
-     %__MODULE__{
+     %ClientRouter{
        name: name,
        region_routing: config.region_routing,
        monitors: monitors,
@@ -72,17 +97,17 @@ defmodule EKV.ClientRouter do
   end
 
   @impl true
-  def handle_call(:backend, _from, state) do
+  def handle_call(:backend, _from, %ClientRouter{} = state) do
     {reply, new_state} = ensure_backend(state)
-    {:reply, reply, reply_waiters_if_ready(reply, new_state)}
+    {:reply, reply, reply_waiters_if_ready(new_state, reply)}
   end
 
-  def handle_call({:await_backend, timeout_ms}, from, state) do
+  def handle_call({:await_backend, timeout_ms}, from, %ClientRouter{} = state) do
     case ensure_backend(state) do
-      {{:ok, backend}, new_state} ->
-        {:reply, {:ok, backend}, reply_waiters_if_ready({:ok, backend}, new_state)}
+      {{:ok, backend}, %ClientRouter{} = new_state} ->
+        {:reply, {:ok, backend}, reply_waiters_if_ready(new_state, {:ok, backend})}
 
-      {{:error, :unavailable}, new_state} ->
+      {{:error, :unavailable}, %ClientRouter{} = new_state} ->
         if timeout_ms == 0 do
           {:reply, {:error, :timeout}, new_state}
         else
@@ -92,23 +117,23 @@ defmodule EKV.ClientRouter do
   end
 
   @impl true
-  def handle_info({:mark_backend_failed, node}, state) do
+  def handle_info({:mark_backend_failed, node}, %ClientRouter{} = state) do
     {:noreply, mark_backend_failed_in_router(state, node)}
   end
 
-  def handle_info({:nodedown, node}, state) do
+  def handle_info({:nodedown, node}, %ClientRouter{} = state) do
     {:noreply, handle_nodedown(state, node)}
   end
 
-  def handle_info({ref, :join, _group, pids}, state) do
+  def handle_info({ref, :join, _group, pids}, %ClientRouter{} = state) do
     {:noreply, handle_pg_membership(state, ref, pids, :join)}
   end
 
-  def handle_info({ref, :leave, _group, pids}, state) do
+  def handle_info({ref, :leave, _group, pids}, %ClientRouter{} = state) do
     {:noreply, handle_pg_membership(state, ref, pids, :leave)}
   end
 
-  def handle_info({:await_backend_timeout, mon_ref}, state) do
+  def handle_info({:await_backend_timeout, mon_ref}, %ClientRouter{} = state) do
     case Map.pop(state.waiters, mon_ref) do
       {nil, _waiters} ->
         {:noreply, state}
@@ -120,7 +145,7 @@ defmodule EKV.ClientRouter do
     end
   end
 
-  def handle_info({:DOWN, mon_ref, :process, _pid, _reason}, state) do
+  def handle_info({:DOWN, mon_ref, :process, _pid, _reason}, %ClientRouter{} = state) do
     case Map.pop(state.waiters, mon_ref) do
       {nil, _waiters} ->
         {:noreply, state}
@@ -131,7 +156,7 @@ defmodule EKV.ClientRouter do
     end
   end
 
-  def handle_info(_msg, state), do: {:noreply, state}
+  def handle_info(_msg, %ClientRouter{} = state), do: {:noreply, state}
 
   defp monitor_region_groups(name, region_routing) do
     scope = EKV.Supervisor.pg_scope(name)
@@ -140,22 +165,21 @@ defmodule EKV.ClientRouter do
       group = EKV.MemberPresence.region_group(name, region)
       {ref, members} = :pg.monitor(scope, group)
       nodes = members |> Enum.map(&node/1) |> MapSet.new()
+      new_monitors = Map.put(monitors, ref, %{region: region})
+      new_members = Map.put(members_by_region, region, nodes)
 
-      {
-        Map.put(monitors, ref, %{region: region}),
-        Map.put(members_by_region, region, nodes)
-      }
+      {new_monitors, new_members}
     end)
   end
 
-  defp ensure_backend(%__MODULE__{name: name} = state) do
+  defp ensure_backend(%ClientRouter{name: name} = state) do
     case cached_backend(name) do
       {:ok, backend} -> {{:ok, backend}, state}
       :error -> select_backend(state)
     end
   end
 
-  defp add_waiter(state, from, timeout_ms) do
+  defp add_waiter(%ClientRouter{} = state, from, timeout_ms) do
     {pid, _tag} = from
     mon_ref = Process.monitor(pid)
     timer_ref = Process.send_after(self(), {:await_backend_timeout, mon_ref}, timeout_ms)
@@ -163,17 +187,17 @@ defmodule EKV.ClientRouter do
     %{state | waiters: Map.put(state.waiters, mon_ref, waiter)}
   end
 
-  defp maybe_reply_waiters(%__MODULE__{waiters: waiters} = state) when map_size(waiters) == 0,
+  defp maybe_reply_waiters(%ClientRouter{waiters: waiters} = state) when map_size(waiters) == 0,
     do: state
 
-  defp maybe_reply_waiters(state) do
+  defp maybe_reply_waiters(%ClientRouter{} = state) do
     case ensure_backend(state) do
-      {{:ok, backend}, new_state} -> reply_waiters_if_ready({:ok, backend}, new_state)
+      {{:ok, backend}, new_state} -> reply_waiters_if_ready(new_state, {:ok, backend})
       {{:error, :unavailable}, new_state} -> new_state
     end
   end
 
-  defp reply_waiters_if_ready({:ok, backend}, %__MODULE__{waiters: waiters} = state)
+  defp reply_waiters_if_ready(%ClientRouter{waiters: waiters} = state, {:ok, backend})
        when map_size(waiters) > 0 do
     Enum.each(waiters, fn {_mon_ref, waiter} ->
       GenServer.reply(waiter.from, {:ok, backend})
@@ -183,9 +207,9 @@ defmodule EKV.ClientRouter do
     %{state | waiters: %{}}
   end
 
-  defp reply_waiters_if_ready(_reply, state), do: state
+  defp reply_waiters_if_ready(%ClientRouter{} = state, _reply), do: state
 
-  defp select_backend(%__MODULE__{} = state) do
+  defp select_backend(%ClientRouter{} = state) do
     case pick_valid_backend(state, true) do
       {:ok, backend} ->
         put_backend(state.name, backend)
@@ -206,7 +230,7 @@ defmodule EKV.ClientRouter do
     end
   end
 
-  defp pick_valid_backend(%__MODULE__{} = state, respect_cooldown?) do
+  defp pick_valid_backend(%ClientRouter{} = state, respect_cooldown?) do
     state
     |> candidate_nodes(respect_cooldown?)
     |> Enum.find_value(:error, fn node ->
@@ -219,7 +243,7 @@ defmodule EKV.ClientRouter do
     end)
   end
 
-  defp candidate_nodes(%__MODULE__{} = state, respect_cooldown?) do
+  defp candidate_nodes(%ClientRouter{} = state, respect_cooldown?) do
     table = table_name(state.name)
 
     case region_candidates(state, table, respect_cooldown?) do
@@ -240,9 +264,9 @@ defmodule EKV.ClientRouter do
     try do
       backend
       |> :erpc.call(EKV.MemberPresence, :member_nodes, [name], @route_probe_timeout)
-      |> Enum.each(fn node ->
-        if node != node() do
-          Node.connect(node)
+      |> Enum.each(fn member_node ->
+        if member_node != node() do
+          Node.connect(member_node)
         end
       end)
     catch
@@ -250,7 +274,8 @@ defmodule EKV.ClientRouter do
     end
   end
 
-  defp handle_pg_membership(state, ref, pids, op) do
+  defp handle_pg_membership(%ClientRouter{} = state, ref, pids, op)
+       when is_reference(ref) and is_list(pids) do
     case Map.fetch(state.monitors, ref) do
       :error ->
         state
@@ -270,7 +295,7 @@ defmodule EKV.ClientRouter do
     end
   end
 
-  defp handle_nodedown(state, node) do
+  defp handle_nodedown(%ClientRouter{} = state, node) do
     table = table_name(state.name)
 
     if cached_backend_from_table(table) == {:ok, node} do
@@ -325,7 +350,7 @@ defmodule EKV.ClientRouter do
     ArgumentError -> :ok
   end
 
-  defp mark_backend_failed_in_router(state, node) do
+  defp mark_backend_failed_in_router(%ClientRouter{} = state, node) do
     table = table_name(state.name)
 
     if cooled_down?(table, node) do
@@ -343,7 +368,7 @@ defmodule EKV.ClientRouter do
     ArgumentError -> state
   end
 
-  defp mark_candidate_invalid(state, node) do
+  defp mark_candidate_invalid(%ClientRouter{} = state, node) do
     table = table_name(state.name)
 
     :ets.insert(table, {{:cooldown_until, node}, now_ms() + @cooldown_ms})
@@ -389,7 +414,7 @@ defmodule EKV.ClientRouter do
     end)
   end
 
-  defp connected_member_candidates(state, table, respect_cooldown?) do
+  defp connected_member_candidates(%ClientRouter{} = state, table, respect_cooldown?) do
     Node.list()
     |> Task.async_stream(
       fn node ->
@@ -410,8 +435,7 @@ defmodule EKV.ClientRouter do
         acc
     end)
     |> then(fn by_region ->
-      state.region_routing
-      |> Enum.find_value([], fn region ->
+      Enum.find_value(state.region_routing, [], fn region ->
         candidates =
           by_region
           |> Map.get(region, [])

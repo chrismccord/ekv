@@ -78,7 +78,7 @@ defmodule EKV.ShutdownBarrier do
       snapshot = live_snapshot(state.name)
 
       if should_wait?(state, snapshot) do
-        maybe_log(state, :info, "shutdown barrier waiting for peers to enter terminal state")
+        maybe_log(state, :info, "shutdown barrier waiting for members to enter terminal state")
         wait_for_snapshot(state, snapshot)
       end
     end

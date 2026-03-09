@@ -225,12 +225,12 @@ defmodule EKV do
   | `:cluster_size` | `nil` | Member mode only. Logical cluster size for CAS quorum math. Required for CAS operations (`if_vsn:`, `consistent: true`, `update/4`). |
   | `:node_id` | `nil` | Member mode only. Stable logical member identity used by CAS ballots. Required for CAS operations. Should remain stable for each logical cluster member. |
   | `:wait_for_quorum` | `false` | Optional startup gate. In member mode, blocks startup until this EKV member can reach CAS quorum. In client mode, blocks startup until the selected backend member reports CAS quorum reachable. |
-  | `:shutdown_barrier` | `false` | Optional graceful-shutdown barrier. Keeps EKV serving during coordinated shutdown for up to the configured timeout so peers can finish final writes and replication. |
+  | `:shutdown_barrier` | `false` | Optional graceful-shutdown barrier. Keeps EKV serving during coordinated shutdown for up to the configured timeout so members can finish final writes and replication. |
   | `:allow_stale_startup` | `false` | Member mode only. Dangerous recovery override. If `true`, EKV trusts on-disk data even when stale-db detection would normally refuse startup. Intended only for explicit disaster recovery / full cold-cluster restore cases. |
   | `:tombstone_ttl` | `604_800_000` (7 days) | Member mode only. How long tombstones (deleted entries) are kept before being permanently purged, in milliseconds. See "Tombstone Lifetime" below. |
   | `:gc_interval` | `300_000` (5 min) | Member mode only. How often garbage collection runs, in milliseconds. GC expires TTL entries, purges old tombstones, and truncates the replication oplog. |
   | `:log` | `:info` | Logging level. `:info` logs cluster events (connects, syncs). `false` disables logging. `:verbose` logs per-shard detail. |
-  | `:partition_ttl_policy` | `:quarantine` | Member mode only. Policy for reconnects after downtime longer than `tombstone_ttl`. `:quarantine` blocks replication with that peer identity until operator rebuild. `:ignore` disables that quarantine and allows reconnect/sync anyway. |
+  | `:partition_ttl_policy` | `:quarantine` | Member mode only. Policy for reconnects after downtime longer than `tombstone_ttl`. `:quarantine` blocks replication with that member identity until operator rebuild. `:ignore` disables that quarantine and allows reconnect/sync anyway. |
   | `:blue_green` | `false` | Member mode only. Enable blue-green deployment mode. See "Blue-Green Deployment" below. |
 
   ### Client Mode
@@ -260,7 +260,7 @@ defmodule EKV do
 
   `shutdown_barrier: timeout_ms` is an opt-in graceful-shutdown aid.
 
-  - In coordinated shutdowns, members can stay alive briefly while peers and
+  - In coordinated shutdowns, members can stay alive briefly while other members and
     clients enter terminal state, which reduces final-write `:no_quorum`
     failures and allows more replication to complete before exit.
   - Blue-green outgoing members skip the barrier after successful handoff.
@@ -312,12 +312,12 @@ defmodule EKV do
   same `data_dir`, it will raise an `ArgumentError`. To change the shard
   count, you must delete the existing data directory and start fresh. All
   replicas in the cluster must use the same shard count — a node with a
-  mismatched count will have its replication connections rejected by peers.
+  mismatched count will have its replication connections rejected by members.
 
   ### Tombstone Lifetime
 
   When you delete a key, EKV doesn't immediately erase it. Instead, it writes
-  a timestamped tombstone that replicates to all peers, ensuring every node
+  a timestamped tombstone that replicates to all members, ensuring every node
   learns about the delete. Tombstones are permanently purged after
   `tombstone_ttl` (default 7 days).
 
@@ -327,7 +327,7 @@ defmodule EKV do
   timestamp is older than the tombstone TTL safety window, EKV refuses startup
   by default instead of trusting that on-disk state. This prevents "zombie"
   keys from reappearing. Operators can then either wipe that node's data dir
-  so it rebuilds from peers, or explicitly set `allow_stale_startup: true`
+  so it rebuilds from members, or explicitly set `allow_stale_startup: true`
   when they intentionally want to trust the old on-disk cluster state.
 
   Reduce `tombstone_ttl` if storage is tight and your nodes are rarely offline
@@ -341,9 +341,9 @@ defmodule EKV do
   `tombstone_ttl`.
 
   By default (`partition_ttl_policy: :quarantine`), EKV detects reconnects
-  after downtime longer than `tombstone_ttl` and quarantines that peer pair
+  after downtime longer than `tombstone_ttl` and quarantines that member pair
   instead of syncing potentially unsafe state. Replication remains blocked for
-  that peer until an operator rebuilds one side.
+  that member until an operator rebuilds one side.
 
   Down-since markers are persisted in `kv_meta`, keyed by `node_id` when
   available (fallback: node name). This preserves quarantine history across
@@ -407,7 +407,7 @@ defmodule EKV do
 
   Replication is automatic and requires no configuration beyond Erlang
   distribution. When a new node connects (via `Node.connect/1` or a cluster
-  manager like `DNSCluster`), EKV discovers peer shards and syncs:
+  manager like `DNSCluster`), EKV discovers member shards and syncs:
 
   - **Delta sync** — if the nodes were recently connected and the replication
     log hasn't been truncated, only the missed entries are sent.
@@ -416,7 +416,7 @@ defmodule EKV do
     enough for the oplog to be truncated, a full state transfer is performed.
 
   After the initial sync, every local write is replicated to all connected
-  peers in real time (fire-and-forget, async). Consistency is maintained by
+  members in real time (fire-and-forget, async). Consistency is maintained by
   LWW, not by delivery order.
 
   ## TTL
@@ -710,7 +710,7 @@ defmodule EKV do
   @doc """
   Delete a key.
 
-  Writes a tombstone that replicates to all peers.
+  Writes a tombstone that replicates to all members.
 
   ## Options
 
@@ -1115,9 +1115,9 @@ defmodule EKV do
       :member ->
         shard_state = :sys.get_state(Replica.shard_name(name, 0))
 
-        peers =
+        connected_members =
           for {node, _pid} <- shard_state.remote_shards do
-            %{node: node, node_id: Map.get(shard_state.peer_node_ids, node)}
+            %{node: node, node_id: Map.get(shard_state.member_node_ids, node)}
           end
 
         %{
@@ -1128,7 +1128,7 @@ defmodule EKV do
           cluster_size: config.cluster_size,
           shards: config.num_shards,
           data_dir: config.data_dir,
-          connected_members: peers
+          connected_members: connected_members
         }
     end
   end
