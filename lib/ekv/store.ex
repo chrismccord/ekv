@@ -466,11 +466,11 @@ defmodule EKV.Store do
   end
 
   @doc """
-  Remove HWM entries for peers not currently connected.
-  Prevents dead peers from anchoring the oplog forever.
+  Remove HWM entries for members not currently connected.
+  Prevents dead members from anchoring the oplog forever.
   """
-  def prune_peer_hwms(db, connected_peers) do
-    connected_set = MapSet.new(connected_peers, &Atom.to_string/1)
+  def prune_member_hwms(db, connected_members) do
+    connected_set = MapSet.new(connected_members, &Atom.to_string/1)
     {:ok, rows} = EKV.Sqlite3.fetch_all(db, "SELECT peer_node FROM kv_peer_hwm", [])
 
     for [peer_node] <- rows, not MapSet.member?(connected_set, peer_node) do

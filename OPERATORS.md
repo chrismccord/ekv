@@ -14,7 +14,7 @@ EKV.info(:my_kv)
 #   cluster_size: 3,
 #   shards: 8,
 #   data_dir: "/var/data/ekv",
-#   connected_peers: [
+#   connected_members: [
 #     %{node: :app@host2, node_id: "f7e8d9c0b1a2"},
 #     %{node: :app@host3, node_id: "1122334455aa"}
 #   ]
@@ -22,7 +22,7 @@ EKV.info(:my_kv)
 ```
 
 Verify:
-- In steady state, `connected_peers` length equals `cluster_size - 1`
+- In steady state, `connected_members` length equals `cluster_size - 1`
 - Each peer has a non-nil `node_id`
 - In steady state, peer `node_id` values are distinct
 
@@ -30,7 +30,7 @@ During blue-green overlap, two Erlang nodes may temporarily share the same
 logical `node_id`. In that case, dedupe by `node_id` and reason about logical
 members rather than raw peer count.
 
-If a partition or maintenance event is active, `connected_peers` may be lower
+If a partition or maintenance event is active, `connected_members` may be lower
 temporarily. Treat this as healthy only if it matches an expected outage.
 
 ## Startup Readiness
@@ -197,7 +197,7 @@ EKV.put(:my_kv, "key", "val", if_vsn: nil)
 info = EKV.info(:my_kv)
 
 logical_members =
-  [info.node_id | Enum.map(info.connected_peers, & &1.node_id)]
+  [info.node_id | Enum.map(info.connected_members, & &1.node_id)]
   |> Enum.uniq()
   |> length()
 
@@ -470,7 +470,7 @@ the mismatched node.
 
 | Check | How | Healthy |
 |-------|-----|---------|
-| Cluster membership | `EKV.info(:my_kv).connected_peers` | Length = `cluster_size - 1` |
+| Cluster membership | `EKV.info(:my_kv).connected_members` | Length = `cluster_size - 1` |
 | Node identity | `EKV.info(:my_kv).node_id` | Non-nil, stable across restarts |
 | Data reachable | `EKV.get(:my_kv, "known_key")` | Returns expected value |
 | CAS working | `EKV.update(:my_kv, "counter", &(&1 + 1))` | Returns `{:ok, _}` |

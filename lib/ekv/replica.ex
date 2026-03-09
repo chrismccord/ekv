@@ -1699,8 +1699,8 @@ defmodule EKV.Replica do
     # 2b. Purge orphan kv_paxos rows (keys that were tombstone-purged)
     if state.cluster_size, do: Store.purge_orphan_paxos(db)
 
-    # 3. Prune HWMs for disconnected peers (prevents unbounded oplog growth)
-    Store.prune_peer_hwms(db, Map.keys(state.remote_shards))
+    # 3. Prune HWMs for disconnected members (prevents unbounded oplog growth)
+    Store.prune_member_hwms(db, Map.keys(state.remote_shards))
 
     # 4. Truncate oplog
     Store.truncate_oplog(db)

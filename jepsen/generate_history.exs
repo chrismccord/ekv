@@ -179,7 +179,7 @@ defmodule EkvJepsen.HistoryGen do
         Enum.all?(nodes, fn node ->
           try do
             info = :erpc.call(node, EKV, :info, [@ekv_name])
-            length(info.connected_peers) == cluster_size - 1
+            length(info.connected_members) == cluster_size - 1
           rescue
             _ -> false
           catch
@@ -321,7 +321,7 @@ defmodule EkvJepsen.HistoryGen do
   defp wait_for_ekv_node!(node, cluster_size) do
     wait_until!("EKV restart #{node}", 20_000, fn ->
       case safe_erpc(node, EKV, :info, [@ekv_name]) do
-        %{connected_peers: peers} -> length(peers) >= cluster_size - 1
+        %{connected_members: peers} -> length(peers) >= cluster_size - 1
         _ -> false
       end
     end)

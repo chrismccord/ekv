@@ -4577,7 +4577,7 @@ defmodule EKVTest do
       assert info.cluster_size == 3
       assert info.shards == 4
       assert info.data_dir == data_dir
-      assert info.connected_peers == []
+      assert info.connected_members == []
     end
   end
 

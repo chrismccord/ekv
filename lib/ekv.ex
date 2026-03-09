@@ -249,6 +249,9 @@ defmodule EKV do
   - After backend failover, eventual reads may observe an older replica view.
     Use `consistent: true` when freshness matters.
 
+  For deployment, scaling, blue-green rollout, quorum startup, and shutdown
+  guidance, see `OPERATORS.md` in the repository.
+
   ### Shutdown Barrier
 
   `shutdown_barrier: timeout_ms` is an opt-in graceful-shutdown aid.
@@ -1049,7 +1052,7 @@ defmodule EKV do
   @doc """
   Return cluster status information.
 
-  Member mode returns node_id, cluster_size, shards, data_dir, connected peers,
+  Member mode returns node_id, cluster_size, shards, data_dir, connected members,
   and region metadata.
 
   Client mode returns region metadata, routing preferences, and the currently
@@ -1084,7 +1087,7 @@ defmodule EKV do
           cluster_size: config.cluster_size,
           shards: config.num_shards,
           data_dir: config.data_dir,
-          connected_peers: peers
+          connected_members: peers
         }
     end
   end
