@@ -1105,7 +1105,11 @@ defmodule EKV do
           mode: :client,
           region: config.region,
           region_routing: config.region_routing,
-          current_backend: EKV.ClientRouter.current_backend(name)
+          current_backend:
+            case EKV.ClientRouter.backend(name) do
+              {:ok, backend} -> backend
+              {:error, :unavailable} -> nil
+            end
         }
 
       :member ->
@@ -1130,7 +1134,7 @@ defmodule EKV do
   end
 
   @doc """
-  Block until CAS quorum is reachable, or return an error on timeout.
+  Block until CAS quorum is reachable, or returns an error on timeout.
 
   In member mode, this checks the same member-reachability predicate that CAS
   writes use for early `:no_quorum` rejection.

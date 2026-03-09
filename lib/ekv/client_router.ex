@@ -25,13 +25,6 @@ defmodule EKV.ClientRouter do
     end
   end
 
-  def current_backend(name) do
-    case backend(name) do
-      {:ok, backend} -> backend
-      {:error, :unavailable} -> nil
-    end
-  end
-
   def await_backend(name, timeout_ms) do
     GenServer.call(
       router_name(name),
