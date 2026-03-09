@@ -69,14 +69,26 @@ defmodule EKV.MemberPresence do
   end
 
   defp join_groups(state) do
-    :ok = :pg.join(region_group(state.name, state.region), self())
+    :ok =
+      :pg.join(
+        EKV.Supervisor.pg_scope(state.name),
+        region_group(state.name, state.region),
+        self()
+      )
+
     %{state | joined?: true}
   end
 
   defp leave_groups(%{joined?: false} = state), do: state
 
   defp leave_groups(state) do
-    :ok = :pg.leave(region_group(state.name, state.region), self())
+    :ok =
+      :pg.leave(
+        EKV.Supervisor.pg_scope(state.name),
+        region_group(state.name, state.region),
+        self()
+      )
+
     %{state | joined?: false}
   end
 

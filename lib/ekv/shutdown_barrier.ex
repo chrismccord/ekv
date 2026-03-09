@@ -87,20 +87,22 @@ defmodule EKV.ShutdownBarrier do
   end
 
   defp join_live_groups(state) do
-    :ok = :pg.join(live_all_group(state.name), self())
+    scope = EKV.Supervisor.pg_scope(state.name)
+    :ok = :pg.join(scope, live_all_group(state.name), self())
 
     if state.mode == :member do
-      :ok = :pg.join(live_member_group(state.name, state.member_identity), self())
+      :ok = :pg.join(scope, live_member_group(state.name, state.member_identity), self())
     end
 
     :ok
   end
 
   defp join_terminal_groups(state) do
-    :ok = :pg.join(terminal_all_group(state.name), self())
+    scope = EKV.Supervisor.pg_scope(state.name)
+    :ok = :pg.join(scope, terminal_all_group(state.name), self())
 
     if state.mode == :member do
-      :ok = :pg.join(terminal_member_group(state.name, state.member_identity), self())
+      :ok = :pg.join(scope, terminal_member_group(state.name, state.member_identity), self())
     end
 
     :ok
@@ -179,18 +181,17 @@ defmodule EKV.ShutdownBarrier do
          name: name,
          member_identity: id
        }) do
-    live_member_group(name, id)
-    |> pg_members()
+    pg_members(name, live_member_group(name, id))
     |> Enum.any?(&(&1 != self()))
   end
 
   defp logical_identity_survives_exit?(_state), do: false
 
   defp live_member_identities(name) do
-    :pg.which_groups()
+    :pg.which_groups(EKV.Supervisor.pg_scope(name))
     |> Enum.reduce(MapSet.new(), fn
       {:ekv_shutdown_live_member, ^name, identity} = group, acc ->
-        if pg_members(group) == [] do
+        if pg_members(name, group) == [] do
           acc
         else
           MapSet.put(acc, identity)
@@ -234,13 +235,13 @@ defmodule EKV.ShutdownBarrier do
     end
   end
 
-  defp current_live_set(name), do: MapSet.new(pg_members(live_all_group(name)))
-  defp current_terminal_set(name), do: MapSet.new(pg_members(terminal_all_group(name)))
+  defp current_live_set(name), do: MapSet.new(pg_members(name, live_all_group(name)))
+  defp current_terminal_set(name), do: MapSet.new(pg_members(name, terminal_all_group(name)))
 
-  defp live_snapshot(name), do: MapSet.new(pg_members(live_all_group(name)))
+  defp live_snapshot(name), do: MapSet.new(pg_members(name, live_all_group(name)))
 
-  defp pg_members(group) do
-    :pg.get_members(group)
+  defp pg_members(name, group) do
+    :pg.get_members(EKV.Supervisor.pg_scope(name), group)
   rescue
     _ -> []
   end

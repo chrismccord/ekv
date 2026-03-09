@@ -150,9 +150,11 @@ defmodule EKV.ClientRouter do
   end
 
   defp monitor_region_groups(name, region_routing) do
+    scope = EKV.Supervisor.pg_scope(name)
+
     Enum.reduce(region_routing, {%{}, %{}}, fn region, {monitors, members_by_region} ->
       group = EKV.MemberPresence.region_group(name, region)
-      {ref, members} = :pg.monitor(group)
+      {ref, members} = :pg.monitor(scope, group)
       nodes = members |> Enum.map(&node/1) |> MapSet.new()
 
       {

@@ -4721,6 +4721,42 @@ defmodule EKVTest do
           )
       end)
     end
+
+    test "each EKV instance uses its own pg scope" do
+      name_a = :"ekv_client_scope_a_#{System.unique_integer([:positive])}"
+      name_b = :"ekv_client_scope_b_#{System.unique_integer([:positive])}"
+
+      {:ok, pid_a} =
+        EKV.start_link(
+          name: name_a,
+          mode: :client,
+          region: "ord",
+          region_routing: ["iad"]
+        )
+
+      {:ok, pid_b} =
+        EKV.start_link(
+          name: name_b,
+          mode: :client,
+          region: "ord",
+          region_routing: ["iad"]
+        )
+
+      on_exit(fn ->
+        Process.exit(pid_a, :shutdown)
+        Process.exit(pid_b, :shutdown)
+      end)
+
+      assert :ok = EKV.subscribe(name_a, "scope/")
+
+      assert Enum.sort(:pg.which_groups(EKV.Supervisor.pg_scope(name_a))) ==
+               Enum.sort([
+                 EKV.client_any_sub_group(name_a),
+                 EKV.client_sub_group(name_a, "scope/")
+               ])
+
+      assert :pg.which_groups(EKV.Supervisor.pg_scope(name_b)) == []
+    end
   end
 
   # =====================================================================

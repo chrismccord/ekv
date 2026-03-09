@@ -4,6 +4,9 @@ defmodule EKV.Supervisor do
 
   _archdoc = ~S"""
   Top-level supervisor. Builds config map and stores it in `persistent_term`.
+  Each EKV instance also owns its own `:pg` scope (`:"#{name}_ekv_pg_scope"`),
+  so subscriptions, member routing, and shutdown coordination stay isolated
+  from other EKV instances and from unrelated default-scope `:pg` traffic.
 
   ## Blue-Green Deployment (Synchronized Handoff)
 
@@ -118,6 +121,13 @@ defmodule EKV.Supervisor do
     Supervisor.start_link(__MODULE__, opts, name: :"#{name}_ekv_sup")
   end
 
+  def pg_scope(name), do: :"#{name}_ekv_pg_scope"
+
+  def pg_scope_child(name) do
+    scope = pg_scope(name)
+    %{id: scope, start: {:pg, :start_link, [scope]}}
+  end
+
   @impl true
   def init(opts) do
     name = Keyword.fetch!(opts, :name)
@@ -223,6 +233,7 @@ defmodule EKV.Supervisor do
 
     children =
       [
+        pg_scope_child(name),
         if(blue_green, do: {EKV.BlueGreenMarker, name: name, data_dir: data_dir, log: log}),
         {EKV.SubTracker, name: sub_tracker_name, sub_count: sub_count},
         {Registry, keys: :duplicate, name: registry_name, listeners: [sub_tracker_name]},
@@ -269,6 +280,7 @@ defmodule EKV.Supervisor do
 
     children =
       [
+        pg_scope_child(name),
         {EKV.ClientRouter, name: name},
         if(is_integer(wait_for_route),
           do: {EKV.RouteGate, name: name, timeout: wait_for_route, log: log}

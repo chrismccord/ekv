@@ -1171,7 +1171,7 @@ defmodule EKV do
 
   @doc false
   def client_subscribers?(name) do
-    case :pg.get_members(client_any_sub_group(name)) do
+    case :pg.get_members(EKV.Supervisor.pg_scope(name), client_any_sub_group(name)) do
       [] -> false
       members when is_list(members) -> true
     end

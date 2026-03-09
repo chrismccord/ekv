@@ -368,7 +368,7 @@ defmodule EKV.ClientModeDistributedTest do
     region_group = EKV.MemberPresence.region_group(ekv_name, "iad")
 
     TestCluster.assert_eventually(fn ->
-      TestCluster.rpc!(n1b, :pg, :get_members, [region_group])
+      TestCluster.rpc!(n1b, :pg, :get_members, [EKV.Supervisor.pg_scope(ekv_name), region_group])
       |> Enum.map(&node/1)
       |> Enum.uniq()
       |> Enum.sort()

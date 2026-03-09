@@ -2314,7 +2314,12 @@ defmodule EKV.CASDistributedTest do
 
       TestCluster.assert_eventually(
         fn ->
-          length(TestCluster.rpc!(node_c, :pg, :get_members, [terminal_group])) >= 2
+          length(
+            TestCluster.rpc!(node_c, :pg, :get_members, [
+              EKV.Supervisor.pg_scope(ekv_name),
+              terminal_group
+            ])
+          ) >= 2
         end,
         timeout: 5_000
       )

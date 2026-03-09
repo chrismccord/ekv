@@ -109,7 +109,7 @@ defmodule EKV.SubDispatcher do
   end
 
   defp client_members(name, prefix) do
-    :pg.get_members(EKV.client_sub_group(name, prefix))
+    :pg.get_members(EKV.Supervisor.pg_scope(name), EKV.client_sub_group(name, prefix))
   rescue
     _ -> []
   end

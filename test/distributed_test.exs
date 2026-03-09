@@ -2092,21 +2092,21 @@ defmodule EKV.DistributedTest do
 
     data_dirs =
       for {_pid, node} <- peers do
-      data_dir = "/tmp/ekv_dist_test_#{node}_#{ekv_name}"
-      TestCluster.rpc!(node, File, :rm_rf!, [data_dir])
+        data_dir = "/tmp/ekv_dist_test_#{node}_#{ekv_name}"
+        TestCluster.rpc!(node, File, :rm_rf!, [data_dir])
 
-      TestCluster.start_ekv(
-        node,
-        name: ekv_name,
-        data_dir: data_dir,
-        shards: num_shards,
-        log: false,
-        gc_interval: :timer.hours(1),
-        tombstone_ttl: :timer.hours(24 * 7)
-      )
+        TestCluster.start_ekv(
+          node,
+          name: ekv_name,
+          data_dir: data_dir,
+          shards: num_shards,
+          log: false,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
 
-      data_dir
-    end
+        data_dir
+      end
 
     await_replica_discovery(peers, ekv_name, num_shards)
     data_dirs
