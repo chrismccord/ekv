@@ -31,10 +31,18 @@ defmodule EKV.ClientSubscriptions do
       {:reply, :ok, state}
     else
       if entry.monitor == nil do
-        :pg.join(EKV.Supervisor.pg_scope(state.name), EKV.client_any_sub_group(state.name), pid)
+        :pg.join(
+          EKV.Supervisor.pg_scope(state.name),
+          EKV.Supervisor.client_any_sub_group(state.name),
+          pid
+        )
       end
 
-      :pg.join(EKV.Supervisor.pg_scope(state.name), EKV.client_sub_group(state.name, prefix), pid)
+      :pg.join(
+        EKV.Supervisor.pg_scope(state.name),
+        EKV.Supervisor.client_sub_group(state.name, prefix),
+        pid
+      )
 
       entry =
         entry
@@ -54,7 +62,7 @@ defmodule EKV.ClientSubscriptions do
         if MapSet.member?(prefixes, prefix) do
           :pg.leave(
             EKV.Supervisor.pg_scope(state.name),
-            EKV.client_sub_group(state.name, prefix),
+            EKV.Supervisor.client_sub_group(state.name, prefix),
             pid
           )
         end
@@ -64,7 +72,7 @@ defmodule EKV.ClientSubscriptions do
         if MapSet.size(prefixes) == 0 do
           :pg.leave(
             EKV.Supervisor.pg_scope(state.name),
-            EKV.client_any_sub_group(state.name),
+            EKV.Supervisor.client_any_sub_group(state.name),
             pid
           )
 

@@ -1209,7 +1209,7 @@ defmodule EKV.DistributedTest do
       # Trigger GC on A to convert any expired into tombstones (already done by delete)
       # The key point: tombstones exist when partition heals
       now = System.system_time(:nanosecond)
-      config = TestCluster.rpc!(node_a, EKV, :get_config, [ekv_name])
+      config = TestCluster.rpc!(node_a, EKV.Supervisor, :get_config, [ekv_name])
       tombstone_cutoff = now - config.tombstone_ttl * 1_000_000
 
       for shard <- 0..(config.num_shards - 1) do
@@ -1292,7 +1292,7 @@ defmodule EKV.DistributedTest do
       # Purge the 5 tombstones on both A and B by triggering GC with a far-future cutoff
       now = System.system_time(:nanosecond)
       future_cutoff = now + :timer.hours(24 * 365) * 1_000_000
-      config = TestCluster.rpc!(node_a, EKV, :get_config, [ekv_name])
+      config = TestCluster.rpc!(node_a, EKV.Supervisor, :get_config, [ekv_name])
 
       for node <- [node_a, node_b] do
         for shard <- 0..(config.num_shards - 1) do
@@ -1384,7 +1384,7 @@ defmodule EKV.DistributedTest do
 
       # Force oplog truncation on A: advance all peer HWMs to max_seq,
       # truncate, then delete B's HWM row so reconnect triggers full sync.
-      config = TestCluster.rpc!(node_a, EKV, :get_config, [ekv_name])
+      config = TestCluster.rpc!(node_a, EKV.Supervisor, :get_config, [ekv_name])
 
       for shard <- 0..(config.num_shards - 1) do
         shard_name = :"#{ekv_name}_ekv_replica_#{shard}"
@@ -1745,7 +1745,7 @@ defmodule EKV.DistributedTest do
       end)
 
       # Manually send a second peer_connect from A to B
-      config = TestCluster.rpc!(node_a, EKV, :get_config, [ekv_name])
+      config = TestCluster.rpc!(node_a, EKV.Supervisor, :get_config, [ekv_name])
 
       for shard <- 0..(config.num_shards - 1) do
         shard_name = :"#{ekv_name}_ekv_replica_#{shard}"

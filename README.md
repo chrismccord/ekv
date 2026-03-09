@@ -155,16 +155,16 @@ Last-Writer-Wins with nanosecond timestamps. Ties are broken deterministically b
 
 A delete is just an entry with `deleted_at` set. Same LWW rules apply -- a put with a higher timestamp beats a delete, and vice versa.
 
-### Consistency Modes (Important)
+### Consistency Modes - LWW vs CAS (Compare-and-Swap)
 
 EKV supports two write modes:
 
 - **Eventual/LWW mode**: default `EKV.put/4` and `EKV.delete/3` without CAS options.
 - **CAS mode**: `EKV.put/4` with `if_vsn:` or `consistent: true`, `EKV.delete/3` with `if_vsn:`, and `EKV.update/4`.
 
-Use mode as **key ownership**:
+Use consistent mode as **key ownership**:
 
-- Different keys may use different modes in the same EKV instance.
+- Different keys may use different consistency modes in the same EKV instance.
 - A key may start in eventual/LWW mode and later transition to CAS mode
   (`LWW -> CAS` is supported).
 - Once a key is CAS-managed, eventual writes on that key are rejected
@@ -187,8 +187,9 @@ CAS writes (`put` with `if_vsn:` or `consistent: true`, `delete` with `if_vsn:`,
 
 - `{:error, :conflict}`: write was rejected before a deciding accept phase
   (for example: version mismatch or pre-accept contention).
-- `{:error, :unconfirmed}`: write entered accept phase, but the caller could not
-  confirm final outcome. The write may already be committed.
+- `{:error, :unconfirmed}`: write entered accept phase, but the caller
+    could not confirm final outcome. The write may already be committed,
+    or it may have lost to a competing ballot and never committed.
 
 On `:unconfirmed`, resolve with `EKV.get(name, key, consistent: true)` before
 taking follow-up actions.

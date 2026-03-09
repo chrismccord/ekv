@@ -195,7 +195,7 @@ defmodule EKV.TestCluster do
   def do_scan_count(name, prefix), do: EKV.scan(name, prefix) |> Enum.count()
 
   def do_store_get(name, key) do
-    config = EKV.get_config(name)
+    config = EKV.Supervisor.get_config(name)
     shard = EKV.Replica.shard_index_for(key, config.num_shards)
     shard_name = EKV.Replica.shard_name(name, shard)
     %{db: db} = :sys.get_state(shard_name)
@@ -221,7 +221,7 @@ defmodule EKV.TestCluster do
 
   @doc "Flush all EKV shard GenServers on a remote node"
   def flush_shards(node, name) do
-    num_shards = rpc!(node, EKV, :get_config, [name]).num_shards
+    num_shards = rpc!(node, EKV.Supervisor, :get_config, [name]).num_shards
 
     for shard <- 0..(num_shards - 1) do
       rpc!(node, :sys, :get_state, [:"#{name}_ekv_replica_#{shard}"])
@@ -232,7 +232,7 @@ defmodule EKV.TestCluster do
 
   @doc "Suspend all EKV shard GenServers on a remote node (simulates latency/freeze)"
   def suspend_shards(node, name) do
-    num_shards = rpc!(node, EKV, :get_config, [name]).num_shards
+    num_shards = rpc!(node, EKV.Supervisor, :get_config, [name]).num_shards
 
     for shard <- 0..(num_shards - 1) do
       rpc!(node, :sys, :suspend, [:"#{name}_ekv_replica_#{shard}"])
@@ -243,7 +243,7 @@ defmodule EKV.TestCluster do
 
   @doc "Resume all EKV shard GenServers on a remote node"
   def resume_shards(node, name) do
-    num_shards = rpc!(node, EKV, :get_config, [name]).num_shards
+    num_shards = rpc!(node, EKV.Supervisor, :get_config, [name]).num_shards
 
     for shard <- 0..(num_shards - 1) do
       rpc!(node, :sys, :resume, [:"#{name}_ekv_replica_#{shard}"])

@@ -11,14 +11,14 @@ defmodule EKV.GC do
   @impl true
   def init(opts) do
     name = Keyword.fetch!(opts, :name)
-    config = EKV.get_config(name)
+    config = EKV.Supervisor.get_config(name)
     schedule_gc(config.gc_interval)
     {:ok, %{name: name}}
   end
 
   @impl true
   def handle_info(:gc_tick, state) do
-    config = EKV.get_config(state.name)
+    config = EKV.Supervisor.get_config(state.name)
     now = System.system_time(:nanosecond)
     tombstone_cutoff = now - config.tombstone_ttl * 1_000_000
 

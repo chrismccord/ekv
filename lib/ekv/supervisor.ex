@@ -121,7 +121,28 @@ defmodule EKV.Supervisor do
     Supervisor.start_link(__MODULE__, opts, name: :"#{name}_ekv_sup")
   end
 
+  @doc false
+  def get_config(name) do
+    :persistent_term.get({EKV, name})
+  end
+
   def pg_scope(name), do: :"#{name}_ekv_pg_scope"
+
+  @doc false
+  def client_sub_group(name, prefix), do: {:ekv_sub, name, prefix}
+
+  @doc false
+  def client_any_sub_group(name), do: {:ekv_sub_any, name}
+
+  @doc false
+  def client_subscribers?(name) do
+    case :pg.get_members(pg_scope(name), client_any_sub_group(name)) do
+      [] -> false
+      members when is_list(members) -> true
+    end
+  rescue
+    _ -> false
+  end
 
   def pg_scope_child(name) do
     scope = pg_scope(name)

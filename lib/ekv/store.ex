@@ -284,6 +284,20 @@ defmodule EKV.Store do
     result
   end
 
+  def max_timestamp(db) do
+    {:ok, stmt} = EKV.Sqlite3.prepare(db, "SELECT MAX(timestamp) FROM kv")
+
+    result =
+      case EKV.Sqlite3.step(db, stmt) do
+        {:row, [nil]} -> nil
+        {:row, [ts]} -> ts
+        :done -> nil
+      end
+
+    :ok = EKV.Sqlite3.release(db, stmt)
+    result
+  end
+
   @doc """
   Single-bounce read using a cached prepared statement
   """

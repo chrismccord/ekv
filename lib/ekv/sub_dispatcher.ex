@@ -18,7 +18,7 @@ defmodule EKV.SubDispatcher do
   def init(opts) do
     name = Keyword.fetch!(opts, :name)
     shard_index = Keyword.fetch!(opts, :shard_index)
-    config = EKV.get_config(name)
+    config = EKV.Supervisor.get_config(name)
 
     {:ok, %SubDispatcher{name: name, shard_index: shard_index, registry: config.registry}}
   end
@@ -109,7 +109,7 @@ defmodule EKV.SubDispatcher do
   end
 
   defp client_members(name, prefix) do
-    :pg.get_members(EKV.Supervisor.pg_scope(name), EKV.client_sub_group(name, prefix))
+    :pg.get_members(EKV.Supervisor.pg_scope(name), EKV.Supervisor.client_sub_group(name, prefix))
   rescue
     _ -> []
   end

@@ -55,7 +55,7 @@ defmodule EKV.ClientRouter do
   @impl true
   def init(opts) do
     name = Keyword.fetch!(opts, :name)
-    config = EKV.get_config(name)
+    config = EKV.Supervisor.get_config(name)
 
     :ok = :net_kernel.monitor_nodes(true)
 
@@ -409,7 +409,7 @@ defmodule EKV.ClientRouter do
     Node.list()
     |> Task.async_stream(
       fn node ->
-        case EKV.remote_invoke(node, :info, [state.name], @route_probe_timeout) do
+        case probe_member_info(node, state.name) do
           {:ok, %{mode: :member, region: region}} -> {:ok, node, region}
           _ -> :error
         end
@@ -440,6 +440,18 @@ defmodule EKV.ClientRouter do
         if candidates == [], do: false, else: candidates
       end)
     end)
+  end
+
+  defp probe_member_info(node, name) do
+    try do
+      case :erpc.call(node, EKV, :__client_invoke__, [:info, [name]], @route_probe_timeout) do
+        {:ok, result} -> {:ok, result}
+        {:raise, _exception} -> :error
+        {:exit, _reason} -> :error
+      end
+    catch
+      :exit, _reason -> :error
+    end
   end
 
   defp now_ms, do: System.monotonic_time(:millisecond)

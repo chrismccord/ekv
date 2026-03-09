@@ -52,7 +52,7 @@ defmodule EKV.ShutdownBarrier do
     name = Keyword.fetch!(opts, :name)
     timeout = Keyword.fetch!(opts, :timeout)
     log = Keyword.get(opts, :log, :info)
-    config = EKV.get_config(name)
+    config = EKV.Supervisor.get_config(name)
 
     state = %__MODULE__{
       name: name,

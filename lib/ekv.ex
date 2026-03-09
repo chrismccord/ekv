@@ -1,6 +1,6 @@
 defmodule EKV do
   @moduledoc """
-  Eventually consistent durable key-value store with zero runtime dependencies.
+  Eventually consistent durable KV store with opt-in per-key linearizable CAS.
 
   EKV supports two runtime roles:
 
@@ -11,11 +11,11 @@ defmodule EKV do
 
   In member mode, EKV stores data on disk (survives restarts and node death)
   and replicates across all connected Erlang nodes automatically. There is no
-  leader for eventual mode — every member serves reads and eventual writes at
-  all times, including during network partitions. CAS writes (`if_vsn:`,
-  `consistent: true`, `update/4`) require quorum and may fail when quorum is
-  unavailable. When connectivity is restored, members converge to the same
-  state.
+  leader in either mode: every member serves eventual reads and writes at all
+  times, including during network partitions, and any member can propose CAS
+  operations. CAS writes (`if_vsn:`, `consistent: true`, `update/4`) still
+  require quorum and may fail when quorum is unavailable. When connectivity is
+  restored, members converge to the same state.
 
   ## Quick Start
 
@@ -120,7 +120,9 @@ defmodule EKV do
   This means:
 
   - The "latest" write always wins, where "latest" is determined by the
-    writer's local `System.system_time(:nanosecond)`.
+    writer's local wall-clock timestamp. EKV uses `System.system_time(:nanosecond)`
+    as the base and ensures same-node local writes on a shard do not reuse a
+    timestamp.
 
   - **Clock skew matters.** If node A's clock is 5 seconds ahead of node B,
     then A's writes will beat B's writes for the same key even if B wrote
@@ -175,8 +177,9 @@ defmodule EKV do
   - `{:ok, ...}` — write committed; returns the committed VSN.
   - `{:error, :conflict}` — definite non-application for this attempt
     (for example stale `if_vsn`).
-  - `{:error, :unconfirmed}` — write reached accept phase, so final outcome is
-    ambiguous from the caller's perspective.
+  - `{:error, :unconfirmed}`: write entered accept phase, but the caller
+    could not confirm final outcome. The write may already be committed,
+    or it may have lost to a competing ballot and never committed.
 
   On `:unconfirmed`, callers can issue `get(name, key, consistent: true)` to
   resolve current committed state before taking follow-up actions.
@@ -483,14 +486,15 @@ defmodule EKV do
   @doc """
   Look up a key's value and version.
 
-  Returns `{value, vsn}` where `vsn` is `{timestamp, origin_node}`,
+  Returns `{value, vsn}` where `vsn` is the version tuple
+  `{timestamp, origin_node}`,
   or `nil` for missing, deleted, or expired keys.
 
   The vsn can be passed to `put/4` with `if_vsn:` for compare-and-swap.
   This is a local read (eventually consistent, no GenServer hop).
   """
   def lookup(name, key) do
-    config = get_config(name)
+    config = EKV.Supervisor.get_config(name)
 
     case mode(config) do
       :client ->
@@ -564,7 +568,7 @@ defmodule EKV do
   - Eventual put (`put` without CAS options): `:ok` or
     `{:error, :cas_managed_key}` when the key is CAS-managed
   - CAS put (`if_vsn:` or `consistent: true`): `{:ok, vsn}` where
-    `vsn` is `{timestamp, origin_node}`
+    `vsn` is the version tuple `{timestamp, origin_node}`
   - With `resolve_unconfirmed: true`, CAS put may also return
     `{:error, :unavailable}` if ambiguity resolution cannot complete.
   """
@@ -586,7 +590,7 @@ defmodule EKV do
     validate_timeout_opt!(opts)
     consistent? = validate_boolean_opt!(opts, :consistent)
     _resolve_unconfirmed? = validate_boolean_opt!(opts, :resolve_unconfirmed)
-    config = get_config(name)
+    config = EKV.Supervisor.get_config(name)
     timeout = rpc_timeout_from_opts(opts)
 
     case mode(config) do
@@ -654,7 +658,7 @@ defmodule EKV do
     validate_backoff_opt!(opts)
     validate_timeout_opt!(opts)
     consistent? = validate_boolean_opt!(opts, :consistent)
-    config = get_config(name)
+    config = EKV.Supervisor.get_config(name)
     timeout = rpc_timeout_from_opts(opts)
 
     case mode(config) do
@@ -733,7 +737,8 @@ defmodule EKV do
 
   - Eventual delete (`delete` without CAS options): `:ok` or
     `{:error, :cas_managed_key}` when the key is CAS-managed
-  - CAS delete (`if_vsn:`): `{:ok, vsn}` where `vsn` is `{timestamp, origin_node}`
+  - CAS delete (`if_vsn:`): `{:ok, vsn}` where `vsn` is the version tuple
+    `{timestamp, origin_node}`
   - With `resolve_unconfirmed: true`, CAS delete may also return
     `{:error, :unavailable}` if ambiguity resolution cannot complete.
   """
@@ -741,7 +746,7 @@ defmodule EKV do
     opts = Keyword.validate!(opts, [:if_vsn, :timeout, :resolve_unconfirmed])
     validate_timeout_opt!(opts)
     _resolve_unconfirmed? = validate_boolean_opt!(opts, :resolve_unconfirmed)
-    config = get_config(name)
+    config = EKV.Supervisor.get_config(name)
     timeout = rpc_timeout_from_opts(opts)
 
     case mode(config) do
@@ -774,7 +779,8 @@ defmodule EKV do
   Auto-retries on conflict (up to 5 times with random backoff).
 
   Returns `{:ok, new_value, vsn}` on success where
-  `vsn` is `{timestamp, origin_node}` for the committed value.
+  `vsn` is the version tuple `{timestamp, origin_node}` for the committed
+  value.
   Returns `{:error, :conflict}` when retries are exhausted before entering an
   accept phase that could decide the write.
   Returns `{:error, :unconfirmed}` when accept phase started but the caller could
@@ -811,7 +817,7 @@ defmodule EKV do
     validate_backoff_opt!(opts)
     validate_timeout_opt!(opts)
     _resolve_unconfirmed? = validate_boolean_opt!(opts, :resolve_unconfirmed)
-    config = get_config(name)
+    config = EKV.Supervisor.get_config(name)
     timeout = rpc_timeout_from_opts(opts)
 
     case mode(config) do
@@ -868,7 +874,8 @@ defmodule EKV do
   Scan key-value pairs matching a prefix.
 
   Scans all shards using cursor-based streaming. Returns a `Stream` of
-  `{key, value, vsn}` tuples where `vsn` is `{timestamp, origin_node}`.
+  `{key, value, vsn}` tuples where `vsn` is the version tuple
+  `{timestamp, origin_node}`.
 
   Results are sorted by key within each shard but not globally sorted
   across shards.
@@ -877,11 +884,11 @@ defmodule EKV do
   chunk is fetched from the selected member via paged RPC.
   """
   def scan(name, prefix) do
-    config = get_config(name)
+    config = EKV.Supervisor.get_config(name)
 
     case mode(config) do
       :client ->
-        remote_page_stream(name, prefix, :scan_page)
+        remote_page_stream(name, prefix, :__scan_page__)
 
       :member ->
         member_scan_stream(name, prefix)
@@ -893,7 +900,7 @@ defmodule EKV do
   cursor-based streaming.
 
   Returns a `Stream` of `{key, vsn}` tuples where `vsn` is
-  `{timestamp, origin_node}`.
+  the version tuple `{timestamp, origin_node}`.
 
   This avoids decoding values while still allowing CAS workflows to chain
   `if_vsn:` operations from scan output.
@@ -905,11 +912,11 @@ defmodule EKV do
   chunk is fetched from the selected member via paged RPC.
   """
   def keys(name, prefix) do
-    config = get_config(name)
+    config = EKV.Supervisor.get_config(name)
 
     case mode(config) do
       :client ->
-        remote_page_stream(name, prefix, :keys_page)
+        remote_page_stream(name, prefix, :__keys_page__)
 
       :member ->
         member_keys_stream(name, prefix)
@@ -918,10 +925,10 @@ defmodule EKV do
 
   # Invoked by a client-originated paged scan RPC; runs on the selected member node.
   @doc false
-  def scan_page(name, prefix, cursor, limit)
+  def __scan_page__(name, prefix, cursor, limit)
       when is_binary(prefix) and is_integer(limit) and limit >= 1 do
-    config = get_config(name)
-    ensure_member_mode!(config, :scan_page)
+    config = EKV.Supervisor.get_config(name)
+    ensure_member_mode!(config, :__scan_page__)
 
     page_results(
       name,
@@ -937,10 +944,10 @@ defmodule EKV do
 
   # Invoked by a client-originated paged keys RPC; runs on the selected member node.
   @doc false
-  def keys_page(name, prefix, cursor, limit)
+  def __keys_page__(name, prefix, cursor, limit)
       when is_binary(prefix) and is_integer(limit) and limit >= 1 do
-    config = get_config(name)
-    ensure_member_mode!(config, :keys_page)
+    config = EKV.Supervisor.get_config(name)
+    ensure_member_mode!(config, :__keys_page__)
 
     page_results(
       name,
@@ -995,7 +1002,7 @@ defmodule EKV do
   deliver events directly to client subscribers without backend affinity.
   """
   def subscribe(name, prefix \\ "") do
-    config = get_config(name)
+    config = EKV.Supervisor.get_config(name)
 
     case mode(config) do
       :client ->
@@ -1017,7 +1024,7 @@ defmodule EKV do
   Unsubscribe the calling process from events for the given prefix.
   """
   def unsubscribe(name, prefix \\ "") do
-    config = get_config(name)
+    config = EKV.Supervisor.get_config(name)
 
     case mode(config) do
       :client -> EKV.ClientSubscriptions.unsubscribe(name, prefix)
@@ -1036,14 +1043,15 @@ defmodule EKV do
   Member mode only.
   """
   def backup(name, dest_dir) do
-    config = get_config(name)
+    config = EKV.Supervisor.get_config(name)
     ensure_member_mode!(config, :backup)
     File.mkdir_p!(dest_dir)
 
     0..(config.num_shards - 1)
     |> Task.async_stream(
       fn shard -> EKV.Store.backup_shard(config.data_dir, dest_dir, shard) end,
-      ordered: false
+      ordered: false,
+      timeout: :infinity
     )
     |> Enum.reduce(:ok, fn
       {:ok, :ok}, :ok -> :ok
@@ -1060,9 +1068,35 @@ defmodule EKV do
 
   Client mode returns region metadata, routing preferences, and the currently
   selected backend (if any).
+
+  ## Examples
+
+      iex> EKV.info(:my_kv)
+      %{
+        name: :my_kv,
+        mode: :member,
+        region: "iad",
+        node_id: "1",
+        cluster_size: 3,
+        shards: 8,
+        data_dir: "/data/ekv",
+        connected_members: [
+          %{node: :"ekv2@10.0.0.2", node_id: "2"},
+          %{node: :"ekv3@10.0.0.3", node_id: "3"}
+        ]
+      }
+
+      iex> EKV.info(:my_kv_client)
+      %{
+        name: :my_kv_client,
+        mode: :client,
+        region: "ord",
+        region_routing: ["ord", "iad", "dfw"],
+        current_backend: :"ekv1@10.0.0.1"
+      }
   """
   def info(name) do
-    config = get_config(name)
+    config = EKV.Supervisor.get_config(name)
 
     case mode(config) do
       :client ->
@@ -1117,7 +1151,7 @@ defmodule EKV do
   Raises `ArgumentError` if the target member is not configured for CAS.
   """
   def await_quorum(name, timeout_ms) when is_integer(timeout_ms) and timeout_ms >= 0 do
-    config = get_config(name)
+    config = EKV.Supervisor.get_config(name)
 
     case mode(config) do
       :client ->
@@ -1139,13 +1173,9 @@ defmodule EKV do
           "EKV: await_quorum/2 timeout must be a non-negative integer, got: #{inspect(timeout_ms)}"
   end
 
-  def get_config(name) do
-    :persistent_term.get({EKV, name})
-  end
-
   # Invoked by a client-originated RPC; runs on the selected member node.
   @doc false
-  def client_invoke(fun, args) when is_atom(fun) and is_list(args) do
+  def __client_invoke__(fun, args) when is_atom(fun) and is_list(args) do
     try do
       {:ok, apply(__MODULE__, fun, args)}
     rescue
@@ -1156,10 +1186,9 @@ defmodule EKV do
   end
 
   # Runs on the client node; issues the cross-node erpc call to a member.
-  @doc false
-  def remote_invoke(node, fun, args, timeout) do
+  defp remote_invoke(node, fun, args, timeout) do
     try do
-      case :erpc.call(node, __MODULE__, :client_invoke, [fun, args], timeout) do
+      case :erpc.call(node, __MODULE__, :__client_invoke__, [fun, args], timeout) do
         {:ok, result} -> {:ok, result}
         {:raise, exception} -> {:raise, exception}
         {:exit, reason} -> {:exit, reason}
@@ -1167,22 +1196,6 @@ defmodule EKV do
     catch
       :exit, _reason -> {:error, :unavailable}
     end
-  end
-
-  @doc false
-  def client_sub_group(name, prefix), do: {:ekv_sub, name, prefix}
-
-  @doc false
-  def client_any_sub_group(name), do: {:ekv_sub_any, name}
-
-  @doc false
-  def client_subscribers?(name) do
-    case :pg.get_members(EKV.Supervisor.pg_scope(name), client_any_sub_group(name)) do
-      [] -> false
-      members when is_list(members) -> true
-    end
-  rescue
-    _ -> false
   end
 
   defp validate_cas_config!(%{cluster_size: nil}) do
@@ -1374,7 +1387,7 @@ defmodule EKV do
   # Runs on a member node; builds the local shard-backed scan stream.
   defp member_scan_stream(name, prefix) do
     prefix_end = EKV.Store.next_binary_prefix(prefix)
-    config = get_config(name)
+    config = EKV.Supervisor.get_config(name)
 
     shard_streams =
       for shard <- 0..(config.num_shards - 1) do
@@ -1421,7 +1434,7 @@ defmodule EKV do
   # Runs on a member node; builds the local shard-backed keys stream.
   defp member_keys_stream(name, prefix) do
     prefix_end = EKV.Store.next_binary_prefix(prefix)
-    config = get_config(name)
+    config = EKV.Supervisor.get_config(name)
 
     shard_streams =
       for shard <- 0..(config.num_shards - 1) do

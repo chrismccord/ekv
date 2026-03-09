@@ -865,6 +865,7 @@ defmodule EKV.Replica do
         # CAS fields (nil if CAS not configured):
         node_id:        string | nil,   # this node's CAS identity
         cluster_size:   integer | nil,  # total CAS participants
+        lww_ts_counter: integer,        # monotonic local LWW timestamp floor
         ballot_counter: integer,        # monotonic, persisted in kv_meta
         peer_node_ids:  %{node => string},  # Erlang node → CAS node_id
         pending_cas:    %{ref => op},   # in-flight CAS operations
@@ -949,6 +950,7 @@ defmodule EKV.Replica do
     # CAS fields
     node_id: nil,
     cluster_size: nil,
+    lww_ts_counter: 0,
     ballot_counter: 0,
     peer_node_ids: %{},
     pending_cas: %{},
@@ -981,7 +983,7 @@ defmodule EKV.Replica do
     num_shards = Keyword.fetch!(opts, :num_shards)
     data_dir = Keyword.fetch!(opts, :data_dir)
 
-    config = EKV.get_config(name)
+    config = EKV.Supervisor.get_config(name)
 
     case Store.open(data_dir, shard_index, config.tombstone_ttl, num_shards, config.gc_interval,
            allow_stale_startup: config[:allow_stale_startup] || false
@@ -1013,6 +1015,10 @@ defmodule EKV.Replica do
     # Prepare cached statements on writer connection
     stmts = Store.prepare_cached_stmts(db)
 
+    # Local eventual-write counter — seed from the current shard watermark so
+    # future same-node writes never reuse an existing committed timestamp.
+    lww_ts_counter = max(System.system_time(:nanosecond), Store.max_timestamp(db) || 0)
+
     # CAS ballot counter — restore from persisted value
     ballot_counter =
       if config.cluster_size do
@@ -1037,6 +1043,7 @@ defmodule EKV.Replica do
       partition_ttl_policy: config.partition_ttl_policy,
       node_id: config.node_id,
       cluster_size: config.cluster_size,
+      lww_ts_counter: lww_ts_counter,
       ballot_counter: ballot_counter
     }
 
@@ -1126,7 +1133,7 @@ defmodule EKV.Replica do
 
   def handle_call({:put, key, value_binary, opts}, _from, state) do
     %{db: db, stmts: stmts} = state
-    now = System.system_time(:nanosecond)
+    {now, state} = next_lww_ts(state)
     origin_node = node()
 
     if Store.cas_managed_key?(db, key) do
@@ -1162,7 +1169,7 @@ defmodule EKV.Replica do
 
   def handle_call({:delete, key}, _from, state) do
     %{db: db, stmts: stmts} = state
-    now = System.system_time(:nanosecond)
+    {now, state} = next_lww_ts(state)
     origin_node = node()
 
     if Store.cas_managed_key?(db, key) do
@@ -1959,7 +1966,7 @@ defmodule EKV.Replica do
 
   defp send_sync_data(state, remote_node, remote_hwm) do
     %{db: db} = state
-    config = EKV.get_config(state.name)
+    config = EKV.Supervisor.get_config(state.name)
     tombstone_cutoff = System.system_time(:nanosecond) - config.tombstone_ttl * 1_000_000
     chunk_size = config.sync_chunk_size
 
@@ -2393,6 +2400,14 @@ defmodule EKV.Replica do
 
   defp monotonic_cas_ts({current_ts, _origin}),
     do: max(System.system_time(:nanosecond), current_ts + 1)
+
+  # Ensure local eventual writes never reuse a timestamp on this shard. LWW
+  # compares {timestamp, origin_node}, so same-origin timestamp reuse would make
+  # later writes ambiguous or no-op under conflict resolution.
+  defp next_lww_ts(state) do
+    now = max(System.system_time(:nanosecond), state.lww_ts_counter + 1)
+    {now, %{state | lww_ts_counter: now}}
+  end
 
   defp decode_kv_row(nil), do: {nil, nil}
 
@@ -2944,8 +2959,8 @@ defmodule EKV.Replica do
   # =====================================================================
 
   defp has_subscribers?(state) do
-    config = EKV.get_config(state.name)
-    :atomics.get(config.sub_count, 1) > 0 or EKV.client_subscribers?(state.name)
+    config = EKV.Supervisor.get_config(state.name)
+    :atomics.get(config.sub_count, 1) > 0 or EKV.Supervisor.client_subscribers?(state.name)
   end
 
   defp dispatch_events(_state, []), do: :ok
@@ -2981,14 +2996,14 @@ defmodule EKV.Replica do
   # =====================================================================
 
   defp log(state, message_fn) when is_function(message_fn, 0) do
-    case EKV.get_config(state.name) do
+    case EKV.Supervisor.get_config(state.name) do
       %{log: false} -> :ok
       _ -> Logger.info(message_fn)
     end
   end
 
   defp log_verbose(state, message_fn) when is_function(message_fn, 0) do
-    case EKV.get_config(state.name) do
+    case EKV.Supervisor.get_config(state.name) do
       %{log: :verbose} -> Logger.info(message_fn)
       _ -> :ok
     end

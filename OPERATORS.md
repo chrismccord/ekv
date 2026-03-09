@@ -306,8 +306,7 @@ loss if an entire cold cluster is restarted after the TTL window.
 
 ### When a Stale Startup Is Rejected
 
-A stale shard will not auto-delete itself anymore. Startup fails closed until
-an operator chooses one of these paths:
+Startup fails closed until an operator chooses one of these paths:
 
 1. Single stale node rejoining fresh peers:
    - wipe that node's EKV data dir
@@ -376,11 +375,11 @@ Enable with `blue_green: true`. Both VMs must share the same `data_dir` and
 
 ### How It Works
 
-Both VMs use the **same** database files (no slot directories). On startup,
+Both VMs use the **same** database files. On startup,
 the new VM performs a synchronized handoff with the old VM:
 
 1. New VM reads the `current` marker file to discover the old node name
-2. Sends `{:ekv_handoff_request}` to each shard on the old VM (in parallel)
+2. Sends `{:ekv_handoff_request, ...}` to each shard on the old VM (in parallel)
 3. Old VM drains pending CAS ops, persists ballot counter, checkpoints WAL,
    closes its writer connection, and sends an ack
 4. New VM receives acks, opens the same database files, starts normally
@@ -455,11 +454,21 @@ but more file descriptors and slightly more memory.
 ### Shard Count is Immutable
 
 The shard count is persisted to `kv_meta` on first open. Changing `:shards`
-after data exists raises `ArgumentError` at startup. To change shard count:
+after data exists raises `ArgumentError` at startup.
 
-1. Take a backup
-2. Delete the data directory
-3. Restart with new shard count (triggers full sync from peers)
+There is **no built-in resharding or automatic shard-count migration**.
+Raw shard backups are tied to the original shard count, and peer full sync
+also requires matching shard counts.
+
+If you need a different shard count and want to preserve data:
+
+1. Stand up a fresh EKV instance or cluster with the desired `:shards`
+2. Migrate data logically through the API or custom export/import tooling
+3. Cut traffic over to the new instance
+
+If you delete the data directory and restart with a new shard count, that is
+effectively a fresh empty store unless some separate migration process
+represents the data.
 
 ### Shard Count Mismatch Between Peers
 

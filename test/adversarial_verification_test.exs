@@ -259,7 +259,7 @@ defmodule EKV.AdversarialVerificationTest do
 
     :erlang.trace(Process.whereis(shard_name), true, [:send])
 
-    config = EKV.get_config(name)
+    config = EKV.Supervisor.get_config(name)
     tombstone_cutoff = System.system_time(:nanosecond) - config.tombstone_ttl * 1_000_000
     state = :sys.get_state(shard_name)
     my_seq = EKV.Store.max_seq(state.db)
@@ -313,7 +313,7 @@ defmodule EKV.AdversarialVerificationTest do
 
     :erlang.trace(Process.whereis(shard_name), true, [:send])
 
-    config = EKV.get_config(name)
+    config = EKV.Supervisor.get_config(name)
     state = :sys.get_state(shard_name)
     my_seq = EKV.Store.max_seq(state.db)
 

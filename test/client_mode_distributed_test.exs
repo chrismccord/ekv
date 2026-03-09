@@ -255,7 +255,7 @@ defmodule EKV.ClientModeDistributedTest do
 
     TestCluster.assert_eventually(
       fn ->
-        TestCluster.rpc!(member_a, EKV, :client_subscribers?, [ekv_name])
+        TestCluster.rpc!(member_a, EKV.Supervisor, :client_subscribers?, [ekv_name])
       end,
       timeout: 5_000
     )

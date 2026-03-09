@@ -201,7 +201,7 @@ defmodule EKVTest do
     end
 
     test "lower timestamp is rejected", %{name: name} do
-      config = EKV.get_config(name)
+      config = EKV.Supervisor.get_config(name)
       shard = EKV.Replica.shard_index_for("lww_key", config.num_shards)
       shard_name = EKV.Replica.shard_name(name, shard)
       %{db: db, stmts: stmts} = :sys.get_state(shard_name)
@@ -241,7 +241,7 @@ defmodule EKVTest do
     end
 
     test "equal timestamp uses origin_node as tiebreaker", %{name: name} do
-      config = EKV.get_config(name)
+      config = EKV.Supervisor.get_config(name)
       shard = EKV.Replica.shard_index_for("tie_key", config.num_shards)
       shard_name = EKV.Replica.shard_name(name, shard)
       %{db: db, stmts: stmts} = :sys.get_state(shard_name)
@@ -301,7 +301,7 @@ defmodule EKVTest do
     test "tiebreaker matches Elixir atom ordering", %{name: name} do
       # Verify that SQLite TEXT comparison matches Erlang atom comparison
       # for node names — both should be lexicographic ASCII
-      config = EKV.get_config(name)
+      config = EKV.Supervisor.get_config(name)
       ts = 5000
 
       pairs = [
@@ -371,7 +371,7 @@ defmodule EKVTest do
     end
 
     test "delete vs put at same timestamp uses origin tiebreaker", %{name: name} do
-      config = EKV.get_config(name)
+      config = EKV.Supervisor.get_config(name)
       shard = EKV.Replica.shard_index_for("del_tie", config.num_shards)
       shard_name = EKV.Replica.shard_name(name, shard)
       %{db: db, stmts: stmts} = :sys.get_state(shard_name)
@@ -426,7 +426,7 @@ defmodule EKVTest do
     end
 
     test "higher timestamp put beats delete", %{name: name} do
-      config = EKV.get_config(name)
+      config = EKV.Supervisor.get_config(name)
       shard = EKV.Replica.shard_index_for("resurr", config.num_shards)
       shard_name = EKV.Replica.shard_name(name, shard)
       %{db: db, stmts: stmts} = :sys.get_state(shard_name)
@@ -466,7 +466,7 @@ defmodule EKVTest do
     end
 
     test "oplog not written when LWW loses", %{name: name} do
-      config = EKV.get_config(name)
+      config = EKV.Supervisor.get_config(name)
       shard = EKV.Replica.shard_index_for("oplog_key", config.num_shards)
       shard_name = EKV.Replica.shard_name(name, shard)
       %{db: db, stmts: stmts} = :sys.get_state(shard_name)
@@ -512,7 +512,7 @@ defmodule EKVTest do
 
   describe "HWM monotonicity" do
     test "HWM does not regress when lower seq is set", %{name: name} do
-      config = EKV.get_config(name)
+      config = EKV.Supervisor.get_config(name)
       shard = EKV.Replica.shard_index_for("hwm_key", config.num_shards)
       shard_name = EKV.Replica.shard_name(name, shard)
       %{db: db} = :sys.get_state(shard_name)
@@ -535,7 +535,7 @@ defmodule EKVTest do
 
   describe "oplog seq gaps on LWW loss" do
     test "LWW loss does not create oplog seq gaps", %{name: name} do
-      config = EKV.get_config(name)
+      config = EKV.Supervisor.get_config(name)
       shard = EKV.Replica.shard_index_for("gap_key", config.num_shards)
       shard_name = EKV.Replica.shard_name(name, shard)
       %{db: db, stmts: stmts} = :sys.get_state(shard_name)
@@ -588,7 +588,7 @@ defmodule EKVTest do
 
   describe "oplog truncation forces full sync" do
     test "truncation removes entries below min HWM", %{name: name} do
-      config = EKV.get_config(name)
+      config = EKV.Supervisor.get_config(name)
       shard = EKV.Replica.shard_index_for("trunc_key_1", config.num_shards)
       shard_name = EKV.Replica.shard_name(name, shard)
       %{db: db, stmts: stmts} = :sys.get_state(shard_name)
@@ -633,7 +633,7 @@ defmodule EKVTest do
 
   describe "GC expires TTL entries into tombstones" do
     test "expired entries become tombstones after GC", %{name: name} do
-      config = EKV.get_config(name)
+      config = EKV.Supervisor.get_config(name)
       shard = EKV.Replica.shard_index_for("gc_ttl_key", config.num_shards)
       shard_name = EKV.Replica.shard_name(name, shard)
       %{db: db, stmts: stmts} = :sys.get_state(shard_name)
@@ -685,7 +685,7 @@ defmodule EKVTest do
 
   describe "GC purges old tombstones" do
     test "tombstones older than cutoff are hard-deleted", %{name: name} do
-      config = EKV.get_config(name)
+      config = EKV.Supervisor.get_config(name)
       shard = EKV.Replica.shard_index_for("gc_purge_key", config.num_shards)
       shard_name = EKV.Replica.shard_name(name, shard)
       %{db: db, stmts: stmts} = :sys.get_state(shard_name)
@@ -738,7 +738,7 @@ defmodule EKVTest do
 
   describe "GC truncates oplog at min HWM" do
     test "oplog entries below min HWM are removed", %{name: name} do
-      config = EKV.get_config(name)
+      config = EKV.Supervisor.get_config(name)
       shard = EKV.Replica.shard_index_for("gc_oplog_1", config.num_shards)
       shard_name = EKV.Replica.shard_name(name, shard)
       %{db: db, stmts: stmts} = :sys.get_state(shard_name)
@@ -794,7 +794,7 @@ defmodule EKVTest do
       assert EKV.get(name, "stale_test") == "alive"
 
       # Get which shard this key goes to
-      config = EKV.get_config(name)
+      config = EKV.Supervisor.get_config(name)
       shard = EKV.Replica.shard_index_for("stale_test", config.num_shards)
       db_path = Path.join(data_dir, "shard_#{shard}.db")
 
@@ -888,7 +888,7 @@ defmodule EKVTest do
 
   describe "concurrent put during GC expiry" do
     test "new write wins after GC tombstones an expired entry", %{name: name} do
-      config = EKV.get_config(name)
+      config = EKV.Supervisor.get_config(name)
       shard = EKV.Replica.shard_index_for("gc_race_key", config.num_shards)
       shard_name = EKV.Replica.shard_name(name, shard)
       %{db: db, stmts: stmts} = :sys.get_state(shard_name)
@@ -943,7 +943,7 @@ defmodule EKVTest do
 
   describe "full state excludes purged tombstones" do
     test "purged tombstones absent, recent tombstones present in full_state", %{name: name} do
-      config = EKV.get_config(name)
+      config = EKV.Supervisor.get_config(name)
       shard = EKV.Replica.shard_index_for("fs_key_1", config.num_shards)
       shard_name = EKV.Replica.shard_name(name, shard)
       %{db: db, stmts: stmts} = :sys.get_state(shard_name)
@@ -1062,7 +1062,7 @@ defmodule EKVTest do
     end
 
     test "LWW rejection does not generate event", %{name: name} do
-      config = EKV.get_config(name)
+      config = EKV.Supervisor.get_config(name)
       shard = EKV.Replica.shard_index_for("lww_sub_key", config.num_shards)
       shard_name = EKV.Replica.shard_name(name, shard)
 
@@ -1154,7 +1154,7 @@ defmodule EKVTest do
     end
 
     test "GC TTL expiry generates delete event", %{name: name} do
-      config = EKV.get_config(name)
+      config = EKV.Supervisor.get_config(name)
       shard = EKV.Replica.shard_index_for("gc_sub_key", config.num_shards)
       shard_name = EKV.Replica.shard_name(name, shard)
       %{db: db, stmts: stmts} = :sys.get_state(shard_name)
@@ -1189,7 +1189,7 @@ defmodule EKVTest do
     end
 
     test "bulk sync generates batched events", %{name: name} do
-      config = EKV.get_config(name)
+      config = EKV.Supervisor.get_config(name)
 
       # Find a key that goes to shard 0
       key1 =
@@ -1228,7 +1228,7 @@ defmodule EKVTest do
     end
 
     test "remote put generates event", %{name: name} do
-      config = EKV.get_config(name)
+      config = EKV.Supervisor.get_config(name)
       shard = EKV.Replica.shard_index_for("remote_put_key", config.num_shards)
       shard_name = EKV.Replica.shard_name(name, shard)
 
@@ -1247,7 +1247,7 @@ defmodule EKVTest do
     test "remote delete generates event with previous value", %{name: name} do
       :ok = EKV.put(name, "remote_del_key", "existing")
 
-      config = EKV.get_config(name)
+      config = EKV.Supervisor.get_config(name)
       shard = EKV.Replica.shard_index_for("remote_del_key", config.num_shards)
       shard_name = EKV.Replica.shard_name(name, shard)
 
@@ -1314,7 +1314,7 @@ defmodule EKVTest do
     end
 
     test "tombstone purge does not generate event", %{name: name} do
-      config = EKV.get_config(name)
+      config = EKV.Supervisor.get_config(name)
       shard = EKV.Replica.shard_index_for("purge_no_event", config.num_shards)
       shard_name = EKV.Replica.shard_name(name, shard)
       %{db: db, stmts: stmts} = :sys.get_state(shard_name)
@@ -1349,7 +1349,7 @@ defmodule EKVTest do
 
   # Flush all subscription dispatchers so async events are delivered before assertions
   defp flush_dispatchers(name) do
-    config = EKV.get_config(name)
+    config = EKV.Supervisor.get_config(name)
 
     for i <- 0..(config.num_shards - 1) do
       dispatcher = EKV.SubDispatcher.dispatcher_name(name, i)
@@ -1811,7 +1811,7 @@ defmodule EKVTest do
 
   describe "delta sync returns correct entries" do
     test "oplog_since returns exactly the right slice", %{name: name} do
-      config = EKV.get_config(name)
+      config = EKV.Supervisor.get_config(name)
       shard = EKV.Replica.shard_index_for("delta_key_1", config.num_shards)
       shard_name = EKV.Replica.shard_name(name, shard)
       %{db: db, stmts: stmts} = :sys.get_state(shard_name)
@@ -1866,7 +1866,7 @@ defmodule EKVTest do
         File.rm_rf!(data_dir)
       end)
 
-      config = EKV.get_config(name)
+      config = EKV.Supervisor.get_config(name)
       assert is_binary(config.node_id)
       assert byte_size(config.node_id) > 0
     end
@@ -1983,7 +1983,7 @@ defmodule EKVTest do
       end)
 
       assert Process.alive?(pid)
-      config = EKV.get_config(name)
+      config = EKV.Supervisor.get_config(name)
       assert config.node_id == "1"
     end
 
@@ -2054,7 +2054,7 @@ defmodule EKVTest do
         File.rm_rf!(data_dir)
       end)
 
-      config = EKV.get_config(name)
+      config = EKV.Supervisor.get_config(name)
       assert config.node_id == "fly-machine-abc123"
     end
 
@@ -2206,7 +2206,7 @@ defmodule EKVTest do
     end
 
     test "rejects invalid ttl at call site before hitting shard", %{cas_name: name} do
-      config = EKV.get_config(name)
+      config = EKV.Supervisor.get_config(name)
       shard_index = EKV.Replica.shard_index_for("ttl/bad", config.num_shards)
       shard_name = EKV.Replica.shard_name(name, shard_index)
       shard_pid = Process.whereis(shard_name)
@@ -2251,7 +2251,7 @@ defmodule EKVTest do
     test "CAS put writes to oplog (visible via delta sync)", %{cas_name: name} do
       {:ok, _} = EKV.put(name, "oplog_cas/1", "val1", if_vsn: nil)
 
-      config = EKV.get_config(name)
+      config = EKV.Supervisor.get_config(name)
       shard = EKV.Replica.shard_index_for("oplog_cas/1", config.num_shards)
       shard_name = EKV.Replica.shard_name(name, shard)
       %{db: db} = :sys.get_state(shard_name)
@@ -3788,7 +3788,7 @@ defmodule EKVTest do
       :erlang.trace(Process.whereis(shard_name), true, [:send])
 
       # Directly trigger full sync by sending a continue_full_sync with nil cursor
-      config = EKV.get_config(name)
+      config = EKV.Supervisor.get_config(name)
       tombstone_cutoff = System.system_time(:nanosecond) - config.tombstone_ttl * 1_000_000
       state = :sys.get_state(shard_name)
       my_seq = EKV.Store.max_seq(state.db)
@@ -3823,7 +3823,7 @@ defmodule EKVTest do
 
       :erlang.trace(Process.whereis(shard_name), true, [:send])
 
-      config = EKV.get_config(name)
+      config = EKV.Supervisor.get_config(name)
       state = :sys.get_state(shard_name)
       my_seq = EKV.Store.max_seq(state.db)
 
@@ -3853,7 +3853,7 @@ defmodule EKVTest do
         %{state | remote_shards: Map.put(state.remote_shards, fake_node, self())}
       end)
 
-      config = EKV.get_config(name)
+      config = EKV.Supervisor.get_config(name)
       tombstone_cutoff = System.system_time(:nanosecond) - config.tombstone_ttl * 1_000_000
       state = :sys.get_state(shard_name)
       my_seq = EKV.Store.max_seq(state.db)
@@ -3905,7 +3905,7 @@ defmodule EKVTest do
         %{state | remote_shards: Map.put(state.remote_shards, fake_node, self())}
       end)
 
-      config = EKV.get_config(name)
+      config = EKV.Supervisor.get_config(name)
       tombstone_cutoff = System.system_time(:nanosecond) - config.tombstone_ttl * 1_000_000
       state = :sys.get_state(shard_name)
       my_seq = EKV.Store.max_seq(state.db)
@@ -3950,7 +3950,7 @@ defmodule EKVTest do
 
       :erlang.trace(Process.whereis(shard_name), true, [:send])
 
-      config = EKV.get_config(name)
+      config = EKV.Supervisor.get_config(name)
       tombstone_cutoff = System.system_time(:nanosecond) - config.tombstone_ttl * 1_000_000
       state = :sys.get_state(shard_name)
       my_seq = EKV.Store.max_seq(state.db)
@@ -4768,8 +4768,8 @@ defmodule EKVTest do
 
       assert Enum.sort(:pg.which_groups(EKV.Supervisor.pg_scope(name_a))) ==
                Enum.sort([
-                 EKV.client_any_sub_group(name_a),
-                 EKV.client_sub_group(name_a, "scope/")
+                 EKV.Supervisor.client_any_sub_group(name_a),
+                 EKV.Supervisor.client_sub_group(name_a, "scope/")
                ])
 
       assert :pg.which_groups(EKV.Supervisor.pg_scope(name_b)) == []
