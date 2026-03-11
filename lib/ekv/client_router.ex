@@ -20,8 +20,8 @@ defmodule EKV.ClientRouter do
   - candidate selection is local and deterministic:
     - first configured region with available members
     - stable node-name ordering within the region
-  - `Node.list/0` + RPC probing is only a fallback path when `:pg` has not
-    converged yet; it is not the primary discovery mechanism
+  - route discovery only trusts EKV's scoped `:pg` membership
+    - it does not probe arbitrary `Node.list/0` peers
   """
 
   use GenServer
@@ -30,7 +30,7 @@ defmodule EKV.ClientRouter do
 
   @cooldown_ms 1_000
   @await_timeout_margin 1_000
-  @route_probe_timeout 500
+  @route_probe_timeout 2_000
 
   defstruct [:name, :region_routing, waiters: %{}, monitors: %{}, members_by_region: %{}]
 
@@ -239,29 +239,37 @@ defmodule EKV.ClientRouter do
     state
     |> candidate_nodes(respect_cooldown?)
     |> Enum.find_value(:error, fn node ->
-      if route_candidate?(state.name, node) do
-        {:ok, node}
-      else
-        mark_candidate_invalid(state, node)
-        false
+      case route_candidate?(state.name, node) do
+        :valid ->
+          {:ok, node}
+
+        :invalid ->
+          mark_candidate_invalid(state, node)
+          false
+
+        :unknown ->
+          # Scoped :pg already says this node is a candidate. If the validation
+          # RPC times out during a cold start, prefer availability over
+          # blacklisting the member as invalid.
+          {:ok, node}
       end
     end)
   end
 
   defp candidate_nodes(%ClientRouter{} = state, respect_cooldown?) do
     table = table_name(state.name)
-
-    case region_candidates(state, table, respect_cooldown?) do
-      [] -> connected_member_candidates(state, table, respect_cooldown?)
-      candidates -> candidates
-    end
+    region_candidates(state, table, respect_cooldown?)
   end
 
   defp route_candidate?(name, node) do
     try do
-      :erpc.call(node, EKV.MemberPresence, :advertised?, [name], @route_probe_timeout)
+      if :erpc.call(node, EKV.MemberPresence, :advertised?, [name], @route_probe_timeout) do
+        :valid
+      else
+        :invalid
+      end
     catch
-      :exit, _reason -> false
+      :exit, _reason -> :unknown
     end
   end
 
@@ -269,11 +277,14 @@ defmodule EKV.ClientRouter do
     try do
       backend
       |> :erpc.call(EKV.MemberPresence, :member_nodes, [name], @route_probe_timeout)
-      |> Enum.each(fn member_node ->
-        if member_node != node() do
-          Node.connect(member_node)
-        end
-      end)
+      |> Enum.reject(&(&1 == node()))
+      |> Task.async_stream(
+        fn member_node -> Node.connect(member_node) end,
+        ordered: false,
+        timeout: @route_probe_timeout,
+        on_timeout: :kill_task
+      )
+      |> Stream.run()
     catch
       _, _reason -> :ok
     end
@@ -417,54 +428,6 @@ defmodule EKV.ClientRouter do
 
       if candidates == [], do: false, else: candidates
     end)
-  end
-
-  defp connected_member_candidates(%ClientRouter{} = state, table, respect_cooldown?) do
-    Node.list()
-    |> Task.async_stream(
-      fn node ->
-        case probe_member_info(node, state.name) do
-          {:ok, %{mode: :member, region: region}} -> {:ok, node, region}
-          _ -> :error
-        end
-      end,
-      ordered: false,
-      timeout: @route_probe_timeout + 100,
-      on_timeout: :kill_task
-    )
-    |> Enum.reduce(%{}, fn
-      {:ok, {:ok, node, region}}, acc ->
-        Map.update(acc, region, [node], &[node | &1])
-
-      _, acc ->
-        acc
-    end)
-    |> then(fn by_region ->
-      Enum.find_value(state.region_routing, [], fn region ->
-        candidates =
-          by_region
-          |> Map.get(region, [])
-          |> Enum.uniq()
-          |> Enum.reject(fn node ->
-            respect_cooldown? and cooled_down?(table, node)
-          end)
-          |> Enum.sort_by(&Atom.to_string/1)
-
-        if candidates == [], do: false, else: candidates
-      end)
-    end)
-  end
-
-  defp probe_member_info(node, name) do
-    try do
-      case :erpc.call(node, EKV, :__client_invoke__, [:info, [name]], @route_probe_timeout) do
-        {:ok, result} -> {:ok, result}
-        {:raise, _exception} -> :error
-        {:exit, _reason} -> :error
-      end
-    catch
-      :exit, _reason -> :error
-    end
   end
 
   defp now_ms, do: System.monotonic_time(:millisecond)
