@@ -164,6 +164,7 @@ defmodule EKV.Supervisor do
     :sync_chunk_size,
     :allow_stale_startup,
     :partition_ttl_policy,
+    :wire_compression_threshold,
     :wait_for_quorum,
     :wait_for_route,
     :shutdown_barrier
@@ -232,12 +233,14 @@ defmodule EKV.Supervisor do
     sync_chunk_size = Keyword.get(opts, :sync_chunk_size, 500)
     allow_stale_startup = Keyword.get(opts, :allow_stale_startup, false)
     partition_ttl_policy = Keyword.get(opts, :partition_ttl_policy, :quarantine)
+    wire_compression_threshold = Keyword.get(opts, :wire_compression_threshold, 256 * 1024)
     wait_for_quorum = Keyword.get(opts, :wait_for_quorum, false)
     wait_for_route = Keyword.get(opts, :wait_for_route, false)
     shutdown_barrier = Keyword.get(opts, :shutdown_barrier, false)
 
     validate_cas_config!(cluster_size, node_id)
     validate_partition_ttl_policy!(partition_ttl_policy)
+    validate_wire_compression_threshold!(wire_compression_threshold)
     validate_wait_for_quorum!(wait_for_quorum, cluster_size)
     validate_wait_for_route!(wait_for_route, :member)
     validate_shutdown_barrier!(shutdown_barrier)
@@ -298,7 +301,8 @@ defmodule EKV.Supervisor do
       node_id: effective_node_id,
       sync_chunk_size: sync_chunk_size,
       allow_stale_startup: allow_stale_startup,
-      partition_ttl_policy: partition_ttl_policy
+      partition_ttl_policy: partition_ttl_policy,
+      wire_compression_threshold: wire_compression_threshold
     }
 
     :persistent_term.put({EKV, name}, config)
@@ -334,14 +338,23 @@ defmodule EKV.Supervisor do
     wait_for_route = Keyword.get(opts, :wait_for_route, false)
     wait_for_quorum = Keyword.get(opts, :wait_for_quorum, false)
     shutdown_barrier = Keyword.get(opts, :shutdown_barrier, false)
+    wire_compression_threshold = Keyword.get(opts, :wire_compression_threshold, 256 * 1024)
 
-    validate_client_opts!(opts, region_routing, wait_for_route, wait_for_quorum, shutdown_barrier)
+    validate_client_opts!(
+      opts,
+      region_routing,
+      wait_for_route,
+      wait_for_quorum,
+      shutdown_barrier,
+      wire_compression_threshold
+    )
 
     config = %{
       mode: :client,
       region: region,
       region_routing: region_routing,
       log: log,
+      wire_compression_threshold: wire_compression_threshold,
       cluster_size: nil,
       node_id: nil,
       num_shards: nil,
@@ -472,12 +485,14 @@ defmodule EKV.Supervisor do
          region_routing,
          wait_for_route,
          wait_for_quorum,
-         shutdown_barrier
+         shutdown_barrier,
+         wire_compression_threshold
        ) do
     validate_region_routing!(region_routing)
     validate_wait_for_route!(wait_for_route, :client)
     validate_wait_for_quorum!(wait_for_quorum, 1)
     validate_shutdown_barrier!(shutdown_barrier)
+    validate_wire_compression_threshold!(wire_compression_threshold)
 
     reject_client_opt!(opts, :blue_green, [false, nil])
     reject_client_opt!(opts, :data_dir, [nil])
@@ -489,6 +504,18 @@ defmodule EKV.Supervisor do
     reject_client_opt!(opts, :sync_chunk_size, [nil])
     reject_client_opt!(opts, :allow_stale_startup, [nil, false])
     reject_client_opt!(opts, :partition_ttl_policy, [nil])
+  end
+
+  defp validate_wire_compression_threshold!(false), do: :ok
+  defp validate_wire_compression_threshold!(nil), do: :ok
+
+  defp validate_wire_compression_threshold!(threshold)
+       when is_integer(threshold) and threshold >= 0,
+       do: :ok
+
+  defp validate_wire_compression_threshold!(threshold) do
+    raise ArgumentError,
+          "EKV: :wire_compression_threshold must be false/nil or a non-negative byte threshold, got: #{inspect(threshold)}"
   end
 
   defp validate_allow_stale_startup!(value) when is_boolean(value), do: :ok

@@ -31,6 +31,33 @@ defmodule Bench.Replica do
     end
   end
 
+  def prepare_large_payload(label, target_bytes)
+      when is_binary(label) and is_integer(target_bytes) do
+    value = build_large_payload(target_bytes)
+    raw = :erlang.term_to_binary(value)
+    wire = wire_compress(raw)
+    :persistent_term.put({__MODULE__, :large_payload, label}, value)
+
+    %{
+      raw_bytes: byte_size(raw),
+      wire_bytes: byte_size(wire),
+      compression_ratio: Float.round(byte_size(raw) / max(byte_size(wire), 1), 1)
+    }
+  end
+
+  def clear_large_payload(label) when is_binary(label) do
+    :persistent_term.erase({__MODULE__, :large_payload, label})
+    :ok
+  end
+
+  def single_put_prepared_payload(name, key, label) when is_binary(label) do
+    EKV.put(name, key, prepared_large_payload(label))
+  end
+
+  def consistent_put_prepared_payload(name, key, label) when is_binary(label) do
+    EKV.put(name, key, prepared_large_payload(label), consistent: true)
+  end
+
   def bulk_put(name, n, prefix) do
     for i <- 1..n do
       EKV.put(name, "#{prefix}#{i}", %{i: i, data: :crypto.strong_rand_bytes(64)})
@@ -236,6 +263,52 @@ defmodule Bench.Replica do
 
   def session_activate(v) when is_map(v), do: Map.put(v, :state, :active)
   def session_activate(v), do: v
+
+  defp prepared_large_payload(label) do
+    :persistent_term.get({__MODULE__, :large_payload, label})
+  end
+
+  defp build_large_payload(target_bytes) do
+    target_bytes = max(target_bytes, 64 * 1024)
+    repeated_text = String.duplicate("ekv-large-payload-", 64)
+
+    Stream.iterate(1, &(&1 + 1))
+    |> Enum.reduce_while([], fn i, acc ->
+      item = %{
+        id: i,
+        status: :active,
+        owner: "worker-#{rem(i, 32)}",
+        tags: ["alpha", "beta", "gamma", "delta", "region:iad", "role:cache"],
+        attrs: %{
+          category: "benchmark",
+          template: "repeated-structured-map",
+          notes: repeated_text
+        },
+        counters: %{a: i, b: i * 2, c: rem(i, 17)},
+        flags: %{enabled: true, visible: true, archived: false}
+      }
+
+      next = [item | acc]
+      value = %{version: 1, kind: :bench_payload, items: Enum.reverse(next)}
+
+      if byte_size(:erlang.term_to_binary(value)) >= target_bytes do
+        {:halt, value}
+      else
+        {:cont, next}
+      end
+    end)
+  end
+
+  defp wire_compress(binary) do
+    z = :zlib.open()
+
+    try do
+      :ok = :zlib.deflateInit(z, 1)
+      z |> :zlib.deflate(binary, :finish) |> IO.iodata_to_binary()
+    after
+      :zlib.close(z)
+    end
+  end
 
   defp run_parallel_worker(_name, _prefix, _worker, 0), do: %{ok: 0, errors: %{}}
 

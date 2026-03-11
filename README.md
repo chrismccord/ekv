@@ -105,6 +105,7 @@ Values can be any Erlang term (stored via `:erlang.term_to_binary/1`). Keys are 
 | `:tombstone_ttl` | `604_800_000` (7 days) | Member mode only. How long tombstones are retained in milliseconds |
 | `:gc_interval` | `300_000` (5 min) | Member mode only. GC tick interval in milliseconds |
 | `:wait_for_quorum` | `false` | Optional startup gate. In member mode, waits for this EKV member to reach CAS quorum. In client mode, waits for the selected backend member to report CAS quorum reachable. |
+| `:wire_compression_threshold` | `262_144` (256 KB) | Optional byte threshold for member-to-member wire compression of large replicated value payloads. `false`/`nil` disables it. Large LWW replication and CAS accept/commit payloads compress on the wire only; values remain uncompressed on disk and on reads. |
 | `:shutdown_barrier` | `false` | Optional graceful-shutdown barrier. Keeps EKV serving during coordinated shutdown for up to the configured timeout so members can finish final writes and replication. |
 | `:allow_stale_startup` | `false` | Member mode only. Dangerous recovery override. If `true`, EKV trusts on-disk data even when stale-db detection would normally refuse startup. Intended only for explicit disaster recovery / full cold-cluster restore cases. |
 | `:blue_green` | `false` | Member mode only. Enable blue-green deployment handoff for shared-volume replacement nodes. |

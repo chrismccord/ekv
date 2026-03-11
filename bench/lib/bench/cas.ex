@@ -4,7 +4,7 @@ defmodule Bench.CAS do
   @name :bench
   @default_remote_timeout_ms 120_000
   @default_replicas [:"replica1@127.0.0.1", :"replica2@127.0.0.1", :"replica3@127.0.0.1"]
-  @all_scenarios Enum.to_list(1..9)
+  @all_scenarios Enum.to_list(1..10)
 
   def run(opts \\ []) do
     ctx = build_context(opts)
@@ -49,6 +49,7 @@ defmodule Bench.CAS do
   defp run_scenario(7, shards, ctx), do: config_store_simulation(shards, ctx)
   defp run_scenario(8, shards, ctx), do: session_lifecycle(shards, ctx)
   defp run_scenario(9, shards, ctx), do: cas_vs_lww(shards, ctx)
+  defp run_scenario(10, shards, ctx), do: large_payload_puts(shards, ctx)
 
   # ---------------------------------------------------------------------------
   # 1. CAS Put Latency — single proposer, various put styles
@@ -596,6 +597,66 @@ defmodule Bench.CAS do
   end
 
   # ---------------------------------------------------------------------------
+  # 10. Large Payload Put Latency — compare wire compression off vs on
+  # ---------------------------------------------------------------------------
+
+  defp large_payload_puts(shards, ctx) do
+    header("10. Large Payload Put Latency")
+
+    payload_target = if ctx.quick, do: 1_000_000, else: 4_000_000
+    requester_node = requester(ctx)
+    n = if ctx.quick, do: 30, else: 75
+
+    for {label, member_opts} <- [
+          {"wire compression disabled", [wire_compression_threshold: false]},
+          {"wire compression enabled", [wire_compression_threshold: 256 * 1024]}
+        ] do
+      with_remote_ekv(shards, ctx, "s10_#{slug(label)}", member_opts, [], fn ->
+        payload_label = "payload/#{ctx.run_id}/#{slug(label)}"
+
+        payload_info =
+          rpc(requester_node, Bench.Replica, :prepare_large_payload, [
+            payload_label,
+            payload_target
+          ])
+
+        IO.puts("  --- #{label} ---")
+        IO.puts("    raw bytes  : #{format_number(payload_info.raw_bytes)}")
+        IO.puts("    wire bytes : #{format_number(payload_info.wire_bytes)}")
+        IO.puts("    ratio      : #{payload_info.compression_ratio}x")
+
+        lww_samples =
+          collect_remote_samples(n, requester_node, fn i ->
+            rpc(requester_node, Bench.Replica, :single_put_prepared_payload, [
+              @name,
+              "large_lww/#{slug(label)}/#{i}",
+              payload_label
+            ])
+          end)
+
+        report_latency("#{format_number(n)} LWW puts (prepared large payload)", lww_samples)
+
+        cas_samples =
+          collect_remote_samples(n, requester_node, fn i ->
+            {:ok, _} =
+              rpc(requester_node, Bench.Replica, :consistent_put_prepared_payload, [
+                @name,
+                "large_cas/#{slug(label)}/#{i}",
+                payload_label
+              ])
+          end)
+
+        report_latency(
+          "#{format_number(n)} consistent puts (prepared large payload)",
+          cas_samples
+        )
+
+        rpc(requester_node, Bench.Replica, :clear_large_payload, [payload_label])
+      end)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
 
@@ -648,6 +709,10 @@ defmodule Bench.CAS do
   end
 
   defp with_remote_ekv(shards, ctx, scope, fun) do
+    with_remote_ekv(shards, ctx, scope, [], [], fun)
+  end
+
+  defp with_remote_ekv(shards, ctx, scope, member_extra_opts, client_extra_opts, fun) do
     member_specs =
       Enum.with_index(ctx.member_specs, 1)
       |> Enum.map(fn {spec, node_id} ->
@@ -661,26 +726,38 @@ defmodule Bench.CAS do
       end)
 
       start_many_ekv(member_specs, fn spec ->
-        start_ekv_on(spec.node,
-          mode: :member,
-          name: @name,
-          data_dir: spec.data_dir,
-          region: spec.region,
-          shards: shards,
-          cluster_size: ctx.cluster_size,
-          node_id: spec.node_id,
-          wait_for_quorum: 30_000
+        start_ekv_on(
+          spec.node,
+          Keyword.merge(
+            [
+              mode: :member,
+              name: @name,
+              data_dir: spec.data_dir,
+              region: spec.region,
+              shards: shards,
+              cluster_size: ctx.cluster_size,
+              node_id: spec.node_id,
+              wait_for_quorum: 30_000
+            ],
+            member_extra_opts
+          )
         )
       end)
 
       Enum.each(ctx.client_specs, fn spec ->
-        start_ekv_on(spec.node,
-          mode: :client,
-          name: @name,
-          region: spec.region,
-          region_routing: spec.region_routing,
-          wait_for_route: 30_000,
-          wait_for_quorum: 30_000
+        start_ekv_on(
+          spec.node,
+          Keyword.merge(
+            [
+              mode: :client,
+              name: @name,
+              region: spec.region,
+              region_routing: spec.region_routing,
+              wait_for_route: 30_000,
+              wait_for_quorum: 30_000
+            ],
+            client_extra_opts
+          )
         )
       end)
 
@@ -830,12 +907,12 @@ defmodule Bench.CAS do
     raw
     |> List.wrap()
     |> Enum.map(fn
-      n when is_integer(n) and n in 1..9 ->
+      n when is_integer(n) and n in 1..10 ->
         n
 
       s when is_binary(s) ->
         case Integer.parse(s) do
-          {n, ""} when n in 1..9 -> n
+          {n, ""} when n in 1..10 -> n
           _ -> raise ArgumentError, "invalid scenario #{inspect(s)}"
         end
 
@@ -946,6 +1023,7 @@ defmodule Bench.CAS do
   defp requester(%{member1: node}), do: node
   defp cross_node(%{request_nodes: [_first, second | _]}), do: second
   defp cross_node(%{member2: node}), do: node
+  defp slug(label), do: label |> String.downcase() |> String.replace(~r/[^a-z0-9]+/u, "_")
 
   defp rpc(node, module, func, args) do
     :erpc.call(node, module, func, args, @default_remote_timeout_ms)

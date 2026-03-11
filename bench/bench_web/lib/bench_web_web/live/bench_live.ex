@@ -10,7 +10,8 @@ defmodule BenchWebWeb.BenchLive do
     {"6", "6. CAS Replication Latency"},
     {"7", "7. Config Store Simulation"},
     {"8", "8. Session Lifecycle"},
-    {"9", "9. CAS vs LWW Put Comparison"}
+    {"9", "9. CAS vs LWW Put Comparison"},
+    {"10", "10. Large Payload Put Latency"}
   ]
 
   @default_scenarios ~w(4 5 6 7 8 9)
@@ -252,7 +253,8 @@ defmodule BenchWebWeb.BenchLive do
                 connected nodes: <span class="text-zinc-100">{@summary.connected_count}</span>
               </p>
               <p class="mt-1">
-                discovered regions: <span class="text-zinc-100">{format_region_counts(@summary.region_counts)}</span>
+                discovered regions:
+                <span class="text-zinc-100">{format_region_counts(@summary.region_counts)}</span>
               </p>
               <p class="mt-1">
                 phase: <span class="text-zinc-100">{@current_phase}</span>
@@ -309,7 +311,10 @@ defmodule BenchWebWeb.BenchLive do
                       </p>
                       <%= if role_value(@form, node.name) == "client" do %>
                         <p class="mt-1 text-[11px] text-zinc-500">
-                          routes: {Enum.join(route_preview(@form, @summary.nodes, node.region), " -> ")}
+                          routes: {Enum.join(
+                            route_preview(@form, @summary.nodes, node.region),
+                            " -> "
+                          )}
                         </p>
                       <% end %>
                     </div>
@@ -321,7 +326,9 @@ defmodule BenchWebWeb.BenchLive do
                         class="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 outline-none ring-cyan-500 transition focus:ring-2"
                       >
                         <%= for {label, value} <- @role_options do %>
-                          <option value={value} selected={role_value(@form, node.name) == value}>{label}</option>
+                          <option value={value} selected={role_value(@form, node.name) == value}>
+                            {label}
+                          </option>
                         <% end %>
                       </select>
                     </label>
@@ -355,8 +362,7 @@ defmodule BenchWebWeb.BenchLive do
                   value="true"
                   checked={checkbox_checked?(@form, :quick)}
                   class="h-4 w-4 rounded border-zinc-600 bg-zinc-900 text-cyan-400 focus:ring-cyan-500"
-                />
-                Quick mode (lower iteration counts for faster feedback)
+                /> Quick mode (lower iteration counts for faster feedback)
               </label>
             </div>
 
@@ -547,7 +553,7 @@ defmodule BenchWebWeb.BenchLive do
       |> Enum.reject(&(&1 == ""))
       |> Enum.map(fn scenario ->
         case Integer.parse(scenario) do
-          {n, ""} when n in 1..9 -> {:ok, n}
+          {n, ""} when n in 1..10 -> {:ok, n}
           _ -> {:error, scenario}
         end
       end)

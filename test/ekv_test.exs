@@ -1301,6 +1301,34 @@ defmodule EKVTest do
                       %{name: ^name}}
     end
 
+    test "compressed remote put generates event", %{name: name} do
+      config = EKV.Supervisor.get_config(name)
+      shard = EKV.Replica.shard_index_for("remote_put_compressed_key", config.num_shards)
+      shard_name = EKV.Replica.shard_name(name, shard)
+
+      :ok = EKV.subscribe(name, "remote_put_compressed_key")
+
+      now = System.system_time(:nanosecond)
+      val = :erlang.term_to_binary("remote_compressed_val")
+
+      send(
+        shard_name,
+        {:ekv_put, "remote_put_compressed_key", wire_compress(val), now, :remote@host, nil}
+      )
+
+      :sys.get_state(shard_name)
+      flush_dispatchers(name)
+
+      assert_receive {:ekv,
+                      [
+                        %EKV.Event{
+                          type: :put,
+                          key: "remote_put_compressed_key",
+                          value: "remote_compressed_val"
+                        }
+                      ], %{name: ^name}}
+    end
+
     test "remote delete generates event with previous value", %{name: name} do
       :ok = EKV.put(name, "remote_del_key", "existing")
 
@@ -3599,6 +3627,20 @@ defmodule EKVTest do
       assert EKV.get(name, key) == nil
     end
 
+    test "compressed accept does NOT write to kv", %{name: name, shard_name: shard_name} do
+      key = "phantom/compressed_accept"
+      ref = make_ref()
+      now = System.system_time(:nanosecond)
+      origin_str = Atom.to_string(node())
+      val_bin = :erlang.term_to_binary("compressed_phantom")
+      entry_tuple = {key, wire_compress(val_bin), now, origin_str, nil, nil}
+
+      send(shard_name, {:ekv_accept, ref, self(), key, 100, "2", entry_tuple, 0})
+
+      assert_receive {:ekv_accepted, ^ref, _, _}, 1000
+      assert EKV.get(name, key) == nil
+    end
+
     test "acceptor accept does NOT dispatch subscriber events", %{
       name: name,
       shard_name: shard_name
@@ -3684,6 +3726,30 @@ defmodule EKVTest do
 
       assert_receive {:ekv, [%EKV.Event{type: :put, key: ^key, value: "payload_put"}], _}, 1000
       assert EKV.get(name, key) == "payload_put"
+    end
+
+    test "compressed commit payload can promote without prior local accept", %{
+      name: name,
+      shard_name: shard_name
+    } do
+      :ok = EKV.subscribe(name, "phantom/")
+      Process.sleep(50)
+
+      key = "phantom/compressed_commit_payload_put"
+      now = System.system_time(:nanosecond)
+      origin_str = Atom.to_string(node())
+      val_bin = :erlang.term_to_binary("payload_put_compressed")
+      entry_tuple = {key, wire_compress(val_bin), now, origin_str, nil, nil}
+
+      send(shard_name, {:ekv_cas_committed, key, 151, "2", entry_tuple, 0})
+      :sys.get_state(shard_name)
+      flush_dispatchers(name)
+
+      assert_receive {:ekv, [%EKV.Event{type: :put, key: ^key, value: "payload_put_compressed"}],
+                      _},
+                     1000
+
+      assert EKV.get(name, key) == "payload_put_compressed"
     end
 
     test "commit payload delete can promote without prior local accept", %{
@@ -5056,6 +5122,17 @@ defmodule EKVTest do
                )
 
       assert Exception.message(error) =~ ":allow_stale_startup is not supported in :client mode"
+    end
+  end
+
+  defp wire_compress(binary) when is_binary(binary) do
+    z = :zlib.open()
+
+    try do
+      :ok = :zlib.deflateInit(z, 1)
+      {:ekv_wire_compressed, z |> :zlib.deflate(binary, :finish) |> IO.iodata_to_binary()}
+    after
+      :zlib.close(z)
     end
   end
 end

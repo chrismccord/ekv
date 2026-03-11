@@ -45,6 +45,7 @@ Do not analyze Byzantine/malicious behavior unless explicitly asked.
   - `wait_for_quorum`
   - `shutdown_barrier`
   - `blue_green`
+  - `wire_compression_threshold`
 
 ### `mode: :client`
 - Stateless node.
@@ -54,6 +55,8 @@ Do not analyze Byzantine/malicious behavior unless explicitly asked.
   - `wait_for_route`
   - `wait_for_quorum` (via selected member)
   - `shutdown_barrier`
+  - `wire_compression_threshold` config is accepted for shared child-spec simplicity, but
+    current wire compression is member-to-member only.
 
 Important:
 - Client mode rejects member-only options like `:blue_green`, `:cluster_size`, `:node_id`, `:data_dir`, `:shards`, `:partition_ttl_policy`.
@@ -116,6 +119,22 @@ Important:
   - `{:ekv_members, name, region}`
 - This is pinned by `EKV.MemberPresence`.
 - New clients should discover members through this path, not by raw `Node.list/0`.
+
+### Wire compression
+- `wire_compression_threshold` defaults to `256 * 1024`.
+- Member-to-member replication compresses only large value payloads on the wire:
+  - `{:ekv_put, ...}`
+  - `{:ekv_accept, ...}`
+  - full-payload `{:ekv_cas_committed, ...}`
+- Compression is field-level only:
+  - message tuple shape stays the same
+  - the value field may be tagged as `{:ekv_wire_compressed, binary}`
+- Receivers inflate before normal processing.
+- SQLite storage and normal reads remain uncompressed.
+- Current implementation assumes a homogeneous member version set.
+  - There is no capability negotiation.
+  - Mixed old/new running members would be unsafe if compression is enabled.
+  - Intended rollout model is cold deploy, not mixed-version rolling upgrade.
 
 ### Client routing
 - `EKV.ClientRouter` is the client control plane.
@@ -190,6 +209,10 @@ Important:
 - Only `paxos_promote` writes committed CAS state into `kv` and `kv_oplog`.
 - No subscriber events on pure accept state.
 - This prevents phantom visibility.
+- Commit dissemination is optimized:
+  - members that already accepted for a unique `node_id` may receive slim commit (`entry_tuple = nil`)
+  - members that may have missed accept receive the full `entry_tuple`
+  - full commit payloads may have a wire-compressed value field
 
 ### Consistent read barrier
 - `consistent: true` must always go through the CAS read/repair path.

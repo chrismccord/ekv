@@ -209,6 +209,17 @@ defmodule EKV.Replica do
   On the receiving side, merge_remote_entry calls the same write_entry
   NIF with the remote's timestamp — LWW decides whether to apply.
 
+  Large replicated value payloads may be compressed on the wire only.
+  The message shape stays the same, but the value field may be tagged as
+  `{:ekv_wire_compressed, compressed_binary}` for:
+
+    - `{:ekv_put, ...}`
+    - `{:ekv_accept, ...}`
+    - full-payload `{:ekv_cas_committed, ...}`
+
+  Receivers inflate the value before normal processing. Values remain
+  uncompressed in SQLite and on the read path.
+
 
   ## Read Path
 
@@ -393,11 +404,15 @@ defmodule EKV.Replica do
 
   After commit, the proposer sends:
 
-    - `{:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple, shard}`
+    - `{:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple | nil, shard}`
       → sent to all members
+      → members that already accepted may receive `nil` payload and promote from
+        local `kv_paxos`
+      → members that may have missed accept receive full `entry_tuple`
+      → when a full payload is present, its value field may be wire-compressed
       → receiver first tries paxos_promote
-      → if stale/missing accepted state, receiver can paxos_accept(entry_tuple)
-        then paxos_promote (ballot-guarded)
+      → if stale/missing accepted state and a full payload is present, receiver
+        can paxos_accept(entry_tuple) then paxos_promote (ballot-guarded)
 
   ### paxos_promote (commit on acceptor side)
 
@@ -948,6 +963,7 @@ defmodule EKV.Replica do
   @member_down_name_prefix "member_down_at:name:"
   @member_down_name_min_retention_ms :timer.hours(24 * 30)
   @member_down_name_max_entries 4096
+  @wire_compressed_tag :ekv_wire_compressed
 
   defstruct [
     :name,
@@ -968,6 +984,7 @@ defmodule EKV.Replica do
     cluster_size: nil,
     lww_ts_counter: 0,
     ballot_counter: 0,
+    wire_compression_threshold: nil,
     member_node_ids: %{},
     pending_cas: %{},
     quorum_waiters: %{},
@@ -1055,6 +1072,7 @@ defmodule EKV.Replica do
       partition_ttl_policy: config.partition_ttl_policy,
       node_id: config.node_id,
       cluster_size: config.cluster_size,
+      wire_compression_threshold: config[:wire_compression_threshold],
       lww_ts_counter: lww_ts_counter,
       ballot_counter: ballot_counter
     }
@@ -1318,6 +1336,8 @@ defmodule EKV.Replica do
         {:ekv_put, key, value_binary, timestamp, origin_node, expires_at},
         %Replica{} = state
       ) do
+    value_binary = wire_decompress_value(value_binary)
+
     {:ok, applied} =
       merge_remote_entry(state, key, value_binary, timestamp, origin_node, expires_at, nil)
 
@@ -1549,6 +1569,7 @@ defmodule EKV.Replica do
         %Replica{} = state
       ) do
     %{db: db} = state
+    entry_tuple = wire_decompress_entry_tuple(entry_tuple)
 
     {_key, value_binary, timestamp, origin_node_str, expires_at, deleted_at} = entry_tuple
     value_args = [value_binary, timestamp, origin_node_str, expires_at, deleted_at]
@@ -1571,6 +1592,7 @@ defmodule EKV.Replica do
         {:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple, _shard},
         %Replica{} = state
       ) do
+    entry_tuple = wire_decompress_entry_tuple(entry_tuple)
     {:noreply, apply_cas_commit(state, key, ballot_c, ballot_n, entry_tuple)}
   end
 
@@ -2095,7 +2117,7 @@ defmodule EKV.Replica do
 
   defp send_to_member(%Replica{} = state, target_node, message) do
     shard_name = shard_name(state.name, state.shard_index)
-    send({shard_name, target_node}, message)
+    send({shard_name, target_node}, wire_encode_message(state, message))
   end
 
   # Track a remote shard pid in remote_shards. Handles three cases:
@@ -2121,19 +2143,102 @@ defmodule EKV.Replica do
     shard_name = shard_name(state.name, state.shard_index)
 
     for target_node <- Map.keys(state.remote_shards) do
-      send({shard_name, target_node}, message)
+      send({shard_name, target_node}, wire_encode_message(state, message))
     end
   end
 
   # Broadcast committed CAS entry to all members.
-  defp broadcast_cas_commit(%Replica{} = state, key, ballot_c, ballot_n, entry_tuple) do
-    shard_name = shard_name(state.name, state.shard_index)
-
+  #
+  # Members that already acknowledged accept for a unique node_id only need the
+  # ballot/key commit signal; they can promote from local kv_paxos state. Members
+  # that may have missed accept (or whose node_id is ambiguous during blue-green
+  # overlap) still receive the full entry_tuple so they can recover via
+  # paxos_accept + paxos_promote on commit.
+  defp broadcast_cas_commit(%Replica{} = state, %{key: key, ballot: {ballot_c, ballot_n}} = op) do
     for {target_node, _pid} <- state.remote_shards do
-      send(
-        {shard_name, target_node},
+      entry_tuple = commit_payload_for_member(state, target_node, op)
+
+      send_to_member(
+        state,
+        target_node,
         {:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple, state.shard_index}
       )
+    end
+  end
+
+  # Runs on the sender member. Only large replicated value payloads are compressed.
+  # Message tuple shapes stay stable; only the value field is tagged.
+  defp wire_encode_message(%Replica{} = state, {:ekv_put, key, value_binary, ts, origin, exp}) do
+    {:ekv_put, key, maybe_wire_compress_value(state, value_binary), ts, origin, exp}
+  end
+
+  defp wire_encode_message(
+         %Replica{} = state,
+         {:ekv_accept, ref, proposer_pid, key, ballot_c, ballot_n, entry_tuple, shard}
+       ) do
+    {:ekv_accept, ref, proposer_pid, key, ballot_c, ballot_n,
+     wire_compress_entry_tuple(state, entry_tuple), shard}
+  end
+
+  defp wire_encode_message(
+         %Replica{} = state,
+         {:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple, shard}
+       ) do
+    {:ekv_cas_committed, key, ballot_c, ballot_n, wire_compress_entry_tuple(state, entry_tuple),
+     shard}
+  end
+
+  defp wire_encode_message(%Replica{} = _state, message), do: message
+
+  defp wire_compress_entry_tuple(%Replica{} = _state, nil), do: nil
+
+  defp wire_compress_entry_tuple(
+         %Replica{} = state,
+         {key, value_binary, timestamp, origin_node_str, expires_at, deleted_at}
+       ) do
+    {key, maybe_wire_compress_value(state, value_binary), timestamp, origin_node_str, expires_at,
+     deleted_at}
+  end
+
+  defp maybe_wire_compress_value(%Replica{} = _state, nil), do: nil
+
+  defp maybe_wire_compress_value(%Replica{wire_compression_threshold: threshold}, value_binary)
+       when threshold in [false, nil],
+       do: value_binary
+
+  defp maybe_wire_compress_value(%Replica{wire_compression_threshold: threshold}, value_binary)
+       when is_binary(value_binary) do
+    if byte_size(value_binary) >= threshold do
+      {@wire_compressed_tag, compress_binary(value_binary)}
+    else
+      value_binary
+    end
+  end
+
+  # Runs on the receiver member. Raw and compressed value payloads are both accepted.
+  defp wire_decompress_entry_tuple(nil), do: nil
+
+  defp wire_decompress_entry_tuple(
+         {key, value_binary, timestamp, origin_node_str, expires_at, deleted_at}
+       ) do
+    {key, wire_decompress_value(value_binary), timestamp, origin_node_str, expires_at, deleted_at}
+  end
+
+  defp wire_decompress_value({@wire_compressed_tag, compressed_binary})
+       when is_binary(compressed_binary) do
+    :zlib.uncompress(compressed_binary)
+  end
+
+  defp wire_decompress_value(value_binary), do: value_binary
+
+  defp compress_binary(binary) when is_binary(binary) do
+    z = :zlib.open()
+
+    try do
+      :ok = :zlib.deflateInit(z, 1)
+      z |> :zlib.deflate(binary, :finish) |> IO.iodata_to_binary()
+    after
+      :zlib.close(z)
     end
   end
 
@@ -2348,7 +2453,7 @@ defmodule EKV.Replica do
         cancel_timer(op.timer)
         dispatch_events(state, op.events)
         GenServer.reply(op.from, op.reply_value)
-        broadcast_cas_commit(state, key, ballot_c, ballot_n, op.entry_tuple)
+        broadcast_cas_commit(state, op)
         %{state | pending_cas: Map.delete(state.pending_cas, ref)}
 
       {:ok, :stale} ->
@@ -2642,6 +2747,37 @@ defmodule EKV.Replica do
         %EKV.Event{type: :put, key: key, value: :erlang.binary_to_term(value_binary)}
       ])
     end
+  end
+
+  defp commit_payload_for_member(%Replica{} = state, target_node, op) do
+    case Map.get(state.member_node_ids, target_node) do
+      nil ->
+        op.entry_tuple
+
+      remote_node_id ->
+        if slim_commit_safe?(state, target_node, remote_node_id, op.accepts) do
+          nil
+        else
+          op.entry_tuple
+        end
+    end
+  end
+
+  defp slim_commit_safe?(%Replica{} = state, _target_node, remote_node_id, _accepts)
+       when remote_node_id == state.node_id,
+       do: false
+
+  defp slim_commit_safe?(%Replica{} = state, target_node, remote_node_id, accepts) do
+    MapSet.member?(accepts, remote_node_id) and
+      unique_live_remote_node_id?(state, target_node, remote_node_id)
+  end
+
+  defp unique_live_remote_node_id?(%Replica{} = state, target_node, remote_node_id) do
+    not Enum.any?(state.member_node_ids, fn {remote_node, other_node_id} ->
+      remote_node != target_node and
+        other_node_id == remote_node_id and
+        Map.has_key?(state.remote_shards, remote_node)
+    end)
   end
 
   def alive_node_id_count(%Replica{} = state) do
