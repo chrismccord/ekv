@@ -909,8 +909,16 @@ defmodule EKV.CASDistributedTest do
       :peer.stop(peer_a)
       Process.sleep(200)
 
-      # Value survives on B and C
-      assert TestCluster.rpc!(node_b, EKV, :get, [ekv_name, "key1"]) == "durable"
+      # Value survives on the remaining quorum member B. C may miss A's final
+      # commit broadcast, but the committed value must still be recoverable via
+      # a consistent read from the surviving quorum.
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, EKV, :get, [ekv_name, "key1"]) == "durable"
+      end)
+
+      assert TestCluster.rpc!(node_c, EKV, :get, [ekv_name, "key1", [consistent: true]]) ==
+               "durable"
+
       assert TestCluster.rpc!(node_c, EKV, :get, [ekv_name, "key1"]) == "durable"
     end
 
