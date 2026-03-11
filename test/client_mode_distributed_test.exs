@@ -290,6 +290,155 @@ defmodule EKV.ClientModeDistributedTest do
     )
   end
 
+  test "terminal member stops advertising before shutdown barrier wait and new clients avoid it" do
+    peers = TestCluster.start_peers(3)
+    on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+    [{_, member_a}, {_, member_b}, {_, client_node}] = peers
+    ekv_name = unique_name(:client_shutdown_advertise)
+    on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+    for {node, node_id, region} <- [{member_a, 1, "iad"}, {member_b, 2, "lhr"}] do
+      data_dir = member_data_dir(node, ekv_name)
+      TestCluster.rpc!(node, File, :rm_rf!, [data_dir])
+
+      {:ok, _pid} =
+        TestCluster.start_ekv(
+          node,
+          name: ekv_name,
+          data_dir: data_dir,
+          shards: 1,
+          log: false,
+          region: region,
+          cluster_size: 2,
+          node_id: node_id,
+          shutdown_barrier: 3_000,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+    end
+
+    stop_task = Task.async(fn -> TestCluster.stop_ekv(member_b, ekv_name, 5_000) end)
+
+    TestCluster.assert_eventually(
+      fn ->
+        TestCluster.rpc!(member_b, EKV.MemberPresence, :advertised?, [ekv_name]) == false
+      end,
+      timeout: 2_000
+    )
+
+    {:ok, _client_pid} =
+      TestCluster.start_ekv(
+        client_node,
+        name: ekv_name,
+        mode: :client,
+        log: false,
+        region: "ord",
+        region_routing: ["lhr", "iad"],
+        wait_for_route: 5_000
+      )
+
+    TestCluster.assert_eventually(
+      fn ->
+        TestCluster.rpc!(client_node, EKV, :info, [ekv_name]).current_backend == member_a
+      end,
+      timeout: 5_000
+    )
+
+    assert :ok = Task.await(stop_task, 6_000)
+  end
+
+  test "client handles backend replica shutdown without raising and fails over" do
+    peers = TestCluster.start_peers(4)
+    on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+    [{_, member_a}, {_, member_b}, {_, member_c}, {_, client_node}] = peers
+    ekv_name = unique_name(:client_backend_shutdown)
+    on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+    for {node, node_id, region} <- [
+          {member_a, 1, "iad"},
+          {member_b, 2, "lhr"},
+          {member_c, 3, "ord"}
+        ] do
+      data_dir = member_data_dir(node, ekv_name)
+      TestCluster.rpc!(node, File, :rm_rf!, [data_dir])
+
+      {:ok, _pid} =
+        TestCluster.start_ekv(
+          node,
+          name: ekv_name,
+          data_dir: data_dir,
+          shards: 1,
+          log: false,
+          region: region,
+          cluster_size: 3,
+          node_id: node_id,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+    end
+
+    assert {:ok, _vsn} =
+             TestCluster.rpc!(member_a, EKV, :put, [ekv_name, "seed", "v1", [if_vsn: nil]])
+
+    {:ok, _client_pid} =
+      TestCluster.start_ekv(
+        client_node,
+        name: ekv_name,
+        mode: :client,
+        log: false,
+        region: "ord",
+        region_routing: ["lhr", "iad", "ord"]
+      )
+
+    TestCluster.assert_eventually(
+      fn ->
+        TestCluster.rpc!(client_node, EKV, :info, [ekv_name]).current_backend == member_b
+      end,
+      timeout: 5_000
+    )
+
+    TestCluster.terminate_replica_shard(member_b, ekv_name, 0)
+
+    assert {:error, :unavailable} =
+             TestCluster.rpc!(client_node, EKV, :put, [ekv_name, "lww", "v1"])
+
+    assert {:error, :unavailable} =
+             TestCluster.rpc!(client_node, EKV, :put, [
+               ekv_name,
+               "seed2",
+               "v2",
+               [if_vsn: nil, resolve_unconfirmed: true]
+             ])
+
+    TestCluster.assert_eventually(
+      fn ->
+        TestCluster.rpc!(client_node, EKV, :info, [ekv_name]).current_backend in [
+          member_a,
+          member_c
+        ]
+      end,
+      timeout: 5_000
+    )
+
+    TestCluster.assert_eventually(
+      fn ->
+        try do
+          TestCluster.rpc!(client_node, EKV, :get, [ekv_name, "seed", [consistent: true]]) == "v1"
+        rescue
+          _ -> false
+        catch
+          :exit, _ -> false
+        end
+      end,
+      timeout: 5_000
+    )
+
+    assert {:ok, _vsn} =
+             TestCluster.rpc!(client_node, EKV, :put, [ekv_name, "seed2", "v2", [if_vsn: nil]])
+  end
+
   test "blue-green overlap keeps existing client bound to outgoing node while new clients route to incoming node" do
     peers = TestCluster.start_peers(6)
     on_exit(fn -> TestCluster.stop_peers(peers) end)

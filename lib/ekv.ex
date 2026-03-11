@@ -1431,7 +1431,7 @@ defmodule EKV do
           raised
 
         {:exit, _reason} = exited ->
-          exited
+          handle_client_exit(name, backend, fun, args, timeout, retryable?, exited)
 
         {:error, :unavailable} ->
           EKV.ClientRouter.mark_backend_failed(name, backend)
@@ -1457,6 +1457,37 @@ defmodule EKV do
       _ -> {:error, :unavailable}
     end
   end
+
+  defp handle_client_exit(name, backend, fun, args, timeout, retryable?, {:exit, reason} = exited) do
+    if backend_local_ekv_exit?(name, reason) do
+      EKV.ClientRouter.mark_backend_failed(name, backend)
+
+      if retryable? do
+        retry_client_rpc(name, backend, fun, args, timeout)
+      else
+        {:error, :unavailable}
+      end
+    else
+      exited
+    end
+  end
+
+  defp backend_local_ekv_exit?(name, {:shutdown, {GenServer, :call, [target | _]}}),
+    do: ekv_local_target?(name, target)
+
+  defp backend_local_ekv_exit?(name, {:noproc, {GenServer, :call, [target | _]}}),
+    do: ekv_local_target?(name, target)
+
+  defp backend_local_ekv_exit?(_name, _reason), do: false
+
+  defp ekv_local_target?(name, target) when is_atom(target) do
+    Atom.to_string(target) |> String.starts_with?("#{name}_ekv_")
+  end
+
+  defp ekv_local_target?(name, {target, target_node}) when target_node == node(),
+    do: ekv_local_target?(name, target)
+
+  defp ekv_local_target?(_name, _target), do: false
 
   # Runs on the client node; waits for a backend route and then asks that member to perform quorum readiness.
   defp client_await_quorum(name, timeout_ms) do

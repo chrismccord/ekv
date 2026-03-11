@@ -51,6 +51,16 @@ defmodule EKV.TestCluster do
     :erpc.call(node, __MODULE__, :do_stop_ekv, [name, timeout])
   end
 
+  @doc "Stop the EKV replica supervisor on a remote node"
+  def stop_replica_sup(node, name, timeout \\ 5_000) do
+    :erpc.call(node, __MODULE__, :do_stop_replica_sup, [name, timeout])
+  end
+
+  @doc "Terminate one EKV replica shard child on a remote node without restarting it"
+  def terminate_replica_shard(node, name, shard_index \\ 0) do
+    :erpc.call(node, __MODULE__, :do_terminate_replica_shard, [name, shard_index])
+  end
+
   @doc false
   def do_stop_ekv(name, timeout) do
     sup_name = :"#{name}_ekv_sup"
@@ -58,6 +68,31 @@ defmodule EKV.TestCluster do
     case Process.whereis(sup_name) do
       nil -> :ok
       pid -> Supervisor.stop(pid, :shutdown, timeout)
+    end
+  end
+
+  @doc false
+  def do_stop_replica_sup(name, timeout) do
+    sup_name = :"#{name}_ekv_replica_sup"
+
+    case Process.whereis(sup_name) do
+      nil -> :ok
+      pid -> Supervisor.stop(pid, :shutdown, timeout)
+    end
+  end
+
+  @doc false
+  def do_terminate_replica_shard(name, shard_index) do
+    sup_name = :"#{name}_ekv_replica_sup"
+    child_id = {EKV.Replica, shard_index}
+
+    case Process.whereis(sup_name) do
+      nil ->
+        :ok
+
+      _pid ->
+        _ = Supervisor.terminate_child(sup_name, child_id)
+        :ok
     end
   end
 

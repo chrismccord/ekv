@@ -75,6 +75,7 @@ defmodule EKV.ShutdownBarrier do
   @impl true
   def terminate(reason, %ShutdownBarrier{} = state) do
     if graceful_shutdown?(reason) do
+      maybe_unadvertise_member(state)
       maybe_log(state, :info, "shutdown barrier entered terminal state")
       join_terminal_groups(state)
       snapshot = live_snapshot(state.name)
@@ -265,6 +266,16 @@ defmodule EKV.ShutdownBarrier do
   defp member_identity(%{mode: :member, node_id: nil}), do: {:node, node()}
   defp member_identity(%{mode: :member, node_id: node_id}), do: node_id
   defp member_identity(_config), do: nil
+
+  defp maybe_unadvertise_member(%ShutdownBarrier{mode: :member, name: name}) do
+    EKV.MemberPresence.leave(name)
+  rescue
+    _ -> :ok
+  catch
+    :exit, _ -> :ok
+  end
+
+  defp maybe_unadvertise_member(%ShutdownBarrier{}), do: :ok
 
   defp quorum_size(cluster_size), do: div(cluster_size, 2) + 1
 
