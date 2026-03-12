@@ -2385,52 +2385,79 @@ defmodule EKV.Replica do
 
     case apply_result do
       {:ok, _new_value_binary, new_entry_tuple, reply_value, broadcast_msg, events} ->
-        {_key, value_binary, ts, origin_str, expires_at, deleted_at} = new_entry_tuple
-        value_args = [value_binary, ts, origin_str, expires_at, deleted_at]
-        {ballot_c, ballot_n} = op.ballot
-
-        # Local accept first. We only count this node toward quorum after the
-        # accept is durably recorded. This avoids "assumed self-accept" races.
-        case Store.paxos_accept(state.db, op.key, ballot_c, ballot_n, value_args) do
-          {:ok, false} ->
-            handle_cas_failure(state, ref, op)
-
-          {:ok, true} ->
-            # Send accept to all members.
-            for {remote_node, _pid} <- state.remote_shards do
-              send_to_member(
-                state,
-                remote_node,
-                {:ekv_accept, ref, self(), op.key, ballot_c, ballot_n, new_entry_tuple,
-                 state.shard_index}
-              )
-            end
-
-            timer = Process.send_after(self(), {:cas_timeout, ref}, 5_000)
-
-            op = %{
-              op
-              | phase: :accept,
-                accepts: MapSet.new([state.node_id]),
-                accept_nacks: 0,
-                responded: MapSet.new([state.node_id]),
-                timer: timer,
-                reply_value: reply_value,
-                broadcast_msg: broadcast_msg,
-                entry_tuple: new_entry_tuple,
-                events: events
-            }
-
-            # For cluster_size: 1 (no members), or if local accept already meets quorum.
-            if MapSet.size(op.accepts) >= op.quorum do
-              commit_cas(state, ref, op)
-            else
-              %{state | pending_cas: Map.put(state.pending_cas, ref, op)}
-            end
-        end
+        enter_accept_phase_with_entry(
+          state,
+          ref,
+          op,
+          new_entry_tuple,
+          reply_value,
+          broadcast_msg,
+          events
+        )
 
       {:error, :conflict} ->
+        maybe_repair_conflict_visibility(
+          state,
+          ref,
+          op,
+          selected_kv_row,
+          current_value,
+          current_vsn
+        )
+    end
+  end
+
+  defp enter_accept_phase_with_entry(
+         %Replica{} = state,
+         ref,
+         op,
+         new_entry_tuple,
+         reply_value,
+         broadcast_msg,
+         events
+       ) do
+    {_key, value_binary, ts, origin_str, expires_at, deleted_at} = new_entry_tuple
+    value_args = [value_binary, ts, origin_str, expires_at, deleted_at]
+    {ballot_c, ballot_n} = op.ballot
+
+    # Local accept first. We only count this node toward quorum after the
+    # accept is durably recorded. This avoids "assumed self-accept" races.
+    case Store.paxos_accept(state.db, op.key, ballot_c, ballot_n, value_args) do
+      {:ok, false} ->
         handle_cas_failure(state, ref, op)
+
+      {:ok, true} ->
+        # Send accept to all members.
+        for {remote_node, _pid} <- state.remote_shards do
+          send_to_member(
+            state,
+            remote_node,
+            {:ekv_accept, ref, self(), op.key, ballot_c, ballot_n, new_entry_tuple,
+             state.shard_index}
+          )
+        end
+
+        timer = Process.send_after(self(), {:cas_timeout, ref}, 5_000)
+
+        op = %{
+          op
+          | phase: :accept,
+            accepts: MapSet.new([state.node_id]),
+            accept_nacks: 0,
+            responded: MapSet.new([state.node_id]),
+            timer: timer,
+            reply_value: reply_value,
+            broadcast_msg: broadcast_msg,
+            entry_tuple: new_entry_tuple,
+            events: events
+        }
+
+        # For cluster_size: 1 (no members), or if local accept already meets quorum.
+        if MapSet.size(op.accepts) >= op.quorum do
+          commit_cas(state, ref, op)
+        else
+          %{state | pending_cas: Map.put(state.pending_cas, ref, op)}
+        end
     end
   end
 
@@ -2566,6 +2593,57 @@ defmodule EKV.Replica do
     end
   end
 
+  defp maybe_repair_conflict_visibility(
+         %Replica{} = state,
+         ref,
+         op,
+         selected_kv_row,
+         current_value,
+         current_vsn
+       ) do
+    if stale_local_kv_view?(state, op.key, selected_kv_row) do
+      {:ok, _value_binary, entry_tuple, _reply_value, broadcast_msg, _events} =
+        apply_cas_read_recovery(op.key, selected_kv_row, current_value, current_vsn)
+
+      repair_op =
+        op
+        |> Map.put(:failure_reason_override, :conflict)
+        |> Map.put(:reply_value, {:error, :conflict})
+
+      enter_accept_phase_with_entry(
+        state,
+        ref,
+        repair_op,
+        entry_tuple,
+        {:error, :conflict},
+        broadcast_msg,
+        []
+      )
+    else
+      handle_cas_failure(state, ref, op)
+    end
+  end
+
+  defp stale_local_kv_view?(%Replica{} = state, key, selected_kv_row) do
+    local_kv_row = Store.get(state.db, key)
+    normalize_kv_row(local_kv_row) != normalize_kv_row(selected_kv_row)
+  end
+
+  defp normalize_kv_row(nil), do: nil
+
+  defp normalize_kv_row({value_binary, ts, origin, expires_at, deleted_at}) do
+    [value_binary, ts, Atom.to_string(origin), expires_at, deleted_at]
+  end
+
+  defp normalize_kv_row([value_binary, ts, origin, expires_at, deleted_at])
+       when is_atom(origin) do
+    [value_binary, ts, Atom.to_string(origin), expires_at, deleted_at]
+  end
+
+  defp normalize_kv_row([value_binary, ts, origin, expires_at, deleted_at]) do
+    [value_binary, ts, to_string(origin), expires_at, deleted_at]
+  end
+
   # Build entry_tuple for cas_read recovery directly from the raw accepted
   # kv_row columns, preserving expires_at and deleted_at exactly as accepted.
   defp apply_cas_read_recovery(key, nil, _current_value, _current_vsn) do
@@ -2668,10 +2746,15 @@ defmodule EKV.Replica do
   end
 
   defp cas_failure_reason(op) do
-    if op.phase == :accept and writes_operation?(op.operation) do
-      :unconfirmed
-    else
-      :conflict
+    cond do
+      is_atom(Map.get(op, :failure_reason_override)) ->
+        op.failure_reason_override
+
+      op.phase == :accept and writes_operation?(op.operation) ->
+        :unconfirmed
+
+      true ->
+        :conflict
     end
   end
 

@@ -1470,7 +1470,7 @@ defmodule EKV do
 
   # Runs on the client node; retries a failed safe RPC against the next selected member.
   defp retry_client_rpc(name, failed_backend, fun, args, timeout) do
-    with {:ok, backend} <- EKV.ClientRouter.backend(name),
+    with {:ok, backend} <- EKV.ClientRouter.next_backend(name, failed_backend),
          false <- backend == failed_backend,
          result <- remote_invoke(backend, fun, args, timeout) do
       result

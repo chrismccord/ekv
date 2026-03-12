@@ -245,6 +245,11 @@ defmodule EKV.TestCluster do
     rpc!(node, __MODULE__, :do_store_get, [name, key])
   end
 
+  @doc "Inject accepted-but-not-promoted CAS state into a remote shard"
+  def inject_paxos_accept(node, name, key, value, ballot_c, ballot_n, opts \\ []) do
+    rpc!(node, __MODULE__, :do_inject_paxos_accept, [name, key, value, ballot_c, ballot_n, opts])
+  end
+
   @doc "Materialize scan stream on remote node, return %{key => value} map"
   def scan_to_map(node, name, prefix) do
     rpc!(node, __MODULE__, :do_scan_to_map, [name, prefix])
@@ -263,6 +268,29 @@ defmodule EKV.TestCluster do
     shard_name = EKV.Replica.shard_name(name, shard)
     %{db: db} = :sys.get_state(shard_name)
     EKV.Store.get(db, key)
+  end
+
+  def do_inject_paxos_accept(name, key, value, ballot_c, ballot_n, opts) do
+    config = EKV.Supervisor.get_config(name)
+    shard = EKV.Replica.shard_index_for(key, config.num_shards)
+    shard_name = EKV.Replica.shard_name(name, shard)
+    %{db: db} = :sys.get_state(shard_name)
+    value_binary = :erlang.term_to_binary(value)
+    timestamp = Keyword.get(opts, :timestamp, System.system_time(:nanosecond))
+    origin = Keyword.get(opts, :origin, Atom.to_string(node()))
+    expires_at = Keyword.get(opts, :expires_at)
+    deleted_at = Keyword.get(opts, :deleted_at)
+
+    {:ok, true} =
+      EKV.Store.paxos_accept(db, key, ballot_c, to_string(ballot_n), [
+        value_binary,
+        timestamp,
+        origin,
+        expires_at,
+        deleted_at
+      ])
+
+    :ok
   end
 
   def do_scan_to_map(name, prefix),

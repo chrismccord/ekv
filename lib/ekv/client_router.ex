@@ -58,6 +58,10 @@ defmodule EKV.ClientRouter do
     )
   end
 
+  def next_backend(name, failed_backend) do
+    GenServer.call(router_name(name), {:backend_after_failure, failed_backend})
+  end
+
   def mark_backend_failed(name, node) do
     table = table_name(name)
 
@@ -98,6 +102,12 @@ defmodule EKV.ClientRouter do
 
   @impl true
   def handle_call(:backend, _from, %ClientRouter{} = state) do
+    {reply, new_state} = ensure_backend(state)
+    {:reply, reply, reply_waiters_if_ready(new_state, reply)}
+  end
+
+  def handle_call({:backend_after_failure, failed_backend}, _from, %ClientRouter{} = state) do
+    state = mark_backend_failed_in_router(state, failed_backend)
     {reply, new_state} = ensure_backend(state)
     {:reply, reply, reply_waiters_if_ready(new_state, reply)}
   end
@@ -269,6 +279,9 @@ defmodule EKV.ClientRouter do
         :invalid
       end
     catch
+      :exit, {{:erpc, :noconnection}, _stack} -> :invalid
+      :exit, {{:nodedown, _node}, _stack} -> :invalid
+      :exit, {{:erpc, :timeout}, _stack} -> :unknown
       :exit, _reason -> :unknown
     end
   end
@@ -417,16 +430,13 @@ defmodule EKV.ClientRouter do
 
   defp region_candidates(state, table, respect_cooldown?) do
     state.region_routing
-    |> Enum.find_value([], fn region ->
-      candidates =
-        state.members_by_region
-        |> Map.get(region, MapSet.new())
-        |> Enum.reject(fn node ->
-          respect_cooldown? and cooled_down?(table, node)
-        end)
-        |> Enum.sort_by(&Atom.to_string/1)
-
-      if candidates == [], do: false, else: candidates
+    |> Enum.flat_map(fn region ->
+      state.members_by_region
+      |> Map.get(region, MapSet.new())
+      |> Enum.reject(fn node ->
+        respect_cooldown? and cooled_down?(table, node)
+      end)
+      |> Enum.sort_by(&Atom.to_string/1)
     end)
   end
 

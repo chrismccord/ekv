@@ -922,6 +922,65 @@ defmodule EKV.CASDistributedTest do
       assert TestCluster.rpc!(node_c, EKV, :get, [ekv_name, "key1"]) == "durable"
     end
 
+    # This verifies a stale member heals its eventual local view after a CAS
+    # conflict discovers a newer quorum state. Without the repair, the member
+    # can keep serving the same stale VSN locally and reject repeated if_vsn
+    # writes with :conflict until some separate consistent read or reconnect
+    # happens to repair it.
+    test "stale member repairs local eventual view after CAS conflict sees newer quorum state" do
+      peers = TestCluster.start_peers(3)
+      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      ekv_name = unique_name(:cas)
+      start_cas_cluster(peers, ekv_name, shards: 1)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      assert {:ok, _vsn1} =
+               TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "repair/1", "v1", [if_vsn: nil]])
+
+      TestCluster.assert_eventually(fn ->
+        Enum.all?([node_a, node_b, node_c], fn node ->
+          TestCluster.rpc!(node, EKV, :get, [ekv_name, "repair/1"]) == "v1"
+        end)
+      end)
+
+      {"v1", vsn1} = TestCluster.rpc!(node_a, EKV, :lookup, [ekv_name, "repair/1"])
+      accepted_ts = elem(vsn1, 0) + 100
+
+      for node <- [node_b, node_c] do
+        assert :ok =
+                 TestCluster.inject_paxos_accept(
+                   node,
+                   ekv_name,
+                   "repair/1",
+                   "v2",
+                   9_000,
+                   "repair-quorum",
+                   timestamp: accepted_ts,
+                   origin: Atom.to_string(node_b)
+                 )
+      end
+
+      assert TestCluster.rpc!(node_b, EKV, :get, [ekv_name, "repair/1"]) == "v1"
+      assert TestCluster.rpc!(node_c, EKV, :get, [ekv_name, "repair/1"]) == "v1"
+      assert TestCluster.rpc!(node_a, EKV, :get, [ekv_name, "repair/1"]) == "v1"
+
+      assert {:error, :conflict} =
+               TestCluster.rpc!(node_a, EKV, :put, [
+                 ekv_name,
+                 "repair/1",
+                 "client-write",
+                 [if_vsn: vsn1]
+               ])
+
+      TestCluster.assert_eventually(fn ->
+        Enum.all?([node_a, node_b, node_c], fn node ->
+          TestCluster.rpc!(node, EKV, :get, [ekv_name, "repair/1"]) == "v2"
+        end)
+      end)
+    end
+
     test "full node restart: ballot counter restored, CAS resumes" do
       peers = TestCluster.start_peers(2)
       on_exit(fn -> TestCluster.stop_peers(peers) end)

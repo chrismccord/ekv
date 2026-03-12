@@ -279,7 +279,7 @@ defmodule EKV.ClientModeDistributedTest do
       fn ->
         try do
           TestCluster.rpc!(client_node, EKV, :get, [ekv_name, "client/cas", [consistent: true]]) ==
-            "SEED"
+            "SEED!"
         rescue
           _ -> false
         catch
