@@ -249,7 +249,7 @@ Important:
 - Otherwise force full sync.
 - Already-connected members now also run periodic anti-entropy by default.
   - This is not a second protocol.
-  - It reuses the same member handshake + HWM-driven delta/full sync path.
+  - It reuses the same HWM-driven delta/full sync path.
   - The goal is to heal missed replication without waiting for reconnect.
 - Chunked sync rules matter:
   - intermediate chunks use seq `0`

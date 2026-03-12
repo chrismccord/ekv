@@ -63,10 +63,10 @@ defmodule EKV.Supervisor do
   remain available after startup completes.
 
   Member replicas also run periodic background anti-entropy by default
-  (`anti_entropy_interval`, default 30s). This reuses the normal member
-  handshake and chunked sync path so an already-connected member that missed a
-  prior replication message eventually heals without needing a reconnect,
-  restart, or explicit consistent read.
+  (`anti_entropy_interval`, default 30s). This reuses the normal HWM-driven
+  chunked sync path so an already-connected member that missed a prior
+  replication message eventually heals without needing a reconnect, restart,
+  or explicit consistent read.
 
   ## Blue-Green Deployment (Synchronized Handoff)
 

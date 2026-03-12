@@ -586,10 +586,10 @@ defmodule EKV.Replica do
   Both sides send data. This is symmetric — each side sends what the
   other is missing based on HWMs.
 
-  Healthy connected members also re-run this handshake periodically via a
-  lightweight anti-entropy tick. That closes the gap where a member can miss
-  one committed update yet stay connected forever. The periodic tick reuses the
-  same handshake + HWM/full-sync path; it is not a second replication protocol.
+  Healthy connected members also re-run the same HWM-driven delta/full sync
+  path periodically via a lightweight anti-entropy tick. That closes the gap
+  where a member can miss one committed update yet stay connected forever. The
+  periodic tick is direct outbound sync, not a second handshake protocol.
 
 
   ## Delta Sync vs Full Sync
@@ -2179,14 +2179,7 @@ defmodule EKV.Replica do
         acc
       else
         remote_hwm = Store.get_hwm(acc.db, remote_node) || 0
-
-        send_to_member(
-          acc,
-          remote_node,
-          {:ekv_member_connect, self(), acc.shard_index, acc.num_shards, remote_hwm, acc.node_id}
-        )
-
-        acc
+        maybe_start_sync(acc, remote_node, remote_hwm)
       end
     end)
   end
