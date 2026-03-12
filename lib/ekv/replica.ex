@@ -1468,7 +1468,7 @@ defmodule EKV.Replica do
     # Update HWM for the sender
     Store.set_hwm(db, from_node, their_seq)
 
-    if is_integer(their_seq) and their_seq > 0 do
+    if is_integer(their_seq) and their_seq >= 0 do
       send_to_member(
         state,
         from_node,
@@ -2096,6 +2096,12 @@ defmodule EKV.Replica do
 
     case fetched do
       [] ->
+        send_to_member(
+          state,
+          remote_node,
+          {:ekv_sync, node(), state.shard_index, [], my_seq}
+        )
+
         clear_sync_inflight(state, remote_node)
 
       _ ->
@@ -2130,6 +2136,14 @@ defmodule EKV.Replica do
 
     case fetched do
       [] ->
+        if my_seq > last_seq do
+          send_to_member(
+            state,
+            remote_node,
+            {:ekv_sync, node(), state.shard_index, [], my_seq}
+          )
+        end
+
         clear_sync_inflight(state, remote_node)
 
       _ ->

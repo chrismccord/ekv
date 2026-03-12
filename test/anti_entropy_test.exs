@@ -318,6 +318,42 @@ defmodule EKV.AntiEntropyTest do
       assert :ok = TestCluster.untrace_shard_sends(node_a, ekv_name)
     end
 
+    test "empty full sync still lowers impossible HWM and settles" do
+      peers = TestCluster.start_peers(2)
+      [{_, node_a}, {_, node_b}] = peers
+      ekv_name = unique_name(:anti_entropy_empty_full_sync)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      start_cluster(peers, ekv_name, anti_entropy_interval: false)
+
+      impossible_hwm = 42
+
+      assert :ok = TestCluster.set_member_hwm(node_b, ekv_name, node_a, impossible_hwm)
+      assert :ok = TestCluster.set_cached_remote_hwm(node_a, ekv_name, node_b, impossible_hwm)
+
+      assert TestCluster.max_seq(node_a, ekv_name) == 0
+      assert :ok = TestCluster.trace_shard_sends(node_a, ekv_name, self())
+      assert :ok = TestCluster.trigger_anti_entropy(node_a, ekv_name)
+
+      assert [
+               {_from, 0, [], 0, 0, _dest}
+             ] = collect_sync_messages([], 500)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.member_hwm(node_b, ekv_name, node_a) == 0
+      end)
+
+      TestCluster.assert_eventually(fn ->
+        state = TestCluster.replica_state(node_a, ekv_name)
+        Map.get(state.remote_member_hwms, node_b) == 0
+      end)
+
+      assert :ok = TestCluster.trigger_anti_entropy(node_a, ekv_name)
+      assert_no_sync_messages()
+      assert :ok = TestCluster.untrace_shard_sends(node_a, ekv_name)
+    end
+
     test "anti-entropy falls back to full sync after real oplog truncation and then settles" do
       peers = TestCluster.start_peers(2)
       [{_, node_a}, {_, node_b}] = peers
