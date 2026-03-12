@@ -550,10 +550,11 @@ defmodule EKV.CASDistributedTest do
         results = Task.await_many([task_a, task_b, task_c], 10_000)
 
         for {node, result, attempted_value} <- results do
-          if not match?({:ok, _}, result) do
+          if match?({:error, :conflict}, result) do
             # CAS failed — immediately check local value BEFORE LWW broadcast overwrites.
-            # If local accept was deferred until quorum, this value cannot be the
-            # attempted write. If it IS, the proposer wrote locally before quorum.
+            # For a definite conflict, the attempted write did not commit. If the
+            # attempted value is visible locally here, the proposer promoted local
+            # state for a write that was rejected.
             local_value = TestCluster.rpc!(node, EKV, :get, [ekv_name, key])
 
             assert local_value != attempted_value,
@@ -947,6 +948,7 @@ defmodule EKV.CASDistributedTest do
 
       {"v1", vsn1} = TestCluster.rpc!(node_a, EKV, :lookup, [ekv_name, "repair/1"])
       accepted_ts = elem(vsn1, 0) + 100
+      accepted_ballot = System.system_time(:nanosecond) + 10_000
 
       for node <- [node_b, node_c] do
         assert :ok =
@@ -955,7 +957,7 @@ defmodule EKV.CASDistributedTest do
                    ekv_name,
                    "repair/1",
                    "v2",
-                   9_000,
+                   accepted_ballot,
                    "repair-quorum",
                    timestamp: accepted_ts,
                    origin: Atom.to_string(node_b)

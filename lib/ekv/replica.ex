@@ -2746,14 +2746,14 @@ defmodule EKV.Replica do
   end
 
   defp cas_failure_reason(op) do
-    cond do
-      is_atom(Map.get(op, :failure_reason_override)) ->
-        op.failure_reason_override
+    case op do
+      %{failure_reason_override: override} when not is_nil(override) ->
+        override
 
-      op.phase == :accept and writes_operation?(op.operation) ->
-        :unconfirmed
+      %{phase: :accept, operation: operation} ->
+        if writes_operation?(operation), do: :unconfirmed, else: :conflict
 
-      true ->
+      _ ->
         :conflict
     end
   end
