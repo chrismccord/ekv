@@ -238,7 +238,7 @@ defmodule EKV.ClientModeDistributedTest do
              TestCluster.rpc!(client_node, EKV, :update, [
                ekv_name,
                "client/cas",
-               {TestCluster, :cas_append, ["!"]}
+               {EKV.TestCluster, :cas_append, ["!"]}
              ])
 
     TestCluster.assert_eventually(fn ->

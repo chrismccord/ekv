@@ -2594,7 +2594,7 @@ defmodule EKVTest do
 
     test "update supports MFA callback with extra args", %{cas_name: name} do
       :ok = EKV.put(name, "u/mfa", "hello")
-      {:ok, "hello!", _} = EKV.update(name, "u/mfa", {TestCluster, :cas_append, ["!"]})
+      {:ok, "hello!", _} = EKV.update(name, "u/mfa", {EKV.TestCluster, :cas_append, ["!"]})
       assert EKV.get(name, "u/mfa") == "hello!"
     end
 
@@ -2641,7 +2641,7 @@ defmodule EKVTest do
       assert_raise ArgumentError,
                    ~r/update callback must be a fun\/1 or \{Mod, fun, extra_args\}/,
                    fn ->
-                     EKV.update(name, "opt/u4", {TestCluster, :cas_append, "!"})
+                     EKV.update(name, "opt/u4", {EKV.TestCluster, :cas_append, "!"})
                    end
     end
 
