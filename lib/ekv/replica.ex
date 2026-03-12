@@ -1483,7 +1483,15 @@ defmodule EKV.Replica do
       when remote_shard == state.shard_index do
     remote_node = node(remote_pid)
 
-    {:noreply, track_remote_member_hwm(state, remote_node, their_seq)}
+    state =
+      if is_integer(their_seq) and their_seq >= 0 do
+        Store.set_hwm(state.db, remote_node, their_seq)
+        track_remote_member_hwm(state, remote_node, their_seq)
+      else
+        state
+      end
+
+    {:noreply, state}
   end
 
   # =====================================================================
@@ -2079,7 +2087,21 @@ defmodule EKV.Replica do
 
         send_full_chunk(state, remote_node, nil, tombstone_cutoff, my_seq, chunk_size)
 
+      is_integer(remote_hwm) and remote_hwm < my_min_seq ->
+        log(state, fn ->
+          "#{log_prefix_shard(state)} remote_hwm #{remote_hwm} < local_min_seq #{my_min_seq} " <>
+            "for #{remote_node}; starting full sync"
+        end)
+
+        send_full_chunk(state, remote_node, nil, tombstone_cutoff, my_seq, chunk_size)
+
       true ->
+        log(state, fn ->
+          "#{log_prefix_shard(state)} starting full sync to #{remote_node} " <>
+            "(remote_hwm=#{inspect(remote_hwm)}, local_min_seq=#{my_min_seq}, " <>
+            "local_max_seq=#{my_seq})"
+        end)
+
         send_full_chunk(state, remote_node, nil, tombstone_cutoff, my_seq, chunk_size)
     end
   end
@@ -2096,6 +2118,11 @@ defmodule EKV.Replica do
 
     case fetched do
       [] ->
+        log(state, fn ->
+          "#{log_prefix_shard(state)} sending empty terminal full sync to #{remote_node} " <>
+            "seq=#{my_seq}"
+        end)
+
         send_to_member(
           state,
           remote_node,
@@ -2109,6 +2136,11 @@ defmodule EKV.Replica do
         entries = if has_more?, do: Enum.take(fetched, chunk_size), else: fetched
         final? = not has_more?
         seq_to_send = if final?, do: my_seq, else: 0
+
+        log(state, fn ->
+          "#{log_prefix_shard(state)} sending full sync to #{remote_node} " <>
+            "entries=#{length(entries)} final=#{final?} seq=#{seq_to_send}"
+        end)
 
         send_to_member(
           state,
@@ -2137,6 +2169,11 @@ defmodule EKV.Replica do
     case fetched do
       [] ->
         if my_seq > last_seq do
+          log(state, fn ->
+            "#{log_prefix_shard(state)} sending empty terminal delta sync to #{remote_node} " <>
+              "from_seq=#{last_seq} to_seq=#{my_seq}"
+          end)
+
           send_to_member(
             state,
             remote_node,
@@ -2159,6 +2196,11 @@ defmodule EKV.Replica do
 
         final? = not has_more?
         seq_to_send = if final?, do: my_seq, else: 0
+
+        log(state, fn ->
+          "#{log_prefix_shard(state)} sending delta sync to #{remote_node} " <>
+            "entries=#{length(entries)} from_seq=#{last_seq} final=#{final?} seq=#{seq_to_send}"
+        end)
 
         send_to_member(
           state,

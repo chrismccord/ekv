@@ -132,7 +132,7 @@ defmodule EKV.AntiEntropyTest do
         TestCluster.rpc!(node, EKV, :get, [ekv_name, "heal/1"]) == "v1"
       end)
 
-      fresh_ts = elem(vsn1, 0) + 1_000
+      fresh_ts = max(elem(vsn1, 0) + 1_000, System.system_time(:nanosecond) + 1_000_000)
 
       for node <- [node_a, node_b] do
         assert :ok =
@@ -170,7 +170,7 @@ defmodule EKV.AntiEntropyTest do
         TestCluster.rpc!(node, EKV, :get, [ekv_name, "disabled/1"]) == "v1"
       end)
 
-      fresh_ts = elem(vsn1, 0) + 1_000
+      fresh_ts = max(elem(vsn1, 0) + 1_000, System.system_time(:nanosecond) + 1_000_000)
 
       for node <- [node_a, node_b] do
         assert :ok =
@@ -218,8 +218,9 @@ defmodule EKV.AntiEntropyTest do
           TestCluster.rpc!(node, EKV, :get, [ekv_name, key1]) == "v1-s1"
       end)
 
-      fresh_ts0 = elem(vsn0, 0) + 1_000
-      fresh_ts1 = elem(vsn1, 0) + 2_000
+      base_ts = System.system_time(:nanosecond) + 1_000_000
+      fresh_ts0 = max(elem(vsn0, 0) + 1_000, base_ts)
+      fresh_ts1 = max(elem(vsn1, 0) + 2_000, base_ts + 1_000)
 
       for node <- [node_a, node_b] do
         assert :ok =
@@ -347,6 +348,68 @@ defmodule EKV.AntiEntropyTest do
       TestCluster.assert_eventually(fn ->
         state = TestCluster.replica_state(node_a, ekv_name)
         Map.get(state.remote_member_hwms, node_b) == 0
+      end)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.member_hwm(node_a, ekv_name, node_b) == 0
+      end)
+
+      assert :ok = TestCluster.trigger_anti_entropy(node_a, ekv_name)
+      assert_no_sync_messages()
+      assert :ok = TestCluster.untrace_shard_sends(node_a, ekv_name)
+    end
+
+    test "empty delta still advances HWM and settles" do
+      peers = TestCluster.start_peers(2)
+      [{_, node_a}, {_, node_b}] = peers
+      ekv_name = unique_name(:anti_entropy_empty_delta)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      start_cluster(
+        peers,
+        ekv_name,
+        anti_entropy_interval: false,
+        gc_interval: :timer.hours(1),
+        tombstone_ttl: 1_000_000
+      )
+
+      assert :ok == TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "stable/1", "keep"])
+      stable_seq = TestCluster.max_seq(node_a, ekv_name)
+      assert :ok == TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "expire/1", "gone", [ttl: 1]])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, EKV, :get, [ekv_name, "stable/1"]) == "keep"
+      end)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_a, EKV, :get, [ekv_name, "expire/1"]) == nil
+      end)
+
+      a_max = TestCluster.max_seq(node_a, ekv_name)
+      assert a_max > 0
+      assert stable_seq < a_max
+      assert :ok = TestCluster.set_member_hwm(node_a, ekv_name, node_b, stable_seq)
+      assert :ok = TestCluster.set_cached_remote_hwm(node_a, ekv_name, node_b, stable_seq)
+
+      assert :ok = TestCluster.trace_shard_sends(node_a, ekv_name, self())
+      assert :ok = TestCluster.trigger_anti_entropy(node_a, ekv_name)
+
+      assert [
+               {_from, 0, [], 0, ^a_max, _dest}
+             ] = collect_sync_messages([], 500)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.member_hwm(node_b, ekv_name, node_a) == a_max
+      end)
+
+      TestCluster.assert_eventually(fn ->
+        state = TestCluster.replica_state(node_a, ekv_name)
+        Map.get(state.remote_member_hwms, node_b) == a_max
+      end)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.member_hwm(node_a, ekv_name, node_b) == a_max
       end)
 
       assert :ok = TestCluster.trigger_anti_entropy(node_a, ekv_name)
