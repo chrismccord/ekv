@@ -255,6 +255,56 @@ defmodule EKV.TestCluster do
     rpc!(node, __MODULE__, :do_inject_committed_entry, [name, key, value, timestamp, opts])
   end
 
+  @doc "Read a replica shard state on a remote node"
+  def replica_state(node, name, shard_index \\ 0) do
+    rpc!(node, __MODULE__, :do_replica_state, [name, shard_index])
+  end
+
+  @doc "Read a member HWM row from a remote shard db"
+  def member_hwm(node, name, member_node, shard_index \\ 0) do
+    rpc!(node, __MODULE__, :do_member_hwm, [name, member_node, shard_index])
+  end
+
+  @doc "Set a member HWM row on a remote shard db"
+  def set_member_hwm(node, name, member_node, seq, shard_index \\ 0) do
+    rpc!(node, __MODULE__, :do_set_member_hwm, [name, member_node, seq, shard_index])
+  end
+
+  @doc "Read a shard's max oplog seq on a remote node"
+  def max_seq(node, name, shard_index \\ 0) do
+    rpc!(node, __MODULE__, :do_max_seq, [name, shard_index])
+  end
+
+  @doc "Read a shard's min oplog seq on a remote node"
+  def min_seq(node, name, shard_index \\ 0) do
+    rpc!(node, __MODULE__, :do_min_seq, [name, shard_index])
+  end
+
+  @doc "Mutate a replica's cached remote_member_hwm on a remote node"
+  def set_cached_remote_hwm(node, name, remote_node, seq, shard_index \\ 0) do
+    rpc!(node, __MODULE__, :do_set_cached_remote_hwm, [name, remote_node, seq, shard_index])
+  end
+
+  @doc "Trigger one anti-entropy tick on a remote shard"
+  def trigger_anti_entropy(node, name, shard_index \\ 0) do
+    rpc!(node, __MODULE__, :do_trigger_anti_entropy, [name, shard_index])
+  end
+
+  @doc "Set a replica shard's handoff_node on a remote node"
+  def set_handoff_node(node, name, handoff_node, shard_index \\ 0) do
+    rpc!(node, __MODULE__, :do_set_handoff_node, [name, handoff_node, shard_index])
+  end
+
+  @doc "Enable send tracing on a remote shard, forwarding trace events to target_pid"
+  def trace_shard_sends(node, name, target_pid, shard_index \\ 0) do
+    rpc!(node, __MODULE__, :do_trace_shard_sends, [name, target_pid, shard_index])
+  end
+
+  @doc "Disable send tracing on a remote shard"
+  def untrace_shard_sends(node, name, shard_index \\ 0) do
+    rpc!(node, __MODULE__, :do_untrace_shard_sends, [name, shard_index])
+  end
+
   @doc "Materialize scan stream on remote node, return %{key => value} map"
   def scan_to_map(node, name, prefix) do
     rpc!(node, __MODULE__, :do_scan_to_map, [name, prefix])
@@ -322,6 +372,102 @@ defmodule EKV.TestCluster do
       )
 
     :ok
+  end
+
+  def do_replica_state(name, shard_index) do
+    shard_name = EKV.Replica.shard_name(name, shard_index)
+    :sys.get_state(shard_name)
+  end
+
+  def do_member_hwm(name, member_node, shard_index) do
+    shard_name = EKV.Replica.shard_name(name, shard_index)
+    %{db: db} = :sys.get_state(shard_name)
+    EKV.Store.get_hwm(db, member_node)
+  end
+
+  def do_set_member_hwm(name, member_node, seq, shard_index) do
+    shard_name = EKV.Replica.shard_name(name, shard_index)
+    %{db: db} = :sys.get_state(shard_name)
+    EKV.Store.set_hwm(db, member_node, seq)
+  end
+
+  def do_max_seq(name, shard_index) do
+    shard_name = EKV.Replica.shard_name(name, shard_index)
+    %{db: db} = :sys.get_state(shard_name)
+    EKV.Store.max_seq(db)
+  end
+
+  def do_min_seq(name, shard_index) do
+    shard_name = EKV.Replica.shard_name(name, shard_index)
+    %{db: db} = :sys.get_state(shard_name)
+    EKV.Store.min_seq(db)
+  end
+
+  def do_set_cached_remote_hwm(name, remote_node, seq, shard_index) do
+    shard_name = EKV.Replica.shard_name(name, shard_index)
+
+    :sys.replace_state(shard_name, fn state ->
+      %{state | remote_member_hwms: Map.put(state.remote_member_hwms, remote_node, seq)}
+    end)
+
+    :ok
+  end
+
+  def do_trigger_anti_entropy(name, shard_index) do
+    shard_name = EKV.Replica.shard_name(name, shard_index)
+    send(shard_name, :anti_entropy_tick)
+    :ok
+  end
+
+  def do_set_handoff_node(name, handoff_node, shard_index) do
+    shard_name = EKV.Replica.shard_name(name, shard_index)
+
+    :sys.replace_state(shard_name, fn state ->
+      %{state | handoff_node: handoff_node}
+    end)
+
+    :ok
+  end
+
+  def do_trace_shard_sends(name, target_pid, shard_index) do
+    shard_name = EKV.Replica.shard_name(name, shard_index)
+
+    case Process.whereis(shard_name) do
+      nil ->
+        {:error, :noproc}
+
+      pid ->
+        tracer =
+          spawn(fn ->
+            forward_trace_events(target_pid)
+          end)
+
+        :erlang.trace(pid, true, [:send, {:tracer, tracer}])
+        :ok
+    end
+  end
+
+  def do_untrace_shard_sends(name, shard_index) do
+    shard_name = EKV.Replica.shard_name(name, shard_index)
+
+    case Process.whereis(shard_name) do
+      nil ->
+        :ok
+
+      pid ->
+        :erlang.trace(pid, false, [:send])
+        :ok
+    end
+  end
+
+  defp forward_trace_events(target_pid) do
+    receive do
+      {:trace, _pid, :send, _message, _destination} = trace ->
+        send(target_pid, trace)
+        forward_trace_events(target_pid)
+    after
+      30_000 -> :ok
+    end
   end
 
   def do_scan_to_map(name, prefix),

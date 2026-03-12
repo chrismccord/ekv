@@ -462,7 +462,7 @@ defmodule EKV.Store do
     {:ok, stmt} =
       EKV.Sqlite3.prepare(db, """
       INSERT INTO kv_member_hwm (member_node, last_seq) VALUES (?1, ?2)
-      ON CONFLICT(member_node) DO UPDATE SET last_seq = MAX(kv_member_hwm.last_seq, excluded.last_seq)
+      ON CONFLICT(member_node) DO UPDATE SET last_seq = excluded.last_seq
       """)
 
     :ok = EKV.Sqlite3.bind(stmt, [Atom.to_string(member_node), seq])

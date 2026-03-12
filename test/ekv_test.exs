@@ -510,8 +510,8 @@ defmodule EKVTest do
   # Pathological / Jepsen-style unit tests
   # =====================================================================
 
-  describe "HWM monotonicity" do
-    test "HWM does not regress when lower seq is set", %{name: name} do
+  describe "HWM updates" do
+    test "HWM tracks the latest advertised sender seq even when it moves lower", %{name: name} do
       config = EKV.Supervisor.get_config(name)
       shard = EKV.Replica.shard_index_for("hwm_key", config.num_shards)
       shard_name = EKV.Replica.shard_name(name, shard)
@@ -523,9 +523,9 @@ defmodule EKVTest do
       :ok = EKV.Store.set_hwm(db, member, 100)
       assert EKV.Store.get_hwm(db, member) == 100
 
-      # Try to set HWM to 50 — should stay at 100
+      # Sender sequence spaces can legitimately reset lower after restart/restore.
       :ok = EKV.Store.set_hwm(db, member, 50)
-      assert EKV.Store.get_hwm(db, member) == 100
+      assert EKV.Store.get_hwm(db, member) == 50
 
       # Set HWM to 200 — should advance
       :ok = EKV.Store.set_hwm(db, member, 200)

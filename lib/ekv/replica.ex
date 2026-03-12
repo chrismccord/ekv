@@ -663,8 +663,8 @@ defmodule EKV.Replica do
 
   HWM safety: intermediate chunks send seq=0 in the sync message.
   Only the final chunk carries the real my_seq. The receiver updates
-  inbound HWM from that final seq; MAX(current, new) makes seq=0
-  harmless and prevents regression on out-of-order arrival.
+  inbound HWM only from that final seq, so seq=0 chunks never affect
+  the stored cursor.
 
   Continuation handlers check remote_shards before each chunk. If the
   member disconnected mid-sync, the continuation silently stops.
@@ -673,7 +673,7 @@ defmodule EKV.Replica do
     - Write between chunks: LWW is idempotent. Duplicates resolved.
     - CAS between chunks: independent tables (kv_paxos vs kv).
     - GC between chunks: cursor-based, skips purged entries.
-    - Second sync triggered: LWW + MAX(hwm) make double-sends safe.
+    - Second sync triggered: LWW makes duplicate replay safe.
 
 
   ## High-Water Marks (HWM)
@@ -690,8 +690,10 @@ defmodule EKV.Replica do
     1. In ekv_sync handler: after applying received data, record the
        sender's seq from the sync message.
 
-  HWM monotonicity: set_hwm uses MAX(current, new) in SQL so HWMs
-  never regress, even if messages arrive out of order.
+  HWM semantics: the stored cursor tracks the sender's latest advertised
+  oplog position exactly, even if that sender restarted or restored to a
+  lower sequence space. A stale lower HWM can cause redundant replay;
+  preserving an impossible higher HWM causes repeated forced full syncs.
 
 
   ## Recovery Scenarios
@@ -903,6 +905,7 @@ defmodule EKV.Replica do
         lww_ts_counter: integer,        # monotonic local LWW timestamp floor
         ballot_counter: integer,        # monotonic, persisted in kv_meta
         member_node_ids:  %{node => string},  # Erlang node → CAS node_id
+        remote_member_hwms: %{node => integer}, # remote advertised HWM for us
         sync_inflight:  MapSet.t(node()), # remote members currently syncing
         pending_cas:    %{ref => op},   # in-flight CAS operations
         quorum_waiters: %{ref => waiter} # pending await_quorum callers
@@ -924,6 +927,7 @@ defmodule EKV.Replica do
       entries: [{key, value_binary, timestamp, origin_node,
                  expires_at, deleted_at}]
       sender_seq: 0 for intermediate chunks, real seq for final chunk
+    {:ekv_sync_ack, pid, shard_index, sender_seq}
 
   Sync continuations (self-messages for chunking):
     {:continue_full_sync, node, last_key, cutoff, my_seq, chunk_size}
@@ -992,6 +996,7 @@ defmodule EKV.Replica do
     ballot_counter: 0,
     wire_compression_threshold: nil,
     member_node_ids: %{},
+    remote_member_hwms: %{},
     sync_inflight: MapSet.new(),
     pending_cas: %{},
     quorum_waiters: %{},
@@ -1463,7 +1468,22 @@ defmodule EKV.Replica do
     # Update HWM for the sender
     Store.set_hwm(db, from_node, their_seq)
 
+    if is_integer(their_seq) and their_seq > 0 do
+      send_to_member(
+        state,
+        from_node,
+        {:ekv_sync_ack, self(), state.shard_index, their_seq}
+      )
+    end
+
     {:noreply, state}
+  end
+
+  def handle_info({:ekv_sync_ack, remote_pid, remote_shard, their_seq}, %Replica{} = state)
+      when remote_shard == state.shard_index do
+    remote_node = node(remote_pid)
+
+    {:noreply, track_remote_member_hwm(state, remote_node, their_seq)}
   end
 
   # =====================================================================
@@ -1497,6 +1517,7 @@ defmodule EKV.Replica do
       state
       | remote_shards: Map.delete(state.remote_shards, dead_node),
         member_node_ids: Map.delete(state.member_node_ids, dead_node),
+        remote_member_hwms: Map.delete(state.remote_member_hwms, dead_node),
         sync_inflight: MapSet.delete(state.sync_inflight, dead_node)
     }
 
@@ -1528,6 +1549,7 @@ defmodule EKV.Replica do
         state
         | remote_shards: Map.delete(state.remote_shards, remote_node),
           member_node_ids: Map.delete(state.member_node_ids, remote_node),
+          remote_member_hwms: Map.delete(state.remote_member_hwms, remote_node),
           sync_inflight: MapSet.delete(state.sync_inflight, remote_node)
       }
 
@@ -1906,6 +1928,7 @@ defmodule EKV.Replica do
             state
             |> track_remote_shard(remote_node, remote_pid)
             |> track_member_node_id(remote_node, remote_node_id)
+            |> track_remote_member_hwm(remote_node, remote_hwm)
 
           if state.cluster_size do
             alive = alive_node_id_count(state)
@@ -1973,6 +1996,7 @@ defmodule EKV.Replica do
             state
             |> track_remote_shard(remote_node, remote_pid)
             |> track_member_node_id(remote_node, remote_node_id)
+            |> track_remote_member_hwm(remote_node, remote_hwm)
 
           if state.cluster_size do
             alive = alive_node_id_count(state)
@@ -2178,7 +2202,7 @@ defmodule EKV.Replica do
            MapSet.member?(acc.sync_inflight, remote_node) do
         acc
       else
-        remote_hwm = Store.get_hwm(acc.db, remote_node) || 0
+        remote_hwm = Map.get(acc.remote_member_hwms, remote_node, 0)
         maybe_start_sync(acc, remote_node, remote_hwm)
       end
     end)
@@ -2204,6 +2228,13 @@ defmodule EKV.Replica do
     max_jitter = min(div(interval, 10), 5_000)
     :rand.uniform(max_jitter) - 1
   end
+
+  defp track_remote_member_hwm(%Replica{} = state, remote_node, remote_hwm)
+       when is_integer(remote_hwm) and remote_hwm >= 0 do
+    %{state | remote_member_hwms: Map.put(state.remote_member_hwms, remote_node, remote_hwm)}
+  end
+
+  defp track_remote_member_hwm(%Replica{} = state, _remote_node, _remote_hwm), do: state
 
   defp send_to_member(%Replica{} = state, target_node, message) do
     shard_name = shard_name(state.name, state.shard_index)
