@@ -62,6 +62,12 @@ defmodule EKV.Supervisor do
   These are readiness aids only. They do not guarantee the route or quorum will
   remain available after startup completes.
 
+  Member replicas also run periodic background anti-entropy by default
+  (`anti_entropy_interval`, default 30s). This reuses the normal member
+  handshake and chunked sync path so an already-connected member that missed a
+  prior replication message eventually heals without needing a reconnect,
+  restart, or explicit consistent read.
+
   ## Blue-Green Deployment (Synchronized Handoff)
 
   When `blue_green: true`, the supervisor performs a synchronized handoff
@@ -162,6 +168,7 @@ defmodule EKV.Supervisor do
     :cluster_size,
     :node_id,
     :sync_chunk_size,
+    :anti_entropy_interval,
     :allow_stale_startup,
     :partition_ttl_policy,
     :wire_compression_threshold,
@@ -231,6 +238,7 @@ defmodule EKV.Supervisor do
     cluster_size = Keyword.get(opts, :cluster_size)
     node_id = Keyword.get(opts, :node_id)
     sync_chunk_size = Keyword.get(opts, :sync_chunk_size, 500)
+    anti_entropy_interval = Keyword.get(opts, :anti_entropy_interval, 30_000)
     allow_stale_startup = Keyword.get(opts, :allow_stale_startup, false)
     partition_ttl_policy = Keyword.get(opts, :partition_ttl_policy, :quarantine)
     wire_compression_threshold = Keyword.get(opts, :wire_compression_threshold, 256 * 1024)
@@ -244,6 +252,7 @@ defmodule EKV.Supervisor do
     validate_wait_for_quorum!(wait_for_quorum, cluster_size)
     validate_wait_for_route!(wait_for_route, :member)
     validate_shutdown_barrier!(shutdown_barrier)
+    validate_anti_entropy_interval!(anti_entropy_interval)
     validate_allow_stale_startup!(allow_stale_startup)
 
     node_id =
@@ -300,6 +309,7 @@ defmodule EKV.Supervisor do
       cluster_size: cluster_size,
       node_id: effective_node_id,
       sync_chunk_size: sync_chunk_size,
+      anti_entropy_interval: anti_entropy_interval,
       allow_stale_startup: allow_stale_startup,
       partition_ttl_policy: partition_ttl_policy,
       wire_compression_threshold: wire_compression_threshold
@@ -502,6 +512,7 @@ defmodule EKV.Supervisor do
     reject_client_opt!(opts, :gc_interval, [nil])
     reject_client_opt!(opts, :tombstone_ttl, [nil])
     reject_client_opt!(opts, :sync_chunk_size, [nil])
+    reject_client_opt!(opts, :anti_entropy_interval, [nil, false])
     reject_client_opt!(opts, :allow_stale_startup, [nil, false])
     reject_client_opt!(opts, :partition_ttl_policy, [nil])
   end
@@ -524,6 +535,18 @@ defmodule EKV.Supervisor do
   defp validate_allow_stale_startup!(value) do
     raise ArgumentError,
           "EKV: :allow_stale_startup must be boolean, got: #{inspect(value)}"
+  end
+
+  defp validate_anti_entropy_interval!(false), do: :ok
+  defp validate_anti_entropy_interval!(nil), do: :ok
+
+  defp validate_anti_entropy_interval!(interval)
+       when is_integer(interval) and interval > 0,
+       do: :ok
+
+  defp validate_anti_entropy_interval!(interval) do
+    raise ArgumentError,
+          "EKV: :anti_entropy_interval must be false/nil or a positive timeout in ms, got: #{inspect(interval)}"
   end
 
   defp validate_region_routing!(region_routing)

@@ -586,6 +586,11 @@ defmodule EKV.Replica do
   Both sides send data. This is symmetric — each side sends what the
   other is missing based on HWMs.
 
+  Healthy connected members also re-run this handshake periodically via a
+  lightweight anti-entropy tick. That closes the gap where a member can miss
+  one committed update yet stay connected forever. The periodic tick reuses the
+  same handshake + HWM/full-sync path; it is not a second replication protocol.
+
 
   ## Delta Sync vs Full Sync
 
@@ -898,6 +903,7 @@ defmodule EKV.Replica do
         lww_ts_counter: integer,        # monotonic local LWW timestamp floor
         ballot_counter: integer,        # monotonic, persisted in kv_meta
         member_node_ids:  %{node => string},  # Erlang node → CAS node_id
+        sync_inflight:  MapSet.t(node()), # remote members currently syncing
         pending_cas:    %{ref => op},   # in-flight CAS operations
         quorum_waiters: %{ref => waiter} # pending await_quorum callers
       }
@@ -986,6 +992,7 @@ defmodule EKV.Replica do
     ballot_counter: 0,
     wire_compression_threshold: nil,
     member_node_ids: %{},
+    sync_inflight: MapSet.new(),
     pending_cas: %{},
     quorum_waiters: %{},
     handoff_node: nil
@@ -1092,6 +1099,8 @@ defmodule EKV.Replica do
         {:ekv_member_connect, self(), shard_index, num_shards, remote_hwm, config.node_id}
       )
     end
+
+    schedule_anti_entropy_tick(state)
 
     {:ok, state}
   end
@@ -1487,7 +1496,8 @@ defmodule EKV.Replica do
     state = %{
       state
       | remote_shards: Map.delete(state.remote_shards, dead_node),
-        member_node_ids: Map.delete(state.member_node_ids, dead_node)
+        member_node_ids: Map.delete(state.member_node_ids, dead_node),
+        sync_inflight: MapSet.delete(state.sync_inflight, dead_node)
     }
 
     state = mark_member_down(state, dead_node, dead_node_id)
@@ -1517,7 +1527,8 @@ defmodule EKV.Replica do
       state = %{
         state
         | remote_shards: Map.delete(state.remote_shards, remote_node),
-          member_node_ids: Map.delete(state.member_node_ids, remote_node)
+          member_node_ids: Map.delete(state.member_node_ids, remote_node),
+          sync_inflight: MapSet.delete(state.sync_inflight, remote_node)
       }
 
       new_state =
@@ -1810,6 +1821,18 @@ defmodule EKV.Replica do
     {:noreply, state}
   end
 
+  def handle_info(:anti_entropy_tick, %Replica{} = state) do
+    state =
+      if state.handoff_node do
+        state
+      else
+        trigger_anti_entropy(state)
+      end
+
+    schedule_anti_entropy_tick(state)
+    {:noreply, state}
+  end
+
   # =====================================================================
   # Chunked sync continuations
   # =====================================================================
@@ -1819,17 +1842,18 @@ defmodule EKV.Replica do
         %Replica{} = state
       ) do
     if Map.has_key?(state.remote_shards, remote_node) do
-      send_full_chunk(
-        state,
-        remote_node,
-        last_key,
-        tombstone_cutoff,
-        my_seq,
-        chunk_size
-      )
+      {:noreply,
+       send_full_chunk(
+         state,
+         remote_node,
+         last_key,
+         tombstone_cutoff,
+         my_seq,
+         chunk_size
+       )}
+    else
+      {:noreply, clear_sync_inflight(state, remote_node)}
     end
-
-    {:noreply, state}
   end
 
   def handle_info(
@@ -1837,10 +1861,10 @@ defmodule EKV.Replica do
         %Replica{} = state
       ) do
     if Map.has_key?(state.remote_shards, remote_node) do
-      send_delta_chunk(state, remote_node, last_seq, my_seq, chunk_size)
+      {:noreply, send_delta_chunk(state, remote_node, last_seq, my_seq, chunk_size)}
+    else
+      {:noreply, clear_sync_inflight(state, remote_node)}
     end
-
-    {:noreply, state}
   end
 
   def handle_info(_msg, %Replica{} = state) do
@@ -1903,7 +1927,7 @@ defmodule EKV.Replica do
           )
 
           log_once(state, fn -> "#{log_prefix(state)} ekv_member_connect from #{remote_node}" end)
-          send_sync_data(state, remote_node, remote_hwm)
+          state = maybe_start_sync(state, remote_node, remote_hwm)
 
           maybe_reply_to_quorum_waiters(state)
       end
@@ -1966,7 +1990,7 @@ defmodule EKV.Replica do
             "#{log_prefix(state)} ekv_member_connect_ack from #{remote_node}"
           end)
 
-          send_sync_data(state, remote_node, remote_hwm)
+          state = maybe_start_sync(state, remote_node, remote_hwm)
 
           maybe_reply_to_quorum_waiters(state)
       end
@@ -2048,7 +2072,7 @@ defmodule EKV.Replica do
 
     case fetched do
       [] ->
-        :ok
+        clear_sync_inflight(state, remote_node)
 
       _ ->
         has_more? = length(fetched) > chunk_size
@@ -2063,7 +2087,7 @@ defmodule EKV.Replica do
         )
 
         if final? do
-          :ok
+          clear_sync_inflight(state, remote_node)
         else
           next_key = elem(List.last(entries), 0)
 
@@ -2071,6 +2095,8 @@ defmodule EKV.Replica do
             self(),
             {:continue_full_sync, remote_node, next_key, tombstone_cutoff, my_seq, chunk_size}
           )
+
+          state
         end
     end
   end
@@ -2080,7 +2106,7 @@ defmodule EKV.Replica do
 
     case fetched do
       [] ->
-        :ok
+        clear_sync_inflight(state, remote_node)
 
       _ ->
         has_more? = length(fetched) > chunk_size
@@ -2103,7 +2129,7 @@ defmodule EKV.Replica do
         )
 
         if final? do
-          :ok
+          clear_sync_inflight(state, remote_node)
         else
           {max_chunk_seq, _, _, _, _, _, _} = List.last(oplog_entries)
 
@@ -2111,8 +2137,79 @@ defmodule EKV.Replica do
             self(),
             {:continue_delta_sync, remote_node, max_chunk_seq, my_seq, chunk_size}
           )
+
+          state
         end
     end
+  end
+
+  defp maybe_start_sync(%Replica{} = state, remote_node, remote_hwm) do
+    cond do
+      state.handoff_node != nil ->
+        state
+
+      not Map.has_key?(state.remote_shards, remote_node) ->
+        clear_sync_inflight(state, remote_node)
+
+      MapSet.member?(state.quarantined_members, remote_node) ->
+        clear_sync_inflight(state, remote_node)
+
+      MapSet.member?(state.sync_inflight, remote_node) ->
+        state
+
+      true ->
+        state
+        |> mark_sync_inflight(remote_node)
+        |> send_sync_data(remote_node, remote_hwm)
+    end
+  end
+
+  defp mark_sync_inflight(%Replica{} = state, remote_node) do
+    %{state | sync_inflight: MapSet.put(state.sync_inflight, remote_node)}
+  end
+
+  defp clear_sync_inflight(%Replica{} = state, remote_node) do
+    %{state | sync_inflight: MapSet.delete(state.sync_inflight, remote_node)}
+  end
+
+  defp trigger_anti_entropy(%Replica{} = state) do
+    Enum.reduce(Map.keys(state.remote_shards), state, fn remote_node, acc ->
+      if MapSet.member?(acc.quarantined_members, remote_node) or
+           MapSet.member?(acc.sync_inflight, remote_node) do
+        acc
+      else
+        remote_hwm = Store.get_hwm(acc.db, remote_node) || 0
+
+        send_to_member(
+          acc,
+          remote_node,
+          {:ekv_member_connect, self(), acc.shard_index, acc.num_shards, remote_hwm, acc.node_id}
+        )
+
+        acc
+      end
+    end)
+  end
+
+  defp schedule_anti_entropy_tick(%Replica{} = state) do
+    case EKV.Supervisor.get_config(state.name)[:anti_entropy_interval] do
+      interval when is_integer(interval) and interval > 0 ->
+        Process.send_after(
+          self(),
+          :anti_entropy_tick,
+          interval + anti_entropy_jitter_ms(interval)
+        )
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp anti_entropy_jitter_ms(interval) when interval <= 1_000, do: :rand.uniform(100) - 1
+
+  defp anti_entropy_jitter_ms(interval) do
+    max_jitter = min(div(interval, 10), 5_000)
+    :rand.uniform(max_jitter) - 1
   end
 
   defp send_to_member(%Replica{} = state, target_node, message) do
@@ -2984,7 +3081,8 @@ defmodule EKV.Replica do
 
     state = %{
       state
-      | quarantined_members: MapSet.delete(state.quarantined_members, remote_node)
+      | quarantined_members: MapSet.delete(state.quarantined_members, remote_node),
+        sync_inflight: MapSet.delete(state.sync_inflight, remote_node)
     }
 
     {:ok, state}
@@ -3011,7 +3109,8 @@ defmodule EKV.Replica do
           state
           | quarantined_members: MapSet.put(state.quarantined_members, remote_node),
             remote_shards: Map.delete(state.remote_shards, remote_node),
-            member_node_ids: Map.delete(state.member_node_ids, remote_node)
+            member_node_ids: Map.delete(state.member_node_ids, remote_node),
+            sync_inflight: MapSet.delete(state.sync_inflight, remote_node)
         }
 
         log_once(state, fn ->
@@ -3027,7 +3126,8 @@ defmodule EKV.Replica do
 
         state = %{
           state
-          | quarantined_members: MapSet.delete(state.quarantined_members, remote_node)
+          | quarantined_members: MapSet.delete(state.quarantined_members, remote_node),
+            sync_inflight: MapSet.delete(state.sync_inflight, remote_node)
         }
 
         {:ok, state}

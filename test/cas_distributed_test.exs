@@ -16,6 +16,7 @@ defmodule EKV.CASDistributedTest do
     quorum_size = div(cluster_size, 2) + 1
     await_quorum? = Keyword.get(opts, :await_quorum, length(peers) >= quorum_size)
     shutdown_barrier = Keyword.get(opts, :shutdown_barrier, false)
+    anti_entropy_interval = Keyword.get(opts, :anti_entropy_interval, 30_000)
 
     peers
     |> Enum.with_index(1)
@@ -33,6 +34,7 @@ defmodule EKV.CASDistributedTest do
         tombstone_ttl: :timer.hours(24 * 7),
         cluster_size: cluster_size,
         node_id: node_id,
+        anti_entropy_interval: anti_entropy_interval,
         shutdown_barrier: shutdown_barrier
       )
     end)
@@ -981,6 +983,48 @@ defmodule EKV.CASDistributedTest do
           TestCluster.rpc!(node, EKV, :get, [ekv_name, "repair/1"]) == "v2"
         end)
       end)
+    end
+
+    test "connected stale member converges via periodic anti-entropy without reconnect" do
+      peers = TestCluster.start_peers(3)
+      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      ekv_name = unique_name(:cas)
+      start_cas_cluster(peers, ekv_name, shards: 1, anti_entropy_interval: 200)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      assert {:ok, vsn1} =
+               TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "anti/1", "v1", [if_vsn: nil]])
+
+      TestCluster.assert_eventually(fn ->
+        Enum.all?([node_a, node_b, node_c], fn node ->
+          TestCluster.rpc!(node, EKV, :get, [ekv_name, "anti/1"]) == "v1"
+        end)
+      end)
+
+      fresh_ts = elem(vsn1, 0) + 1_000
+
+      for node <- [node_a, node_b] do
+        assert :ok =
+                 TestCluster.inject_committed_entry(
+                   node,
+                   ekv_name,
+                   "anti/1",
+                   "v2",
+                   fresh_ts,
+                   origin: node_a
+                 )
+      end
+
+      assert TestCluster.rpc!(node_c, EKV, :get, [ekv_name, "anti/1"]) == "v1"
+
+      TestCluster.assert_eventually(
+        fn ->
+          TestCluster.rpc!(node_c, EKV, :get, [ekv_name, "anti/1"]) == "v2"
+        end,
+        timeout: 5_000
+      )
     end
 
     test "full node restart: ballot counter restored, CAS resumes" do

@@ -43,6 +43,7 @@ Do not analyze Byzantine/malicious behavior unless explicitly asked.
 - Runs SQLite shards, replication, GC, CAS proposer/acceptor logic.
 - May run:
   - `wait_for_quorum`
+  - `anti_entropy_interval`
   - `shutdown_barrier`
   - `blue_green`
   - `wire_compression_threshold`
@@ -246,6 +247,10 @@ Important:
 - Sender stores member HWM as sender snapshot `my_seq`, not remote sequence.
 - Delta sync is only valid when the member cursor is still inside the local oplog window.
 - Otherwise force full sync.
+- Already-connected members now also run periodic anti-entropy by default.
+  - This is not a second protocol.
+  - It reuses the same member handshake + HWM-driven delta/full sync path.
+  - The goal is to heal missed replication without waiting for reconnect.
 - Chunked sync rules matter:
   - intermediate chunks use seq `0`
   - final chunk must send a non-zero terminal seq

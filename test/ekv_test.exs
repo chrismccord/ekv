@@ -4921,6 +4921,20 @@ defmodule EKVTest do
       assert msg =~ ":shutdown_barrier must be false/nil or a non-negative timeout in ms"
     end
 
+    test "rejects anti_entropy_interval in client mode" do
+      Process.flag(:trap_exit, true)
+
+      assert {:error, {%ArgumentError{message: msg}, _}} =
+               EKV.start_link(
+                 name: :"ekv_client_anti_entropy_bad_#{System.unique_integer([:positive])}",
+                 mode: :client,
+                 region_routing: ["iad"],
+                 anti_entropy_interval: 100
+               )
+
+      assert msg =~ ":anti_entropy_interval is not supported in :client mode"
+    end
+
     test "reports client info and rejects member-only APIs" do
       name = :"ekv_client_info_#{System.unique_integer([:positive])}"
 

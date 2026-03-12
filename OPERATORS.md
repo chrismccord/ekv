@@ -72,6 +72,19 @@ usable backend route before the app continues.
 - The chosen backend stays sticky until failure.
 - `wait_for_route` is about routing readiness, not quorum.
 
+### anti_entropy_interval
+
+Members run periodic anti-entropy by default:
+
+```elixir
+{EKV, name: :my_kv, data_dir: "/var/data/ekv", anti_entropy_interval: 30_000}
+```
+
+- This re-runs the normal member handshake + delta/full sync path for already-connected members.
+- It is meant to heal a member that missed a prior replication message without waiting for reconnect.
+- In the steady state it should be cheap because members are already caught up and delta sync is usually empty.
+- Set `false` only for debugging; the default is the safer production setting.
+
 ## Backups
 
 ### Taking a Backup
