@@ -2496,7 +2496,7 @@ defmodule EKV.Replica do
         end
 
       {:update, fun, opts, _retries} ->
-        new_value = fun.(current_value)
+        new_value = apply_update_callback(fun, current_value)
         new_value_binary = :erlang.term_to_binary(new_value)
         now = monotonic_cas_ts(current_vsn)
         origin = node()
@@ -2524,6 +2524,13 @@ defmodule EKV.Replica do
 
   defp monotonic_cas_ts({current_ts, _origin}),
     do: max(System.system_time(:nanosecond), current_ts + 1)
+
+  defp apply_update_callback(fun, current_value) when is_function(fun, 1), do: fun.(current_value)
+
+  defp apply_update_callback({mod, fun, extra_args}, current_value)
+       when is_atom(mod) and is_atom(fun) and is_list(extra_args) do
+    apply(mod, fun, [current_value | extra_args])
+  end
 
   # Ensure local eventual writes never reuse a timestamp on this shard. LWW
   # compares {timestamp, origin_node}, so same-origin timestamp reuse would make

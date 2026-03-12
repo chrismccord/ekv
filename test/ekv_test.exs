@@ -2592,6 +2592,12 @@ defmodule EKVTest do
       assert EKV.get(name, "u/2") == 20
     end
 
+    test "update supports MFA callback with extra args", %{cas_name: name} do
+      :ok = EKV.put(name, "u/mfa", "hello")
+      {:ok, "hello!", _} = EKV.update(name, "u/mfa", {TestCluster, :cas_append, ["!"]})
+      assert EKV.get(name, "u/mfa") == "hello!"
+    end
+
     test "update returns {:ok, new_value}", %{cas_name: name} do
       {:ok, "hello", _} = EKV.update(name, "u/3", fn nil -> "hello" end)
     end
@@ -2629,6 +2635,14 @@ defmodule EKVTest do
       assert_raise ArgumentError, ~r/:resolve_unconfirmed must be boolean/, fn ->
         EKV.update(name, "opt/u3", fn nil -> "val" end, resolve_unconfirmed: :yes)
       end
+    end
+
+    test "rejects invalid update callback shape", %{cas_name: name} do
+      assert_raise ArgumentError,
+                   ~r/update callback must be a fun\/1 or \{Mod, fun, extra_args\}/,
+                   fn ->
+                     EKV.update(name, "opt/u4", {TestCluster, :cas_append, "!"})
+                   end
     end
 
     test "update dispatches subscriber events", %{cas_name: name} do

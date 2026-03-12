@@ -314,4 +314,6 @@ defmodule EKV.TestCluster do
 
     :ok
   end
+
+  def cas_append(v, suffix), do: to_string(v) <> suffix
 end

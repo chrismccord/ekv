@@ -814,11 +814,32 @@ defmodule EKV do
     `{:ok, new_value, vsn}`/`{:error, :conflict}` when possible, or
     `{:error, :unavailable}` if that resolution cannot complete.
 
-  In client mode, `fun` is executed on the selected member, so it must be a
-  serializable function that is available on member nodes (for example a named
-  function capture like `&MyModule.bump/1`).
+  The update callback may be either:
+
+  - a `fun/1` which receives the current value
+  - an MFA tuple `{Mod, fun, extra_args}` which is invoked as
+    `apply(Mod, fun, [current_value | extra_args])`
+
+  In client mode, the callback is executed on the selected member, so prefer a
+  named function capture like `&MyModule.bump/1` or an MFA tuple.
   """
-  def update(name, key, fun, opts \\ []) when is_function(fun, 1) do
+  def update(name, key, callback, opts \\ [])
+
+  def update(name, key, fun, opts) when is_function(fun, 1) do
+    do_update(name, key, fun, opts)
+  end
+
+  def update(name, key, {mod, fun, extra_args} = update_mfa, opts)
+      when is_atom(mod) and is_atom(fun) and is_list(extra_args) do
+    do_update(name, key, update_mfa, opts)
+  end
+
+  def update(_name, _key, callback, _opts) do
+    raise ArgumentError,
+          "EKV: update callback must be a fun/1 or {Mod, fun, extra_args}, got: #{inspect(callback)}"
+  end
+
+  defp do_update(name, key, update_callback, opts) do
     opts = Keyword.validate!(opts, [:ttl, :retries, :backoff, :timeout, :resolve_unconfirmed])
     validate_ttl_opt!(opts)
     validate_retries_opt!(opts)
@@ -830,7 +851,7 @@ defmodule EKV do
 
     case mode(config) do
       :client ->
-        client_write_call(name, :update, [name, key, fun, opts], timeout)
+        client_write_call(name, :update, [name, key, update_callback, opts], timeout)
 
       :member ->
         validate_cas_config!(config)
@@ -839,7 +860,7 @@ defmodule EKV do
         result =
           GenServer.call(
             Replica.shard_name(name, shard_index),
-            {:update, key, fun, opts},
+            {:update, key, update_callback, opts},
             timeout
           )
 

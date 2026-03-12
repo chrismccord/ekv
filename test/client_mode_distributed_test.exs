@@ -234,9 +234,16 @@ defmodule EKV.ClientModeDistributedTest do
                &TestCluster.cas_upcase/1
              ])
 
+    assert {:ok, "SEED!", _vsn} =
+             TestCluster.rpc!(client_node, EKV, :update, [
+               ekv_name,
+               "client/cas",
+               {TestCluster, :cas_append, ["!"]}
+             ])
+
     TestCluster.assert_eventually(fn ->
       TestCluster.rpc!(member_a, EKV, :get, [ekv_name, "client/cas", [consistent: true]]) ==
-        "SEED"
+        "SEED!"
     end)
 
     for i <- 1..550 do
