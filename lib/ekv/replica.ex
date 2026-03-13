@@ -909,6 +909,7 @@ defmodule EKV.Replica do
         node_id:        string | nil,   # this node's CAS identity
         cluster_size:   integer | nil,  # total CAS participants
         lww_ts_counter: integer,        # monotonic local LWW timestamp floor
+        local_max_seq:  integer,        # current shard kv_oplog high-water mark
         ballot_counter: integer,        # monotonic, persisted in kv_meta
         member_node_ids:  %{node => string},  # Erlang node → CAS node_id
         remote_member_hwms: %{node => integer}, # remote advertised HWM for us
@@ -999,6 +1000,7 @@ defmodule EKV.Replica do
     node_id: nil,
     cluster_size: nil,
     lww_ts_counter: 0,
+    local_max_seq: 0,
     ballot_counter: 0,
     wire_compression_threshold: nil,
     member_node_ids: %{},
@@ -1065,6 +1067,7 @@ defmodule EKV.Replica do
     # Local eventual-write counter — seed from the current shard watermark so
     # future same-node writes never reuse an existing committed timestamp.
     lww_ts_counter = max(System.system_time(:nanosecond), Store.max_timestamp(db) || 0)
+    local_max_seq = Store.max_seq(db)
 
     # CAS ballot counter — restore from persisted value
     ballot_counter =
@@ -1092,6 +1095,7 @@ defmodule EKV.Replica do
       cluster_size: config.cluster_size,
       wire_compression_threshold: config[:wire_compression_threshold],
       lww_ts_counter: lww_ts_counter,
+      local_max_seq: local_max_seq,
       ballot_counter: ballot_counter
     }
 
@@ -1205,18 +1209,23 @@ defmodule EKV.Replica do
           nil
         )
 
-      if applied do
-        sender_seq = Store.max_seq(db)
+      state =
+        if applied do
+          {state, sender_seq} = advance_local_max_seq(state)
 
-        broadcast_to_members(
-          state,
-          {:ekv_put, key, value_binary, now, origin_node, expires_at, sender_seq}
-        )
+          broadcast_to_members(
+            state,
+            {:ekv_put, key, value_binary, now, origin_node, expires_at, sender_seq}
+          )
 
-        dispatch_events(state, [
-          %EKV.Event{type: :put, key: key, value: :erlang.binary_to_term(value_binary)}
-        ])
-      end
+          dispatch_events(state, [
+            %EKV.Event{type: :put, key: key, value: :erlang.binary_to_term(value_binary)}
+          ])
+
+          state
+        else
+          state
+        end
 
       {:reply, :ok, state}
     end
@@ -1245,11 +1254,15 @@ defmodule EKV.Replica do
           now
         )
 
-      if applied do
-        sender_seq = Store.max_seq(db)
-        broadcast_to_members(state, {:ekv_delete, key, now, origin_node, sender_seq})
-        dispatch_events(state, [%EKV.Event{type: :delete, key: key, value: prev_value}])
-      end
+      state =
+        if applied do
+          {state, sender_seq} = advance_local_max_seq(state)
+          broadcast_to_members(state, {:ekv_delete, key, now, origin_node, sender_seq})
+          dispatch_events(state, [%EKV.Event{type: :delete, key: key, value: prev_value}])
+          state
+        else
+          state
+        end
 
       {:reply, :ok, state}
     end
@@ -1364,7 +1377,7 @@ defmodule EKV.Replica do
       ) do
     value_binary = wire_decompress_value(value_binary)
 
-    {:ok, applied} =
+    {applied, state} =
       merge_remote_entry(state, key, value_binary, timestamp, origin_node, expires_at, nil)
 
     ack_live_progress(state, origin_node, sender_seq)
@@ -1381,7 +1394,7 @@ defmodule EKV.Replica do
   def handle_info({:ekv_delete, key, timestamp, origin_node, sender_seq}, %Replica{} = state) do
     prev_value = if has_subscribers?(state), do: read_previous_value(state, key)
 
-    {:ok, applied} =
+    {applied, state} =
       merge_remote_entry(state, key, nil, timestamp, origin_node, nil, timestamp)
 
     ack_live_progress(state, origin_node, sender_seq)
@@ -1438,14 +1451,14 @@ defmodule EKV.Replica do
 
     has_subs = has_subscribers?(state)
 
-    sync_events =
-      Enum.reduce(entries, [], fn {key, value_binary, timestamp, origin_node, expires_at,
-                                   deleted_at},
-                                  acc ->
+    {state, sync_events} =
+      Enum.reduce(entries, {state, []}, fn {key, value_binary, timestamp, origin_node, expires_at,
+                                            deleted_at},
+                                           {state, acc} ->
         if shard_index_for(key, num_shards) == shard do
           prev_value = if deleted_at && has_subs, do: read_previous_value(state, key)
 
-          {:ok, applied} =
+          {applied, state} =
             if deleted_at do
               merge_remote_entry(state, key, nil, timestamp, origin_node, nil, deleted_at)
             else
@@ -1470,12 +1483,12 @@ defmodule EKV.Replica do
                   value: :erlang.binary_to_term(value_binary)
                 }
 
-            [event | acc]
+            {state, [event | acc]}
           else
-            acc
+            {state, acc}
           end
         else
-          acc
+          {state, acc}
         end
       end)
 
@@ -1498,11 +1511,10 @@ defmodule EKV.Replica do
   def handle_info({:ekv_sync_ack, remote_pid, remote_shard, their_seq}, %Replica{} = state)
       when remote_shard == state.shard_index do
     remote_node = node(remote_pid)
-    local_max_seq = Store.max_seq(state.db)
+    local_max_seq = state.local_max_seq
 
     state =
       if is_integer(their_seq) and their_seq >= 0 and their_seq <= local_max_seq do
-        Store.set_hwm(state.db, remote_node, their_seq)
         track_remote_member_hwm(state, remote_node, their_seq)
       else
         state
@@ -1807,17 +1819,18 @@ defmodule EKV.Replica do
     # 1. Observe TTL expiry and emit :expired.
     expired = Store.find_expired(db, now)
 
-    gc_events =
-      Enum.reduce(expired, [], fn {key, value_binary, _timestamp, _origin_node, _expires_at},
-                                  acc ->
+    {state, gc_events} =
+      Enum.reduce(expired, {state, []}, fn {key, value_binary, _timestamp, _origin_node,
+                                            _expires_at},
+                                           {state, acc} ->
         if Store.cas_managed_key?(db, key) do
           {:ok, applied} = Store.mark_expired(db, key, now)
 
           if applied do
             prev_value = if value_binary, do: :erlang.binary_to_term(value_binary)
-            [%EKV.Event{type: :expired, key: key, value: prev_value} | acc]
+            {state, [%EKV.Event{type: :expired, key: key, value: prev_value} | acc]}
           else
-            acc
+            {state, acc}
           end
         else
           origin = node()
@@ -1836,12 +1849,12 @@ defmodule EKV.Replica do
             )
 
           if applied do
-            sender_seq = Store.max_seq(db)
+            {state, sender_seq} = advance_local_max_seq(state)
             broadcast_to_members(state, {:ekv_delete, key, now, origin, sender_seq})
             prev_value = if value_binary, do: :erlang.binary_to_term(value_binary)
-            [%EKV.Event{type: :expired, key: key, value: prev_value} | acc]
+            {state, [%EKV.Event{type: :expired, key: key, value: prev_value} | acc]}
           else
-            acc
+            {state, acc}
           end
         end
       end)
@@ -1862,6 +1875,7 @@ defmodule EKV.Replica do
 
     # 4. Truncate oplog
     Store.truncate_oplog(db)
+    state = %{state | local_max_seq: Store.max_seq(db)}
 
     # 5. Bump liveness timestamp
     Store.touch_last_active(db)
@@ -2072,17 +2086,24 @@ defmodule EKV.Replica do
        ) do
     %{db: db, stmts: stmts} = state
 
-    Store.write_entry(
-      db,
-      stmts.kv_upsert,
-      stmts.oplog_insert,
-      key,
-      value_binary,
-      timestamp,
-      origin_node,
-      expires_at,
-      deleted_at
-    )
+    case Store.write_entry(
+           db,
+           stmts.kv_upsert,
+           stmts.oplog_insert,
+           key,
+           value_binary,
+           timestamp,
+           origin_node,
+           expires_at,
+           deleted_at
+         ) do
+      {:ok, true} ->
+        {state, _sender_seq} = advance_local_max_seq(state)
+        {true, state}
+
+      {:ok, false} ->
+        {false, state}
+    end
   end
 
   defp send_sync_data(%Replica{} = state, remote_node, remote_hwm) do
@@ -2094,7 +2115,7 @@ defmodule EKV.Replica do
     # remote_hwm is what the remote side reports having already applied from us.
     # Use it as the delta cursor into our local oplog sequence space.
     my_min_seq = Store.min_seq(db)
-    my_seq = Store.max_seq(db)
+    my_seq = state.local_max_seq
 
     cond do
       is_integer(remote_hwm) and remote_hwm >= my_min_seq and remote_hwm <= my_seq ->
@@ -2691,7 +2712,7 @@ defmodule EKV.Replica do
            ballot_n
          ) do
       {:ok, _value_binary, _ts, _origin, _expires, _deleted_at, _prev_value_binary} ->
-        sender_seq = Store.max_seq(db)
+        {state, sender_seq} = advance_local_max_seq(state)
         cancel_timer(op.timer)
         dispatch_events(state, op.events)
         GenServer.reply(op.from, op.reply_value)
@@ -2780,6 +2801,11 @@ defmodule EKV.Replica do
   defp next_lww_ts(%Replica{} = state) do
     now = max(System.system_time(:nanosecond), state.lww_ts_counter + 1)
     {now, %{state | lww_ts_counter: now}}
+  end
+
+  defp advance_local_max_seq(%Replica{} = state) do
+    next = state.local_max_seq + 1
+    {%{state | local_max_seq: next}, next}
   end
 
   defp decode_kv_row(nil), do: {nil, nil}
@@ -2995,6 +3021,7 @@ defmodule EKV.Replica do
            ballot_n
          ) do
       {:ok, value_binary, _ts, _origin, _expires, deleted_at, prev_value_binary} ->
+        {state, _sender_seq} = advance_local_max_seq(state)
         dispatch_promote_event(state, key, value_binary, deleted_at, prev_value_binary)
         state
 
@@ -3016,6 +3043,8 @@ defmodule EKV.Replica do
                      ballot_n
                    ) do
                 {:ok, promoted_value, _ts, _origin, _expires, promoted_deleted, prev_value_binary} ->
+                  {state, _sender_seq} = advance_local_max_seq(state)
+
                   dispatch_promote_event(
                     state,
                     key,
@@ -3024,16 +3053,18 @@ defmodule EKV.Replica do
                     prev_value_binary
                   )
 
+                  state
+
                 {:ok, :stale} ->
-                  :ok
+                  state
               end
 
             {:ok, false} ->
-              :ok
+              state
           end
+        else
+          state
         end
-
-        state
     end
   end
 
@@ -3056,7 +3087,6 @@ defmodule EKV.Replica do
 
   defp ack_live_progress(%Replica{} = state, sender_node, sender_seq)
        when is_atom(sender_node) and is_integer(sender_seq) and sender_seq >= 0 do
-    Store.set_hwm(state.db, sender_node, sender_seq)
     send_to_member(state, sender_node, {:ekv_sync_ack, self(), state.shard_index, sender_seq})
     :ok
   end

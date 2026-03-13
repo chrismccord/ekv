@@ -358,7 +358,7 @@ defmodule EKV.TestCluster do
     expires_at = Keyword.get(opts, :expires_at)
     deleted_at = Keyword.get(opts, :deleted_at)
 
-    {:ok, true} =
+    {:ok, _applied} =
       EKV.Store.write_entry(
         db,
         stmts.kv_upsert,

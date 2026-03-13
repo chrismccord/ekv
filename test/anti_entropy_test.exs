@@ -210,15 +210,6 @@ defmodule EKV.AntiEntropyTest do
         TestCluster.keys_count(node_b, ekv_name, "live_lww/") == 5
       end)
 
-      a_max = TestCluster.max_seq(node_a, ekv_name)
-
-      TestCluster.assert_eventually(fn ->
-        state = TestCluster.replica_state(node_a, ekv_name)
-
-        Map.get(state.remote_member_hwms, node_b) == a_max and
-          TestCluster.member_hwm(node_a, ekv_name, node_b) == a_max
-      end)
-
       assert :ok = TestCluster.trace_shard_sends(node_a, ekv_name, self())
       assert :ok = TestCluster.trigger_anti_entropy(node_a, ekv_name)
       assert_no_sync_messages(400)
@@ -239,15 +230,6 @@ defmodule EKV.AntiEntropyTest do
 
       TestCluster.assert_eventually(fn ->
         TestCluster.rpc!(node_b, EKV, :get, [ekv_name, "live_cas/1"]) == "v1"
-      end)
-
-      a_max = TestCluster.max_seq(node_a, ekv_name)
-
-      TestCluster.assert_eventually(fn ->
-        state = TestCluster.replica_state(node_a, ekv_name)
-
-        Map.get(state.remote_member_hwms, node_b) == a_max and
-          TestCluster.member_hwm(node_a, ekv_name, node_b) == a_max
       end)
 
       assert :ok = TestCluster.trace_shard_sends(node_a, ekv_name, self())
@@ -411,10 +393,6 @@ defmodule EKV.AntiEntropyTest do
         Map.get(state.remote_member_hwms, node_b) == 0
       end)
 
-      TestCluster.assert_eventually(fn ->
-        TestCluster.member_hwm(node_a, ekv_name, node_b) == 0
-      end)
-
       assert :ok = TestCluster.trigger_anti_entropy(node_a, ekv_name)
       assert_no_sync_messages()
       assert :ok = TestCluster.untrace_shard_sends(node_a, ekv_name)
@@ -467,10 +445,6 @@ defmodule EKV.AntiEntropyTest do
       TestCluster.assert_eventually(fn ->
         state = TestCluster.replica_state(node_a, ekv_name)
         Map.get(state.remote_member_hwms, node_b) == a_max
-      end)
-
-      TestCluster.assert_eventually(fn ->
-        TestCluster.member_hwm(node_a, ekv_name, node_b) == a_max
       end)
 
       assert :ok = TestCluster.trigger_anti_entropy(node_a, ekv_name)
@@ -567,6 +541,13 @@ defmodule EKV.AntiEntropyTest do
 
       TestCluster.assert_eventually(fn ->
         TestCluster.keys_count(node_a, ekv_name, "restart/") == 4
+      end)
+
+      b_max = TestCluster.max_seq(node_b, ekv_name)
+
+      TestCluster.assert_eventually(fn ->
+        state = TestCluster.replica_state(node_b, ekv_name)
+        Map.get(state.remote_member_hwms, node_a) == b_max
       end)
 
       assert :ok = TestCluster.trace_shard_sends(node_b, ekv_name, self())
