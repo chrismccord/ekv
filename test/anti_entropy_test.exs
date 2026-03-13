@@ -104,6 +104,16 @@ defmodule EKV.AntiEntropyTest do
           timeout
         )
 
+      {:trace, _pid, :send, {:ekv, 1, :sync, {from_node, shard, entries, seq}, _meta},
+       destination} ->
+        collect_sync_messages(
+          [
+            {from_node, shard, Enum.map(entries, &elem(&1, 0)), length(entries), seq, destination}
+            | acc
+          ],
+          timeout
+        )
+
       {:trace, _pid, :send, _msg, _destination} ->
         collect_sync_messages(acc, timeout)
     after

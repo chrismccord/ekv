@@ -1350,7 +1350,7 @@ defmodule EKV.StressTest do
       # This creates a kv_paxos row with promised_counter > 0, accepted_counter = 0
       ref = make_ref()
       send(shard_name, {:ekv_prepare, ref, self(), key, 100, "2", 0})
-      assert_receive {:ekv_promise, ^ref, _, _, _, _, _}, 2000
+      assert_receive {:ekv, 1, :promise, {^ref, _, _, _, _, _}, %{}}, 2000
 
       # Verify: key NOT in kv, but kv_paxos has a promised row
       assert EKV.get(name, key) == nil
@@ -1370,7 +1370,7 @@ defmodule EKV.StressTest do
 
       ref2 = make_ref()
       send(shard_name, {:ekv_accept, ref2, self(), key, 100, "2", entry, 0})
-      assert_receive {:ekv_accepted, ^ref2, _, _}, 2000
+      assert_receive {:ekv, 1, :accepted, {^ref2, _, _}, %{}}, 2000
 
       # Commit and verify the value
       send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, node(), 0})
@@ -1392,7 +1392,7 @@ defmodule EKV.StressTest do
 
       ref = make_ref()
       send(shard_name, {:ekv_accept, ref, self(), key, 100, "2", entry, 0})
-      assert_receive {:ekv_accepted, ^ref, _, _}, 2000
+      assert_receive {:ekv, 1, :accepted, {^ref, _, _}, %{}}, 2000
 
       # Commit — promotes to kv while retaining accepted+promised ballot state
       send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, node(), 0})
@@ -1431,7 +1431,7 @@ defmodule EKV.StressTest do
       ref2 = make_ref()
       send(shard_name, {:ekv_prepare, ref2, self(), key, 200, "3", 0})
 
-      assert_receive {:ekv_promise, ^ref2, _, _, acc_c2, acc_n2, _kv_row}, 2000
+      assert_receive {:ekv, 1, :promise, {^ref2, _, _, acc_c2, acc_n2, _kv_row}, %{}}, 2000
       assert acc_c2 == acc_c
       assert acc_n2 == "2"
     end
@@ -1646,7 +1646,7 @@ defmodule EKV.StressTest do
 
       ref = make_ref()
       send(shard_name, {:ekv_accept, ref, self(), key, 100, "2", entry, 0})
-      assert_receive {:ekv_accepted, ^ref, _, _}, 2000
+      assert_receive {:ekv, 1, :accepted, {^ref, _, _}, %{}}, 2000
 
       # Value NOT in kv yet (only in kv_paxos)
       assert EKV.get(name, key) == nil
@@ -1674,17 +1674,17 @@ defmodule EKV.StressTest do
       # Prepare ballot=100 → promise
       ref1 = make_ref()
       send(shard_name, {:ekv_prepare, ref1, self(), key, 100, "2", 0})
-      assert_receive {:ekv_promise, ^ref1, _, _, _, _, _}, 2000
+      assert_receive {:ekv, 1, :promise, {^ref1, _, _, _, _, _}, %{}}, 2000
 
       # Prepare ballot=200 → promise (supersedes 100)
       ref2 = make_ref()
       send(shard_name, {:ekv_prepare, ref2, self(), key, 200, "3", 0})
-      assert_receive {:ekv_promise, ^ref2, _, _, _, _, _}, 2000
+      assert_receive {:ekv, 1, :promise, {^ref2, _, _, _, _, _}, %{}}, 2000
 
       # Prepare ballot=150 → nack (lower than 200)
       ref3 = make_ref()
       send(shard_name, {:ekv_prepare, ref3, self(), key, 150, "4", 0})
-      assert_receive {:ekv_nack, ^ref3, _, _, 200, "3"}, 2000
+      assert_receive {:ekv, 1, :nack, {^ref3, _, _, 200, "3"}, %{}}, 2000
 
       # Accept ballot=200 → accepted
       now = System.system_time(:nanosecond)
@@ -1694,7 +1694,7 @@ defmodule EKV.StressTest do
 
       ref4 = make_ref()
       send(shard_name, {:ekv_accept, ref4, self(), key, 200, "3", entry200, 0})
-      assert_receive {:ekv_accepted, ^ref4, _, _}, 2000
+      assert_receive {:ekv, 1, :accepted, {^ref4, _, _}, %{}}, 2000
 
       # Commit ballot=200 → value in kv
       send(shard_name, {:ekv_cas_committed, key, 200, "3", nil, 0, node(), 0})
@@ -1707,7 +1707,7 @@ defmodule EKV.StressTest do
 
       ref5 = make_ref()
       send(shard_name, {:ekv_accept, ref5, self(), key, 100, "2", entry100, 0})
-      assert_receive {:ekv_accept_nack, ^ref5, _, _}, 2000
+      assert_receive {:ekv, 1, :accept_nack, {^ref5, _, _}, %{}}, 2000
 
       # Only ballot 200's value in kv
       assert EKV.get(name, key) == "ballot_200_val"
@@ -1732,19 +1732,19 @@ defmodule EKV.StressTest do
       # paxos_accept checks ballot_c >= promised_c → 100 >= 0 → succeeds (inserts new row)
       ref1 = make_ref()
       send(shard_name, {:ekv_accept, ref1, self(), key, 100, "2", entry, 0})
-      assert_receive {:ekv_accepted, ^ref1, _, _}, 2000
+      assert_receive {:ekv, 1, :accepted, {^ref1, _, _}, %{}}, 2000
 
       # Now send prepare with SAME ballot — arrives late due to reordering
       # paxos_prepare checks ballot_c > promised_c (strictly greater)
       # After accept, promised_counter=100 → 100 is NOT > 100 → nack
       ref2 = make_ref()
       send(shard_name, {:ekv_prepare, ref2, self(), key, 100, "2", 0})
-      assert_receive {:ekv_nack, ^ref2, _, _, 100, "2"}, 2000
+      assert_receive {:ekv, 1, :nack, {^ref2, _, _, 100, "2"}, %{}}, 2000
 
       # Higher ballot can still recover — prepare with ballot 200
       ref3 = make_ref()
       send(shard_name, {:ekv_prepare, ref3, self(), key, 200, "3", 0})
-      assert_receive {:ekv_promise, ^ref3, _, _, acc_c, acc_n, _kv_row}, 2000
+      assert_receive {:ekv, 1, :promise, {^ref3, _, _, acc_c, acc_n, _kv_row}, %{}}, 2000
 
       # Promise carries the accepted value from the out-of-order accept
       assert acc_c == 100
@@ -1767,18 +1767,18 @@ defmodule EKV.StressTest do
       # Round 1: ballot {100, "2"} — prepare + accept
       ref1 = make_ref()
       send(shard_name, {:ekv_prepare, ref1, self(), key, 100, "2", 0})
-      assert_receive {:ekv_promise, ^ref1, _, _, _, _, _}, 2000
+      assert_receive {:ekv, 1, :promise, {^ref1, _, _, _, _, _}, %{}}, 2000
 
       val_old = :erlang.term_to_binary("old_val")
       entry_100 = {key, val_old, now, origin_str, nil, nil}
       ref2 = make_ref()
       send(shard_name, {:ekv_accept, ref2, self(), key, 100, "2", entry_100, 0})
-      assert_receive {:ekv_accepted, ^ref2, _, _}, 2000
+      assert_receive {:ekv, 1, :accepted, {^ref2, _, _}, %{}}, 2000
 
       # Round 2: ballot {200, "3"} — supersedes round 1
       ref3 = make_ref()
       send(shard_name, {:ekv_prepare, ref3, self(), key, 200, "3", 0})
-      assert_receive {:ekv_promise, ^ref3, _, _, acc_c, acc_n, _kv_row}, 2000
+      assert_receive {:ekv, 1, :promise, {^ref3, _, _, acc_c, acc_n, _kv_row}, %{}}, 2000
       # Promise carries round 1's accepted value
       assert acc_c == 100
       assert acc_n == "2"
@@ -1787,7 +1787,7 @@ defmodule EKV.StressTest do
       entry_200 = {key, val_new, now + 1, origin_str, nil, nil}
       ref4 = make_ref()
       send(shard_name, {:ekv_accept, ref4, self(), key, 200, "3", entry_200, 0})
-      assert_receive {:ekv_accepted, ^ref4, _, _}, 2000
+      assert_receive {:ekv, 1, :accepted, {^ref4, _, _}, %{}}, 2000
 
       # Commit round 2 — value promoted to kv
       send(shard_name, {:ekv_cas_committed, key, 200, "3", nil, 0, node(), 0})
@@ -1814,7 +1814,7 @@ defmodule EKV.StressTest do
       # Proposer A: prepare ballot {100, "2"}
       ref1 = make_ref()
       send(shard_name, {:ekv_prepare, ref1, self(), key, 100, "2", 0})
-      assert_receive {:ekv_promise, ^ref1, _, _, _, _, _}, 2000
+      assert_receive {:ekv, 1, :promise, {^ref1, _, _, _, _, _}, %{}}, 2000
 
       # Trigger GC — purge_orphan_paxos must NOT delete the promised row
       # (our fix: AND promised_counter = 0 in purge SQL)
@@ -1839,7 +1839,7 @@ defmodule EKV.StressTest do
       # Concurrent proposer B: prepare ballot {200, "3"} — supersedes A
       ref2 = make_ref()
       send(shard_name, {:ekv_prepare, ref2, self(), key, 200, "3", 0})
-      assert_receive {:ekv_promise, ^ref2, _, _, _, _, _}, 2000
+      assert_receive {:ekv, 1, :promise, {^ref2, _, _, _, _, _}, %{}}, 2000
 
       # Late accept from proposer A (ballot 100) — must be rejected
       # because promised_counter is now 200
@@ -1850,7 +1850,7 @@ defmodule EKV.StressTest do
 
       ref3 = make_ref()
       send(shard_name, {:ekv_accept, ref3, self(), key, 100, "2", entry_a, 0})
-      assert_receive {:ekv_accept_nack, ^ref3, _, _}, 2000
+      assert_receive {:ekv, 1, :accept_nack, {^ref3, _, _}, %{}}, 2000
 
       # Accept from proposer B (ballot 200) — succeeds
       val_b = :erlang.term_to_binary("val_b")
@@ -1858,7 +1858,7 @@ defmodule EKV.StressTest do
 
       ref4 = make_ref()
       send(shard_name, {:ekv_accept, ref4, self(), key, 200, "3", entry_b, 0})
-      assert_receive {:ekv_accepted, ^ref4, _, _}, 2000
+      assert_receive {:ekv, 1, :accepted, {^ref4, _, _}, %{}}, 2000
 
       # Commit ballot 200 — only B's value committed
       send(shard_name, {:ekv_cas_committed, key, 200, "3", nil, 0, node(), 0})
@@ -1880,24 +1880,24 @@ defmodule EKV.StressTest do
       # Prepare both keys with ballot {100, "2"}
       ref_a1 = make_ref()
       send(shard_name, {:ekv_prepare, ref_a1, self(), key_a, 100, "2", 0})
-      assert_receive {:ekv_promise, ^ref_a1, _, _, _, _, _}, 2000
+      assert_receive {:ekv, 1, :promise, {^ref_a1, _, _, _, _, _}, %{}}, 2000
 
       ref_b1 = make_ref()
       send(shard_name, {:ekv_prepare, ref_b1, self(), key_b, 100, "2", 0})
-      assert_receive {:ekv_promise, ^ref_b1, _, _, _, _, _}, 2000
+      assert_receive {:ekv, 1, :promise, {^ref_b1, _, _, _, _, _}, %{}}, 2000
 
       # Accept both keys
       val_a = :erlang.term_to_binary("val_a")
       entry_a = {key_a, val_a, now, origin_str, nil, nil}
       ref_a2 = make_ref()
       send(shard_name, {:ekv_accept, ref_a2, self(), key_a, 100, "2", entry_a, 0})
-      assert_receive {:ekv_accepted, ^ref_a2, _, _}, 2000
+      assert_receive {:ekv, 1, :accepted, {^ref_a2, _, _}, %{}}, 2000
 
       val_b = :erlang.term_to_binary("val_b")
       entry_b = {key_b, val_b, now + 1, origin_str, nil, nil}
       ref_b2 = make_ref()
       send(shard_name, {:ekv_accept, ref_b2, self(), key_b, 100, "2", entry_b, 0})
-      assert_receive {:ekv_accepted, ^ref_b2, _, _}, 2000
+      assert_receive {:ekv, 1, :accepted, {^ref_b2, _, _}, %{}}, 2000
 
       # Partial commit: proposer crashes after sending commit for key_a only
       send(shard_name, {:ekv_cas_committed, key_a, 100, "2", nil, 0, node(), 0})
@@ -1926,7 +1926,9 @@ defmodule EKV.StressTest do
       # New proposer (ballot {200, "3"}) recovers key_b
       ref_b3 = make_ref()
       send(shard_name, {:ekv_prepare, ref_b3, self(), key_b, 200, "3", 0})
-      assert_receive {:ekv_promise, ^ref_b3, _, _, rec_acc_c, rec_acc_n, _kv_row}, 2000
+
+      assert_receive {:ekv, 1, :promise, {^ref_b3, _, _, rec_acc_c, rec_acc_n, _kv_row}, %{}},
+                     2000
 
       # Promise carries the accepted value from the crashed proposer
       assert rec_acc_c == 100
@@ -1935,7 +1937,7 @@ defmodule EKV.StressTest do
       # Accept with the recovered value (re-propose it at higher ballot)
       ref_b4 = make_ref()
       send(shard_name, {:ekv_accept, ref_b4, self(), key_b, 200, "3", entry_b, 0})
-      assert_receive {:ekv_accepted, ^ref_b4, _, _}, 2000
+      assert_receive {:ekv, 1, :accepted, {^ref_b4, _, _}, %{}}, 2000
 
       # Commit ballot 200 — key_b now in kv
       send(shard_name, {:ekv_cas_committed, key_b, 200, "3", nil, 0, node(), 0})

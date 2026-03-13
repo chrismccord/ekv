@@ -554,13 +554,21 @@ defmodule EKV.Replica do
   When two member nodes discover each other (init, nodeup), they exchange a
   handshake per shard. The handshake attempts to reach a registered process
   on any `:nodeup` it sees. This safely noops on non-member nodes.
-  The handshake determines whether to send a delta (oplog slice) or
-  a full state snapshot.
+  Member-to-member traffic is wrapped in a fixed wire envelope:
+
+      {:ekv, 1, kind, payload, meta}
+
+  Replica immediately normalizes that envelope back into internal raw tuples,
+  so the state machine still works in terms of `{:ekv_put, ...}`,
+  `{:ekv_sync, ...}`, and the other internal message forms shown below. The
+  handshake determines whether to send a delta (oplog slice) or a full state
+  snapshot.
 
       Node A (shard i)                        Node B (shard i)
         │                                           │
-        │  {:ekv_member_connect,                    │
-        │   pid_a, i, num_shards, hwm_a, nid_a}     │
+        │  {:ekv, 1, :member_connect,               │
+        │   {pid_a, i, num_shards, hwm_a, nid_a},   │
+        │   %{features: ...}}                       │
         │──────────────────────────────────────────>│
         │                                           │
         │                          validate num_shards match
@@ -568,8 +576,9 @@ defmodule EKV.Replica do
         │                          add A to remote_shards
         │                          track A's node_id
         │                                           │
-        │  {:ekv_member_connect_ack,                │
-        │   pid_b, i, num_shards, hwm_b, nid_b}     │
+        │  {:ekv, 1, :member_connect_ack,           │
+        │   {pid_b, i, num_shards, hwm_b, nid_b},   │
+        │   %{features: ...}}                       │
         │<──────────────────────────────────────────│
         │                                           │
         │                          send_sync_data(A, hwm_a):
@@ -578,15 +587,15 @@ defmodule EKV.Replica do
         │                            else:
         │                              full sync (chunked)
         │                                           │
-        │  {:ekv_sync, node_b, i, chunk, seq}       │
+        │  {:ekv, 1, :sync, {node_b, i, chunk, seq}, %{}} │
         │<──────────────────────────────────────────│
-        │  {:ekv_sync, node_b, i, chunk, seq}       │
+        │  {:ekv, 1, :sync, {node_b, i, chunk, seq}, %{}} │
         │<──────────────────────────────────────────│
         │  ...                                      │
         │                                           │
         │  (A does the same for B)                  │
         │──────────────────────────────────────────>│
-        │  {:ekv_sync, node_a, i, chunk, seq}       │
+        │  {:ekv, 1, :sync, {node_a, i, chunk, seq}, %{}} │
         │                                           │
 
   Both sides send data. This is symmetric — each side sends what the
@@ -648,7 +657,7 @@ defmodule EKV.Replica do
         │
         │ send_full_chunk(cursor=nil)
         │   query chunk 1 (500 entries)
-        │   send {:ekv_sync, entries, seq=0}  ──> member
+        │   send {:ekv, 1, :sync, {..., seq=0}, %{}}  ──> member
         │   send(self(), {:continue_full_sync, cursor="last_key"})
         │   return {:noreply, state}
         │
@@ -657,14 +666,14 @@ defmodule EKV.Replica do
         │ handle_info(:continue_full_sync)
         │   check member still in remote_shards (abort if gone)
         │   query chunk 2 (500 entries)
-        │   send {:ekv_sync, entries, seq=0}  ──> member
+        │   send {:ekv, 1, :sync, {..., seq=0}, %{}}  ──> member
         │   send(self(), {:continue_full_sync, cursor="last_key"})
         │
         │ ... process other messages ...
         │
         │ handle_info(:continue_full_sync)
         │   query chunk 3 (< 500 entries = final)
-        │   send {:ekv_sync, entries, seq=my_seq}  ──> member
+        │   send {:ekv, 1, :sync, {..., seq=my_seq}, %{}}  ──> member
         │
 
   HWM safety: intermediate chunks send seq=0 in the sync message.
@@ -921,35 +930,54 @@ defmodule EKV.Replica do
 
   ## Message Reference
 
-  Steady-state LWW replication (per-operation, fire-and-forget):
-    {:ekv_put, key, value_binary, timestamp, origin_node, expires_at, sender_seq}
-    {:ekv_delete, key, timestamp, origin_node, sender_seq}
+  Member-to-member wire traffic uses:
 
-  Member handshake (on nodeup / init):
-    {:ekv_member_connect, pid, shard_index, num_shards, my_hwm_for_remote, node_id}
-    {:ekv_member_connect_ack, pid, shard_index, num_shards, my_hwm_for_remote, node_id}
+    {:ekv, 1, kind, payload, meta}
 
-  Chunked sync (after handshake, multiple messages per sync):
-    {:ekv_sync, from_node, shard_index, entries, sender_seq}
-      entries: [{key, value_binary, timestamp, origin_node,
-                 expires_at, deleted_at}]
+  Required fields live in `payload`. Optional/extensible fields live in
+  `meta`. `sender_seq` is required in the v1 replication contract, so it is
+  part of payload for `:put`, `:delete`, and `:cas_committed`.
+
+  Wire protocol v1 kinds:
+    :put                 {key, value_binary, timestamp, origin_node, expires_at, sender_seq}
+    :delete              {key, timestamp, origin_node, sender_seq}
+    :member_connect      {pid, shard_index, num_shards, my_hwm_for_remote, node_id}
+    :member_connect_ack  {pid, shard_index, num_shards, my_hwm_for_remote, node_id}
+    :sync                {from_node, shard_index, entries, sender_seq}
+      entries: [{key, value_binary, timestamp, origin_node, expires_at, deleted_at}]
       sender_seq: 0 for intermediate chunks, real seq for final chunk
-    {:ekv_sync_ack, pid, shard_index, sender_seq}
+    :sync_ack            {pid, shard_index, sender_seq}
+    :prepare             {ref, proposer_pid, key, ballot_c, ballot_n, shard}
+    :accept              {ref, proposer_pid, key, ballot_c, ballot_n, entry_tuple, shard}
+    :cas_committed       {key, ballot_c, ballot_n, entry_tuple, shard, sender_node, sender_seq}
+    :promise             {ref, pid, node_id, acc_c, acc_n, kv_row}
+    :nack                {ref, pid, node_id, promised_c, promised_n}
+    :accepted            {ref, pid, node_id}
+    :accept_nack         {ref, pid, node_id}
+
+  Current `meta` usage:
+    - handshake messages advertise `%{features: %{live_progress: true, wire_compression: true}}`
+    - replication/control messages keep `meta` empty unless an optional feature requires it
+
+  Internally, Replica still uses the raw tuples below after decoding the wire
+  envelope:
+    {:ekv_put, ...}
+    {:ekv_delete, ...}
+    {:ekv_member_connect, ...}
+    {:ekv_member_connect_ack, ...}
+    {:ekv_sync, ...}
+    {:ekv_sync_ack, ...}
+    {:ekv_prepare, ...}
+    {:ekv_accept, ...}
+    {:ekv_cas_committed, ...}
+    {:ekv_promise, ...}
+    {:ekv_nack, ...}
+    {:ekv_accepted, ...}
+    {:ekv_accept_nack, ...}
 
   Sync continuations (self-messages for chunking):
     {:continue_full_sync, node, last_key, cutoff, my_seq, chunk_size}
     {:continue_delta_sync, node, last_seq, my_seq, chunk_size}
-
-  CAS proposer → members:
-    {:ekv_prepare, ref, proposer_pid, key, ballot_c, ballot_n, shard}
-    {:ekv_accept, ref, proposer_pid, key, ballot_c, ballot_n, entry_tuple, shard}
-    {:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple, shard, sender_node, sender_seq}
-
-  CAS acceptors → proposer:
-    {:ekv_promise, ref, pid, node_id, acc_c, acc_n, kv_row}
-    {:ekv_nack, ref, pid, node_id, promised_c, promised_n}
-    {:ekv_accepted, ref, pid, node_id}
-    {:ekv_accept_nack, ref, pid, node_id}
 
   CAS internal (self-messages):
     {:cas_timeout, ref}
@@ -980,7 +1008,10 @@ defmodule EKV.Replica do
   @member_down_name_prefix "member_down_at:name:"
   @member_down_name_min_retention_ms :timer.hours(24 * 30)
   @member_down_name_max_entries 4096
+  @wire_protocol_version 1
   @wire_compressed_tag :ekv_wire_compressed
+  @wire_feature_live_progress :live_progress
+  @wire_feature_compression :wire_compression
 
   defstruct [
     :name,
@@ -1005,6 +1036,7 @@ defmodule EKV.Replica do
     wire_compression_threshold: nil,
     member_node_ids: %{},
     remote_member_hwms: %{},
+    remote_features: %{},
     sync_inflight: MapSet.new(),
     pending_cas: %{},
     quorum_waiters: %{},
@@ -1104,15 +1136,9 @@ defmodule EKV.Replica do
     log_once(state, fn -> "#{log_prefix(state)} started (shards=#{num_shards})" end)
 
     # Discover members on all known nodes
-    registered_name = shard_name(name, shard_index)
-
     for remote_node <- Node.list() do
       remote_hwm = Store.get_hwm(db, remote_node) || 0
-
-      send(
-        {registered_name, remote_node},
-        {:ekv_member_connect, self(), shard_index, num_shards, remote_hwm, config.node_id}
-      )
+      send_to_member(state, remote_node, member_connect_message(state, remote_hwm))
     end
 
     schedule_anti_entropy_tick(state)
@@ -1371,6 +1397,22 @@ defmodule EKV.Replica do
   # Replication receive
   # =====================================================================
 
+  def handle_info({:ekv, @wire_protocol_version, kind, payload, meta}, %Replica{} = state) do
+    case decode_wire_message(kind, payload, meta) do
+      {:ok, message} -> handle_info(message, state)
+      :ignore -> {:noreply, state}
+    end
+  end
+
+  def handle_info({:ekv, version, kind, _payload, _meta}, %Replica{} = state)
+      when is_integer(version) do
+    log_verbose(state, fn ->
+      "#{log_prefix_shard(state)} ignoring unsupported wire version #{version} kind=#{inspect(kind)}"
+    end)
+
+    {:noreply, state}
+  end
+
   def handle_info(
         {:ekv_put, key, value_binary, timestamp, origin_node, expires_at, sender_seq},
         %Replica{} = state
@@ -1422,7 +1464,25 @@ defmodule EKV.Replica do
        remote_shard,
        remote_num_shards,
        remote_hwm,
-       remote_node_id
+       remote_node_id,
+       MapSet.new()
+     )}
+  end
+
+  def handle_info(
+        {:ekv_member_connect, remote_pid, remote_shard, remote_num_shards, remote_hwm,
+         remote_node_id, remote_features},
+        %Replica{} = state
+      ) do
+    {:noreply,
+     do_member_connect(
+       state,
+       remote_pid,
+       remote_shard,
+       remote_num_shards,
+       remote_hwm,
+       remote_node_id,
+       remote_features
      )}
   end
 
@@ -1438,7 +1498,25 @@ defmodule EKV.Replica do
        remote_shard,
        remote_num_shards,
        remote_hwm,
-       remote_node_id
+       remote_node_id,
+       MapSet.new()
+     )}
+  end
+
+  def handle_info(
+        {:ekv_member_connect_ack, remote_pid, remote_shard, remote_num_shards, remote_hwm,
+         remote_node_id, remote_features},
+        %Replica{} = state
+      ) do
+    {:noreply,
+     do_member_connect_ack(
+       state,
+       remote_pid,
+       remote_shard,
+       remote_num_shards,
+       remote_hwm,
+       remote_node_id,
+       remote_features
      )}
   end
 
@@ -1533,13 +1611,10 @@ defmodule EKV.Replica do
         {:noreply, state}
 
       {:ok, %Replica{} = state} ->
-        %{shard_index: shard, name: name, db: db} = state
+        %{db: db} = state
         remote_hwm = Store.get_hwm(db, remote_node) || 0
 
-        send(
-          {shard_name(name, shard), remote_node},
-          {:ekv_member_connect, self(), shard, state.num_shards, remote_hwm, state.node_id}
-        )
+        send_to_member(state, remote_node, member_connect_message(state, remote_hwm))
 
         {:noreply, state}
     end
@@ -1555,6 +1630,7 @@ defmodule EKV.Replica do
       | remote_shards: Map.delete(state.remote_shards, dead_node),
         member_node_ids: Map.delete(state.member_node_ids, dead_node),
         remote_member_hwms: Map.delete(state.remote_member_hwms, dead_node),
+        remote_features: Map.delete(state.remote_features, dead_node),
         sync_inflight: MapSet.delete(state.sync_inflight, dead_node)
     }
 
@@ -1587,6 +1663,7 @@ defmodule EKV.Replica do
         | remote_shards: Map.delete(state.remote_shards, remote_node),
           member_node_ids: Map.delete(state.member_node_ids, remote_node),
           remote_member_hwms: Map.delete(state.remote_member_hwms, remote_node),
+          remote_features: Map.delete(state.remote_features, remote_node),
           sync_inflight: MapSet.delete(state.sync_inflight, remote_node)
       }
 
@@ -1625,10 +1702,24 @@ defmodule EKV.Replica do
 
     case Store.paxos_prepare(db, key, ballot_c, ballot_n) do
       {:ok, :promise, acc_c, acc_n, kv_row} ->
-        send(proposer_pid, {:ekv_promise, ref, self(), state.node_id, acc_c, acc_n, kv_row})
+        send(
+          proposer_pid,
+          wire_encode_message(
+            state,
+            node(proposer_pid),
+            {:ekv_promise, ref, self(), state.node_id, acc_c, acc_n, kv_row}
+          )
+        )
 
       {:ok, :nack, prom_c, prom_n} ->
-        send(proposer_pid, {:ekv_nack, ref, self(), state.node_id, prom_c, prom_n})
+        send(
+          proposer_pid,
+          wire_encode_message(
+            state,
+            node(proposer_pid),
+            {:ekv_nack, ref, self(), state.node_id, prom_c, prom_n}
+          )
+        )
     end
 
     {:noreply, state}
@@ -1648,10 +1739,24 @@ defmodule EKV.Replica do
     # The proposer will send {:ekv_cas_committed, ..., entry_tuple, ...} after quorum.
     case Store.paxos_accept(db, key, ballot_c, ballot_n, value_args) do
       {:ok, true} ->
-        send(proposer_pid, {:ekv_accepted, ref, self(), state.node_id})
+        send(
+          proposer_pid,
+          wire_encode_message(
+            state,
+            node(proposer_pid),
+            {:ekv_accepted, ref, self(), state.node_id}
+          )
+        )
 
       {:ok, false} ->
-        send(proposer_pid, {:ekv_accept_nack, ref, self(), state.node_id})
+        send(
+          proposer_pid,
+          wire_encode_message(
+            state,
+            node(proposer_pid),
+            {:ekv_accept_nack, ref, self(), state.node_id}
+          )
+        )
     end
 
     {:noreply, state}
@@ -1946,7 +2051,8 @@ defmodule EKV.Replica do
          remote_shard,
          remote_num_shards,
          remote_hwm,
-         remote_node_id
+         remote_node_id,
+         remote_features
        )
        when remote_shard == state.shard_index do
     if remote_num_shards != state.num_shards do
@@ -1972,6 +2078,7 @@ defmodule EKV.Replica do
             |> track_remote_shard(remote_node, remote_pid)
             |> track_member_node_id(remote_node, remote_node_id)
             |> track_remote_member_hwm(remote_node, remote_hwm)
+            |> track_remote_features(remote_node, remote_features)
 
           if state.cluster_size do
             alive = alive_node_id_count(state)
@@ -1988,8 +2095,7 @@ defmodule EKV.Replica do
           send_to_member(
             state,
             remote_node,
-            {:ekv_member_connect_ack, self(), state.shard_index, state.num_shards,
-             my_hwm_for_remote, state.node_id}
+            member_connect_ack_message(state, my_hwm_for_remote)
           )
 
           log_once(state, fn -> "#{log_prefix(state)} ekv_member_connect from #{remote_node}" end)
@@ -2006,7 +2112,8 @@ defmodule EKV.Replica do
          _remote_shard,
          _remote_num_shards,
          _remote_hwm,
-         _remote_node_id
+         _remote_node_id,
+         _remote_features
        ) do
     state
   end
@@ -2017,7 +2124,8 @@ defmodule EKV.Replica do
          remote_shard,
          remote_num_shards,
          remote_hwm,
-         remote_node_id
+         remote_node_id,
+         remote_features
        )
        when remote_shard == state.shard_index do
     if remote_num_shards != state.num_shards do
@@ -2040,6 +2148,7 @@ defmodule EKV.Replica do
             |> track_remote_shard(remote_node, remote_pid)
             |> track_member_node_id(remote_node, remote_node_id)
             |> track_remote_member_hwm(remote_node, remote_hwm)
+            |> track_remote_features(remote_node, remote_features)
 
           if state.cluster_size do
             alive = alive_node_id_count(state)
@@ -2070,7 +2179,8 @@ defmodule EKV.Replica do
          _remote_shard,
          _remote_num_shards,
          _remote_hwm,
-         _remote_node_id
+         _remote_node_id,
+         _remote_features
        ) do
     state
   end
@@ -2334,9 +2444,22 @@ defmodule EKV.Replica do
 
   defp track_remote_member_hwm(%Replica{} = state, _remote_node, _remote_hwm), do: state
 
+  defp track_remote_features(%Replica{} = state, remote_node, remote_features) do
+    %{state | remote_features: Map.put(state.remote_features, remote_node, remote_features)}
+  end
+
+  defp member_connect_message(%Replica{} = state, remote_hwm) do
+    {:ekv_member_connect, self(), state.shard_index, state.num_shards, remote_hwm, state.node_id}
+  end
+
+  defp member_connect_ack_message(%Replica{} = state, remote_hwm) do
+    {:ekv_member_connect_ack, self(), state.shard_index, state.num_shards, remote_hwm,
+     state.node_id}
+  end
+
   defp send_to_member(%Replica{} = state, target_node, message) do
     shard_name = shard_name(state.name, state.shard_index)
-    send({shard_name, target_node}, wire_encode_message(state, message))
+    send({shard_name, target_node}, wire_encode_message(state, target_node, message))
   end
 
   # Track a remote shard pid in remote_shards. Handles three cases:
@@ -2362,7 +2485,7 @@ defmodule EKV.Replica do
     shard_name = shard_name(state.name, state.shard_index)
 
     for target_node <- Map.keys(state.remote_shards) do
-      send({shard_name, target_node}, wire_encode_message(state, message))
+      send({shard_name, target_node}, wire_encode_message(state, target_node, message))
     end
   end
 
@@ -2394,54 +2517,232 @@ defmodule EKV.Replica do
   # Message tuple shapes stay stable; only the value field is tagged.
   defp wire_encode_message(
          %Replica{} = state,
+         target_node,
          {:ekv_put, key, value_binary, ts, origin, exp, sender_seq}
        ) do
-    {:ekv_put, key, maybe_wire_compress_value(state, value_binary), ts, origin, exp, sender_seq}
+    compress? = remote_supports_feature?(state, target_node, @wire_feature_compression)
+
+    payload =
+      {key, maybe_wire_compress_value(state, value_binary, compress?), ts, origin, exp,
+       sender_seq}
+
+    {:ekv, @wire_protocol_version, :put, payload, %{}}
   end
 
   defp wire_encode_message(
          %Replica{} = _state,
+         _target_node,
          {:ekv_delete, key, ts, origin, sender_seq}
        ) do
-    {:ekv_delete, key, ts, origin, sender_seq}
+    {:ekv, @wire_protocol_version, :delete, {key, ts, origin, sender_seq}, %{}}
   end
 
   defp wire_encode_message(
          %Replica{} = state,
+         target_node,
          {:ekv_accept, ref, proposer_pid, key, ballot_c, ballot_n, entry_tuple, shard}
        ) do
-    {:ekv_accept, ref, proposer_pid, key, ballot_c, ballot_n,
-     wire_compress_entry_tuple(state, entry_tuple), shard}
+    compress? = remote_supports_feature?(state, target_node, @wire_feature_compression)
+
+    payload =
+      {ref, proposer_pid, key, ballot_c, ballot_n,
+       wire_compress_entry_tuple(state, entry_tuple, compress?), shard}
+
+    {:ekv, @wire_protocol_version, :accept, payload, %{}}
   end
 
   defp wire_encode_message(
          %Replica{} = state,
+         target_node,
          {:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple, shard, sender_node,
           sender_seq}
        ) do
-    {:ekv_cas_committed, key, ballot_c, ballot_n, wire_compress_entry_tuple(state, entry_tuple),
-     shard, sender_node, sender_seq}
+    compress? = remote_supports_feature?(state, target_node, @wire_feature_compression)
+
+    payload =
+      {key, ballot_c, ballot_n, wire_compress_entry_tuple(state, entry_tuple, compress?), shard,
+       sender_node, sender_seq}
+
+    {:ekv, @wire_protocol_version, :cas_committed, payload, %{}}
   end
 
-  defp wire_encode_message(%Replica{} = _state, message), do: message
+  defp wire_encode_message(
+         %Replica{} = _state,
+         _target_node,
+         {:ekv_member_connect, pid, shard, num_shards, remote_hwm, remote_node_id}
+       ) do
+    {:ekv, @wire_protocol_version, :member_connect,
+     {pid, shard, num_shards, remote_hwm, remote_node_id}, %{features: wire_features_meta()}}
+  end
 
-  defp wire_compress_entry_tuple(%Replica{} = _state, nil), do: nil
+  defp wire_encode_message(
+         %Replica{} = _state,
+         _target_node,
+         {:ekv_member_connect_ack, pid, shard, num_shards, remote_hwm, remote_node_id}
+       ) do
+    {:ekv, @wire_protocol_version, :member_connect_ack,
+     {pid, shard, num_shards, remote_hwm, remote_node_id}, %{features: wire_features_meta()}}
+  end
+
+  defp wire_encode_message(
+         %Replica{} = _state,
+         _target_node,
+         {:ekv_sync, from_node, shard, entries, sender_seq}
+       ) do
+    {:ekv, @wire_protocol_version, :sync, {from_node, shard, entries, sender_seq}, %{}}
+  end
+
+  defp wire_encode_message(
+         %Replica{} = _state,
+         _target_node,
+         {:ekv_sync_ack, pid, shard, sender_seq}
+       ) do
+    {:ekv, @wire_protocol_version, :sync_ack, {pid, shard, sender_seq}, %{}}
+  end
+
+  defp wire_encode_message(
+         %Replica{} = _state,
+         _target_node,
+         {:ekv_prepare, ref, proposer_pid, key, ballot_c, ballot_n, shard}
+       ) do
+    {:ekv, @wire_protocol_version, :prepare, {ref, proposer_pid, key, ballot_c, ballot_n, shard},
+     %{}}
+  end
+
+  defp wire_encode_message(
+         %Replica{} = _state,
+         _target_node,
+         {:ekv_promise, ref, pid, node_id, acc_c, acc_n, kv_row}
+       ) do
+    {:ekv, @wire_protocol_version, :promise, {ref, pid, node_id, acc_c, acc_n, kv_row}, %{}}
+  end
+
+  defp wire_encode_message(
+         %Replica{} = _state,
+         _target_node,
+         {:ekv_nack, ref, pid, node_id, promised_c, promised_n}
+       ) do
+    {:ekv, @wire_protocol_version, :nack, {ref, pid, node_id, promised_c, promised_n}, %{}}
+  end
+
+  defp wire_encode_message(%Replica{} = _state, _target_node, {:ekv_accepted, ref, pid, node_id}) do
+    {:ekv, @wire_protocol_version, :accepted, {ref, pid, node_id}, %{}}
+  end
+
+  defp wire_encode_message(
+         %Replica{} = _state,
+         _target_node,
+         {:ekv_accept_nack, ref, pid, node_id}
+       ) do
+    {:ekv, @wire_protocol_version, :accept_nack, {ref, pid, node_id}, %{}}
+  end
+
+  defp wire_encode_message(%Replica{} = _state, _target_node, message), do: message
+
+  defp decode_wire_message(:put, {key, value_binary, ts, origin, exp, sender_seq}, _meta) do
+    {:ok, {:ekv_put, key, value_binary, ts, origin, exp, sender_seq}}
+  end
+
+  defp decode_wire_message(:delete, {key, ts, origin, sender_seq}, _meta) do
+    {:ok, {:ekv_delete, key, ts, origin, sender_seq}}
+  end
+
+  defp decode_wire_message(
+         :member_connect,
+         {pid, shard, num_shards, remote_hwm, remote_node_id},
+         meta
+       ) do
+    {:ok,
+     {:ekv_member_connect, pid, shard, num_shards, remote_hwm, remote_node_id,
+      normalize_wire_features(meta)}}
+  end
+
+  defp decode_wire_message(
+         :member_connect_ack,
+         {pid, shard, num_shards, remote_hwm, remote_node_id},
+         meta
+       ) do
+    {:ok,
+     {:ekv_member_connect_ack, pid, shard, num_shards, remote_hwm, remote_node_id,
+      normalize_wire_features(meta)}}
+  end
+
+  defp decode_wire_message(:sync, {from_node, shard, entries, sender_seq}, _meta) do
+    {:ok, {:ekv_sync, from_node, shard, entries, sender_seq}}
+  end
+
+  defp decode_wire_message(:sync_ack, {pid, shard, sender_seq}, _meta) do
+    {:ok, {:ekv_sync_ack, pid, shard, sender_seq}}
+  end
+
+  defp decode_wire_message(:prepare, {ref, proposer_pid, key, ballot_c, ballot_n, shard}, _meta) do
+    {:ok, {:ekv_prepare, ref, proposer_pid, key, ballot_c, ballot_n, shard}}
+  end
+
+  defp decode_wire_message(
+         :accept,
+         {ref, proposer_pid, key, ballot_c, ballot_n, entry_tuple, shard},
+         _meta
+       ) do
+    {:ok, {:ekv_accept, ref, proposer_pid, key, ballot_c, ballot_n, entry_tuple, shard}}
+  end
+
+  defp decode_wire_message(
+         :cas_committed,
+         {key, ballot_c, ballot_n, entry_tuple, shard, sender_node, sender_seq},
+         _meta
+       ) do
+    {:ok,
+     {:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple, shard, sender_node, sender_seq}}
+  end
+
+  defp decode_wire_message(:promise, {ref, pid, node_id, acc_c, acc_n, kv_row}, _meta) do
+    {:ok, {:ekv_promise, ref, pid, node_id, acc_c, acc_n, kv_row}}
+  end
+
+  defp decode_wire_message(:nack, {ref, pid, node_id, promised_c, promised_n}, _meta) do
+    {:ok, {:ekv_nack, ref, pid, node_id, promised_c, promised_n}}
+  end
+
+  defp decode_wire_message(:accepted, {ref, pid, node_id}, _meta) do
+    {:ok, {:ekv_accepted, ref, pid, node_id}}
+  end
+
+  defp decode_wire_message(:accept_nack, {ref, pid, node_id}, _meta) do
+    {:ok, {:ekv_accept_nack, ref, pid, node_id}}
+  end
+
+  defp decode_wire_message(_kind, _payload, _meta), do: :ignore
+
+  defp wire_compress_entry_tuple(%Replica{} = _state, nil, _compress?), do: nil
 
   defp wire_compress_entry_tuple(
          %Replica{} = state,
-         {key, value_binary, timestamp, origin_node_str, expires_at, deleted_at}
+         {key, value_binary, timestamp, origin_node_str, expires_at, deleted_at},
+         compress?
        ) do
-    {key, maybe_wire_compress_value(state, value_binary), timestamp, origin_node_str, expires_at,
-     deleted_at}
+    {key, maybe_wire_compress_value(state, value_binary, compress?), timestamp, origin_node_str,
+     expires_at, deleted_at}
   end
 
-  defp maybe_wire_compress_value(%Replica{} = _state, nil), do: nil
+  defp maybe_wire_compress_value(%Replica{} = _state, nil, _compress?), do: nil
 
-  defp maybe_wire_compress_value(%Replica{wire_compression_threshold: threshold}, value_binary)
+  defp maybe_wire_compress_value(%Replica{} = _state, value_binary, false),
+    do: value_binary
+
+  defp maybe_wire_compress_value(
+         %Replica{wire_compression_threshold: threshold},
+         value_binary,
+         true
+       )
        when threshold in [false, nil],
        do: value_binary
 
-  defp maybe_wire_compress_value(%Replica{wire_compression_threshold: threshold}, value_binary)
+  defp maybe_wire_compress_value(
+         %Replica{wire_compression_threshold: threshold},
+         value_binary,
+         true
+       )
        when is_binary(value_binary) do
     if byte_size(value_binary) >= threshold do
       {@wire_compressed_tag, compress_binary(value_binary)}
@@ -2449,6 +2750,26 @@ defmodule EKV.Replica do
       value_binary
     end
   end
+
+  defp remote_supports_feature?(%Replica{} = state, remote_node, feature) do
+    case Map.get(state.remote_features, remote_node) do
+      %MapSet{} = features -> MapSet.member?(features, feature)
+      _ -> false
+    end
+  end
+
+  defp wire_features_meta do
+    %{features: %{@wire_feature_live_progress => true, @wire_feature_compression => true}}
+  end
+
+  defp normalize_wire_features(%{features: features}) when is_map(features) do
+    features
+    |> Enum.filter(fn {_feature, enabled?} -> enabled? end)
+    |> Enum.map(fn {feature, _enabled?} -> feature end)
+    |> MapSet.new()
+  end
+
+  defp normalize_wire_features(_meta), do: MapSet.new()
 
   # Runs on the receiver member. Raw and compressed value payloads are both accepted.
   defp wire_decompress_entry_tuple(nil), do: nil

@@ -123,19 +123,26 @@ Important:
 
 ### Wire compression
 - `wire_compression_threshold` defaults to `256 * 1024`.
-- Member-to-member replication compresses only large value payloads on the wire:
-  - `{:ekv_put, ...}`
-  - `{:ekv_accept, ...}`
-  - full-payload `{:ekv_cas_committed, ...}`
-- Compression is field-level only:
-  - message tuple shape stays the same
+- Member-to-member wire traffic now uses a versioned envelope:
+  - `{:ekv, 1, kind, payload, meta}`
+- Required fields live in `payload`.
+- Optional/extensible fields live in `meta`.
+- Compression is field-level only on v1 replication messages:
+  - `:put`
+  - `:accept`
+  - full-payload `:cas_committed`
   - the value field may be tagged as `{:ekv_wire_compressed, binary}`
 - Receivers inflate before normal processing.
 - SQLite storage and normal reads remain uncompressed.
-- Current implementation assumes a homogeneous member version set.
-  - There is no capability negotiation.
-  - Mixed old/new running members would be unsafe if compression is enabled.
-  - Intended rollout model is cold deploy, not mixed-version rolling upgrade.
+- Features are negotiated in `:member_connect` / `:member_connect_ack` meta.
+  - Current advertised features:
+    - `:live_progress`
+    - `:wire_compression`
+- Version determines parse shape.
+- Features determine which optional send-side behaviors are allowed.
+- There is still no support for unversioned/old mixed-member overlap.
+  - This is a fresh protocol reset, not a bridge.
+  - Intended rollout model is cold deploy or a cluster rename/reset.
 
 ### Client routing
 - `EKV.ClientRouter` is the client control plane.
@@ -243,7 +250,9 @@ Important:
 - If visible logical members exceed `cluster_size`, CAS must fail with `{:error, :cluster_overflow}`.
 
 ### Sync / HWM correctness
-- `kv_member_hwm` is monotonic.
+- `kv_member_hwm` is not monotonic by design.
+  - It tracks the sender's latest advertised sequence space exactly.
+  - If a sender restarts/restores to a lower local max seq, the stored HWM must be allowed to move lower too.
 - Sender stores member HWM as sender snapshot `my_seq`, not remote sequence.
 - Delta sync is only valid when the member cursor is still inside the local oplog window.
 - Otherwise force full sync.
@@ -251,10 +260,14 @@ Important:
   - This is not a second protocol.
   - It reuses the same HWM-driven delta/full sync path.
   - The goal is to heal missed replication without waiting for reconnect.
+- Live replication now advances sender/receiver progress directly.
+  - `sender_seq` is part of the required v1 replication payload.
+  - Receivers ack that progress via `:sync_ack`, even when the merge is a no-op.
+  - Anti-entropy should now repair true misses instead of replaying the healthy recent tail every interval.
 - Chunked sync rules matter:
   - intermediate chunks use seq `0`
-  - final chunk must send a non-zero terminal seq
-  - exact-multiple chunk sizes still require a final non-zero seq chunk
+  - final chunk must send the real terminal seq
+  - empty full sync and empty delta still need a terminal sync/ack settlement so HWM can move to `0` or another lowered cursor
 
 ### Long partition protection
 - Startup stale-db rejection:

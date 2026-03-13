@@ -335,6 +335,9 @@ defmodule EKV.AdversarialVerificationTest do
       {:trace, _, :send, {:ekv_sync, _, _, entries, seq}, _} ->
         collect_trace_sync_details([{length(entries), seq} | acc])
 
+      {:trace, _, :send, {:ekv, 1, :sync, {_, _, entries, seq}, _meta}, _} ->
+        collect_trace_sync_details([{length(entries), seq} | acc])
+
       {:trace, _, :send, _, _} ->
         collect_trace_sync_details(acc)
     after
