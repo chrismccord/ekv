@@ -195,6 +195,67 @@ defmodule EKV.AntiEntropyTest do
       )
     end
 
+    test "live LWW replication advances remote progress so anti-entropy stays quiet" do
+      peers = TestCluster.start_peers(2)
+      [{_, node_a}, {_, node_b}] = peers
+      ekv_name = unique_name(:anti_entropy_live_lww)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      start_cluster(peers, ekv_name, anti_entropy_interval: false)
+
+      write_many(node_a, ekv_name, "live_lww", 5)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.keys_count(node_b, ekv_name, "live_lww/") == 5
+      end)
+
+      a_max = TestCluster.max_seq(node_a, ekv_name)
+
+      TestCluster.assert_eventually(fn ->
+        state = TestCluster.replica_state(node_a, ekv_name)
+
+        Map.get(state.remote_member_hwms, node_b) == a_max and
+          TestCluster.member_hwm(node_a, ekv_name, node_b) == a_max
+      end)
+
+      assert :ok = TestCluster.trace_shard_sends(node_a, ekv_name, self())
+      assert :ok = TestCluster.trigger_anti_entropy(node_a, ekv_name)
+      assert_no_sync_messages(400)
+      assert :ok = TestCluster.untrace_shard_sends(node_a, ekv_name)
+    end
+
+    test "live CAS commit replication advances remote progress so anti-entropy stays quiet" do
+      peers = TestCluster.start_peers(2)
+      [{_, node_a}, {_, node_b}] = peers
+      ekv_name = unique_name(:anti_entropy_live_cas)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      start_cluster(peers, ekv_name, anti_entropy_interval: false)
+
+      assert {:ok, _vsn} =
+               TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "live_cas/1", "v1", [if_vsn: nil]])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, EKV, :get, [ekv_name, "live_cas/1"]) == "v1"
+      end)
+
+      a_max = TestCluster.max_seq(node_a, ekv_name)
+
+      TestCluster.assert_eventually(fn ->
+        state = TestCluster.replica_state(node_a, ekv_name)
+
+        Map.get(state.remote_member_hwms, node_b) == a_max and
+          TestCluster.member_hwm(node_a, ekv_name, node_b) == a_max
+      end)
+
+      assert :ok = TestCluster.trace_shard_sends(node_a, ekv_name, self())
+      assert :ok = TestCluster.trigger_anti_entropy(node_a, ekv_name)
+      assert_no_sync_messages(400)
+      assert :ok = TestCluster.untrace_shard_sends(node_a, ekv_name)
+    end
+
     test "multi-shard connected stale member converges on all affected shards" do
       peers = TestCluster.start_peers(3)
       [{_, node_a}, {_, node_b}, {_, node_c}] = peers

@@ -1123,7 +1123,7 @@ defmodule EKVTest do
 
       send(
         shard_name,
-        {:ekv_put, "lww_sub_key", value_binary, high_ts, :big_node@host, nil}
+        {:ekv_put, "lww_sub_key", value_binary, high_ts, :big_node@host, nil, 0}
       )
 
       :sys.get_state(shard_name)
@@ -1137,7 +1137,7 @@ defmodule EKVTest do
 
       send(
         shard_name,
-        {:ekv_put, "lww_sub_key", loser_binary, low_ts, :small_node@host, nil}
+        {:ekv_put, "lww_sub_key", loser_binary, low_ts, :small_node@host, nil, 0}
       )
 
       :sys.get_state(shard_name)
@@ -1293,7 +1293,7 @@ defmodule EKVTest do
 
       now = System.system_time(:nanosecond)
       val = :erlang.term_to_binary("remote_val")
-      send(shard_name, {:ekv_put, "remote_put_key", val, now, :remote@host, nil})
+      send(shard_name, {:ekv_put, "remote_put_key", val, now, :remote@host, nil, 0})
       :sys.get_state(shard_name)
       flush_dispatchers(name)
 
@@ -1313,7 +1313,7 @@ defmodule EKVTest do
 
       send(
         shard_name,
-        {:ekv_put, "remote_put_compressed_key", wire_compress(val), now, :remote@host, nil}
+        {:ekv_put, "remote_put_compressed_key", wire_compress(val), now, :remote@host, nil, 0}
       )
 
       :sys.get_state(shard_name)
@@ -1339,7 +1339,7 @@ defmodule EKVTest do
       :ok = EKV.subscribe(name, "remote_del_key")
 
       now = System.system_time(:nanosecond) + 1_000_000_000
-      send(shard_name, {:ekv_delete, "remote_del_key", now, :remote@host})
+      send(shard_name, {:ekv_delete, "remote_del_key", now, :remote@host, 0})
       :sys.get_state(shard_name)
       flush_dispatchers(name)
 
@@ -3690,7 +3690,7 @@ defmodule EKVTest do
       assert EKV.get(name, key) == nil
 
       # Commit notification → promote
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0})
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, node(), 0})
       :sys.get_state(shard_name)
 
       assert EKV.get(name, key) == "promoted"
@@ -3714,7 +3714,7 @@ defmodule EKVTest do
       refute_receive {:ekv, _, _}, 100
 
       # Commit — event dispatched
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0})
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, node(), 0})
       :sys.get_state(shard_name)
       flush_dispatchers(name)
 
@@ -3734,7 +3734,7 @@ defmodule EKVTest do
       val_bin = :erlang.term_to_binary("payload_put")
       entry_tuple = {key, val_bin, now, origin_str, nil, nil}
 
-      send(shard_name, {:ekv_cas_committed, key, 150, "2", entry_tuple, 0})
+      send(shard_name, {:ekv_cas_committed, key, 150, "2", entry_tuple, 0, node(), 0})
       :sys.get_state(shard_name)
       flush_dispatchers(name)
 
@@ -3755,7 +3755,7 @@ defmodule EKVTest do
       val_bin = :erlang.term_to_binary("payload_put_compressed")
       entry_tuple = {key, wire_compress(val_bin), now, origin_str, nil, nil}
 
-      send(shard_name, {:ekv_cas_committed, key, 151, "2", entry_tuple, 0})
+      send(shard_name, {:ekv_cas_committed, key, 151, "2", entry_tuple, 0, node(), 0})
       :sys.get_state(shard_name)
       flush_dispatchers(name)
 
@@ -3788,7 +3788,7 @@ defmodule EKVTest do
       origin_str = Atom.to_string(node())
       entry_tuple = {key, nil, now, origin_str, nil, now}
 
-      send(shard_name, {:ekv_cas_committed, key, 250, "3", entry_tuple, 0})
+      send(shard_name, {:ekv_cas_committed, key, 250, "3", entry_tuple, 0, node(), 0})
       :sys.get_state(shard_name)
       flush_dispatchers(name)
 
@@ -3816,7 +3816,7 @@ defmodule EKVTest do
       assert_receive {:ekv_accepted, ^ref2, _, _}, 1000
 
       # Stale commit for ballot {100, "2"} — should be ignored
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0})
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, node(), 0})
       :sys.get_state(shard_name)
 
       # Neither value promoted to kv
@@ -3839,7 +3839,7 @@ defmodule EKVTest do
       assert_receive {:ekv_accepted, ^ref, _, _}, 1000
 
       # Commit → promote
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0})
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, node(), 0})
       :sys.get_state(shard_name)
 
       assert EKV.get(name, key) == "clear_test"
@@ -3936,7 +3936,7 @@ defmodule EKVTest do
       assert EKV.get(name, key) == "v1"
 
       # Commit → promote writes tombstone to kv
-      send(shard_name, {:ekv_cas_committed, key, 200, "2", nil, 0})
+      send(shard_name, {:ekv_cas_committed, key, 200, "2", nil, 0, node(), 0})
       :sys.get_state(shard_name)
       flush_dispatchers(name)
 
@@ -4313,12 +4313,12 @@ defmodule EKVTest do
       assert_receive {:ekv_accepted, ^ref2, _, _}, 1000
 
       # Stale commit for ballot {100, "2"} — should return :stale, value NOT in kv
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0})
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, node(), 0})
       :sys.get_state(shard_name)
       assert EKV.get(name, key) == nil
 
       # Commit for ballot {200, "3"} — should succeed
-      send(shard_name, {:ekv_cas_committed, key, 200, "3", nil, 0})
+      send(shard_name, {:ekv_cas_committed, key, 200, "3", nil, 0, node(), 0})
       :sys.get_state(shard_name)
       assert EKV.get(name, key) == "v2"
     end
@@ -4340,7 +4340,7 @@ defmodule EKVTest do
       Process.sleep(50)
 
       # First commit — succeeds
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0})
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, node(), 0})
       :sys.get_state(shard_name)
       flush_dispatchers(name)
 
@@ -4348,7 +4348,7 @@ defmodule EKVTest do
       assert_receive {:ekv, [%EKV.Event{type: :put, key: ^key, value: "dup_val"}], _}, 1000
 
       # Second commit (duplicate) replays the same promoted value/event.
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0})
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, node(), 0})
       :sys.get_state(shard_name)
       flush_dispatchers(name)
 
@@ -4447,7 +4447,7 @@ defmodule EKVTest do
       assert_receive {:ekv_accepted, ^ref_accept_b, _, _}, 1000
 
       # B commits
-      send(shard_name, {:ekv_cas_committed, key, 200, "3", nil, 0})
+      send(shard_name, {:ekv_cas_committed, key, 200, "3", nil, 0, node(), 0})
       :sys.get_state(shard_name)
       assert EKV.get(name, key) == "from_b"
     end
@@ -4485,7 +4485,7 @@ defmodule EKVTest do
       send(shard_name, {:ekv_accept, ref_accept, self(), key, 100, "2", entry, 0})
       assert_receive {:ekv_accepted, ^ref_accept, _, _}, 1000
 
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0})
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, node(), 0})
       :sys.get_state(shard_name)
 
       assert EKV.get(name, key) == "cas_val"
@@ -4526,7 +4526,7 @@ defmodule EKVTest do
       end)
 
       # Send commit notification — kv_paxos should still have the accepted value
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0})
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, node(), 0})
       :sys.get_state(shard_name)
 
       assert EKV.get(name, key) == "survive_restart"

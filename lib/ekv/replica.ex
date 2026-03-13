@@ -195,19 +195,25 @@ defmodule EKV.Replica do
         │                          │                           │
         │                          │ {:ekv_put, key,           │
         │                          │  value_binary, ts,        │
-        │                          │  origin_node, expires_at} │
+        │                          │  origin_node, expires_at, │
+        │                          │  sender_seq}              │
         │                          │──────────────────────────>│
         │                          │  (fire-and-forget to      │
         │                          │   each known member)      │
+        │                          │<──────────────────────────│
+        │                          │ {:ekv_sync_ack, ...,      │
+        │                          │  sender_seq}              │
         │                          │                           │
         │<─────────────────────────│                           │
         │         :ok              │                           │
 
   Delete is identical but sets deleted_at = now and value = nil.
-  Broadcast message: `{:ekv_delete, key, ts, origin_node}`.
+  Broadcast message: `{:ekv_delete, key, ts, origin_node, sender_seq}`.
 
   On the receiving side, merge_remote_entry calls the same write_entry
-  NIF with the remote's timestamp — LWW decides whether to apply.
+  NIF with the remote's timestamp — LWW decides whether to apply. Receivers
+  still ack `sender_seq` even when the merge is a no-op, so anti-entropy
+  tracks "processed up through seq X" instead of replaying recent live writes.
 
   Large replicated value payloads may be compressed on the wire only.
   The message shape stays the same, but the value field may be tagged as
@@ -915,8 +921,8 @@ defmodule EKV.Replica do
   ## Message Reference
 
   Steady-state LWW replication (per-operation, fire-and-forget):
-    {:ekv_put, key, value_binary, timestamp, origin_node, expires_at}
-    {:ekv_delete, key, timestamp, origin_node}
+    {:ekv_put, key, value_binary, timestamp, origin_node, expires_at, sender_seq}
+    {:ekv_delete, key, timestamp, origin_node, sender_seq}
 
   Member handshake (on nodeup / init):
     {:ekv_member_connect, pid, shard_index, num_shards, my_hwm_for_remote, node_id}
@@ -936,7 +942,7 @@ defmodule EKV.Replica do
   CAS proposer → members:
     {:ekv_prepare, ref, proposer_pid, key, ballot_c, ballot_n, shard}
     {:ekv_accept, ref, proposer_pid, key, ballot_c, ballot_n, entry_tuple, shard}
-    {:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple, shard}
+    {:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple, shard, sender_node, sender_seq}
 
   CAS acceptors → proposer:
     {:ekv_promise, ref, pid, node_id, acc_c, acc_n, kv_row}
@@ -1200,7 +1206,12 @@ defmodule EKV.Replica do
         )
 
       if applied do
-        broadcast_to_members(state, {:ekv_put, key, value_binary, now, origin_node, expires_at})
+        sender_seq = Store.max_seq(db)
+
+        broadcast_to_members(
+          state,
+          {:ekv_put, key, value_binary, now, origin_node, expires_at, sender_seq}
+        )
 
         dispatch_events(state, [
           %EKV.Event{type: :put, key: key, value: :erlang.binary_to_term(value_binary)}
@@ -1235,7 +1246,8 @@ defmodule EKV.Replica do
         )
 
       if applied do
-        broadcast_to_members(state, {:ekv_delete, key, now, origin_node})
+        sender_seq = Store.max_seq(db)
+        broadcast_to_members(state, {:ekv_delete, key, now, origin_node, sender_seq})
         dispatch_events(state, [%EKV.Event{type: :delete, key: key, value: prev_value}])
       end
 
@@ -1347,13 +1359,15 @@ defmodule EKV.Replica do
   # =====================================================================
 
   def handle_info(
-        {:ekv_put, key, value_binary, timestamp, origin_node, expires_at},
+        {:ekv_put, key, value_binary, timestamp, origin_node, expires_at, sender_seq},
         %Replica{} = state
       ) do
     value_binary = wire_decompress_value(value_binary)
 
     {:ok, applied} =
       merge_remote_entry(state, key, value_binary, timestamp, origin_node, expires_at, nil)
+
+    ack_live_progress(state, origin_node, sender_seq)
 
     if applied do
       dispatch_events(state, [
@@ -1364,11 +1378,13 @@ defmodule EKV.Replica do
     {:noreply, state}
   end
 
-  def handle_info({:ekv_delete, key, timestamp, origin_node}, %Replica{} = state) do
+  def handle_info({:ekv_delete, key, timestamp, origin_node, sender_seq}, %Replica{} = state) do
     prev_value = if has_subscribers?(state), do: read_previous_value(state, key)
 
     {:ok, applied} =
       merge_remote_entry(state, key, nil, timestamp, origin_node, nil, timestamp)
+
+    ack_live_progress(state, origin_node, sender_seq)
 
     if applied do
       dispatch_events(state, [%EKV.Event{type: :delete, key: key, value: prev_value}])
@@ -1482,9 +1498,10 @@ defmodule EKV.Replica do
   def handle_info({:ekv_sync_ack, remote_pid, remote_shard, their_seq}, %Replica{} = state)
       when remote_shard == state.shard_index do
     remote_node = node(remote_pid)
+    local_max_seq = Store.max_seq(state.db)
 
     state =
-      if is_integer(their_seq) and their_seq >= 0 do
+      if is_integer(their_seq) and their_seq >= 0 and their_seq <= local_max_seq do
         Store.set_hwm(state.db, remote_node, their_seq)
         track_remote_member_hwm(state, remote_node, their_seq)
       else
@@ -1630,11 +1647,14 @@ defmodule EKV.Replica do
 
   # CAS commit notification carries committed entry tuple.
   def handle_info(
-        {:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple, _shard},
+        {:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple, _shard, sender_node,
+         sender_seq},
         %Replica{} = state
       ) do
     entry_tuple = wire_decompress_entry_tuple(entry_tuple)
-    {:noreply, apply_cas_commit(state, key, ballot_c, ballot_n, entry_tuple)}
+    state = apply_cas_commit(state, key, ballot_c, ballot_n, entry_tuple)
+    ack_live_progress(state, sender_node, sender_seq)
+    {:noreply, state}
   end
 
   # =====================================================================
@@ -1816,7 +1836,8 @@ defmodule EKV.Replica do
             )
 
           if applied do
-            broadcast_to_members(state, {:ekv_delete, key, now, origin})
+            sender_seq = Store.max_seq(db)
+            broadcast_to_members(state, {:ekv_delete, key, now, origin, sender_seq})
             prev_value = if value_binary, do: :erlang.binary_to_term(value_binary)
             [%EKV.Event{type: :expired, key: key, value: prev_value} | acc]
           else
@@ -2331,22 +2352,37 @@ defmodule EKV.Replica do
   # that may have missed accept (or whose node_id is ambiguous during blue-green
   # overlap) still receive the full entry_tuple so they can recover via
   # paxos_accept + paxos_promote on commit.
-  defp broadcast_cas_commit(%Replica{} = state, %{key: key, ballot: {ballot_c, ballot_n}} = op) do
+  defp broadcast_cas_commit(
+         %Replica{} = state,
+         %{key: key, ballot: {ballot_c, ballot_n}} = op,
+         sender_seq
+       ) do
     for {target_node, _pid} <- state.remote_shards do
       entry_tuple = commit_payload_for_member(state, target_node, op)
 
       send_to_member(
         state,
         target_node,
-        {:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple, state.shard_index}
+        {:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple, state.shard_index, node(),
+         sender_seq}
       )
     end
   end
 
   # Runs on the sender member. Only large replicated value payloads are compressed.
   # Message tuple shapes stay stable; only the value field is tagged.
-  defp wire_encode_message(%Replica{} = state, {:ekv_put, key, value_binary, ts, origin, exp}) do
-    {:ekv_put, key, maybe_wire_compress_value(state, value_binary), ts, origin, exp}
+  defp wire_encode_message(
+         %Replica{} = state,
+         {:ekv_put, key, value_binary, ts, origin, exp, sender_seq}
+       ) do
+    {:ekv_put, key, maybe_wire_compress_value(state, value_binary), ts, origin, exp, sender_seq}
+  end
+
+  defp wire_encode_message(
+         %Replica{} = _state,
+         {:ekv_delete, key, ts, origin, sender_seq}
+       ) do
+    {:ekv_delete, key, ts, origin, sender_seq}
   end
 
   defp wire_encode_message(
@@ -2359,10 +2395,11 @@ defmodule EKV.Replica do
 
   defp wire_encode_message(
          %Replica{} = state,
-         {:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple, shard}
+         {:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple, shard, sender_node,
+          sender_seq}
        ) do
     {:ekv_cas_committed, key, ballot_c, ballot_n, wire_compress_entry_tuple(state, entry_tuple),
-     shard}
+     shard, sender_node, sender_seq}
   end
 
   defp wire_encode_message(%Replica{} = _state, message), do: message
@@ -2654,10 +2691,11 @@ defmodule EKV.Replica do
            ballot_n
          ) do
       {:ok, _value_binary, _ts, _origin, _expires, _deleted_at, _prev_value_binary} ->
+        sender_seq = Store.max_seq(db)
         cancel_timer(op.timer)
         dispatch_events(state, op.events)
         GenServer.reply(op.from, op.reply_value)
-        broadcast_cas_commit(state, op)
+        broadcast_cas_commit(state, op, sender_seq)
         %{state | pending_cas: Map.delete(state.pending_cas, ref)}
 
       {:ok, :stale} ->
@@ -3015,6 +3053,15 @@ defmodule EKV.Replica do
       ])
     end
   end
+
+  defp ack_live_progress(%Replica{} = state, sender_node, sender_seq)
+       when is_atom(sender_node) and is_integer(sender_seq) and sender_seq >= 0 do
+    Store.set_hwm(state.db, sender_node, sender_seq)
+    send_to_member(state, sender_node, {:ekv_sync_ack, self(), state.shard_index, sender_seq})
+    :ok
+  end
+
+  defp ack_live_progress(%Replica{} = _state, _sender_node, _sender_seq), do: :ok
 
   defp commit_payload_for_member(%Replica{} = state, target_node, op) do
     case Map.get(state.member_node_ids, target_node) do
