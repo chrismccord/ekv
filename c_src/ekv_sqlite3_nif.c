@@ -481,12 +481,12 @@ static ERL_NIF_TERM ekv_release(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
 
 /* ------------------------------------------------------------------ */
 /* NIF: write_entry(db, kv_stmt, oplog_stmt, kv_args, oplog_args)      */
-/*   -> {:ok, true|false} | {:error, msg}                              */
+/*   -> {:ok, true, seq} | {:ok, false} | {:error, msg}                */
 /*                                                                     */
 /* Single dirty IO bounce: BEGIN IMMEDIATE, bind+step kv upsert,       */
 /* check sqlite3_changes() for LWW result. If 0 (LWW lost), ROLLBACK  */
-/* and return {:ok, false}. Otherwise bind+step oplog, COMMIT, return  */
-/* {:ok, true}.                                                        */
+/* and return {:ok, false}. Otherwise bind+step oplog, capture the     */
+/* inserted rowid as the durable seq, COMMIT, return {:ok, true, seq}. */
 /* ------------------------------------------------------------------ */
 
 static ERL_NIF_TERM ekv_write_entry(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
@@ -571,6 +571,7 @@ static ERL_NIF_TERM ekv_write_entry(ErlNifEnv *env, int argc, const ERL_NIF_TERM
         enif_mutex_unlock(conn->mutex);
         return err;
     }
+    sqlite3_int64 seq = sqlite3_last_insert_rowid(conn->db);
     sqlite3_reset(oplog_s->stmt);
 
     /* 6. COMMIT */
@@ -583,7 +584,12 @@ static ERL_NIF_TERM ekv_write_entry(ErlNifEnv *env, int argc, const ERL_NIF_TERM
     }
 
     enif_mutex_unlock(conn->mutex);
-    return enif_make_tuple2(env, atom_ok, atom_true);
+    return enif_make_tuple3(
+        env,
+        atom_ok,
+        atom_true,
+        enif_make_int64(env, (ErlNifSInt64)seq)
+    );
 }
 
 /* ------------------------------------------------------------------ */
@@ -1301,7 +1307,7 @@ static ERL_NIF_TERM ekv_paxos_accept(ErlNifEnv *env, int argc, const ERL_NIF_TER
 /* ------------------------------------------------------------------ */
 /* NIF: paxos_promote(db, kv_force_stmt, oplog_stmt, key,             */
 /*                    ballot_c, ballot_n)                              */
-/*   -> {:ok, value, ts, origin, expires, deleted, prev_value|nil}     */
+/*   -> {:ok, value, ts, origin, expires, deleted, prev_value|nil, seq}*/
 /*   -> {:ok, :stale}                                                  */
 /*   -> {:error, msg}                                                  */
 /*                                                                     */
@@ -1532,6 +1538,7 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
         enif_mutex_unlock(conn->mutex);
         return err;
     }
+    sqlite3_int64 seq = sqlite3_last_insert_rowid(conn->db);
     sqlite3_reset(oplog_s->stmt);
 
     /* 7. COMMIT */
@@ -1549,9 +1556,19 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
 
     enif_mutex_unlock(conn->mutex);
 
-    /* {:ok, value, timestamp, origin, expires_at, deleted_at, prev_value_or_nil} */
-    return enif_make_tuple(env, 7, atom_ok,
-        value_term, ts_term, origin_term, expires_term, deleted_term, prev_value);
+    /* {:ok, value, timestamp, origin, expires_at, deleted_at, prev_value_or_nil, seq} */
+    return enif_make_tuple(
+        env,
+        8,
+        atom_ok,
+        value_term,
+        ts_term,
+        origin_term,
+        expires_term,
+        deleted_term,
+        prev_value,
+        enif_make_int64(env, (ErlNifSInt64)seq)
+    );
 }
 
 /* ------------------------------------------------------------------ */

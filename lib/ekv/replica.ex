@@ -1226,35 +1226,34 @@ defmodule EKV.Replica do
       ttl = Keyword.get(opts, :ttl)
       expires_at = if ttl, do: now + ttl * 1_000_000
 
-      {:ok, applied} =
-        Store.write_entry(
-          db,
-          stmts.kv_upsert,
-          stmts.oplog_insert,
-          key,
-          value_binary,
-          now,
-          origin_node,
-          expires_at,
-          nil
-        )
-
       state =
-        if applied do
-          {state, sender_seq} = advance_local_max_seq(state)
+        case Store.write_entry(
+               db,
+               stmts.kv_upsert,
+               stmts.oplog_insert,
+               key,
+               value_binary,
+               now,
+               origin_node,
+               expires_at,
+               nil
+             ) do
+          {:ok, true, sender_seq} ->
+            state = set_local_max_seq(state, sender_seq)
 
-          broadcast_to_members(
-            state,
-            {:ekv_put, key, value_binary, now, origin_node, expires_at, sender_seq}
-          )
+            broadcast_to_members(
+              state,
+              {:ekv_put, key, value_binary, now, origin_node, expires_at, sender_seq}
+            )
 
-          dispatch_events(state, [
-            %EKV.Event{type: :put, key: key, value: :erlang.binary_to_term(value_binary)}
-          ])
+            dispatch_events(state, [
+              %EKV.Event{type: :put, key: key, value: :erlang.binary_to_term(value_binary)}
+            ])
 
-          state
-        else
-          state
+            state
+
+          {:ok, false} ->
+            state
         end
 
       {:reply, :ok, state}
@@ -1271,27 +1270,26 @@ defmodule EKV.Replica do
     else
       prev_value = if has_subscribers?(state), do: read_previous_value(state, key)
 
-      {:ok, applied} =
-        Store.write_entry(
-          db,
-          stmts.kv_upsert,
-          stmts.oplog_insert,
-          key,
-          nil,
-          now,
-          origin_node,
-          nil,
-          now
-        )
-
       state =
-        if applied do
-          {state, sender_seq} = advance_local_max_seq(state)
-          broadcast_to_members(state, {:ekv_delete, key, now, origin_node, sender_seq})
-          dispatch_events(state, [%EKV.Event{type: :delete, key: key, value: prev_value}])
-          state
-        else
-          state
+        case Store.write_entry(
+               db,
+               stmts.kv_upsert,
+               stmts.oplog_insert,
+               key,
+               nil,
+               now,
+               origin_node,
+               nil,
+               now
+             ) do
+          {:ok, true, sender_seq} ->
+            state = set_local_max_seq(state, sender_seq)
+            broadcast_to_members(state, {:ekv_delete, key, now, origin_node, sender_seq})
+            dispatch_events(state, [%EKV.Event{type: :delete, key: key, value: prev_value}])
+            state
+
+          {:ok, false} ->
+            state
         end
 
       {:reply, :ok, state}
@@ -1944,26 +1942,25 @@ defmodule EKV.Replica do
         else
           origin = node()
 
-          {:ok, applied} =
-            Store.write_entry(
-              db,
-              state.stmts.kv_upsert,
-              state.stmts.oplog_insert,
-              key,
-              nil,
-              now,
-              origin,
-              nil,
-              now
-            )
+          case Store.write_entry(
+                 db,
+                 state.stmts.kv_upsert,
+                 state.stmts.oplog_insert,
+                 key,
+                 nil,
+                 now,
+                 origin,
+                 nil,
+                 now
+               ) do
+            {:ok, true, sender_seq} ->
+              state = set_local_max_seq(state, sender_seq)
+              broadcast_to_members(state, {:ekv_delete, key, now, origin, sender_seq})
+              prev_value = if value_binary, do: :erlang.binary_to_term(value_binary)
+              {state, [%EKV.Event{type: :expired, key: key, value: prev_value} | acc]}
 
-          if applied do
-            {state, sender_seq} = advance_local_max_seq(state)
-            broadcast_to_members(state, {:ekv_delete, key, now, origin, sender_seq})
-            prev_value = if value_binary, do: :erlang.binary_to_term(value_binary)
-            {state, [%EKV.Event{type: :expired, key: key, value: prev_value} | acc]}
-          else
-            {state, acc}
+            {:ok, false} ->
+              {state, acc}
           end
         end
       end)
@@ -2211,8 +2208,8 @@ defmodule EKV.Replica do
            expires_at,
            deleted_at
          ) do
-      {:ok, true} ->
-        {state, _sender_seq} = advance_local_max_seq(state)
+      {:ok, true, sender_seq} ->
+        state = set_local_max_seq(state, sender_seq)
         {true, state}
 
       {:ok, false} ->
@@ -3077,8 +3074,8 @@ defmodule EKV.Replica do
            ballot_c,
            ballot_n
          ) do
-      {:ok, _value_binary, _ts, _origin, _expires, _deleted_at, _prev_value_binary} ->
-        {state, sender_seq} = advance_local_max_seq(state)
+      {:ok, _value_binary, _ts, _origin, _expires, _deleted_at, _prev_value_binary, sender_seq} ->
+        state = set_local_max_seq(state, sender_seq)
         cancel_timer(op.timer)
         dispatch_events(state, op.events)
         GenServer.reply(op.from, op.reply_value)
@@ -3169,9 +3166,8 @@ defmodule EKV.Replica do
     {now, %{state | lww_ts_counter: now}}
   end
 
-  defp advance_local_max_seq(%Replica{} = state) do
-    next = state.local_max_seq + 1
-    {%{state | local_max_seq: next}, next}
+  defp set_local_max_seq(%Replica{} = state, seq) when is_integer(seq) and seq >= 0 do
+    %{state | local_max_seq: seq}
   end
 
   defp decode_kv_row(nil), do: {nil, nil}
@@ -3386,8 +3382,8 @@ defmodule EKV.Replica do
            ballot_c,
            ballot_n
          ) do
-      {:ok, value_binary, _ts, _origin, _expires, deleted_at, prev_value_binary} ->
-        {state, _sender_seq} = advance_local_max_seq(state)
+      {:ok, value_binary, _ts, _origin, _expires, deleted_at, prev_value_binary, sender_seq} ->
+        state = set_local_max_seq(state, sender_seq)
         dispatch_promote_event(state, key, value_binary, deleted_at, prev_value_binary)
         state
 
@@ -3408,8 +3404,9 @@ defmodule EKV.Replica do
                      ballot_c,
                      ballot_n
                    ) do
-                {:ok, promoted_value, _ts, _origin, _expires, promoted_deleted, prev_value_binary} ->
-                  {state, _sender_seq} = advance_local_max_seq(state)
+                {:ok, promoted_value, _ts, _origin, _expires, promoted_deleted, prev_value_binary,
+                 sender_seq} ->
+                  state = set_local_max_seq(state, sender_seq)
 
                   dispatch_promote_event(
                     state,

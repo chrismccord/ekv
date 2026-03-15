@@ -260,7 +260,7 @@ defmodule EKV.Store do
   @doc """
   Combined write: LWW check + kv upsert + oplog insert in a single NIF call.
 
-  Returns {:ok, true} if the write was applied (LWW won or new key),
+  Returns {:ok, true, seq} if the write was applied (LWW won or new key),
   or {:ok, false} if the write was skipped (LWW lost).
   """
   def write_entry(

@@ -209,7 +209,7 @@ defmodule EKVTest do
       # Write with ts=1000
       val1 = :erlang.term_to_binary("winner")
 
-      {:ok, true} =
+      {:ok, true, _seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -251,7 +251,7 @@ defmodule EKVTest do
       # Write from node_a
       val_a = :erlang.term_to_binary("from_a")
 
-      {:ok, true} =
+      {:ok, true, _seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -266,7 +266,7 @@ defmodule EKVTest do
       # Write from node_b with same timestamp — node_b > node_a lexicographically, should win
       val_b = :erlang.term_to_binary("from_b")
 
-      {:ok, true} =
+      {:ok, true, _seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -322,7 +322,7 @@ defmodule EKVTest do
         # Write from loser first
         val_l = :erlang.term_to_binary(:loser_val)
 
-        {:ok, true} =
+        {:ok, true, _seq} =
           EKV.Store.write_entry(
             db,
             stmts.kv_upsert,
@@ -337,7 +337,7 @@ defmodule EKVTest do
         # Write from winner with same timestamp — should win
         val_w = :erlang.term_to_binary(:winner_val)
 
-        {:ok, true} =
+        {:ok, true, _seq} =
           EKV.Store.write_entry(
             db,
             stmts.kv_upsert,
@@ -381,7 +381,7 @@ defmodule EKVTest do
       # Put from node_a
       val = :erlang.term_to_binary("alive")
 
-      {:ok, true} =
+      {:ok, true, _seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -394,7 +394,7 @@ defmodule EKVTest do
         )
 
       # Delete from node_b at same timestamp — node_b > node_a, delete wins
-      {:ok, true} =
+      {:ok, true, _seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -432,7 +432,7 @@ defmodule EKVTest do
       %{db: db, stmts: stmts} = :sys.get_state(shard_name)
 
       # Delete at ts=1000
-      {:ok, true} =
+      {:ok, true, _seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -450,7 +450,7 @@ defmodule EKVTest do
       # Put at ts=2000 — higher timestamp, should win
       val = :erlang.term_to_binary("resurrected")
 
-      {:ok, true} =
+      {:ok, true, _seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -473,7 +473,7 @@ defmodule EKVTest do
 
       val1 = :erlang.term_to_binary("first")
 
-      {:ok, true} =
+      {:ok, true, _seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -544,7 +544,7 @@ defmodule EKVTest do
       for i <- 1..3 do
         val = :erlang.term_to_binary("val_#{i}")
 
-        {:ok, true} =
+        {:ok, true, _seq} =
           EKV.Store.write_entry(
             db,
             stmts.kv_upsert,
@@ -597,7 +597,7 @@ defmodule EKVTest do
       for i <- 1..10 do
         val = :erlang.term_to_binary("val_#{i}")
 
-        {:ok, true} =
+        {:ok, true, _seq} =
           EKV.Store.write_entry(
             db,
             stmts.kv_upsert,
@@ -643,7 +643,7 @@ defmodule EKVTest do
       past = now - 1_000_000_000
       val = :erlang.term_to_binary("doomed")
 
-      {:ok, true} =
+      {:ok, true, _seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -694,7 +694,7 @@ defmodule EKVTest do
       now = System.system_time(:nanosecond)
       val = :erlang.term_to_binary("to_be_purged")
 
-      {:ok, true} =
+      {:ok, true, _seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -706,7 +706,7 @@ defmodule EKVTest do
           nil
         )
 
-      {:ok, true} =
+      {:ok, true, _seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -747,7 +747,7 @@ defmodule EKVTest do
       expired_at = now - (config.tombstone_ttl * 1_000_000 + 1_000_000)
       val = :erlang.term_to_binary("old_expired")
 
-      {:ok, true} =
+      {:ok, true, _seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -783,7 +783,7 @@ defmodule EKVTest do
       for i <- 1..10 do
         val = :erlang.term_to_binary("v_#{i}")
 
-        {:ok, true} =
+        {:ok, true, _seq} =
           EKV.Store.write_entry(
             db,
             stmts.kv_upsert,
@@ -934,7 +934,7 @@ defmodule EKVTest do
       past = now - 1_000_000_000
       val = :erlang.term_to_binary("expired")
 
-      {:ok, true} =
+      {:ok, true, _seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -961,7 +961,7 @@ defmodule EKVTest do
       future = now + 1_000_000_000
       val2 = :erlang.term_to_binary("resurrected")
 
-      {:ok, true} =
+      {:ok, true, _seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -992,7 +992,7 @@ defmodule EKVTest do
       for i <- 1..3 do
         val = :erlang.term_to_binary("val_#{i}")
 
-        {:ok, true} =
+        {:ok, true, _seq} =
           EKV.Store.write_entry(
             db,
             stmts.kv_upsert,
@@ -1008,7 +1008,7 @@ defmodule EKVTest do
       # Delete entry 1 with an old tombstone (will be purged)
       old_deleted_at = now - :timer.hours(24 * 14) * 1_000_000
 
-      {:ok, true} =
+      {:ok, true, _seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -1022,7 +1022,7 @@ defmodule EKVTest do
         )
 
       # Delete entry 2 with a recent tombstone (will be kept)
-      {:ok, true} =
+      {:ok, true, _seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -1036,7 +1036,7 @@ defmodule EKVTest do
         )
 
       # Expire entry 3 — it should remain logically absent and stay out of full sync.
-      {:ok, true} =
+      {:ok, true, _seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -1215,7 +1215,7 @@ defmodule EKVTest do
       past = now - 1_000_000_000
       val = :erlang.term_to_binary("doomed")
 
-      {:ok, true} =
+      {:ok, true, _seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -1407,7 +1407,7 @@ defmodule EKVTest do
       now = System.system_time(:nanosecond)
 
       # Create a tombstone
-      {:ok, true} =
+      {:ok, true, _seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -1862,7 +1862,7 @@ defmodule EKVTest do
       {:ok, db} = EKV.Store.open(source_dir, 0, :timer.hours(24 * 7), 2, :timer.minutes(5))
       stmts = EKV.Store.prepare_cached_stmts(db)
 
-      {:ok, true} =
+      {:ok, true, _seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -1905,7 +1905,7 @@ defmodule EKVTest do
       for i <- 1..10 do
         val = :erlang.term_to_binary("delta_val_#{i}")
 
-        {:ok, true} =
+        {:ok, true, _seq} =
           EKV.Store.write_entry(
             db,
             stmts.kv_upsert,
@@ -1942,7 +1942,7 @@ defmodule EKVTest do
       now = System.system_time(:nanosecond)
       expired_at = now - 1_000_000
 
-      {:ok, true} =
+      {:ok, true, _seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -1954,7 +1954,7 @@ defmodule EKVTest do
           expired_at
         )
 
-      {:ok, true} =
+      {:ok, true, _seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -2960,7 +2960,7 @@ defmodule EKVTest do
       assert EKV.Store.get(db, "pax/12") == nil
 
       # Promote
-      {:ok, ^val_bin, ^now, ^origin_str, nil, nil, nil} =
+      {:ok, ^val_bin, ^now, ^origin_str, nil, nil, nil, _seq} =
         EKV.Store.paxos_promote(db, stmts.kv_force_upsert, stmts.oplog_insert, "pax/12", 100, "1")
 
       # Now in kv
@@ -3005,7 +3005,7 @@ defmodule EKVTest do
         EKV.Store.paxos_accept(db, "pax/14", 100, "1", [val_bin, now, origin_str, nil, nil])
 
       # Promote
-      {:ok, _, _, _, _, _, _} =
+      {:ok, _, _, _, _, _, _, _seq} =
         EKV.Store.paxos_promote(db, stmts.kv_force_upsert, stmts.oplog_insert, "pax/14", 100, "1")
 
       # After promote, higher prepare recovers retained accepted state
