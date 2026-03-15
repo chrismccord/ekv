@@ -985,6 +985,74 @@ defmodule EKV.CASDistributedTest do
       end)
     end
 
+    test "stale eventual read with stale if_vsn repairs after conflict against newer committed quorum state" do
+      peers = TestCluster.start_peers(3)
+      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      ekv_name = unique_name(:cas)
+      start_cas_cluster(peers, ekv_name, shards: 1, anti_entropy_interval: false)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      assert {:ok, vsn1} =
+               TestCluster.rpc!(node_a, EKV, :put, [
+                 ekv_name,
+                 "repair_committed/1",
+                 "v1",
+                 [if_vsn: nil]
+               ])
+
+      TestCluster.assert_eventually(fn ->
+        Enum.all?([node_a, node_b, node_c], fn node ->
+          TestCluster.rpc!(node, EKV, :get, [ekv_name, "repair_committed/1"]) == "v1"
+        end)
+      end)
+
+      assert {:ok, _vsn2} =
+               TestCluster.rpc!(node_a, EKV, :put, [
+                 ekv_name,
+                 "repair_committed/1",
+                 "v2",
+                 [if_vsn: vsn1]
+               ])
+
+      TestCluster.assert_eventually(fn ->
+        Enum.all?([node_a, node_b, node_c], fn node ->
+          TestCluster.rpc!(node, EKV, :get, [ekv_name, "repair_committed/1"]) == "v2"
+        end)
+      end)
+
+      assert :ok =
+               TestCluster.force_local_kv_row(
+                 node_c,
+                 ekv_name,
+                 "repair_committed/1",
+                 "v1",
+                 elem(vsn1, 0),
+                 origin: elem(vsn1, 1)
+               )
+
+      assert TestCluster.rpc!(node_c, EKV, :get, [ekv_name, "repair_committed/1"]) == "v1"
+
+      assert {"v1", ^vsn1} =
+               TestCluster.rpc!(node_c, EKV, :lookup, [ekv_name, "repair_committed/1"])
+
+      assert {:error, :conflict} =
+               TestCluster.rpc!(node_c, EKV, :put, [
+                 ekv_name,
+                 "repair_committed/1",
+                 "client-write",
+                 [if_vsn: vsn1]
+               ])
+
+      TestCluster.assert_eventually(
+        fn ->
+          TestCluster.rpc!(node_c, EKV, :get, [ekv_name, "repair_committed/1"]) == "v2"
+        end,
+        timeout: 5_000
+      )
+    end
+
     test "connected stale member converges via periodic anti-entropy without reconnect" do
       peers = TestCluster.start_peers(3)
       [{_, node_a}, {_, node_b}, {_, node_c}] = peers

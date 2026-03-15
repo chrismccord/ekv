@@ -255,6 +255,11 @@ defmodule EKV.TestCluster do
     rpc!(node, __MODULE__, :do_inject_committed_entry, [name, key, value, timestamp, opts])
   end
 
+  @doc "Force only the local kv row on a remote shard, without touching oplog or HWM"
+  def force_local_kv_row(node, name, key, value, timestamp, opts \\ []) do
+    rpc!(node, __MODULE__, :do_force_local_kv_row, [name, key, value, timestamp, opts])
+  end
+
   @doc "Read a replica shard state on a remote node"
   def replica_state(node, name, shard_index \\ 0) do
     rpc!(node, __MODULE__, :do_replica_state, [name, shard_index])
@@ -376,6 +381,41 @@ defmodule EKV.TestCluster do
         deleted_at
       )
 
+    :ok
+  end
+
+  def do_force_local_kv_row(name, key, value, timestamp, opts) do
+    config = EKV.Supervisor.get_config(name)
+    shard = EKV.Replica.shard_index_for(key, config.num_shards)
+    shard_name = EKV.Replica.shard_name(name, shard)
+    %{db: db} = :sys.get_state(shard_name)
+    value_binary = :erlang.term_to_binary(value)
+    origin = Keyword.get(opts, :origin, node())
+    expires_at = Keyword.get(opts, :expires_at)
+    deleted_at = Keyword.get(opts, :deleted_at)
+    origin_str = Atom.to_string(origin)
+
+    {:ok, stmt} =
+      EKV.Sqlite3.prepare(
+        db,
+        """
+        INSERT INTO kv (key, value, timestamp, origin_node, expires_at, deleted_at, expired_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)
+        ON CONFLICT(key) DO UPDATE SET
+          value = excluded.value,
+          timestamp = excluded.timestamp,
+          origin_node = excluded.origin_node,
+          expires_at = excluded.expires_at,
+          deleted_at = excluded.deleted_at,
+          expired_at = NULL
+        """
+      )
+
+    :ok =
+      EKV.Sqlite3.bind(stmt, [key, value_binary, timestamp, origin_str, expires_at, deleted_at])
+
+    :done = EKV.Sqlite3.step(db, stmt)
+    :ok = EKV.Sqlite3.release(db, stmt)
     :ok
   end
 
