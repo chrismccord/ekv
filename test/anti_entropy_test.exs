@@ -226,6 +226,51 @@ defmodule EKV.AntiEntropyTest do
       assert :ok = TestCluster.untrace_shard_sends(node_a, ekv_name)
     end
 
+    test "non-origin member settles remote-origin live entries once and then stays quiet" do
+      peers = TestCluster.start_peers(2)
+      [{_, node_a}, {_, node_b}] = peers
+      ekv_name = unique_name(:anti_entropy_non_origin_lww)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      start_cluster(peers, ekv_name, anti_entropy_interval: false)
+
+      write_many(node_a, ekv_name, "remote_origin", 5)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.keys_count(node_b, ekv_name, "remote_origin/") == 5
+      end)
+
+      assert Enum.map(TestCluster.oplog_since(node_b, ekv_name, 0, 10), &elem(&1, 4)) ==
+               List.duplicate(node_a, 5)
+
+      assert Map.has_key?(TestCluster.replica_state(node_b, ekv_name).remote_shards, node_a)
+      assert :ok = TestCluster.set_cached_remote_hwm(node_b, ekv_name, node_a, 1)
+
+      b_max = TestCluster.max_seq(node_b, ekv_name)
+      assert b_max > 0
+
+      assert :ok = TestCluster.trace_shard_sends(node_b, ekv_name, self())
+      assert :ok = TestCluster.trigger_anti_entropy(node_b, ekv_name)
+
+      assert [
+               {^node_b, 0, [], 0, ^b_max, _dest}
+             ] = collect_sync_messages([], 500)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.member_hwm(node_a, ekv_name, node_b) == b_max
+      end)
+
+      TestCluster.assert_eventually(fn ->
+        state = TestCluster.replica_state(node_b, ekv_name)
+        Map.get(state.remote_member_hwms, node_a) == b_max
+      end)
+
+      assert :ok = TestCluster.trigger_anti_entropy(node_b, ekv_name)
+      assert_no_sync_messages(400)
+      assert :ok = TestCluster.untrace_shard_sends(node_b, ekv_name)
+    end
+
     test "live CAS commit replication advances remote progress so anti-entropy stays quiet" do
       peers = TestCluster.start_peers(2)
       [{_, node_a}, {_, node_b}] = peers
@@ -297,6 +342,55 @@ defmodule EKV.AntiEntropyTest do
         end,
         timeout: 5_000
       )
+    end
+
+    test "non-origin member relays dead-origin entries during delta repair" do
+      peers = TestCluster.start_peers(3)
+      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
+      ekv_name = unique_name(:anti_entropy_dead_origin_relay)
+      key1 = "dead_origin/1"
+      key2 = "dead_origin/2"
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      start_cluster(peers, ekv_name, anti_entropy_interval: false)
+
+      assert :ok == TestCluster.rpc!(node_a, EKV, :put, [ekv_name, key1, "v1"])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, EKV, :get, [ekv_name, key1]) == "v1" and
+          TestCluster.rpc!(node_c, EKV, :get, [ekv_name, key1]) == "v1"
+      end)
+
+      TestCluster.disconnect_nodes(node_a, node_c)
+      assert :ok == TestCluster.rpc!(node_a, EKV, :put, [ekv_name, key2, "v2"])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, EKV, :get, [ekv_name, key2]) == "v2"
+      end)
+
+      assert TestCluster.rpc!(node_c, EKV, :get, [ekv_name, key2]) == nil
+
+      assert :ok = TestCluster.stop_ekv(node_a, ekv_name, 10_000)
+
+      TestCluster.assert_eventually(fn ->
+        state = TestCluster.replica_state(node_b, ekv_name)
+        not Map.has_key?(state.remote_shards, node_a)
+      end)
+
+      assert :ok = TestCluster.set_cached_remote_hwm(node_b, ekv_name, node_c, 1)
+      assert :ok = TestCluster.trace_shard_sends(node_b, ekv_name, self())
+      assert :ok = TestCluster.trigger_anti_entropy(node_b, ekv_name)
+
+      assert [
+               {^node_b, 0, [^key2], 1, _seq, _dest}
+             ] = collect_sync_messages([], 500)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_c, EKV, :get, [ekv_name, key2]) == "v2"
+      end)
+
+      assert :ok = TestCluster.untrace_shard_sends(node_b, ekv_name)
     end
   end
 

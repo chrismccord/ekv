@@ -275,6 +275,11 @@ defmodule EKV.TestCluster do
     rpc!(node, __MODULE__, :do_max_seq, [name, shard_index])
   end
 
+  @doc "Read raw oplog rows from a remote shard"
+  def oplog_since(node, name, last_seq, limit, shard_index \\ 0) do
+    rpc!(node, __MODULE__, :do_oplog_since, [name, last_seq, limit, shard_index])
+  end
+
   @doc "Read a shard's min oplog seq on a remote node"
   def min_seq(node, name, shard_index \\ 0) do
     rpc!(node, __MODULE__, :do_min_seq, [name, shard_index])
@@ -395,6 +400,12 @@ defmodule EKV.TestCluster do
     shard_name = EKV.Replica.shard_name(name, shard_index)
     %{db: db} = :sys.get_state(shard_name)
     EKV.Store.max_seq(db)
+  end
+
+  def do_oplog_since(name, last_seq, limit, shard_index) do
+    shard_name = EKV.Replica.shard_name(name, shard_index)
+    %{db: db} = :sys.get_state(shard_name)
+    EKV.Store.oplog_since_chunk(db, last_seq, limit)
   end
 
   def do_min_seq(name, shard_index) do

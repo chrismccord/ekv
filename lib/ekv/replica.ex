@@ -616,8 +616,12 @@ defmodule EKV.Replica do
       │ Query: SELECT * FROM kv_oplog WHERE seq > member_hwm           │
       │        ORDER BY seq LIMIT chunk_size                           │
       │                                                                │
-      │ Sends only mutations since the last sync. Efficient for        │
-      │ brief disconnects where the oplog hasn't been truncated.       │
+      │ Scans the local oplog tail but only relays entries this        │
+      │ member is authoritative for: its own origin_node, or writes    │
+      │ from origin members that are no longer connected. That keeps   │
+      │ healthy steady-state anti-entropy from replaying everyone      │
+      │ else's live traffic while still giving dead-origin entries a   │
+      │ repair path.                                                   │
       └────────────────────────────────────────────────────────────────┘
 
       ┌────────────────────────────────────────────────────────────────┐
@@ -2340,8 +2344,9 @@ defmodule EKV.Replica do
         oplog_entries = if has_more?, do: Enum.take(fetched, chunk_size), else: fetched
 
         entries =
-          Enum.map(oplog_entries, fn {_seq, key, value, timestamp, origin_node, expires_at,
-                                      is_delete} ->
+          oplog_entries
+          |> Enum.filter(&delta_sync_replayable?(state, &1))
+          |> Enum.map(fn {_seq, key, value, timestamp, origin_node, expires_at, is_delete} ->
             deleted_at = if is_delete, do: timestamp, else: nil
             {key, value, timestamp, origin_node, expires_at, deleted_at}
           end)
@@ -2349,28 +2354,55 @@ defmodule EKV.Replica do
         final? = not has_more?
         seq_to_send = if final?, do: my_seq, else: 0
 
-        log(state, fn ->
-          "#{log_prefix_shard(state)} sending delta sync to #{remote_node} " <>
-            "entries=#{length(entries)} from_seq=#{last_seq} final=#{final?} seq=#{seq_to_send}"
-        end)
+        cond do
+          entries == [] and final? ->
+            log(state, fn ->
+              "#{log_prefix_shard(state)} sending empty terminal delta sync to #{remote_node} " <>
+                "from_seq=#{last_seq} to_seq=#{my_seq}"
+            end)
 
-        send_to_member(
-          state,
-          remote_node,
-          {:ekv_sync, node(), state.shard_index, entries, seq_to_send}
-        )
+            send_to_member(
+              state,
+              remote_node,
+              {:ekv_sync, node(), state.shard_index, [], my_seq}
+            )
 
-        if final? do
-          clear_sync_inflight(state, remote_node)
-        else
-          {max_chunk_seq, _, _, _, _, _, _} = List.last(oplog_entries)
+            clear_sync_inflight(state, remote_node)
 
-          send(
-            self(),
-            {:continue_delta_sync, remote_node, max_chunk_seq, my_seq, chunk_size}
-          )
+          entries == [] ->
+            max_chunk_seq = oplog_chunk_max_seq(oplog_entries)
 
-          state
+            send(
+              self(),
+              {:continue_delta_sync, remote_node, max_chunk_seq, my_seq, chunk_size}
+            )
+
+            state
+
+          true ->
+            log(state, fn ->
+              "#{log_prefix_shard(state)} sending delta sync to #{remote_node} " <>
+                "entries=#{length(entries)} from_seq=#{last_seq} final=#{final?} seq=#{seq_to_send}"
+            end)
+
+            send_to_member(
+              state,
+              remote_node,
+              {:ekv_sync, node(), state.shard_index, entries, seq_to_send}
+            )
+
+            if final? do
+              clear_sync_inflight(state, remote_node)
+            else
+              max_chunk_seq = oplog_chunk_max_seq(oplog_entries)
+
+              send(
+                self(),
+                {:continue_delta_sync, remote_node, max_chunk_seq, my_seq, chunk_size}
+              )
+
+              state
+            end
         end
     end
   end
@@ -2446,6 +2478,19 @@ defmodule EKV.Replica do
 
   defp track_remote_features(%Replica{} = state, remote_node, remote_features) do
     %{state | remote_features: Map.put(state.remote_features, remote_node, remote_features)}
+  end
+
+  defp oplog_chunk_max_seq(oplog_entries) do
+    oplog_entries
+    |> List.last()
+    |> elem(0)
+  end
+
+  defp delta_sync_replayable?(
+         %Replica{} = state,
+         {_seq, _key, _value, _timestamp, origin_node, _expires_at, _is_delete}
+       ) do
+    origin_node == node() or not Map.has_key?(state.remote_shards, origin_node)
   end
 
   defp member_connect_message(%Replica{} = state, remote_hwm) do

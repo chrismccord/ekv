@@ -264,6 +264,9 @@ Important:
   - `sender_seq` is part of the required v1 replication payload.
   - Receivers ack that progress via `:sync_ack`, even when the merge is a no-op.
   - Anti-entropy should now repair true misses instead of replaying the healthy recent tail every interval.
+- Delta sync relays only entries this member is authoritative for.
+  - That means local-origin writes, plus writes from origin members that are no longer connected.
+  - Healthy replicas should not continuously replay each other's live traffic in steady state.
 - Chunked sync rules matter:
   - intermediate chunks use seq `0`
   - final chunk must send the real terminal seq

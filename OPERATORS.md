@@ -83,7 +83,7 @@ Members run periodic anti-entropy by default:
 - This re-runs the normal member handshake + delta/full sync path for already-connected members.
 - This re-runs the normal HWM-driven delta/full sync path for already-connected members.
 - It is meant to heal a member that missed a prior replication message without waiting for reconnect.
-- In the steady state it should be cheap because members are already caught up and delta sync is usually empty.
+- In the steady state it should be cheap because delta sync now only relays origin-owned writes, plus writes from origin members that are no longer connected.
 - Set `false` only for debugging; the default is the safer production setting.
 
 ## Backups
