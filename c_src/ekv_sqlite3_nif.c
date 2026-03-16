@@ -51,14 +51,52 @@ static ERL_NIF_TERM make_error(ErlNifEnv *env, const char *msg)
         enif_make_string(env, msg, ERL_NIF_LATIN1));
 }
 
+static int make_binary_term(ErlNifEnv *env, const void *src, size_t len, ERL_NIF_TERM *term)
+{
+    ErlNifBinary bin;
+    if (!enif_alloc_binary(len, &bin))
+        return 0;
+
+    if (len > 0) {
+        if (!src) {
+            enif_release_binary(&bin);
+            return 0;
+        }
+        memcpy(bin.data, src, len);
+    }
+
+    *term = enif_make_binary(env, &bin);
+    return 1;
+}
+
+static int copy_alloc(const void *src, size_t len, void **dst)
+{
+    void *copy;
+
+    *dst = NULL;
+    if (len == 0)
+        return 1;
+    if (!src)
+        return 0;
+
+    copy = enif_alloc(len);
+    if (!copy)
+        return 0;
+
+    memcpy(copy, src, len);
+    *dst = copy;
+    return 1;
+}
+
 static ERL_NIF_TERM make_sqlite_error(ErlNifEnv *env, sqlite3 *db)
 {
     const char *msg = sqlite3_errmsg(db);
-    size_t len = strlen(msg);
     ERL_NIF_TERM bin;
-    unsigned char *buf = enif_make_new_binary(env, len, &bin);
-    memcpy(buf, msg, len);
-    return enif_make_tuple2(env, atom_error, bin);
+
+    if (make_binary_term(env, msg, strlen(msg), &bin))
+        return enif_make_tuple2(env, atom_error, bin);
+
+    return make_error(env, msg);
 }
 
 static void finalize_stmt(sqlite3_stmt **stmt)
@@ -153,6 +191,10 @@ static ERL_NIF_TERM ekv_open(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
     sqlite3_busy_timeout(db, 5000);
 
     connection_t *conn = enif_alloc_resource(connection_type, sizeof(connection_t));
+    if (!conn) {
+        sqlite3_close_v2(db);
+        return make_error(env, "alloc failed");
+    }
     memset(conn, 0, sizeof(connection_t));
     conn->db = db;
     conn->mutex = enif_mutex_create("ekv_sqlite3");
@@ -273,6 +315,10 @@ static ERL_NIF_TERM ekv_prepare(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
     enif_mutex_unlock(conn->mutex);
 
     statement_t *s = enif_alloc_resource(statement_type, sizeof(statement_t));
+    if (!s) {
+        sqlite3_finalize(raw_stmt);
+        return make_error(env, "alloc failed");
+    }
     s->stmt = raw_stmt;
     s->conn = conn;
     enif_keep_resource(conn);
@@ -327,7 +373,8 @@ static int bind_args(ErlNifEnv *env, sqlite3_stmt *stmt, ERL_NIF_TERM list)
         /* binary/string */
         else if (enif_is_binary(env, head)) {
             ErlNifBinary bin;
-            enif_inspect_binary(env, head, &bin);
+            if (!enif_inspect_binary(env, head, &bin))
+                return -1;
             if (bin.size > INT_MAX)
                 return -1;
             rc = sqlite3_bind_text(stmt, idx,
@@ -665,36 +712,33 @@ static ERL_NIF_TERM ekv_bind(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
 /* Column extraction helper                                            */
 /* ------------------------------------------------------------------ */
 
-static ERL_NIF_TERM make_column(ErlNifEnv *env, sqlite3_stmt *stmt, int col)
+static int make_column(ErlNifEnv *env, sqlite3_stmt *stmt, int col, ERL_NIF_TERM *term)
 {
     switch (sqlite3_column_type(stmt, col)) {
     case SQLITE_INTEGER:
-        return enif_make_int64(env, sqlite3_column_int64(stmt, col));
+        *term = enif_make_int64(env, sqlite3_column_int64(stmt, col));
+        return 1;
 
     case SQLITE_FLOAT:
-        return enif_make_double(env, sqlite3_column_double(stmt, col));
+        *term = enif_make_double(env, sqlite3_column_double(stmt, col));
+        return 1;
 
     case SQLITE_TEXT: {
         int len = sqlite3_column_bytes(stmt, col);
         const unsigned char *text = sqlite3_column_text(stmt, col);
-        ERL_NIF_TERM bin;
-        unsigned char *buf = enif_make_new_binary(env, (size_t)len, &bin);
-        if (len > 0) memcpy(buf, text, (size_t)len);
-        return bin;
+        return make_binary_term(env, text, (size_t)len, term);
     }
 
     case SQLITE_BLOB: {
         int len = sqlite3_column_bytes(stmt, col);
         const void *blob = sqlite3_column_blob(stmt, col);
-        ERL_NIF_TERM bin;
-        unsigned char *buf = enif_make_new_binary(env, (size_t)len, &bin);
-        if (len > 0) memcpy(buf, blob, (size_t)len);
-        return bin;
+        return make_binary_term(env, blob, (size_t)len, term);
     }
 
     case SQLITE_NULL:
     default:
-        return atom_nil;
+        *term = atom_nil;
+        return 1;
     }
 }
 
@@ -740,8 +784,14 @@ static ERL_NIF_TERM ekv_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
             enif_mutex_unlock(conn->mutex);
             return make_error(env, "alloc failed");
         }
-        for (int i = 0; i < ncols; i++)
-            cols[i] = make_column(env, s->stmt, i);
+        for (int i = 0; i < ncols; i++) {
+            if (!make_column(env, s->stmt, i, &cols[i])) {
+                enif_free(cols);
+                sqlite3_reset(s->stmt);
+                enif_mutex_unlock(conn->mutex);
+                return make_error(env, "alloc failed");
+            }
+        }
         ERL_NIF_TERM row_list = enif_make_list_from_array(env, cols, (unsigned)ncols);
         enif_free(cols);
         enif_mutex_unlock(conn->mutex);
@@ -1040,8 +1090,14 @@ static ERL_NIF_TERM ekv_read_entry(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
             enif_mutex_unlock(conn->mutex);
             return make_error(env, "alloc failed");
         }
-        for (int i = 0; i < ncols; i++)
-            cols[i] = make_column(env, s->stmt, i);
+        for (int i = 0; i < ncols; i++) {
+            if (!make_column(env, s->stmt, i, &cols[i])) {
+                enif_free(cols);
+                sqlite3_reset(s->stmt);
+                enif_mutex_unlock(conn->mutex);
+                return make_error(env, "alloc failed");
+            }
+        }
         ERL_NIF_TERM row_list = enif_make_list_from_array(env, cols, (unsigned)ncols);
         enif_free(cols);
         sqlite3_reset(s->stmt);
@@ -1128,8 +1184,15 @@ static ERL_NIF_TERM ekv_fetch_all(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
                 enif_mutex_unlock(conn->mutex);
                 return make_error(env, "alloc failed");
             }
-            for (int i = 0; i < ncols; i++)
-                cols[i] = make_column(env, stmt, i);
+            for (int i = 0; i < ncols; i++) {
+                if (!make_column(env, stmt, i, &cols[i])) {
+                    enif_free(cols);
+                    sqlite3_finalize(stmt);
+                    enif_free(rows);
+                    enif_mutex_unlock(conn->mutex);
+                    return make_error(env, "alloc failed");
+                }
+            }
             row = enif_make_list_from_array(env, cols, (unsigned)ncols);
             enif_free(cols);
         }
@@ -1616,13 +1679,27 @@ static ERL_NIF_TERM ekv_paxos_prepare(ErlNifEnv *env, int argc, const ERL_NIF_TE
          * so we must not require value to be non-NULL. */
         if (accepted_c > 0) {
             has_accepted_value = 1;
-            for (int i = 0; i < 5; i++)
-                paxos_value_cols[i] = make_column(env, sel, 4 + i);
+            for (int i = 0; i < 5; i++) {
+                if (!make_column(env, sel, 4 + i, &paxos_value_cols[i])) {
+                    sqlite3_finalize(sel);
+                    sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+                    enif_mutex_unlock(conn->mutex);
+                    enif_free(ballot_n_str);
+                    return make_error(env, "alloc failed");
+                }
+            }
         }
     }
 
     /* Copy accepted_n before finalizing (data owned by stmt) */
     char *accepted_n_copy = enif_alloc(accepted_n_len + 1);
+    if (!accepted_n_copy) {
+        sqlite3_finalize(sel);
+        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+        enif_mutex_unlock(conn->mutex);
+        enif_free(ballot_n_str);
+        return make_error(env, "alloc failed");
+    }
     memcpy(accepted_n_copy, accepted_n_str, accepted_n_len);
     accepted_n_copy[accepted_n_len] = '\0';
 
@@ -1638,6 +1715,14 @@ static ERL_NIF_TERM ekv_paxos_prepare(ErlNifEnv *env, int argc, const ERL_NIF_TE
         /* NACK — copy promised_n before finalizing */
         int prom_n_len_copy = promised_n_len;
         char *prom_n_copy = enif_alloc(prom_n_len_copy + 1);
+        if (!prom_n_copy) {
+            sqlite3_finalize(sel);
+            sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+            enif_mutex_unlock(conn->mutex);
+            enif_free(ballot_n_str);
+            enif_free(accepted_n_copy);
+            return make_error(env, "alloc failed");
+        }
         memcpy(prom_n_copy, promised_n_str, prom_n_len_copy);
         prom_n_copy[prom_n_len_copy] = '\0';
 
@@ -1647,10 +1732,12 @@ static ERL_NIF_TERM ekv_paxos_prepare(ErlNifEnv *env, int argc, const ERL_NIF_TE
 
         ERL_NIF_TERM promised_n_term;
         {
-            ErlNifBinary bin;
-            enif_alloc_binary(prom_n_len_copy, &bin);
-            if (prom_n_len_copy > 0) memcpy(bin.data, prom_n_copy, prom_n_len_copy);
-            promised_n_term = enif_make_binary(env, &bin);
+            if (!make_binary_term(env, prom_n_copy, (size_t)prom_n_len_copy, &promised_n_term)) {
+                enif_free(prom_n_copy);
+                enif_free(ballot_n_str);
+                enif_free(accepted_n_copy);
+                return make_error(env, "alloc failed");
+            }
         }
 
         enif_free(prom_n_copy);
@@ -1722,8 +1809,16 @@ static ERL_NIF_TERM ekv_paxos_prepare(ErlNifEnv *env, int argc, const ERL_NIF_TE
         if (rc == SQLITE_ROW) {
             int ncols = sqlite3_column_count(kv_sel);
             ERL_NIF_TERM cols[5];
-            for (int i = 0; i < ncols && i < 5; i++)
-                cols[i] = make_column(env, kv_sel, i);
+            for (int i = 0; i < ncols && i < 5; i++) {
+                if (!make_column(env, kv_sel, i, &cols[i])) {
+                    sqlite3_finalize(kv_sel);
+                    sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+                    enif_mutex_unlock(conn->mutex);
+                    enif_free(ballot_n_str);
+                    enif_free(accepted_n_copy);
+                    return make_error(env, "alloc failed");
+                }
+            }
             kv_row = enif_make_list_from_array(env, cols, (unsigned)ncols);
         } else {
             kv_row = atom_nil;
@@ -1747,10 +1842,11 @@ static ERL_NIF_TERM ekv_paxos_prepare(ErlNifEnv *env, int argc, const ERL_NIF_TE
     /* Build accepted_n return term */
     ERL_NIF_TERM accepted_n_term;
     {
-        ErlNifBinary bin;
-        enif_alloc_binary(accepted_n_len, &bin);
-        if (accepted_n_len > 0) memcpy(bin.data, accepted_n_copy, accepted_n_len);
-        accepted_n_term = enif_make_binary(env, &bin);
+        if (!make_binary_term(env, accepted_n_copy, (size_t)accepted_n_len, &accepted_n_term)) {
+            enif_free(ballot_n_str);
+            enif_free(accepted_n_copy);
+            return make_error(env, "alloc failed");
+        }
     }
 
     enif_free(ballot_n_str);
@@ -1927,7 +2023,13 @@ static ERL_NIF_TERM ekv_paxos_accept(ErlNifEnv *env, int argc, const ERL_NIF_TER
             }
         } else if (enif_is_binary(env, val_elems[i])) {
             ErlNifBinary bin;
-            enif_inspect_binary(env, val_elems[i], &bin);
+            if (!enif_inspect_binary(env, val_elems[i], &bin)) {
+                sqlite3_finalize(pax_ups);
+                sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+                enif_mutex_unlock(conn->mutex);
+                enif_free(ballot_n_str);
+                return enif_make_badarg(env);
+            }
             if (i == 0) {
                 /* value_binary → bind as BLOB */
                 sqlite3_bind_blob(pax_ups, pos, bin.data, (int)bin.size, SQLITE_TRANSIENT);
@@ -2099,11 +2201,22 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
     }
 
     /* Extract value columns from kv_paxos */
-    ERL_NIF_TERM value_term = make_column(env, sel, 2);     /* accepted_value (BLOB) */
-    ERL_NIF_TERM ts_term = make_column(env, sel, 3);        /* accepted_timestamp */
-    ERL_NIF_TERM origin_term = make_column(env, sel, 4);    /* accepted_origin */
-    ERL_NIF_TERM expires_term = make_column(env, sel, 5);   /* accepted_expires_at */
-    ERL_NIF_TERM deleted_term = make_column(env, sel, 6);   /* accepted_deleted_at */
+    ERL_NIF_TERM value_term;
+    ERL_NIF_TERM ts_term;
+    ERL_NIF_TERM origin_term;
+    ERL_NIF_TERM expires_term;
+    ERL_NIF_TERM deleted_term;
+    if (!make_column(env, sel, 2, &value_term) ||
+        !make_column(env, sel, 3, &ts_term) ||
+        !make_column(env, sel, 4, &origin_term) ||
+        !make_column(env, sel, 5, &expires_term) ||
+        !make_column(env, sel, 6, &deleted_term)) {
+        sqlite3_finalize(sel);
+        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+        enif_mutex_unlock(conn->mutex);
+        enif_free(ballot_n_str);
+        return make_error(env, "alloc failed");
+    }
 
     /* We need the raw values for binding to kv/oplog statements */
     /* Re-read the raw column data for bind operations */
@@ -2131,14 +2244,21 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
 
     /* Copy value data before finalizing sel (data owned by stmt) */
     void *value_copy = NULL;
-    if (has_value && value_len > 0) {
-        value_copy = enif_alloc(value_len);
-        memcpy(value_copy, value_data, value_len);
+    if (!copy_alloc(value_data, (size_t)value_len, &value_copy)) {
+        sqlite3_finalize(sel);
+        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+        enif_mutex_unlock(conn->mutex);
+        enif_free(ballot_n_str);
+        return make_error(env, "alloc failed");
     }
     char *origin_copy = NULL;
-    if (has_origin && origin_len > 0) {
-        origin_copy = enif_alloc(origin_len);
-        memcpy(origin_copy, origin_data, origin_len);
+    if (!copy_alloc(origin_data, (size_t)origin_len, (void **)&origin_copy)) {
+        if (value_copy) enif_free(value_copy);
+        sqlite3_finalize(sel);
+        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+        enif_mutex_unlock(conn->mutex);
+        enif_free(ballot_n_str);
+        return make_error(env, "alloc failed");
     }
 
     sqlite3_finalize(sel);
@@ -2152,7 +2272,15 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
     if (rc == SQLITE_OK) {
         sqlite3_bind_text(prev_sel, 1, (const char *)key_bin.data, (int)key_bin.size, SQLITE_TRANSIENT);
         if (sqlite3_step(prev_sel) == SQLITE_ROW) {
-            prev_value = make_column(env, prev_sel, 0);
+            if (!make_column(env, prev_sel, 0, &prev_value)) {
+                sqlite3_finalize(prev_sel);
+                if (value_copy) enif_free(value_copy);
+                if (origin_copy) enif_free(origin_copy);
+                enif_free(ballot_n_str);
+                sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+                enif_mutex_unlock(conn->mutex);
+                return make_error(env, "alloc failed");
+            }
         }
         sqlite3_finalize(prev_sel);
     }

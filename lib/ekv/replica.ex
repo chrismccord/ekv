@@ -582,44 +582,44 @@ defmodule EKV.Replica do
     - full sync remains the fallback when replay history is missing or outside
       the retained window
 
-      Node A (shard i)                     Node B (shard i)
-        │                                        │
-        │ {:ekv, 1, :member_connect,             │
-        │  {pid_a, i, num_shards, progress_a,    │
-        │   node_id_a}, %{features: ...}}        │
-        │───────────────────────────────────────>│
-        │                                        │
-        │                        validate shard counts match
-        │                        monitor pid_a
-        │                        add A to remote_shards
-        │                        persist A's advertised progress map
-        │                                        │
-        │ {:ekv, 1, :member_connect_ack,         │
-        │  {pid_b, i, num_shards, progress_b,    │
-        │   node_id_b}, %{features: ...}}        │
-        │<───────────────────────────────────────│
-        │                                        │
-        │         after handshake, each side compares:
-        │           remote origin heads vs local contiguous progress
-        │         if local side is behind:
-        │           request delta from that live origin
-        │         if local side is behind on explicitly unavailable
-        │         dead-origin state:
-        │           request full sync from a live peer
-        │                                        │
-        │ {:ekv, 1, :summary_probe,              │
-        │  {pid_a, i, progress_a}, %{}}          │
-        │───────────────────────────────────────>│
-        │ {:ekv, 1, :summary_reply,              │
-        │  {pid_b, i, progress_b}, %{}}          │
-        │<───────────────────────────────────────│
-        │ {:ekv, 1, :sync_request,               │
-        │  {pid_b, i, {:delta, node_a, from_seq}}, %{}} │
-        │<───────────────────────────────────────│
-        │ {:ekv, 1, :sync,                       │
-        │  {node_a, i, mode, entries, progress}, │
-        │  %{}}                                  │
-        │───────────────────────────────────────>│
+      Node A (shard i)                                         Node B (shard i)
+        │                                                             │
+        │ {:ekv, 1, :member_connect,                                  │
+        │  {pid_a, i, num_shards, progress_a,                         │
+        │   node_id_a}, %{features: ...}}                             │
+        │────────────────────────────────────────────────────────────>│
+        │                                                             │
+        │                        validate shard counts match          │
+        │                        monitor pid_a                        │
+        │                        add A to remote_shards               │
+        │                        persist A's advertised progress map  │
+        │                                                             │
+        │ {:ekv, 1, :member_connect_ack,                              │
+        │  {pid_b, i, num_shards, progress_b,                         │
+        │   node_id_b}, %{features: ...}}                             │
+        │<────────────────────────────────────────────────────────────│
+        │                                                             │
+        │         after handshake, each side compares:                │
+        │           remote origin heads vs local contiguous progress  │
+        │         if local side is behind:                            │
+        │           request delta from that live origin               │
+        │         if local side is behind on explicitly unavailable   │
+        │         dead-origin state:                                  │
+        │           request full sync from a live peer                │
+        │                                                             │
+        │ {:ekv, 1, :summary_probe,                                   │
+        │  {pid_a, i, progress_a}, %{}}                               │
+        │────────────────────────────────────────────────────────────>│
+        │ {:ekv, 1, :summary_reply,                                   │
+        │  {pid_b, i, progress_b}, %{}}                               │
+        │<────────────────────────────────────────────────────────────│
+        │ {:ekv, 1, :sync_request,                                    │
+        │  {pid_b, i, {:delta, node_a, from_seq}}, %{}}               │
+        │<────────────────────────────────────────────────────────────│
+        │ {:ekv, 1, :sync,                                            │
+        │  {node_a, i, mode, entries, progress},                      │
+        │  %{}}                                                       │
+        │────────────────────────────────────────────────────────────>│
 
   Healthy connected members periodically exchange summary probes. The steady
   state anti-entropy tick is therefore lightweight control-plane traffic:
