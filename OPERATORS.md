@@ -80,10 +80,10 @@ Members run periodic anti-entropy by default:
 {EKV, name: :my_kv, data_dir: "/var/data/ekv", anti_entropy_interval: 30_000}
 ```
 
-- This re-runs the normal member handshake + delta/full sync path for already-connected members.
-- This re-runs the normal HWM-driven delta/full sync path for already-connected members.
+- This sends a lightweight per-shard summary probe to already-connected members.
+- The receiver compares the remote summary with its own local contiguous progress and explicitly requests repair only if it is behind.
 - It is meant to heal a member that missed a prior replication message without waiting for reconnect.
-- In the steady state it should be cheap because delta sync now only relays origin-owned writes, plus writes from origin members that are no longer connected.
+- In the steady state it should be cheap because healthy members only exchange summary metadata; data chunks are sent only in response to an explicit `:sync_request`.
 - Set `false` only for debugging; the default is the safer production setting.
 
 ## Backups
@@ -234,7 +234,7 @@ from members populates its data.
 
 1. Stop the node being removed
 2. Wait for one GC cycle (`gc_interval`, default 5 min) — the removed node's
-   HWM is pruned, allowing oplog truncation to proceed
+   member progress is pruned, allowing replay-log truncation to proceed
 3. Optionally update `cluster_size` on remaining nodes and rolling restart
 
 ## Client Mode

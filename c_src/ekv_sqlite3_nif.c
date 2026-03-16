@@ -312,6 +312,293 @@ static int bind_args(ErlNifEnv *env, sqlite3_stmt *stmt, ERL_NIF_TERM list)
     return 0;
 }
 
+static int list_nth_term(ErlNifEnv *env, ERL_NIF_TERM list, unsigned nth, ERL_NIF_TERM *out)
+{
+    ERL_NIF_TERM head;
+    unsigned idx = 0;
+
+    while (enif_get_list_cell(env, list, &head, &list)) {
+        if (idx == nth) {
+            *out = head;
+            return 1;
+        }
+        idx++;
+    }
+
+    return 0;
+}
+
+static int next_local_origin_seq(sqlite3 *db, sqlite3_int64 *out_seq)
+{
+    sqlite3_stmt *sel = NULL;
+    sqlite3_stmt *upsert = NULL;
+    sqlite3_int64 current = 0;
+    int rc;
+
+    rc = sqlite3_prepare_v3(
+        db,
+        "SELECT value_int FROM kv_meta WHERE key = 'local_origin_seq'",
+        -1,
+        0,
+        &sel,
+        NULL
+    );
+    if (rc != SQLITE_OK) return rc;
+
+    rc = sqlite3_step(sel);
+    if (rc == SQLITE_ROW && sqlite3_column_type(sel, 0) != SQLITE_NULL) {
+        current = sqlite3_column_int64(sel, 0);
+        rc = SQLITE_OK;
+    } else if (rc == SQLITE_DONE) {
+        rc = SQLITE_OK;
+    }
+    sqlite3_finalize(sel);
+    if (rc != SQLITE_OK) return rc;
+
+    *out_seq = current + 1;
+
+    rc = sqlite3_prepare_v3(
+        db,
+        "INSERT INTO kv_meta (key, value_int) VALUES ('local_origin_seq', ?1) "
+        "ON CONFLICT(key) DO UPDATE SET value_int = excluded.value_int",
+        -1,
+        0,
+        &upsert,
+        NULL
+    );
+    if (rc != SQLITE_OK) return rc;
+
+    sqlite3_bind_int64(upsert, 1, *out_seq);
+    rc = sqlite3_step(upsert);
+    sqlite3_finalize(upsert);
+
+    return (rc == SQLITE_DONE) ? SQLITE_OK : rc;
+}
+
+static int read_local_origin_progress(
+    sqlite3 *db,
+    const char *origin_node,
+    int origin_node_len,
+    sqlite3_int64 *out_seq
+)
+{
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v3(
+        db,
+        "SELECT last_seq FROM kv_origin_progress WHERE origin_node = ?1",
+        -1,
+        0,
+        &stmt,
+        NULL
+    );
+    if (rc != SQLITE_OK) return rc;
+
+    sqlite3_bind_text(stmt, 1, origin_node, origin_node_len, SQLITE_TRANSIENT);
+    rc = sqlite3_step(stmt);
+
+    if (rc == SQLITE_ROW && sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
+        *out_seq = sqlite3_column_int64(stmt, 0);
+        rc = SQLITE_OK;
+    } else if (rc == SQLITE_DONE) {
+        *out_seq = 0;
+        rc = SQLITE_OK;
+    }
+
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
+static int write_local_origin_progress(
+    sqlite3 *db,
+    const char *origin_node,
+    int origin_node_len,
+    sqlite3_int64 origin_seq
+)
+{
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v3(
+        db,
+        "INSERT INTO kv_origin_progress (origin_node, last_seq) VALUES (?1, ?2) "
+        "ON CONFLICT(origin_node) DO UPDATE SET last_seq = excluded.last_seq",
+        -1,
+        0,
+        &stmt,
+        NULL
+    );
+    if (rc != SQLITE_OK) return rc;
+
+    sqlite3_bind_text(stmt, 1, origin_node, origin_node_len, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 2, origin_seq);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    return (rc == SQLITE_DONE) ? SQLITE_OK : rc;
+}
+
+static int advance_local_origin_progress(
+    sqlite3 *db,
+    const char *origin_node,
+    int origin_node_len,
+    sqlite3_int64 seen_seq,
+    sqlite3_int64 *out_progress
+)
+{
+    sqlite3_stmt *stmt = NULL;
+    sqlite3_int64 current = 0;
+    sqlite3_int64 last_contiguous = 0;
+    sqlite3_int64 expected = 0;
+    int rc = read_local_origin_progress(db, origin_node, origin_node_len, &current);
+    if (rc != SQLITE_OK) return rc;
+
+    if (seen_seq <= current) {
+        *out_progress = current;
+        return SQLITE_OK;
+    }
+
+    if (seen_seq > current + 1) {
+        *out_progress = current;
+        return SQLITE_OK;
+    }
+
+    rc = sqlite3_prepare_v3(
+        db,
+        "SELECT origin_seq FROM kv_oplog "
+        "WHERE origin_node = ?1 AND origin_seq > ?2 "
+        "ORDER BY origin_seq",
+        -1,
+        0,
+        &stmt,
+        NULL
+    );
+    if (rc != SQLITE_OK) return rc;
+
+    sqlite3_bind_text(stmt, 1, origin_node, origin_node_len, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 2, current);
+
+    last_contiguous = current;
+    expected = current + 1;
+
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        sqlite3_int64 row_seq = sqlite3_column_int64(stmt, 0);
+        if (row_seq != expected)
+            break;
+
+        last_contiguous = row_seq;
+        expected++;
+    }
+
+    sqlite3_finalize(stmt);
+
+    if (rc != SQLITE_ROW && rc != SQLITE_DONE)
+        return rc;
+
+    rc = write_local_origin_progress(db, origin_node, origin_node_len, last_contiguous);
+    if (rc != SQLITE_OK) return rc;
+
+    *out_progress = last_contiguous;
+    return SQLITE_OK;
+}
+
+static int begin_immediate(sqlite3 *db)
+{
+    return sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
+}
+
+static void rollback_tx(sqlite3 *db)
+{
+    sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+}
+
+static int commit_tx(sqlite3 *db)
+{
+    return sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
+}
+
+static int get_progress_entry(
+    ErlNifEnv *env,
+    ERL_NIF_TERM term,
+    ErlNifBinary *origin_node,
+    ErlNifSInt64 *seq
+)
+{
+    const ERL_NIF_TERM *elems;
+    int arity;
+
+    if (!enif_get_tuple(env, term, &arity, &elems) || arity != 2) {
+        return 0;
+    }
+
+    if (!enif_inspect_iolist_as_binary(env, elems[0], origin_node)) {
+        return 0;
+    }
+
+    if (!enif_get_int64(env, elems[1], seq)) {
+        return 0;
+    }
+
+    return 1;
+}
+
+static int step_progress_entries(
+    ErlNifEnv *env,
+    sqlite3_stmt *stmt,
+    ERL_NIF_TERM entries,
+    const char *member_node,
+    int member_node_len
+)
+{
+    ERL_NIF_TERM head;
+
+    while (enif_get_list_cell(env, entries, &head, &entries)) {
+        ErlNifBinary origin_node;
+        ErlNifSInt64 seq;
+
+        if (!get_progress_entry(env, head, &origin_node, &seq)) {
+            return -1;
+        }
+
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+
+        if (member_node != NULL) {
+            int rc = sqlite3_bind_text(stmt, 1, member_node, member_node_len, SQLITE_TRANSIENT);
+            if (rc != SQLITE_OK) return rc;
+
+            rc = sqlite3_bind_text(
+                stmt,
+                2,
+                (const char *)origin_node.data,
+                (int)origin_node.size,
+                SQLITE_TRANSIENT
+            );
+            if (rc != SQLITE_OK) return rc;
+
+            rc = sqlite3_bind_int64(stmt, 3, (sqlite3_int64)seq);
+            if (rc != SQLITE_OK) return rc;
+        } else {
+            int rc = sqlite3_bind_text(
+                stmt,
+                1,
+                (const char *)origin_node.data,
+                (int)origin_node.size,
+                SQLITE_TRANSIENT
+            );
+            if (rc != SQLITE_OK) return rc;
+
+            rc = sqlite3_bind_int64(stmt, 2, (sqlite3_int64)seq);
+            if (rc != SQLITE_OK) return rc;
+        }
+
+        if (sqlite3_step(stmt) != SQLITE_DONE) {
+            return sqlite3_errcode(sqlite3_db_handle(stmt));
+        }
+    }
+
+    sqlite3_reset(stmt);
+    sqlite3_clear_bindings(stmt);
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* NIF: bind(stmt, args) -> :ok | {:error, msg}                        */
 /* ------------------------------------------------------------------ */
@@ -480,13 +767,16 @@ static ERL_NIF_TERM ekv_release(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
 }
 
 /* ------------------------------------------------------------------ */
-/* NIF: write_entry(db, kv_stmt, oplog_stmt, kv_args, oplog_args)      */
-/*   -> {:ok, true, seq} | {:ok, false} | {:error, msg}                */
+/* NIF: write_entry(db, kv_stmt, oplog_stmt, kv_args, oplog_args,      */
+/*                  local_origin)                                       */
+/*   -> {:ok, true, origin_seq} | {:ok, false}                         */
+/*   -> {:ok, false, origin_seq} | {:error, msg}                       */
 /*                                                                     */
 /* Single dirty IO bounce: BEGIN IMMEDIATE, bind+step kv upsert,       */
 /* check sqlite3_changes() for LWW result. If 0 (LWW lost), ROLLBACK  */
-/* and return {:ok, false}. Otherwise bind+step oplog, capture the     */
-/* inserted rowid as the durable seq, COMMIT, return {:ok, true, seq}. */
+/* and return {:ok, false}. Otherwise bind+step oplog, advance the     */
+/* contiguous local origin progress, COMMIT, return                    */
+/* {:ok, applied?, origin_seq, local_progress_seq}.                    */
 /* ------------------------------------------------------------------ */
 
 static ERL_NIF_TERM ekv_write_entry(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
@@ -517,12 +807,28 @@ static ERL_NIF_TERM ekv_write_entry(ErlNifEnv *env, int argc, const ERL_NIF_TERM
         return make_error(env, "statement finalized");
     }
 
-    /* 1. Bind kv args */
-    int br = bind_args(env, kv_s->stmt, argv[3]);
-    if (br != 0) {
+    ERL_NIF_TERM kv_origin_term;
+    ERL_NIF_TERM kv_origin_seq_term;
+    if (!list_nth_term(env, argv[3], 3, &kv_origin_term) ||
+        !list_nth_term(env, argv[3], 4, &kv_origin_seq_term)) {
         enif_mutex_unlock(conn->mutex);
-        return (br == -1) ? enif_make_badarg(env)
-                          : make_sqlite_error(env, conn->db);
+        return enif_make_badarg(env);
+    }
+
+    ErlNifBinary origin_bin;
+    if (!enif_inspect_iolist_as_binary(env, kv_origin_term, &origin_bin)) {
+        enif_mutex_unlock(conn->mutex);
+        return enif_make_badarg(env);
+    }
+
+    sqlite3_int64 origin_seq = 0;
+    sqlite3_int64 local_progress_seq = 0;
+    int origin_seq_provided = !enif_is_identical(kv_origin_seq_term, atom_nil);
+    if (origin_seq_provided) {
+        if (!enif_get_int64(env, kv_origin_seq_term, (ErlNifSInt64 *)&origin_seq)) {
+            enif_mutex_unlock(conn->mutex);
+            return enif_make_badarg(env);
+        }
     }
 
     /* 2. BEGIN IMMEDIATE */
@@ -534,7 +840,26 @@ static ERL_NIF_TERM ekv_write_entry(ErlNifEnv *env, int argc, const ERL_NIF_TERM
         return err;
     }
 
-    /* 3. Step kv upsert */
+    if (!origin_seq_provided) {
+        rc = next_local_origin_seq(conn->db, &origin_seq);
+        if (rc != SQLITE_OK) {
+            ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+            sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+            enif_mutex_unlock(conn->mutex);
+            return err;
+        }
+    }
+
+    /* 3. Bind + step kv upsert */
+    int br = bind_args(env, kv_s->stmt, argv[3]);
+    if (br != 0) {
+        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+        enif_mutex_unlock(conn->mutex);
+        return (br == -1) ? enif_make_badarg(env)
+                          : make_sqlite_error(env, conn->db);
+    }
+    sqlite3_bind_int64(kv_s->stmt, 5, origin_seq);
+
     rc = sqlite3_step(kv_s->stmt);
     if (rc != SQLITE_DONE) {
         ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
@@ -548,10 +873,12 @@ static ERL_NIF_TERM ekv_write_entry(ErlNifEnv *env, int argc, const ERL_NIF_TERM
     /* 4. Check LWW result */
     int changes = sqlite3_changes(conn->db);
     if (changes == 0) {
-        /* LWW lost — rollback */
-        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-        enif_mutex_unlock(conn->mutex);
-        return enif_make_tuple2(env, atom_ok, atom_false);
+        /* Local-origin LWW loss creates no replay history or progress. */
+        if (!origin_seq_provided) {
+            sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+            enif_mutex_unlock(conn->mutex);
+            return enif_make_tuple2(env, atom_ok, atom_false);
+        }
     }
 
     /* 5. Bind + step oplog */
@@ -562,6 +889,7 @@ static ERL_NIF_TERM ekv_write_entry(ErlNifEnv *env, int argc, const ERL_NIF_TERM
         return (br == -1) ? enif_make_badarg(env)
                           : make_sqlite_error(env, conn->db);
     }
+    sqlite3_bind_int64(oplog_s->stmt, 5, origin_seq);
 
     rc = sqlite3_step(oplog_s->stmt);
     if (rc != SQLITE_DONE) {
@@ -571,8 +899,21 @@ static ERL_NIF_TERM ekv_write_entry(ErlNifEnv *env, int argc, const ERL_NIF_TERM
         enif_mutex_unlock(conn->mutex);
         return err;
     }
-    sqlite3_int64 seq = sqlite3_last_insert_rowid(conn->db);
     sqlite3_reset(oplog_s->stmt);
+
+    rc = advance_local_origin_progress(
+        conn->db,
+        (const char *)origin_bin.data,
+        (int)origin_bin.size,
+        origin_seq,
+        &local_progress_seq
+    );
+    if (rc != SQLITE_OK) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
 
     /* 6. COMMIT */
     rc = sqlite3_exec(conn->db, "COMMIT", NULL, NULL, NULL);
@@ -584,11 +925,22 @@ static ERL_NIF_TERM ekv_write_entry(ErlNifEnv *env, int argc, const ERL_NIF_TERM
     }
 
     enif_mutex_unlock(conn->mutex);
-    return enif_make_tuple3(
+    if (changes > 0) {
+        return enif_make_tuple4(
+            env,
+            atom_ok,
+            atom_true,
+            enif_make_int64(env, (ErlNifSInt64)origin_seq),
+            enif_make_int64(env, (ErlNifSInt64)local_progress_seq)
+        );
+    }
+
+    return enif_make_tuple4(
         env,
         atom_ok,
-        atom_true,
-        enif_make_int64(env, (ErlNifSInt64)seq)
+        atom_false,
+        enif_make_int64(env, (ErlNifSInt64)origin_seq),
+        enif_make_int64(env, (ErlNifSInt64)local_progress_seq)
     );
 }
 
@@ -852,6 +1204,279 @@ static ERL_NIF_TERM ekv_backup(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv
         return make_error(env, "backup failed");
     }
 
+    return atom_ok;
+}
+
+/* ------------------------------------------------------------------ */
+/* NIF: merge_local_progress_summary(db, [{origin_node, seq}...])      */
+/* ------------------------------------------------------------------ */
+
+static ERL_NIF_TERM ekv_merge_local_progress_summary(
+    ErlNifEnv *env,
+    int argc,
+    const ERL_NIF_TERM argv[]
+)
+{
+    (void)argc;
+    connection_t *conn;
+    sqlite3_stmt *stmt = NULL;
+
+    if (!enif_get_resource(env, argv[0], connection_type, (void **)&conn))
+        return enif_make_badarg(env);
+
+    enif_mutex_lock(conn->mutex);
+    if (!conn->db) {
+        enif_mutex_unlock(conn->mutex);
+        return make_error(env, "database closed");
+    }
+
+    int rc = begin_immediate(conn->db);
+    if (rc != SQLITE_OK) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
+
+    rc = sqlite3_prepare_v3(
+        conn->db,
+        "INSERT INTO kv_origin_progress (origin_node, last_seq) VALUES (?1, ?2) "
+        "ON CONFLICT(origin_node) DO UPDATE SET last_seq = MAX(last_seq, excluded.last_seq)",
+        -1,
+        0,
+        &stmt,
+        NULL
+    );
+
+    if (rc != SQLITE_OK) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        rollback_tx(conn->db);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
+
+    rc = step_progress_entries(env, stmt, argv[1], NULL, 0);
+    sqlite3_finalize(stmt);
+
+    if (rc == -1) {
+        rollback_tx(conn->db);
+        enif_mutex_unlock(conn->mutex);
+        return enif_make_badarg(env);
+    }
+
+    if (rc != SQLITE_OK) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        rollback_tx(conn->db);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
+
+    rc = commit_tx(conn->db);
+    if (rc != SQLITE_OK) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        rollback_tx(conn->db);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
+
+    enif_mutex_unlock(conn->mutex);
+    return atom_ok;
+}
+
+/* ------------------------------------------------------------------ */
+/* NIF: replace_local_progress_summary(db, [{origin_node, seq}...])    */
+/* ------------------------------------------------------------------ */
+
+static ERL_NIF_TERM ekv_replace_local_progress_summary(
+    ErlNifEnv *env,
+    int argc,
+    const ERL_NIF_TERM argv[]
+)
+{
+    (void)argc;
+    connection_t *conn;
+    sqlite3_stmt *stmt = NULL;
+
+    if (!enif_get_resource(env, argv[0], connection_type, (void **)&conn))
+        return enif_make_badarg(env);
+
+    enif_mutex_lock(conn->mutex);
+    if (!conn->db) {
+        enif_mutex_unlock(conn->mutex);
+        return make_error(env, "database closed");
+    }
+
+    int rc = begin_immediate(conn->db);
+    if (rc != SQLITE_OK) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
+
+    rc = sqlite3_exec(conn->db, "DELETE FROM kv_origin_progress", NULL, NULL, NULL);
+    if (rc != SQLITE_OK) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        rollback_tx(conn->db);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
+
+    rc = sqlite3_prepare_v3(
+        conn->db,
+        "INSERT INTO kv_origin_progress (origin_node, last_seq) VALUES (?1, ?2)",
+        -1,
+        0,
+        &stmt,
+        NULL
+    );
+
+    if (rc != SQLITE_OK) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        rollback_tx(conn->db);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
+
+    rc = step_progress_entries(env, stmt, argv[1], NULL, 0);
+    sqlite3_finalize(stmt);
+
+    if (rc == -1) {
+        rollback_tx(conn->db);
+        enif_mutex_unlock(conn->mutex);
+        return enif_make_badarg(env);
+    }
+
+    if (rc != SQLITE_OK) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        rollback_tx(conn->db);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
+
+    rc = commit_tx(conn->db);
+    if (rc != SQLITE_OK) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        rollback_tx(conn->db);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
+
+    enif_mutex_unlock(conn->mutex);
+    return atom_ok;
+}
+
+/* ------------------------------------------------------------------ */
+/* NIF: replace_peer_progress(db, member_node, [{origin_node, seq}...]) */
+/* ------------------------------------------------------------------ */
+
+static ERL_NIF_TERM ekv_replace_peer_progress(
+    ErlNifEnv *env,
+    int argc,
+    const ERL_NIF_TERM argv[]
+)
+{
+    (void)argc;
+    connection_t *conn;
+    ErlNifBinary member_node;
+    sqlite3_stmt *delete_stmt = NULL;
+    sqlite3_stmt *insert_stmt = NULL;
+
+    if (!enif_get_resource(env, argv[0], connection_type, (void **)&conn))
+        return enif_make_badarg(env);
+
+    if (!enif_inspect_iolist_as_binary(env, argv[1], &member_node))
+        return enif_make_badarg(env);
+
+    enif_mutex_lock(conn->mutex);
+    if (!conn->db) {
+        enif_mutex_unlock(conn->mutex);
+        return make_error(env, "database closed");
+    }
+
+    int rc = begin_immediate(conn->db);
+    if (rc != SQLITE_OK) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
+
+    rc = sqlite3_prepare_v3(
+        conn->db,
+        "DELETE FROM kv_member_progress WHERE member_node = ?1",
+        -1,
+        0,
+        &delete_stmt,
+        NULL
+    );
+    if (rc != SQLITE_OK) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        rollback_tx(conn->db);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
+
+    sqlite3_bind_text(
+        delete_stmt,
+        1,
+        (const char *)member_node.data,
+        (int)member_node.size,
+        SQLITE_TRANSIENT
+    );
+
+    rc = sqlite3_step(delete_stmt);
+    sqlite3_finalize(delete_stmt);
+    if (rc != SQLITE_DONE) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        rollback_tx(conn->db);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
+
+    rc = sqlite3_prepare_v3(
+        conn->db,
+        "INSERT INTO kv_member_progress (member_node, origin_node, last_seq) VALUES (?1, ?2, ?3)",
+        -1,
+        0,
+        &insert_stmt,
+        NULL
+    );
+    if (rc != SQLITE_OK) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        rollback_tx(conn->db);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
+
+    rc = step_progress_entries(
+        env,
+        insert_stmt,
+        argv[2],
+        (const char *)member_node.data,
+        (int)member_node.size
+    );
+    sqlite3_finalize(insert_stmt);
+
+    if (rc == -1) {
+        rollback_tx(conn->db);
+        enif_mutex_unlock(conn->mutex);
+        return enif_make_badarg(env);
+    }
+
+    if (rc != SQLITE_OK) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        rollback_tx(conn->db);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
+
+    rc = commit_tx(conn->db);
+    if (rc != SQLITE_OK) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        rollback_tx(conn->db);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
+
+    enif_mutex_unlock(conn->mutex);
     return atom_ok;
 }
 
@@ -1306,8 +1931,8 @@ static ERL_NIF_TERM ekv_paxos_accept(ErlNifEnv *env, int argc, const ERL_NIF_TER
 
 /* ------------------------------------------------------------------ */
 /* NIF: paxos_promote(db, kv_force_stmt, oplog_stmt, key,             */
-/*                    ballot_c, ballot_n)                              */
-/*   -> {:ok, value, ts, origin, expires, deleted, prev_value|nil, seq}*/
+/*                    ballot_c, ballot_n, origin_seq)                  */
+/*   -> {:ok, value, ts, origin, expires, deleted, prev_value|nil, origin_seq, local_progress_seq}*/
 /*   -> {:ok, :stale}                                                  */
 /*   -> {:error, msg}                                                  */
 /*                                                                     */
@@ -1345,6 +1970,14 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
     if (!enif_inspect_iolist_as_binary(env, argv[5], &ballot_n_bin))
         return enif_make_badarg(env);
 
+    sqlite3_int64 origin_seq = 0;
+    sqlite3_int64 local_progress_seq = 0;
+    int origin_seq_provided = !enif_is_identical(argv[6], atom_nil);
+    if (origin_seq_provided) {
+        if (!enif_get_int64(env, argv[6], (ErlNifSInt64 *)&origin_seq))
+            return enif_make_badarg(env);
+    }
+
     /* Null-terminate ballot_n for strcmp */
     char *ballot_n_str = enif_alloc(ballot_n_bin.size + 1);
     if (!ballot_n_str) return make_error(env, "alloc failed");
@@ -1370,6 +2003,17 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
         enif_mutex_unlock(conn->mutex);
         enif_free(ballot_n_str);
         return err;
+    }
+
+    if (!origin_seq_provided) {
+        rc = next_local_origin_seq(conn->db, &origin_seq);
+        if (rc != SQLITE_OK) {
+            ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+            sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+            enif_mutex_unlock(conn->mutex);
+            enif_free(ballot_n_str);
+            return err;
+        }
     }
 
     /* 2. SELECT accepted state from kv_paxos */
@@ -1473,7 +2117,7 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
         sqlite3_finalize(prev_sel);
     }
 
-    /* 5. Bind + step kv_force_upsert: [key, value, ts, origin, expires, deleted] */
+    /* 5. Bind + step kv_force_upsert: [key, value, ts, origin, origin_seq, expires, deleted] */
     sqlite3_reset(kv_s->stmt);
     sqlite3_clear_bindings(kv_s->stmt);
     sqlite3_bind_text(kv_s->stmt, 1, (const char *)key_bin.data, (int)key_bin.size, SQLITE_TRANSIENT);
@@ -1486,14 +2130,15 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
         sqlite3_bind_text(kv_s->stmt, 4, origin_copy, origin_len, SQLITE_TRANSIENT);
     else
         sqlite3_bind_null(kv_s->stmt, 4);
+    sqlite3_bind_int64(kv_s->stmt, 5, origin_seq);
     if (has_expires)
-        sqlite3_bind_int64(kv_s->stmt, 5, expires_at);
-    else
-        sqlite3_bind_null(kv_s->stmt, 5);
-    if (has_deleted)
-        sqlite3_bind_int64(kv_s->stmt, 6, deleted_at);
+        sqlite3_bind_int64(kv_s->stmt, 6, expires_at);
     else
         sqlite3_bind_null(kv_s->stmt, 6);
+    if (has_deleted)
+        sqlite3_bind_int64(kv_s->stmt, 7, deleted_at);
+    else
+        sqlite3_bind_null(kv_s->stmt, 7);
 
     rc = sqlite3_step(kv_s->stmt);
     if (rc != SQLITE_DONE) {
@@ -1508,7 +2153,7 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
     }
     sqlite3_reset(kv_s->stmt);
 
-    /* 6. Bind + step oplog_insert: [key, value, ts, origin, expires, is_delete] */
+    /* 6. Bind + step oplog_insert: [key, value, ts, origin, origin_seq, expires, is_delete] */
     sqlite3_reset(oplog_s->stmt);
     sqlite3_clear_bindings(oplog_s->stmt);
     sqlite3_bind_text(oplog_s->stmt, 1, (const char *)key_bin.data, (int)key_bin.size, SQLITE_TRANSIENT);
@@ -1521,11 +2166,12 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
         sqlite3_bind_text(oplog_s->stmt, 4, origin_copy, origin_len, SQLITE_TRANSIENT);
     else
         sqlite3_bind_null(oplog_s->stmt, 4);
+    sqlite3_bind_int64(oplog_s->stmt, 5, origin_seq);
     if (has_expires)
-        sqlite3_bind_int64(oplog_s->stmt, 5, expires_at);
+        sqlite3_bind_int64(oplog_s->stmt, 6, expires_at);
     else
-        sqlite3_bind_null(oplog_s->stmt, 5);
-    sqlite3_bind_int64(oplog_s->stmt, 6, has_deleted ? 1 : 0);  /* is_delete */
+        sqlite3_bind_null(oplog_s->stmt, 6);
+    sqlite3_bind_int64(oplog_s->stmt, 7, has_deleted ? 1 : 0);  /* is_delete */
 
     rc = sqlite3_step(oplog_s->stmt);
     if (rc != SQLITE_DONE) {
@@ -1538,8 +2184,24 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
         enif_mutex_unlock(conn->mutex);
         return err;
     }
-    sqlite3_int64 seq = sqlite3_last_insert_rowid(conn->db);
     sqlite3_reset(oplog_s->stmt);
+
+    rc = advance_local_origin_progress(
+        conn->db,
+        origin_copy,
+        origin_len,
+        origin_seq,
+        &local_progress_seq
+    );
+    if (rc != SQLITE_OK) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        if (value_copy) enif_free(value_copy);
+        if (origin_copy) enif_free(origin_copy);
+        enif_free(ballot_n_str);
+        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
 
     /* 7. COMMIT */
     rc = sqlite3_exec(conn->db, "COMMIT", NULL, NULL, NULL);
@@ -1556,10 +2218,10 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
 
     enif_mutex_unlock(conn->mutex);
 
-    /* {:ok, value, timestamp, origin, expires_at, deleted_at, prev_value_or_nil, seq} */
+    /* {:ok, value, timestamp, origin, expires_at, deleted_at, prev_value_or_nil, origin_seq, local_progress_seq} */
     return enif_make_tuple(
         env,
-        8,
+        9,
         atom_ok,
         value_term,
         ts_term,
@@ -1567,7 +2229,8 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
         expires_term,
         deleted_term,
         prev_value,
-        enif_make_int64(env, (ErlNifSInt64)seq)
+        enif_make_int64(env, (ErlNifSInt64)origin_seq),
+        enif_make_int64(env, (ErlNifSInt64)local_progress_seq)
     );
 }
 
@@ -1583,13 +2246,19 @@ static ErlNifFunc nif_funcs[] = {
     {"ekv_bind",          2, ekv_bind,          ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_step",          2, ekv_step,          ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_release",       2, ekv_release,       ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"ekv_write_entry",   5, ekv_write_entry,   ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"ekv_write_entry",   6, ekv_write_entry,   ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_read_entry",    3, ekv_read_entry,    ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_fetch_all",     3, ekv_fetch_all,     ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_backup",        2, ekv_backup,        ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"ekv_merge_local_progress_summary", 2, ekv_merge_local_progress_summary,
+        ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"ekv_replace_local_progress_summary", 2, ekv_replace_local_progress_summary,
+        ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"ekv_replace_peer_progress", 3, ekv_replace_peer_progress,
+        ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_paxos_prepare", 4, ekv_paxos_prepare, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_paxos_accept",  5, ekv_paxos_accept,  ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"ekv_paxos_promote", 6, ekv_paxos_promote, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"ekv_paxos_promote", 7, ekv_paxos_promote, ERL_NIF_DIRTY_JOB_IO_BOUND},
 };
 
 static int on_load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info)

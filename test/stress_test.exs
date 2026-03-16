@@ -120,7 +120,7 @@ defmodule EKV.StressTest do
       for {_pid, node} <- peers do
         TestCluster.rpc!(node, Kernel, :send, [
           shard_name,
-          {:ekv_put, key, old_value_bin, old_ts, old_origin, nil, 0}
+          {:ekv_put, key, old_value_bin, old_ts, old_origin, 1, nil}
         ])
 
         # Drain shard mailbox so the synthetic write is definitely applied.
@@ -208,7 +208,7 @@ defmodule EKV.StressTest do
 
       TestCluster.rpc!(n1, Kernel, :send, [
         shard_name,
-        {:ekv_put, conflict_key, ahead_bin, ahead_ts, ahead_origin, nil, 0}
+        {:ekv_put, conflict_key, ahead_bin, ahead_ts, ahead_origin, 1, nil}
       ])
 
       TestCluster.rpc!(n1, :sys, :get_state, [shard_name])

@@ -265,14 +265,28 @@ defmodule EKV.TestCluster do
     rpc!(node, __MODULE__, :do_replica_state, [name, shard_index])
   end
 
-  @doc "Read a member HWM row from a remote shard db"
-  def member_hwm(node, name, member_node, shard_index \\ 0) do
-    rpc!(node, __MODULE__, :do_member_hwm, [name, member_node, shard_index])
+  @doc "Read local applied progress for an origin stream from a remote shard db"
+  def local_progress(node, name, origin_node, shard_index \\ 0) do
+    rpc!(node, __MODULE__, :do_local_progress, [name, origin_node, shard_index])
   end
 
-  @doc "Set a member HWM row on a remote shard db"
-  def set_member_hwm(node, name, member_node, seq, shard_index \\ 0) do
-    rpc!(node, __MODULE__, :do_set_member_hwm, [name, member_node, seq, shard_index])
+  @doc "Force local applied progress for an origin stream on a remote shard db"
+  def set_local_progress(node, name, origin_node, seq, shard_index \\ 0) do
+    rpc!(node, __MODULE__, :do_set_local_progress, [name, origin_node, seq, shard_index])
+  end
+
+  def force_local_progress(node, name, origin_node, seq, shard_index \\ 0) do
+    rpc!(node, __MODULE__, :do_force_local_progress, [name, origin_node, seq, shard_index])
+  end
+
+  @doc "Read cached durable peer progress for a remote member/origin pair"
+  def peer_progress(node, name, peer_node, origin_node, shard_index \\ 0) do
+    rpc!(node, __MODULE__, :do_peer_progress, [name, peer_node, origin_node, shard_index])
+  end
+
+  @doc "Force cached durable peer progress for a remote member/origin pair"
+  def set_peer_progress(node, name, peer_node, origin_node, seq, shard_index \\ 0) do
+    rpc!(node, __MODULE__, :do_set_peer_progress, [name, peer_node, origin_node, seq, shard_index])
   end
 
   @doc "Read a shard's max oplog seq on a remote node"
@@ -290,9 +304,15 @@ defmodule EKV.TestCluster do
     rpc!(node, __MODULE__, :do_min_seq, [name, shard_index])
   end
 
-  @doc "Mutate a replica's cached remote_member_hwm on a remote node"
-  def set_cached_remote_hwm(node, name, remote_node, seq, shard_index \\ 0) do
-    rpc!(node, __MODULE__, :do_set_cached_remote_hwm, [name, remote_node, seq, shard_index])
+  @doc "Mutate a replica's cached remote progress for one origin stream on a remote node"
+  def set_cached_remote_progress(node, name, remote_node, origin_node, seq, shard_index \\ 0) do
+    rpc!(node, __MODULE__, :do_set_cached_remote_progress, [
+      name,
+      remote_node,
+      origin_node,
+      seq,
+      shard_index
+    ])
   end
 
   @doc "Trigger one anti-entropy tick on a remote shard"
@@ -362,13 +382,25 @@ defmodule EKV.TestCluster do
     config = EKV.Supervisor.get_config(name)
     shard = EKV.Replica.shard_index_for(key, config.num_shards)
     shard_name = EKV.Replica.shard_name(name, shard)
-    %{db: db, stmts: stmts} = :sys.get_state(shard_name)
+    %{db: db, stmts: stmts, local_origin_seq: local_origin_seq} = :sys.get_state(shard_name)
     value_binary = :erlang.term_to_binary(value)
     origin = Keyword.get(opts, :origin, node())
+    origin_seq =
+      Keyword.get_lazy(opts, :origin_seq, fn ->
+        if origin == node() do
+          local_origin_seq + 1
+        else
+          db
+          |> EKV.Store.local_progress_summary()
+          |> Map.get(origin, 0)
+          |> Kernel.+(1)
+        end
+      end)
+
     expires_at = Keyword.get(opts, :expires_at)
     deleted_at = Keyword.get(opts, :deleted_at)
 
-    {:ok, true, _seq} =
+    {:ok, true, seq, local_progress_seq} =
       EKV.Store.write_entry(
         db,
         stmts.kv_upsert,
@@ -378,8 +410,20 @@ defmodule EKV.TestCluster do
         timestamp,
         origin,
         expires_at,
-        deleted_at
+        deleted_at,
+        origin_seq
       )
+
+    :sys.replace_state(shard_name, fn state ->
+      local_progress =
+        Map.update(state.local_progress, origin, local_progress_seq, &max(&1, local_progress_seq))
+
+      if origin == node() do
+        %{state | local_progress: local_progress, local_origin_seq: max(state.local_origin_seq, seq)}
+      else
+        %{state | local_progress: local_progress}
+      end
+    end)
 
     :ok
   end
@@ -424,16 +468,81 @@ defmodule EKV.TestCluster do
     :sys.get_state(shard_name)
   end
 
-  def do_member_hwm(name, member_node, shard_index) do
+  def do_local_progress(name, origin_node, shard_index) do
     shard_name = EKV.Replica.shard_name(name, shard_index)
-    %{db: db} = :sys.get_state(shard_name)
-    EKV.Store.get_hwm(db, member_node)
+    %{db: db, local_origin_seq: local_origin_seq} = :sys.get_state(shard_name)
+
+    if origin_node == node() do
+      local_origin_seq
+    else
+      db
+      |> EKV.Store.local_progress_summary()
+      |> Map.get(origin_node, 0)
+    end
   end
 
-  def do_set_member_hwm(name, member_node, seq, shard_index) do
+  def do_set_local_progress(name, origin_node, seq, shard_index) do
     shard_name = EKV.Replica.shard_name(name, shard_index)
     %{db: db} = :sys.get_state(shard_name)
-    EKV.Store.set_hwm(db, member_node, seq)
+    :ok = EKV.Store.merge_local_progress(db, origin_node, seq)
+
+    :sys.replace_state(shard_name, fn state ->
+      local_progress =
+        Map.update(state.local_progress, origin_node, seq, &max(&1, seq))
+
+      if origin_node == node() do
+        %{state | local_progress: local_progress, local_origin_seq: max(state.local_origin_seq, seq)}
+      else
+        %{state | local_progress: local_progress}
+      end
+    end)
+
+    :ok
+  end
+
+  def do_force_local_progress(name, origin_node, seq, shard_index) do
+    shard_name = EKV.Replica.shard_name(name, shard_index)
+    %{db: db} = :sys.get_state(shard_name)
+
+    progress =
+      db
+      |> EKV.Store.local_progress_summary()
+      |> Map.put(origin_node, seq)
+
+    :ok = EKV.Store.replace_local_progress_summary(db, progress)
+
+    :sys.replace_state(shard_name, fn state ->
+      local_progress = Map.put(state.local_progress, origin_node, seq)
+
+      if origin_node == node() do
+        %{state | local_progress: local_progress, local_origin_seq: seq}
+      else
+        %{state | local_progress: local_progress}
+      end
+    end)
+
+    :ok
+  end
+
+  def do_peer_progress(name, peer_node, origin_node, shard_index) do
+    shard_name = EKV.Replica.shard_name(name, shard_index)
+    %{db: db} = :sys.get_state(shard_name)
+
+    db
+    |> EKV.Store.get_peer_progress(peer_node)
+    |> Map.get(origin_node, 0)
+  end
+
+  def do_set_peer_progress(name, peer_node, origin_node, seq, shard_index) do
+    shard_name = EKV.Replica.shard_name(name, shard_index)
+    %{db: db} = :sys.get_state(shard_name)
+
+    progress =
+      db
+      |> EKV.Store.get_peer_progress(peer_node)
+      |> Map.put(origin_node, seq)
+
+    EKV.Store.replace_peer_progress(db, peer_node, progress)
   end
 
   def do_max_seq(name, shard_index) do
@@ -454,11 +563,18 @@ defmodule EKV.TestCluster do
     EKV.Store.min_seq(db)
   end
 
-  def do_set_cached_remote_hwm(name, remote_node, seq, shard_index) do
+  def do_set_cached_remote_progress(name, remote_node, origin_node, seq, shard_index) do
     shard_name = EKV.Replica.shard_name(name, shard_index)
 
     :sys.replace_state(shard_name, fn state ->
-      %{state | remote_member_hwms: Map.put(state.remote_member_hwms, remote_node, seq)}
+      remote_progress = Map.get(state.remote_member_progress, remote_node, %{})
+      updated_progress = Map.put(remote_progress, origin_node, seq)
+
+      %{
+        state
+        | remote_member_progress: Map.put(state.remote_member_progress, remote_node, updated_progress),
+          remote_member_hwms: Map.put(state.remote_member_hwms, remote_node, seq)
+      }
     end)
 
     :ok

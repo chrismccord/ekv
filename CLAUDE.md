@@ -249,28 +249,27 @@ Important:
 - Distinct logical `node_id`s drive quorum and overflow checks.
 - If visible logical members exceed `cluster_size`, CAS must fail with `{:error, :cluster_overflow}`.
 
-### Sync / HWM correctness
-- `kv_member_hwm` is not monotonic by design.
-  - It tracks the sender's latest advertised sequence space exactly.
-  - If a sender restarts/restores to a lower local max seq, the stored HWM must be allowed to move lower too.
-- Sender stores member HWM as sender snapshot `my_seq`, not remote sequence.
-- Delta sync is only valid when the member cursor is still inside the local oplog window.
-- Otherwise force full sync.
+### Sync / replay-progress correctness
+- `kv_origin_progress` is local applied progress per origin stream.
+- `kv_member_progress` is peer progress per origin stream.
+- Progress is exact, not monotonic-by-max.
+  - If a peer restarts/full-syncs to a lower authoritative cursor, the stored peer progress must be allowed to move lower too.
+- Delta sync is only valid when the requester is behind a live origin stream and the requested range is still inside the retained replay window.
+- Otherwise serve full sync.
 - Already-connected members now also run periodic anti-entropy by default.
-  - This is not a second protocol.
-  - It reuses the same HWM-driven delta/full sync path.
+  - The tick is a summary probe/reply exchange, not unsolicited sender push.
+  - The behind receiver decides whether to request delta or full repair.
   - The goal is to heal missed replication without waiting for reconnect.
-- Live replication now advances sender/receiver progress directly.
-  - `sender_seq` is part of the required v1 replication payload.
-  - Receivers ack that progress via `:sync_ack`, even when the merge is a no-op.
-  - Anti-entropy should now repair true misses instead of replaying the healthy recent tail every interval.
-- Delta sync relays only entries this member is authoritative for.
-  - That means local-origin writes, plus writes from origin members that are no longer connected.
-  - Healthy replicas should not continuously replay each other's live traffic in steady state.
+- Live LWW and CAS replication both carry `(origin_node, origin_seq)` directly.
+  - Receivers advance local contiguous progress in the same write/promote transaction.
+  - Gaps trigger explicit pull repair from the live origin instead of live progress-ack chatter.
+- Normal delta sync is live-origin-owned.
+- If a peer is behind on dead-origin data, a live peer serves full sync instead of inventing a non-origin delta stream.
 - Chunked sync rules matter:
-  - intermediate chunks use seq `0`
-  - final chunk must send the real terminal seq
-  - empty full sync and empty delta still need a terminal sync/ack settlement so HWM can move to `0` or another lowered cursor
+  - intermediate chunks use `progress=nil`
+  - final chunk must send the real terminal progress map
+  - `:progress_ack` is sync-settlement only; it is not part of the hot live-write path
+  - empty delta still needs a terminal sync/ack settlement so the requester can advance to the sender's head without replaying extra chunks
 
 ### Long partition protection
 - Startup stale-db rejection:

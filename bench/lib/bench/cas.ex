@@ -777,8 +777,8 @@ defmodule Bench.CAS do
   defp start_ekv_on(node, opts) do
     defaults =
       case Keyword.get(opts, :mode, :member) do
-        :client -> [log: false]
-        _member -> [log: false, gc_interval: :timer.hours(1)]
+        :client -> []
+        _member -> [gc_interval: :timer.hours(1)]
       end
 
     full_opts = Keyword.merge(defaults, opts)

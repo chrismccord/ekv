@@ -9,19 +9,20 @@ defmodule EKV.Store do
 
   - current committed KV state
   - CAS accept/promote state (`kv_paxos`)
-  - delta/full sync source data (`kv_oplog`, `kv_member_hwm`)
+  - anti-entropy replay/progress (`kv_oplog`, `kv_origin_progress`, `kv_member_progress`)
   - startup stale-db checks (`allow_stale_startup` override)
   - local TTL-expiry bookkeeping via `expired_at`
 
   ## Tables
 
   - `kv` — current committed state of all keys:
-    `(value, timestamp, origin_node, expires_at, deleted_at, expired_at)`
+    `(value, timestamp, origin_node, origin_seq, expires_at, deleted_at, expired_at)`
     `expired_at` is local-only bookkeeping so GC emits `:expired` once; it is
     not a replicated tombstone marker.
-  - `kv_oplog` — append-only replication log for live puts and explicit deletes.
+  - `kv_oplog` — authoritative replay log keyed by `(origin_node, origin_seq)`.
     Already-expired rows are filtered out when delta sync is built.
-  - `kv_member_hwm` — per-member high-water marks for oplog sync/truncation.
+  - `kv_origin_progress` — local applied replay progress per origin.
+  - `kv_member_progress` — per-member, per-origin progress for anti-entropy/truncation.
   - `kv_meta` — shard metadata such as `last_active_at`, persisted `node_id`,
     and long-partition down-since markers.
   - `kv_paxos` — durable CASPaxos acceptor state per key.
@@ -34,12 +35,13 @@ defmodule EKV.Store do
 
   # SQL for the 2 hot cached statements
   @kv_upsert_sql """
-  INSERT INTO kv (key, value, timestamp, origin_node, expires_at, deleted_at)
-  VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+  INSERT INTO kv (key, value, timestamp, origin_node, origin_seq, expires_at, deleted_at)
+  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
   ON CONFLICT(key) DO UPDATE SET
     value = excluded.value, timestamp = excluded.timestamp,
-    origin_node = excluded.origin_node, expires_at = excluded.expires_at,
-    deleted_at = excluded.deleted_at, expired_at = NULL
+    origin_node = excluded.origin_node, origin_seq = excluded.origin_seq,
+    expires_at = excluded.expires_at, deleted_at = excluded.deleted_at,
+    expired_at = NULL
   WHERE excluded.timestamp > kv.timestamp
     OR (excluded.timestamp = kv.timestamp AND excluded.origin_node > kv.origin_node)
   """
@@ -47,17 +49,19 @@ defmodule EKV.Store do
   # Unconditional upsert — no LWW WHERE clause. Used by paxos_accept where
   # Paxos ballots determine ordering, not timestamps.
   @kv_force_upsert_sql """
-  INSERT INTO kv (key, value, timestamp, origin_node, expires_at, deleted_at)
-  VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+  INSERT INTO kv (key, value, timestamp, origin_node, origin_seq, expires_at, deleted_at)
+  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
   ON CONFLICT(key) DO UPDATE SET
     value = excluded.value, timestamp = excluded.timestamp,
-    origin_node = excluded.origin_node, expires_at = excluded.expires_at,
-    deleted_at = excluded.deleted_at, expired_at = NULL
+    origin_node = excluded.origin_node, origin_seq = excluded.origin_seq,
+    expires_at = excluded.expires_at, deleted_at = excluded.deleted_at,
+    expired_at = NULL
   """
 
   @oplog_insert_sql """
-  INSERT INTO kv_oplog (key, value, timestamp, origin_node, expires_at, is_delete)
-  VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+  INSERT INTO kv_oplog (key, value, timestamp, origin_node, origin_seq, expires_at, is_delete)
+  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+  ON CONFLICT(origin_node, origin_seq) DO NOTHING
   """
 
   def open(data_dir, shard_index, tombstone_ttl, num_shards, gc_interval, opts \\ []) do
@@ -99,6 +103,7 @@ defmodule EKV.Store do
         value BLOB,
         timestamp INTEGER NOT NULL,
         origin_node TEXT NOT NULL,
+        origin_seq INTEGER NOT NULL DEFAULT 0,
         expires_at INTEGER,
         deleted_at INTEGER,
         expired_at INTEGER
@@ -113,8 +118,33 @@ defmodule EKV.Store do
         value BLOB,
         timestamp INTEGER NOT NULL,
         origin_node TEXT NOT NULL,
+        origin_seq INTEGER NOT NULL DEFAULT 0,
         expires_at INTEGER,
         is_delete INTEGER NOT NULL DEFAULT 0
+      )
+      """)
+
+    :ok =
+      EKV.Sqlite3.execute(db, """
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_kv_oplog_origin_seq
+      ON kv_oplog(origin_node, origin_seq)
+      """)
+
+    :ok =
+      EKV.Sqlite3.execute(db, """
+      CREATE TABLE IF NOT EXISTS kv_origin_progress (
+        origin_node TEXT NOT NULL PRIMARY KEY,
+        last_seq INTEGER NOT NULL
+      )
+      """)
+
+    :ok =
+      EKV.Sqlite3.execute(db, """
+      CREATE TABLE IF NOT EXISTS kv_member_progress (
+        member_node TEXT NOT NULL,
+        origin_node TEXT NOT NULL,
+        last_seq INTEGER NOT NULL,
+        PRIMARY KEY (member_node, origin_node)
       )
       """)
 
@@ -193,6 +223,16 @@ defmodule EKV.Store do
       {:error, _} -> :ok
     end
 
+    case EKV.Sqlite3.execute(db, "ALTER TABLE kv ADD COLUMN origin_seq INTEGER NOT NULL DEFAULT 0") do
+      :ok -> :ok
+      {:error, _} -> :ok
+    end
+
+    case EKV.Sqlite3.execute(db, "ALTER TABLE kv_oplog ADD COLUMN origin_seq INTEGER NOT NULL DEFAULT 0") do
+      :ok -> :ok
+      {:error, _} -> :ok
+    end
+
     :ok =
       EKV.Sqlite3.execute(
         db,
@@ -260,8 +300,11 @@ defmodule EKV.Store do
   @doc """
   Combined write: LWW check + kv upsert + oplog insert in a single NIF call.
 
-  Returns {:ok, true, seq} if the write was applied (LWW won or new key),
-  or {:ok, false} if the write was skipped (LWW lost).
+  Returns:
+    - `{:ok, true, origin_seq, local_progress_seq}` when the write was applied
+    - `{:ok, false, origin_seq, local_progress_seq}` when the kv row was not updated but
+      the replay row/progress state was still processed
+    - `{:ok, false}` only for local-origin LWW loss where no replay row was retained
   """
   def write_entry(
         db,
@@ -272,15 +315,17 @@ defmodule EKV.Store do
         timestamp,
         origin_node,
         expires_at,
-        deleted_at \\ nil
+        deleted_at \\ nil,
+        origin_seq \\ nil
       ) do
     is_delete = if deleted_at, do: 1, else: 0
     origin_str = Atom.to_string(origin_node)
+    local_origin = origin_node == node()
 
-    kv_args = [key, value_binary, timestamp, origin_str, expires_at, deleted_at]
-    oplog_args = [key, value_binary, timestamp, origin_str, expires_at, is_delete]
+    kv_args = [key, value_binary, timestamp, origin_str, origin_seq, expires_at, deleted_at]
+    oplog_args = [key, value_binary, timestamp, origin_str, origin_seq, expires_at, is_delete]
 
-    EKV.Sqlite3.write_entry(db, kv_stmt, oplog_stmt, kv_args, oplog_args)
+    EKV.Sqlite3.write_entry(db, kv_stmt, oplog_stmt, kv_args, oplog_args, local_origin)
   end
 
   # =====================================================================
@@ -398,20 +443,41 @@ defmodule EKV.Store do
   # =====================================================================
 
   @oplog_since_sql """
-  SELECT seq, key, value, timestamp, origin_node, expires_at, is_delete
+  SELECT seq, key, value, timestamp, origin_node, origin_seq, expires_at, is_delete
   FROM kv_oplog WHERE seq > ?1 ORDER BY seq
   """
 
   def oplog_since(db, seq) do
     {:ok, rows} = EKV.Sqlite3.fetch_all(db, @oplog_since_sql, [seq])
 
-    Enum.map(rows, fn [seq, key, value, timestamp, origin_node, expires_at, is_delete] ->
-      {seq, key, value, timestamp, String.to_atom(origin_node), expires_at, is_delete == 1}
+    Enum.map(rows, fn [seq, key, value, timestamp, origin_node, origin_seq, expires_at, is_delete] ->
+      {seq, key, value, timestamp, String.to_atom(origin_node), origin_seq, expires_at,
+       is_delete == 1}
     end)
   end
 
   def max_seq(db) do
     {:ok, stmt} = EKV.Sqlite3.prepare(db, "SELECT MAX(seq) FROM kv_oplog")
+
+    result =
+      case EKV.Sqlite3.step(db, stmt) do
+        {:row, [nil]} -> 0
+        {:row, [seq]} -> seq
+        :done -> 0
+      end
+
+    :ok = EKV.Sqlite3.release(db, stmt)
+    result
+  end
+
+  def max_origin_seq(db, origin_node) do
+    {:ok, stmt} =
+      EKV.Sqlite3.prepare(
+        db,
+        "SELECT MAX(origin_seq) FROM kv_oplog WHERE origin_node = ?1"
+      )
+
+    :ok = EKV.Sqlite3.bind(stmt, [Atom.to_string(origin_node)])
 
     result =
       case EKV.Sqlite3.step(db, stmt) do
@@ -439,7 +505,151 @@ defmodule EKV.Store do
   end
 
   # =====================================================================
-  # Member HWM
+  # Anti-Entropy Progress
+  # =====================================================================
+
+  def local_progress_summary(db) do
+    {:ok, rows} =
+      EKV.Sqlite3.fetch_all(
+        db,
+        "SELECT origin_node, last_seq FROM kv_origin_progress ORDER BY origin_node",
+        []
+      )
+
+    Map.new(rows, fn [origin_node, seq] -> {String.to_atom(origin_node), seq} end)
+  end
+
+  def merge_local_progress_summary(_db, progress_map) when progress_map == %{}, do: :ok
+
+  def merge_local_progress_summary(db, progress_map) when is_map(progress_map) do
+    EKV.Sqlite3.merge_local_progress_summary(db, encode_progress_entries(progress_map))
+  end
+
+  def replace_local_progress_summary(db, progress_map) when is_map(progress_map) do
+    EKV.Sqlite3.replace_local_progress_summary(db, encode_progress_entries(progress_map))
+  end
+
+  def merge_local_progress(db, origin_node, seq) do
+    {:ok, stmt} =
+      EKV.Sqlite3.prepare(
+        db,
+        """
+        INSERT INTO kv_origin_progress (origin_node, last_seq) VALUES (?1, ?2)
+        ON CONFLICT(origin_node) DO UPDATE SET last_seq = MAX(last_seq, excluded.last_seq)
+        """
+      )
+
+    :ok = EKV.Sqlite3.bind(stmt, [Atom.to_string(origin_node), seq])
+    :done = EKV.Sqlite3.step(db, stmt)
+    :ok = EKV.Sqlite3.release(db, stmt)
+    :ok
+  end
+
+  def get_peer_progress(db, member_node) do
+    {:ok, rows} =
+      EKV.Sqlite3.fetch_all(
+        db,
+        "SELECT origin_node, last_seq FROM kv_member_progress WHERE member_node = ?1 ORDER BY origin_node",
+        [Atom.to_string(member_node)]
+      )
+
+    Map.new(rows, fn [origin_node, seq] -> {String.to_atom(origin_node), seq} end)
+  end
+
+  def replace_peer_progress(db, member_node, progress_map) when is_map(progress_map) do
+    EKV.Sqlite3.replace_peer_progress(
+      db,
+      Atom.to_string(member_node),
+      encode_progress_entries(progress_map)
+    )
+  end
+
+  def update_peer_progress(db, member_node, origin_node, seq) do
+    {:ok, stmt} =
+      EKV.Sqlite3.prepare(
+        db,
+        """
+        INSERT INTO kv_member_progress (member_node, origin_node, last_seq)
+        VALUES (?1, ?2, ?3)
+        ON CONFLICT(member_node, origin_node) DO UPDATE SET last_seq = MAX(last_seq, excluded.last_seq)
+        """
+      )
+
+    :ok = EKV.Sqlite3.bind(stmt, [Atom.to_string(member_node), Atom.to_string(origin_node), seq])
+    :done = EKV.Sqlite3.step(db, stmt)
+    :ok = EKV.Sqlite3.release(db, stmt)
+    :ok
+  end
+
+  def prune_member_progress(db, connected_members) do
+    connected_set = MapSet.new(connected_members, &Atom.to_string/1)
+
+    {:ok, rows} =
+      EKV.Sqlite3.fetch_all(db, "SELECT DISTINCT member_node FROM kv_member_progress", [])
+
+    for [member_node] <- rows, not MapSet.member?(connected_set, member_node) do
+      {:ok, stmt} =
+        EKV.Sqlite3.prepare(db, "DELETE FROM kv_member_progress WHERE member_node = ?1")
+
+      :ok = EKV.Sqlite3.bind(stmt, [member_node])
+      :done = EKV.Sqlite3.step(db, stmt)
+      :ok = EKV.Sqlite3.release(db, stmt)
+    end
+
+    :ok
+  end
+
+  def replay_origin_bounds(db) do
+    {:ok, rows} =
+      EKV.Sqlite3.fetch_all(
+        db,
+        """
+        SELECT origin_node, MIN(origin_seq), MAX(origin_seq)
+        FROM kv_oplog
+        GROUP BY origin_node
+        """,
+        []
+      )
+
+    Map.new(rows, fn [origin_node, min_seq, max_seq] ->
+      {String.to_atom(origin_node), {min_seq, max_seq}}
+    end)
+  end
+
+  @replay_since_origin_chunk_sql """
+  SELECT key, value, timestamp, origin_node, origin_seq, expires_at, is_delete
+  FROM kv_oplog
+  WHERE origin_node = ?1
+    AND origin_seq > ?2
+    AND (is_delete = 1 OR expires_at IS NULL OR expires_at > ?3)
+  ORDER BY origin_seq LIMIT ?4
+  """
+
+  def replay_since_origin_chunk(db, origin_node, origin_seq, limit) do
+    now = System.system_time(:nanosecond)
+
+    {:ok, rows} =
+      EKV.Sqlite3.fetch_all(db, @replay_since_origin_chunk_sql, [
+        Atom.to_string(origin_node),
+        origin_seq,
+        now,
+        limit
+      ])
+
+    Enum.map(rows, fn [key, value, timestamp, origin_node, replay_seq, expires_at, is_delete] ->
+      {key, value, timestamp, String.to_atom(origin_node), replay_seq, expires_at,
+       is_delete == 1}
+    end)
+  end
+
+  defp encode_progress_entries(progress_map) do
+    Enum.map(progress_map, fn {origin_node, seq} ->
+      {Atom.to_string(origin_node), seq}
+    end)
+  end
+
+  # =====================================================================
+  # Legacy flat HWM helpers
   # =====================================================================
 
   def get_hwm(db, member_node) do
@@ -572,29 +782,31 @@ defmodule EKV.Store do
   end
 
   @doc """
-  Truncate oplog entries below the min of all member HWMs
+  Truncate replay-log entries below the minimum retained peer progress per origin.
   """
   def truncate_oplog(db) do
-    {:ok, stmt} =
-      EKV.Sqlite3.prepare(db, "SELECT MIN(last_seq) FROM kv_member_hwm")
+    {:ok, rows} =
+      EKV.Sqlite3.fetch_all(
+        db,
+        """
+        SELECT origin_node, MIN(last_seq)
+        FROM kv_member_progress
+        GROUP BY origin_node
+        """,
+        []
+      )
 
-    min_hwm =
-      case EKV.Sqlite3.step(db, stmt) do
-        {:row, [nil]} -> nil
-        {:row, [seq]} -> seq
-        :done -> nil
-      end
-
-    :ok = EKV.Sqlite3.release(db, stmt)
-
-    if min_hwm do
+    Enum.each(rows, fn [origin_node, min_seq] ->
       {:ok, del_stmt} =
-        EKV.Sqlite3.prepare(db, "DELETE FROM kv_oplog WHERE seq < ?1")
+        EKV.Sqlite3.prepare(
+          db,
+          "DELETE FROM kv_oplog WHERE origin_node = ?1 AND origin_seq < ?2"
+        )
 
-      :ok = EKV.Sqlite3.bind(del_stmt, [min_hwm])
+      :ok = EKV.Sqlite3.bind(del_stmt, [origin_node, min_seq])
       :done = EKV.Sqlite3.step(db, del_stmt)
       :ok = EKV.Sqlite3.release(db, del_stmt)
-    end
+    end)
 
     :ok
   end
@@ -604,7 +816,7 @@ defmodule EKV.Store do
   # =====================================================================
 
   @full_state_sql """
-  SELECT key, value, timestamp, origin_node, expires_at, deleted_at
+  SELECT key, value, timestamp, origin_node, origin_seq, expires_at, deleted_at
   FROM kv
   WHERE (deleted_at IS NULL AND (expires_at IS NULL OR expires_at > ?2))
      OR deleted_at > ?1
@@ -617,8 +829,8 @@ defmodule EKV.Store do
     now = System.system_time(:nanosecond)
     {:ok, rows} = EKV.Sqlite3.fetch_all(db, @full_state_sql, [tombstone_cutoff, now])
 
-    Enum.map(rows, fn [key, value, timestamp, origin_node, expires_at, deleted_at] ->
-      {key, value, timestamp, String.to_atom(origin_node), expires_at, deleted_at}
+    Enum.map(rows, fn [key, value, timestamp, origin_node, origin_seq, expires_at, deleted_at] ->
+      {key, value, timestamp, String.to_atom(origin_node), origin_seq, expires_at, deleted_at}
     end)
   end
 
@@ -627,7 +839,7 @@ defmodule EKV.Store do
   # =====================================================================
 
   @full_state_first_chunk_sql """
-  SELECT key, value, timestamp, origin_node, expires_at, deleted_at
+  SELECT key, value, timestamp, origin_node, origin_seq, expires_at, deleted_at
   FROM kv
   WHERE (deleted_at IS NULL AND (expires_at IS NULL OR expires_at > ?2))
      OR deleted_at > ?1
@@ -635,7 +847,7 @@ defmodule EKV.Store do
   """
 
   @full_state_chunk_sql """
-  SELECT key, value, timestamp, origin_node, expires_at, deleted_at
+  SELECT key, value, timestamp, origin_node, origin_seq, expires_at, deleted_at
   FROM kv
   WHERE (((deleted_at IS NULL AND (expires_at IS NULL OR expires_at > ?3))
      OR deleted_at > ?1))
@@ -666,13 +878,13 @@ defmodule EKV.Store do
   end
 
   defp map_full_state_rows(rows) do
-    Enum.map(rows, fn [key, value, timestamp, origin_node, expires_at, deleted_at] ->
-      {key, value, timestamp, String.to_atom(origin_node), expires_at, deleted_at}
+    Enum.map(rows, fn [key, value, timestamp, origin_node, origin_seq, expires_at, deleted_at] ->
+      {key, value, timestamp, String.to_atom(origin_node), origin_seq, expires_at, deleted_at}
     end)
   end
 
   @oplog_since_chunk_sql """
-  SELECT seq, key, value, timestamp, origin_node, expires_at, is_delete
+  SELECT seq, key, value, timestamp, origin_node, origin_seq, expires_at, is_delete
   FROM kv_oplog
   WHERE seq > ?1
     AND (is_delete = 1 OR expires_at IS NULL OR expires_at > ?2)
@@ -686,8 +898,9 @@ defmodule EKV.Store do
     now = System.system_time(:nanosecond)
     {:ok, rows} = EKV.Sqlite3.fetch_all(db, @oplog_since_chunk_sql, [seq, now, limit])
 
-    Enum.map(rows, fn [seq, key, value, timestamp, origin_node, expires_at, is_delete] ->
-      {seq, key, value, timestamp, String.to_atom(origin_node), expires_at, is_delete == 1}
+    Enum.map(rows, fn [seq, key, value, timestamp, origin_node, origin_seq, expires_at, is_delete] ->
+      {seq, key, value, timestamp, String.to_atom(origin_node), origin_seq, expires_at,
+       is_delete == 1}
     end)
   end
 
@@ -940,8 +1153,8 @@ defmodule EKV.Store do
     EKV.Sqlite3.paxos_accept(db, key, ballot_c, ballot_n, value_args)
   end
 
-  def paxos_promote(db, kv_force_stmt, oplog_stmt, key, ballot_c, ballot_n) do
-    EKV.Sqlite3.paxos_promote(db, kv_force_stmt, oplog_stmt, key, ballot_c, ballot_n)
+  def paxos_promote(db, kv_force_stmt, oplog_stmt, key, ballot_c, ballot_n, origin_seq \\ nil) do
+    EKV.Sqlite3.paxos_promote(db, kv_force_stmt, oplog_stmt, key, ballot_c, ballot_n, origin_seq)
   end
 
   def cas_managed_key?(db, key) do
