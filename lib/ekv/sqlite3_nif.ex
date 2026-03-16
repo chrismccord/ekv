@@ -48,6 +48,7 @@ defmodule EKV.Sqlite3NIF do
   def ekv_backup(_source_path, _dest_path), do: :erlang.nif_error(:not_loaded)
   def ekv_merge_local_progress_summary(_db, _entries), do: :erlang.nif_error(:not_loaded)
   def ekv_replace_local_progress_summary(_db, _entries), do: :erlang.nif_error(:not_loaded)
+
   def ekv_replace_peer_progress(_db, _member_node, _entries),
     do: :erlang.nif_error(:not_loaded)
 
@@ -66,5 +67,5 @@ defmodule EKV.Sqlite3NIF do
         _ballot_n,
         _origin_seq
       ),
-    do: :erlang.nif_error(:not_loaded)
+      do: :erlang.nif_error(:not_loaded)
 end

@@ -258,6 +258,7 @@ defmodule EKV.AdversarialVerificationTest do
     config = EKV.Supervisor.get_config(name)
     tombstone_cutoff = System.system_time(:nanosecond) - config.tombstone_ttl * 1_000_000
     state = :sys.get_state(shard_name)
+
     progress_summary =
       state.db
       |> EKV.Store.local_progress_summary()
@@ -265,8 +266,8 @@ defmodule EKV.AdversarialVerificationTest do
 
     send(
       shard_name,
-      {:continue_full_sync,
-       fake_node, nil, tombstone_cutoff, progress_summary, config.sync_chunk_size}
+      {:continue_full_sync, fake_node, nil, tombstone_cutoff, progress_summary,
+       config.sync_chunk_size}
     )
 
     Process.sleep(200)
@@ -340,7 +341,9 @@ defmodule EKV.AdversarialVerificationTest do
   defp collect_trace_sync_details(origin_node, acc) do
     receive do
       {:trace, _, :send, {:ekv_sync, _, _, _mode, entries, progress}, _} ->
-        collect_trace_sync_details(origin_node, [{length(entries), progress_seq(progress, origin_node)} | acc])
+        collect_trace_sync_details(origin_node, [
+          {length(entries), progress_seq(progress, origin_node)} | acc
+        ])
 
       {:trace, _, :send, {:ekv, 1, :sync, {_, _, _mode, entries, progress}, _meta}, _} ->
         collect_trace_sync_details(origin_node, [
@@ -354,6 +357,8 @@ defmodule EKV.AdversarialVerificationTest do
     end
   end
 
-  defp progress_seq(progress, origin_node) when is_map(progress), do: Map.get(progress, origin_node, 0)
+  defp progress_seq(progress, origin_node) when is_map(progress),
+    do: Map.get(progress, origin_node, 0)
+
   defp progress_seq(_progress, _origin_node), do: 0
 end

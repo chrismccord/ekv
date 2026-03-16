@@ -231,12 +231,18 @@ defmodule EKV.Store do
       {:error, _} -> :ok
     end
 
-    case EKV.Sqlite3.execute(db, "ALTER TABLE kv ADD COLUMN origin_seq INTEGER NOT NULL DEFAULT 0") do
+    case EKV.Sqlite3.execute(
+           db,
+           "ALTER TABLE kv ADD COLUMN origin_seq INTEGER NOT NULL DEFAULT 0"
+         ) do
       :ok -> :ok
       {:error, _} -> :ok
     end
 
-    case EKV.Sqlite3.execute(db, "ALTER TABLE kv_oplog ADD COLUMN origin_seq INTEGER NOT NULL DEFAULT 0") do
+    case EKV.Sqlite3.execute(
+           db,
+           "ALTER TABLE kv_oplog ADD COLUMN origin_seq INTEGER NOT NULL DEFAULT 0"
+         ) do
       :ok -> :ok
       {:error, _} -> :ok
     end
@@ -645,8 +651,7 @@ defmodule EKV.Store do
       ])
 
     Enum.map(rows, fn [key, value, timestamp, origin_node, replay_seq, expires_at, is_delete] ->
-      {key, value, timestamp, String.to_atom(origin_node), replay_seq, expires_at,
-       is_delete == 1}
+      {key, value, timestamp, String.to_atom(origin_node), replay_seq, expires_at, is_delete == 1}
     end)
   end
 

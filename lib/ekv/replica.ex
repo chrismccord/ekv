@@ -603,7 +603,8 @@ defmodule EKV.Replica do
         │           remote origin heads vs local contiguous progress
         │         if local side is behind:
         │           request delta from that live origin
-        │         if local side is behind on dead-origin state:
+        │         if local side is behind on explicitly unavailable
+        │         dead-origin state:
         │           request full sync from a live peer
         │                                        │
         │ {:ekv, 1, :summary_probe,              │
@@ -624,6 +625,9 @@ defmodule EKV.Replica do
   state anti-entropy tick is therefore lightweight control-plane traffic:
   it exchanges current per-origin heads and lets actually-behind receivers
   request repair explicitly.
+  Each shard keeps at most one summary probe in flight per peer and at most
+  one full-sync source active at a time, so cold-start/bootstrap repair does
+  not fan out into duplicate full snapshots from every eligible peer.
 
 
   ## Delta Sync vs Full Sync
@@ -641,9 +645,11 @@ defmodule EKV.Replica do
       │                                                                │
       │ Ordinary delta replay remains origin-owned: only the live      │
       │ origin serves its stream. If a requester is behind on data     │
-      │ from origins that are now dead/disconnected, the live peer     │
-      │ escalates to full sync instead of fabricating a non-origin     │
-      │ delta stream.                                                  │
+      │ from an origin that is explicitly unavailable                  │
+      │ (down/quarantined/disconnected at the node level), a           │
+      │ live peer escalates to full sync instead of fabricating a      │
+      │ non-origin delta stream. Mere handshake lag is not enough to   │
+      │ trigger this fallback.                                         │
       └────────────────────────────────────────────────────────────────┘
 
       ┌────────────────────────────────────────────────────────────────┐
@@ -949,7 +955,9 @@ defmodule EKV.Replica do
         ballot_counter: integer,        # monotonic, persisted in kv_meta
         member_node_ids:  %{node => string},  # Erlang node → CAS node_id
         remote_member_progress: %{node => %{origin => seq}},
+        summary_probe_inflight: MapSet.t(node()), # peers with a summary probe in flight
         sync_inflight:  MapSet.t(node()), # remote members currently servicing our repair requests
+        full_sync_inflight: node() | nil, # single full-bootstrap source for this shard
         pending_cas:    %{ref => op},   # in-flight CAS operations
         quorum_waiters: %{ref => waiter} # pending await_quorum callers
       }
@@ -1075,7 +1083,9 @@ defmodule EKV.Replica do
     remote_member_progress: %{},
     remote_member_hwms: %{},
     remote_features: %{},
+    summary_probe_inflight: MapSet.new(),
     sync_inflight: MapSet.new(),
+    full_sync_inflight: nil,
     pending_cas: %{},
     quorum_waiters: %{},
     handoff_node: nil
@@ -1598,6 +1608,7 @@ defmodule EKV.Replica do
       {:ok, %Replica{} = state} ->
         state =
           state
+          |> clear_summary_probe_inflight(remote_node)
           |> track_remote_shard(remote_node, remote_pid)
           |> replace_remote_member_progress(remote_node, remote_progress)
           |> reconcile_authoritative_origin_head(remote_node, remote_progress)
@@ -1627,6 +1638,7 @@ defmodule EKV.Replica do
       {:ok, %Replica{} = state} ->
         state =
           state
+          |> clear_summary_probe_inflight(remote_node)
           |> track_remote_shard(remote_node, remote_pid)
           |> replace_remote_member_progress(remote_node, remote_progress)
           |> reconcile_authoritative_origin_head(remote_node, remote_progress)
@@ -1737,9 +1749,17 @@ defmodule EKV.Replica do
 
     state =
       if replied? do
-        state
-        |> clear_sync_inflight(from_node)
-        |> maybe_request_repair(from_node, Map.get(state.remote_member_progress, from_node, %{}))
+        state = clear_sync_inflight(state, from_node)
+
+        if mode == :full do
+          maybe_request_repairs(state)
+        else
+          maybe_request_repair(
+            state,
+            from_node,
+            Map.get(state.remote_member_progress, from_node, %{})
+          )
+        end
       else
         state
       end
@@ -1747,7 +1767,10 @@ defmodule EKV.Replica do
     {:noreply, state}
   end
 
-  def handle_info({:ekv_progress_ack, remote_pid, remote_shard, mode, progress}, %Replica{} = state)
+  def handle_info(
+        {:ekv_progress_ack, remote_pid, remote_shard, mode, progress},
+        %Replica{} = state
+      )
       when remote_shard == state.shard_index do
     remote_node = node(remote_pid)
     progress = normalize_progress_summary(progress)
@@ -1789,8 +1812,10 @@ defmodule EKV.Replica do
         remote_member_progress: Map.delete(state.remote_member_progress, dead_node),
         remote_member_hwms: Map.delete(state.remote_member_hwms, dead_node),
         remote_features: Map.delete(state.remote_features, dead_node),
-        sync_inflight: MapSet.delete(state.sync_inflight, dead_node)
+        summary_probe_inflight: MapSet.delete(state.summary_probe_inflight, dead_node)
     }
+
+    state = clear_sync_inflight(state, dead_node)
 
     state = mark_member_down(state, dead_node, dead_node_id)
     # Check if any pending CAS ops lost quorum
@@ -1823,8 +1848,10 @@ defmodule EKV.Replica do
           remote_member_progress: Map.delete(state.remote_member_progress, remote_node),
           remote_member_hwms: Map.delete(state.remote_member_hwms, remote_node),
           remote_features: Map.delete(state.remote_features, remote_node),
-          sync_inflight: MapSet.delete(state.sync_inflight, remote_node)
+          summary_probe_inflight: MapSet.delete(state.summary_probe_inflight, remote_node)
       }
+
+      state = clear_sync_inflight(state, remote_node)
 
       new_state =
         state
@@ -2380,7 +2407,8 @@ defmodule EKV.Replica do
            origin_seq
          ) do
       {:ok, true, applied_origin_seq, local_progress_seq} ->
-        {true, track_applied_origin_progress(state, origin_node, applied_origin_seq, local_progress_seq)}
+        {true,
+         track_applied_origin_progress(state, origin_node, applied_origin_seq, local_progress_seq)}
 
       {:ok, false, applied_origin_seq, local_progress_seq} ->
         {false,
@@ -2471,6 +2499,7 @@ defmodule EKV.Replica do
           remote_node,
           {:ekv_sync, node(), state.shard_index, :full, [], progress_summary}
         )
+
         state
 
       _ ->
@@ -2530,6 +2559,7 @@ defmodule EKV.Replica do
             {:ekv_sync, node(), state.shard_index, :delta, [], %{origin_node => my_seq}}
           )
         end
+
         state
 
       _ ->
@@ -2558,6 +2588,7 @@ defmodule EKV.Replica do
               remote_node,
               {:ekv_sync, node(), state.shard_index, :delta, [], %{origin_node => my_seq}}
             )
+
             state
 
           entries == [] ->
@@ -2600,12 +2631,26 @@ defmodule EKV.Replica do
     end
   end
 
-  defp mark_sync_inflight(%Replica{} = state, remote_node) do
+  defp mark_sync_inflight(%Replica{} = state, remote_node, :full) do
+    %{
+      state
+      | sync_inflight: MapSet.put(state.sync_inflight, remote_node),
+        full_sync_inflight: remote_node
+    }
+  end
+
+  defp mark_sync_inflight(%Replica{} = state, remote_node, _request) do
     %{state | sync_inflight: MapSet.put(state.sync_inflight, remote_node)}
   end
 
   defp clear_sync_inflight(%Replica{} = state, remote_node) do
-    %{state | sync_inflight: MapSet.delete(state.sync_inflight, remote_node)}
+    state = %{state | sync_inflight: MapSet.delete(state.sync_inflight, remote_node)}
+
+    if state.full_sync_inflight == remote_node do
+      %{state | full_sync_inflight: nil}
+    else
+      state
+    end
   end
 
   defp request_sync(%Replica{} = state, remote_node, request) do
@@ -2619,12 +2664,23 @@ defmodule EKV.Replica do
       MapSet.member?(state.quarantined_members, remote_node) ->
         clear_sync_inflight(state, remote_node)
 
+      request == :full and state.full_sync_inflight == remote_node ->
+        state
+
+      request == :full and not is_nil(state.full_sync_inflight) ->
+        state
+
       MapSet.member?(state.sync_inflight, remote_node) ->
         state
 
       true ->
-        send_to_member(state, remote_node, {:ekv_sync_request, self(), state.shard_index, request})
-        mark_sync_inflight(state, remote_node)
+        send_to_member(
+          state,
+          remote_node,
+          {:ekv_sync_request, self(), state.shard_index, request}
+        )
+
+        mark_sync_inflight(state, remote_node, request)
     end
   end
 
@@ -2633,6 +2689,20 @@ defmodule EKV.Replica do
       nil -> clear_sync_inflight(state, remote_node)
       request -> request_sync(state, remote_node, request)
     end
+  end
+
+  defp maybe_request_repairs(%Replica{} = state) do
+    Enum.reduce(state.remote_member_progress, state, fn {remote_node, remote_progress}, acc ->
+      maybe_request_repair(acc, remote_node, remote_progress)
+    end)
+  end
+
+  defp mark_summary_probe_inflight(%Replica{} = state, remote_node) do
+    %{state | summary_probe_inflight: MapSet.put(state.summary_probe_inflight, remote_node)}
+  end
+
+  defp clear_summary_probe_inflight(%Replica{} = state, remote_node) do
+    %{state | summary_probe_inflight: MapSet.delete(state.summary_probe_inflight, remote_node)}
   end
 
   defp sync_request_for_remote(%Replica{} = state, remote_node, remote_progress) do
@@ -2649,7 +2719,7 @@ defmodule EKV.Replica do
           local_seq = Map.get(local_progress, origin_node, 0)
 
           if origin_node != node() and origin_node != remote_node and remote_seq > local_seq and
-               not Map.has_key?(state.remote_shards, origin_node) do
+               origin_unavailable_for_full_sync?(state, origin_node) do
             :full
           else
             nil
@@ -2657,6 +2727,42 @@ defmodule EKV.Replica do
         end)
     end
   end
+
+  defp origin_unavailable_for_full_sync?(%Replica{} = state, origin_node)
+       when is_atom(origin_node) do
+    cond do
+      MapSet.member?(state.quarantined_members, origin_node) ->
+        true
+
+      known_down_member?(state, origin_node) ->
+        true
+
+      origin_node not in Node.list() ->
+        true
+
+      Map.has_key?(state.remote_shards, origin_node) ->
+        false
+
+      true ->
+        false
+    end
+  end
+
+  defp origin_unavailable_for_full_sync?(%Replica{} = _state, _origin_node), do: false
+
+  defp known_down_member?(%Replica{} = state, remote_node) when is_atom(remote_node) do
+    marker_key = member_down_name_key(remote_node)
+
+    case Map.fetch(state.member_down_at, marker_key) do
+      {:ok, down_since} ->
+        is_integer(down_since)
+
+      :error ->
+        is_integer(Store.member_down_marker_get(state.db, marker_key))
+    end
+  end
+
+  defp known_down_member?(%Replica{} = _state, _remote_node), do: false
 
   defp progress_ack_summary(%Replica{} = state, :full, _progress) do
     local_progress_summary_for_wire(state)
@@ -2673,7 +2779,8 @@ defmodule EKV.Replica do
   defp trigger_summary_probe(%Replica{} = state) do
     Enum.reduce(Map.keys(state.remote_shards), state, fn remote_node, acc ->
       if MapSet.member?(acc.quarantined_members, remote_node) or
-           MapSet.member?(acc.sync_inflight, remote_node) do
+           MapSet.member?(acc.sync_inflight, remote_node) or
+           MapSet.member?(acc.summary_probe_inflight, remote_node) do
         acc
       else
         send_to_member(
@@ -2682,7 +2789,7 @@ defmodule EKV.Replica do
           {:ekv_summary_probe, self(), acc.shard_index, local_progress_summary_for_wire(acc)}
         )
 
-        acc
+        mark_summary_probe_inflight(acc, remote_node)
       end
     end)
   end
@@ -2712,10 +2819,16 @@ defmodule EKV.Replica do
        when is_map(remote_progress) do
     remote_progress = normalize_progress_summary(remote_progress)
     :ok = Store.replace_peer_progress(state.db, remote_node, remote_progress)
-    %{state | remote_member_progress: Map.put(state.remote_member_progress, remote_node, remote_progress)}
+
+    %{
+      state
+      | remote_member_progress:
+          Map.put(state.remote_member_progress, remote_node, remote_progress)
+    }
   end
 
-  defp replace_remote_member_progress(%Replica{} = state, _remote_node, _remote_progress), do: state
+  defp replace_remote_member_progress(%Replica{} = state, _remote_node, _remote_progress),
+    do: state
 
   defp merge_remote_member_progress(%Replica{} = state, remote_node, remote_progress)
        when is_map(remote_progress) do
@@ -2751,12 +2864,14 @@ defmodule EKV.Replica do
   end
 
   defp member_connect_ack_message(%Replica{} = state, progress_summary) do
-    {:ekv_member_connect_ack, self(), state.shard_index, state.num_shards,
-     progress_summary, state.node_id}
+    {:ekv_member_connect_ack, self(), state.shard_index, state.num_shards, progress_summary,
+     state.node_id}
   end
 
   defp local_progress_summary_for_wire(%Replica{} = state) do
-    Map.put(state.local_progress, node(), state.local_origin_seq)
+    state.local_progress
+    |> normalize_progress_summary()
+    |> Map.put(node(), state.local_origin_seq)
   end
 
   defp send_to_member(%Replica{} = state, target_node, message) do
@@ -3128,7 +3243,10 @@ defmodule EKV.Replica do
   defp normalize_progress_summary(_progress), do: %{}
 
   defp normalize_origin_node(origin_node) when is_atom(origin_node), do: origin_node
-  defp normalize_origin_node(origin_node) when is_binary(origin_node), do: String.to_atom(origin_node)
+
+  defp normalize_origin_node(origin_node) when is_binary(origin_node),
+    do: String.to_atom(origin_node)
+
   defp normalize_origin_node(origin_node), do: origin_node
 
   # Runs on the receiver member. Raw and compressed value payloads are both accepted.
@@ -3492,17 +3610,22 @@ defmodule EKV.Replica do
   end
 
   defp set_local_origin_seq(%Replica{} = state, seq) when is_integer(seq) and seq >= 0 do
+    local_progress = normalize_progress_summary(state.local_progress)
+
     %{
       state
       | local_origin_seq: seq,
-        local_progress: Map.put(state.local_progress, node(), max(seq, Map.get(state.local_progress, node(), 0)))
+        local_progress:
+          Map.put(local_progress, node(), max(seq, Map.get(local_progress, node(), 0)))
     }
   end
 
   defp merge_local_progress_seq(%Replica{} = state, origin_node, seq)
-       when is_atom(origin_node) and is_integer(seq) and seq >= 0 do
-    next_seq = max(Map.get(state.local_progress, origin_node, 0), seq)
-    local_progress = Map.put(state.local_progress, origin_node, next_seq)
+       when is_integer(seq) and seq >= 0 do
+    origin_node = normalize_origin_node(origin_node)
+    local_progress = normalize_progress_summary(state.local_progress)
+    next_seq = max(Map.get(local_progress, origin_node, 0), seq)
+    local_progress = Map.put(local_progress, origin_node, next_seq)
     state = %{state | local_progress: local_progress}
 
     if origin_node == node() do
@@ -3514,20 +3637,32 @@ defmodule EKV.Replica do
 
   defp merge_local_progress_seq(%Replica{} = state, _origin_node, _seq), do: state
 
-  defp replace_local_progress_summary(%Replica{} = state, progress_summary) when is_map(progress_summary) do
+  defp replace_local_progress_summary(%Replica{} = state, progress_summary)
+       when is_map(progress_summary) do
     progress_summary = normalize_progress_summary(progress_summary)
-    local_progress = Map.merge(state.local_progress, progress_summary, fn _origin, current, incoming -> max(current, incoming) end)
+
+    local_progress =
+      state.local_progress
+      |> normalize_progress_summary()
+      |> Map.merge(progress_summary, fn _origin, current, incoming -> max(current, incoming) end)
+
     local_origin_seq = max(state.local_origin_seq, Map.get(local_progress, node(), 0))
-    %{state | local_progress: Map.put(local_progress, node(), local_origin_seq), local_origin_seq: local_origin_seq}
+
+    %{
+      state
+      | local_progress: Map.put(local_progress, node(), local_origin_seq),
+        local_origin_seq: local_origin_seq
+    }
   end
 
   defp reconcile_authoritative_origin_head(%Replica{} = state, remote_node, remote_progress)
        when is_atom(remote_node) and is_map(remote_progress) do
+    local_progress = normalize_progress_summary(state.local_progress)
     remote_head = Map.get(remote_progress, remote_node)
-    local_head = Map.get(state.local_progress, remote_node, 0)
+    local_head = Map.get(local_progress, remote_node, 0)
 
     if is_integer(remote_head) and remote_head >= 0 and local_head > remote_head do
-      local_progress = Map.put(state.local_progress, remote_node, remote_head)
+      local_progress = Map.put(local_progress, remote_node, remote_head)
       :ok = Store.replace_local_progress_summary(state.db, local_progress)
       %{state | local_progress: local_progress}
     else
@@ -3538,7 +3673,12 @@ defmodule EKV.Replica do
   defp reconcile_authoritative_origin_head(%Replica{} = state, _remote_node, _remote_progress),
     do: state
 
-  defp track_applied_origin_progress(%Replica{} = state, origin_node, origin_seq, local_progress_seq) do
+  defp track_applied_origin_progress(
+         %Replica{} = state,
+         origin_node,
+         origin_seq,
+         local_progress_seq
+       ) do
     state =
       if origin_node == node() and is_integer(origin_seq) and origin_seq >= 0 do
         set_local_origin_seq(state, max(state.local_origin_seq, origin_seq))
@@ -3566,7 +3706,8 @@ defmodule EKV.Replica do
     end
   end
 
-  defp maybe_request_origin_gap_repair(%Replica{} = state, _origin_node, _origin_seq, _gap?), do: state
+  defp maybe_request_origin_gap_repair(%Replica{} = state, _origin_node, _origin_seq, _gap?),
+    do: state
 
   defp decode_kv_row(nil), do: {nil, nil}
 
@@ -3809,6 +3950,7 @@ defmodule EKV.Replica do
                 {:ok, promoted_value, _ts, origin, _expires, promoted_deleted, prev_value_binary,
                  promoted_seq, local_progress_seq} ->
                   origin = normalize_origin_node(origin)
+
                   state =
                     track_applied_origin_progress(
                       state,
@@ -3986,7 +4128,7 @@ defmodule EKV.Replica do
       clear_member_down_marker(state, member_down_name_key(remote_node))
     else
       state
-      |> clear_member_down_marker(member_down_name_key(remote_node))
+      |> remember_member_down_marker(member_down_name_key(remote_node))
       |> remember_member_down_marker(member_down_id_key(remote_node_id))
     end
   end
@@ -4002,9 +4144,13 @@ defmodule EKV.Replica do
 
     state = %{
       state
-      | quarantined_members: MapSet.delete(state.quarantined_members, remote_node),
-        sync_inflight: MapSet.delete(state.sync_inflight, remote_node)
+      | quarantined_members: MapSet.delete(state.quarantined_members, remote_node)
     }
+
+    state =
+      state
+      |> clear_summary_probe_inflight(remote_node)
+      |> clear_sync_inflight(remote_node)
 
     {:ok, state}
   end
@@ -4023,6 +4169,11 @@ defmodule EKV.Replica do
           | quarantined_members: MapSet.delete(state.quarantined_members, remote_node)
         }
 
+        state =
+          state
+          |> clear_summary_probe_inflight(remote_node)
+          |> clear_sync_inflight(remote_node)
+
         {:ok, state}
 
       is_integer(down_since_ms) and age_ms > state.tombstone_ttl ->
@@ -4031,8 +4182,10 @@ defmodule EKV.Replica do
           | quarantined_members: MapSet.put(state.quarantined_members, remote_node),
             remote_shards: Map.delete(state.remote_shards, remote_node),
             member_node_ids: Map.delete(state.member_node_ids, remote_node),
-            sync_inflight: MapSet.delete(state.sync_inflight, remote_node)
+            summary_probe_inflight: MapSet.delete(state.summary_probe_inflight, remote_node)
         }
+
+        state = clear_sync_inflight(state, remote_node)
 
         log_once(state, fn ->
           "#{log_prefix(state)} quarantining #{remote_node}: reconnect downtime exceeded " <>
@@ -4047,9 +4200,13 @@ defmodule EKV.Replica do
 
         state = %{
           state
-          | quarantined_members: MapSet.delete(state.quarantined_members, remote_node),
-            sync_inflight: MapSet.delete(state.sync_inflight, remote_node)
+          | quarantined_members: MapSet.delete(state.quarantined_members, remote_node)
         }
+
+        state =
+          state
+          |> clear_summary_probe_inflight(remote_node)
+          |> clear_sync_inflight(remote_node)
 
         {:ok, state}
     end

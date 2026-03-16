@@ -511,7 +511,9 @@ defmodule EKVTest do
   # =====================================================================
 
   describe "member progress updates" do
-    test "peer progress tracks the latest advertised origin seq even when it moves lower", %{name: name} do
+    test "peer progress tracks the latest advertised origin seq even when it moves lower", %{
+      name: name
+    } do
       config = EKV.Supervisor.get_config(name)
       shard = EKV.Replica.shard_index_for("hwm_key", config.num_shards)
       shard_name = EKV.Replica.shard_name(name, shard)
@@ -1267,14 +1269,15 @@ defmodule EKVTest do
       now = System.system_time(:nanosecond)
 
       entries = [
-        {k1, :erlang.term_to_binary("v1"), now - 2000, :"remote@host", 1, nil, nil},
-        {k2, :erlang.term_to_binary("v2"), now - 1000, :"remote@host", 2, nil, nil}
+        {k1, :erlang.term_to_binary("v1"), now - 2000, :remote@host, 1, nil, nil},
+        {k2, :erlang.term_to_binary("v2"), now - 1000, :remote@host, 2, nil, nil}
       ]
 
       send(
         shard_name,
-        {:ekv_sync, :"remote@host", 0, :full, entries, %{:"remote@host" => 2}}
+        {:ekv_sync, :remote@host, 0, :full, entries, %{:remote@host => 2}}
       )
+
       :sys.get_state(shard_name)
       flush_dispatchers(name)
 
@@ -4061,6 +4064,7 @@ defmodule EKVTest do
       config = EKV.Supervisor.get_config(name)
       tombstone_cutoff = System.system_time(:nanosecond) - config.tombstone_ttl * 1_000_000
       state = :sys.get_state(shard_name)
+
       progress =
         state.db
         |> EKV.Store.local_progress_summary()
@@ -4068,12 +4072,7 @@ defmodule EKVTest do
 
       send(
         shard_name,
-        {:continue_full_sync,
-         fake_node,
-         nil,
-         tombstone_cutoff,
-         progress,
-         config.sync_chunk_size}
+        {:continue_full_sync, fake_node, nil, tombstone_cutoff, progress, config.sync_chunk_size}
       )
 
       Process.sleep(200)
@@ -4137,6 +4136,7 @@ defmodule EKVTest do
       config = EKV.Supervisor.get_config(name)
       tombstone_cutoff = System.system_time(:nanosecond) - config.tombstone_ttl * 1_000_000
       state = :sys.get_state(shard_name)
+
       progress =
         state.db
         |> EKV.Store.local_progress_summary()
@@ -4147,12 +4147,7 @@ defmodule EKVTest do
 
       send(
         shard_name,
-        {:continue_full_sync,
-         fake_node,
-         nil,
-         tombstone_cutoff,
-         progress,
-         config.sync_chunk_size}
+        {:continue_full_sync, fake_node, nil, tombstone_cutoff, progress, config.sync_chunk_size}
       )
 
       # Resume to process just the first chunk (sends chunk + queues next continuation)
@@ -4197,6 +4192,7 @@ defmodule EKVTest do
       config = EKV.Supervisor.get_config(name)
       tombstone_cutoff = System.system_time(:nanosecond) - config.tombstone_ttl * 1_000_000
       state = :sys.get_state(shard_name)
+
       progress =
         state.db
         |> EKV.Store.local_progress_summary()
@@ -4207,12 +4203,7 @@ defmodule EKVTest do
 
       send(
         shard_name,
-        {:continue_full_sync,
-         fake_node,
-         nil,
-         tombstone_cutoff,
-         progress,
-         config.sync_chunk_size}
+        {:continue_full_sync, fake_node, nil, tombstone_cutoff, progress, config.sync_chunk_size}
       )
 
       :sys.resume(shard_name)
@@ -4250,6 +4241,7 @@ defmodule EKVTest do
       config = EKV.Supervisor.get_config(name)
       tombstone_cutoff = System.system_time(:nanosecond) - config.tombstone_ttl * 1_000_000
       state = :sys.get_state(shard_name)
+
       progress =
         state.db
         |> EKV.Store.local_progress_summary()
@@ -4257,12 +4249,7 @@ defmodule EKVTest do
 
       send(
         shard_name,
-        {:continue_full_sync,
-         fake_node,
-         nil,
-         tombstone_cutoff,
-         progress,
-         config.sync_chunk_size}
+        {:continue_full_sync, fake_node, nil, tombstone_cutoff, progress, config.sync_chunk_size}
       )
 
       Process.sleep(200)
@@ -4278,7 +4265,8 @@ defmodule EKVTest do
       {intermediate, [final]} = Enum.split(sync_messages, -1)
 
       for {_entries_count, progress} <- intermediate do
-        assert progress == nil, "intermediate chunk should have nil progress, got #{inspect(progress)}"
+        assert progress == nil,
+               "intermediate chunk should have nil progress, got #{inspect(progress)}"
       end
 
       # Final chunk carries a progress summary.

@@ -84,6 +84,8 @@ Members run periodic anti-entropy by default:
 - The receiver compares the remote summary with its own local contiguous progress and explicitly requests repair only if it is behind.
 - It is meant to heal a member that missed a prior replication message without waiting for reconnect.
 - In the steady state it should be cheap because healthy members only exchange summary metadata; data chunks are sent only in response to an explicit `:sync_request`.
+- Each shard keeps only one summary probe in flight per peer and only one full-sync source in flight at a time, so startup/bootstrap repair should not fan out into duplicate full snapshots from multiple peers.
+- Full sync fallback for third-party origins is reserved for origins that are explicitly known unavailable (down/quarantined/disconnected at the node level), not just shard-handshake lag during startup.
 - In a healthy hot cluster you should mostly see `member_connect` / summary traffic, not steady `sending delta sync` spam.
 - Set `false` only for debugging; the default is the safer production setting.
 

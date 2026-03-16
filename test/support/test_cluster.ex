@@ -320,6 +320,11 @@ defmodule EKV.TestCluster do
     rpc!(node, __MODULE__, :do_trigger_anti_entropy, [name, shard_index])
   end
 
+  @doc "Drop one remote shard mapping from a replica state without simulating a full node down"
+  def drop_remote_shard(node, name, remote_node, shard_index \\ 0) do
+    rpc!(node, __MODULE__, :do_drop_remote_shard, [name, remote_node, shard_index])
+  end
+
   @doc "Set a replica shard's handoff_node on a remote node"
   def set_handoff_node(node, name, handoff_node, shard_index \\ 0) do
     rpc!(node, __MODULE__, :do_set_handoff_node, [name, handoff_node, shard_index])
@@ -385,6 +390,7 @@ defmodule EKV.TestCluster do
     %{db: db, stmts: stmts, local_origin_seq: local_origin_seq} = :sys.get_state(shard_name)
     value_binary = :erlang.term_to_binary(value)
     origin = Keyword.get(opts, :origin, node())
+
     origin_seq =
       Keyword.get_lazy(opts, :origin_seq, fn ->
         if origin == node() do
@@ -419,7 +425,11 @@ defmodule EKV.TestCluster do
         Map.update(state.local_progress, origin, local_progress_seq, &max(&1, local_progress_seq))
 
       if origin == node() do
-        %{state | local_progress: local_progress, local_origin_seq: max(state.local_origin_seq, seq)}
+        %{
+          state
+          | local_progress: local_progress,
+            local_origin_seq: max(state.local_origin_seq, seq)
+        }
       else
         %{state | local_progress: local_progress}
       end
@@ -491,7 +501,11 @@ defmodule EKV.TestCluster do
         Map.update(state.local_progress, origin_node, seq, &max(&1, seq))
 
       if origin_node == node() do
-        %{state | local_progress: local_progress, local_origin_seq: max(state.local_origin_seq, seq)}
+        %{
+          state
+          | local_progress: local_progress,
+            local_origin_seq: max(state.local_origin_seq, seq)
+        }
       else
         %{state | local_progress: local_progress}
       end
@@ -572,7 +586,8 @@ defmodule EKV.TestCluster do
 
       %{
         state
-        | remote_member_progress: Map.put(state.remote_member_progress, remote_node, updated_progress),
+        | remote_member_progress:
+            Map.put(state.remote_member_progress, remote_node, updated_progress),
           remote_member_hwms: Map.put(state.remote_member_hwms, remote_node, seq)
       }
     end)
@@ -583,6 +598,27 @@ defmodule EKV.TestCluster do
   def do_trigger_anti_entropy(name, shard_index) do
     shard_name = EKV.Replica.shard_name(name, shard_index)
     send(shard_name, :anti_entropy_tick)
+    :ok
+  end
+
+  def do_drop_remote_shard(name, remote_node, shard_index) do
+    shard_name = EKV.Replica.shard_name(name, shard_index)
+
+    :sys.replace_state(shard_name, fn state ->
+      state = %{
+        state
+        | remote_shards: Map.delete(state.remote_shards, remote_node),
+          summary_probe_inflight: MapSet.delete(state.summary_probe_inflight, remote_node),
+          sync_inflight: MapSet.delete(state.sync_inflight, remote_node)
+      }
+
+      if state.full_sync_inflight == remote_node do
+        %{state | full_sync_inflight: nil}
+      else
+        state
+      end
+    end)
+
     :ok
   end
 

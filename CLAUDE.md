@@ -263,6 +263,9 @@ Important:
   - The tick is a summary probe/reply exchange, not unsolicited sender push.
   - The behind receiver decides whether to request delta or full repair.
   - The goal is to heal missed replication without waiting for reconnect.
+  - Each shard keeps at most one summary probe in flight per peer and one
+    full-sync source in flight at a time, so bootstrap repair cannot fan out
+    into duplicate full snapshots from every eligible peer.
 - Live LWW and CAS replication both carry `(origin_node, origin_seq)` directly.
   - Receivers advance local contiguous progress in the same write/promote transaction.
   - Gaps trigger explicit pull repair from the live origin instead of live progress-ack chatter.
@@ -273,7 +276,10 @@ Important:
     the next `origin_seq` in the same transaction, local contiguous self
     progress can advance directly to that seq without scanning `kv_oplog`.
 - Normal delta sync is live-origin-owned.
-- If a peer is behind on dead-origin data, a live peer serves full sync instead of inventing a non-origin delta stream.
+- If a peer is behind on data from an origin that is explicitly known unavailable
+  (down/quarantined/disconnected at the node level), a live peer serves full sync instead of inventing a
+  non-origin delta stream.
+- Missing shard handshake alone is not enough to trigger that full-sync fallback.
 - Chunked sync rules matter:
   - intermediate chunks use `progress=nil`
   - final chunk must send the real terminal progress map
