@@ -84,6 +84,7 @@ Members run periodic anti-entropy by default:
 - The receiver compares the remote summary with its own local contiguous progress and explicitly requests repair only if it is behind.
 - It is meant to heal a member that missed a prior replication message without waiting for reconnect.
 - In the steady state it should be cheap because healthy members only exchange summary metadata; data chunks are sent only in response to an explicit `:sync_request`.
+- In a healthy hot cluster you should mostly see `member_connect` / summary traffic, not steady `sending delta sync` spam.
 - Set `false` only for debugging; the default is the safer production setting.
 
 ## Backups
@@ -128,7 +129,8 @@ If the backup is younger than `tombstone_ttl` (default 7 days):
 
 1. Stop the node
 2. Replace `data_dir` contents with backup files
-3. Restart normally — delta sync from members catches up
+3. Restart normally — after reconnect, the restarted member will pull repair
+   from healthy peers (`delta` if retained replay covers the gap, `full` if it does not)
 
 ### Restoring an Old Backup to the Entire Cluster
 

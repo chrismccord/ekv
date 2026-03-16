@@ -21,11 +21,19 @@ defmodule EKV.Store do
     not a replicated tombstone marker.
   - `kv_oplog` — authoritative replay log keyed by `(origin_node, origin_seq)`.
     Already-expired rows are filtered out when delta sync is built.
-  - `kv_origin_progress` — local applied replay progress per origin.
-  - `kv_member_progress` — per-member, per-origin progress for anti-entropy/truncation.
+  - `kv_origin_progress` — highest contiguous locally-applied replay progress
+    per origin. Local-origin writes/promotes can advance this directly because
+    the shard allocates self `origin_seq` in-order inside the same transaction.
+  - `kv_member_progress` — per-member, per-origin progress for anti-entropy
+    summaries, sync settlement, and replay retention/truncation.
   - `kv_meta` — shard metadata such as `last_active_at`, persisted `node_id`,
     and long-partition down-since markers.
   - `kv_paxos` — durable CASPaxos acceptor state per key.
+
+  Write/promote primitives still cross the Elixir/NIF boundary once. The
+  extra replay bookkeeping now happens inside that same SQLite transaction:
+  allocate the next local `origin_seq` when needed, append the replay row,
+  and update local contiguous progress before commit.
   """
 
   @get_sql """

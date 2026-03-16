@@ -134,9 +134,11 @@ defmodule EKV.Replica do
       ┌──────────────────────────────────────────────────────────────┐
       │ NIF function          │ Bounces │ Operations                 │
       ├───────────────────────┼─────────┼────────────────────────────│
-      │ write_entry           │    1    │ BEGIN + kv upsert (LWW) +  │
-      │                       │         │ check changes + oplog +    │
-      │                       │         │ COMMIT (or ROLLBACK)       │
+      │ write_entry           │    1    │ BEGIN + local origin seq   │
+      │                       │         │ alloc (if needed) + kv     │
+      │                       │         │ upsert (LWW) + check       │
+      │                       │         │ changes + oplog + progress │
+      │                       │         │ update + COMMIT/ROLLBACK   │
       │ read_entry            │    1    │ reset + bind + step on     │
       │                       │         │ cached prepared stmt       │
       │ fetch_all             │    1    │ prepare + bind + step all  │
@@ -147,9 +149,12 @@ defmodule EKV.Replica do
       │ paxos_accept          │    1    │ BEGIN + ballot check +     │
       │                       │         │ upsert kv_paxos + COMMIT   │
       │ paxos_promote         │    1    │ BEGIN + read kv_paxos +    │
-      │                       │         │ ballot check + kv upsert + │
-      │                       │         │ oplog insert + clear       │
-      │                       │         │ kv_paxos + COMMIT          │
+      │                       │         │ ballot check + local       │
+      │                       │         │ origin seq alloc (if       │
+      │                       │         │ needed) + kv upsert +      │
+      │                       │         │ oplog insert + progress    │
+      │                       │         │ update + clear kv_paxos +  │
+      │                       │         │ COMMIT                     │
       └──────────────────────────────────────────────────────────────┘
 
   Without combined NIFs, a simple put would be 5 dirty bounces
@@ -158,6 +163,10 @@ defmodule EKV.Replica do
   Cached prepared statements:
     - Writer: kv_upsert (LWW), kv_force_upsert (no LWW), oplog_insert
     - Readers: get statement (per reader connection)
+    - NIF-internal writer helpers: local origin seq/progress statements are
+      cached on the connection as well, so the extra replay bookkeeping stays
+      inside the same single dirty NIF hop without per-write prepare/finalize
+      churn.
 
   All IO-touching NIFs use ERL_NIF_DIRTY_JOB_IO_BOUND. The bind NIF
   runs on a normal scheduler (no IO).
@@ -211,9 +220,12 @@ defmodule EKV.Replica do
   On the receiving side, merge_remote_entry calls the same write_entry
   NIF with the remote's timestamp and `origin_seq`. The write path advances
   local contiguous replay progress for that origin in the same SQLite
-  transaction. Live writes therefore piggyback the sender's current head via
-  `(origin_node, origin_seq)`, and receivers can detect gaps immediately
-  without any extra live progress-ack message.
+  transaction. For self-origin writes, the shard allocates `origin_seq`
+  durably in that transaction and can advance self progress directly to the
+  allocated seq without scanning for gaps; remote-origin writes still use
+  contiguous-prefix advancement. Live writes therefore piggyback the sender's
+  current head via `(origin_node, origin_seq)`, and receivers can detect gaps
+  immediately without any extra live progress-ack message.
 
   Large replicated value payloads may be compressed on the wire only.
   The message shape stays the same, but the value field may be tagged as
@@ -974,7 +986,11 @@ defmodule EKV.Replica do
     :accept_nack         {ref, pid, node_id}
 
   Current `meta` usage:
-    - handshake messages advertise `%{features: %{live_progress: true, wire_compression: true}}`
+    - handshake messages advertise
+      `%{features: %{live_progress: true, wire_compression: true}}`
+      where `live_progress` means the peer supports progress summaries and
+      sync-settlement progress exchange in the v1 contract; it is not a
+      promise of per-write live progress-ack traffic
     - replication/control messages keep `meta` empty unless an optional feature requires it
 
   Internally, Replica still uses the raw tuples below after decoding the wire

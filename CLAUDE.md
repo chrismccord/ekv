@@ -138,6 +138,9 @@ Important:
   - Current advertised features:
     - `:live_progress`
     - `:wire_compression`
+  - `:live_progress` now means the peer understands progress summaries,
+    `:summary_probe` / `:summary_reply`, `:sync_request`, and sync-settlement
+    `:progress_ack`. It does not imply per-write live progress acks.
 - Version determines parse shape.
 - Features determine which optional send-side behaviors are allowed.
 - There is still no support for unversioned/old mixed-member overlap.
@@ -263,6 +266,12 @@ Important:
 - Live LWW and CAS replication both carry `(origin_node, origin_seq)` directly.
   - Receivers advance local contiguous progress in the same write/promote transaction.
   - Gaps trigger explicit pull repair from the live origin instead of live progress-ack chatter.
+- Local write/promote hot paths still use a single DB NIF hop.
+  - The NIF now caches helper statements for local origin-seq allocation and
+    progress maintenance instead of preparing/finalizing them per write.
+  - Self-origin writes/promotes use a safe fast path: once the shard allocates
+    the next `origin_seq` in the same transaction, local contiguous self
+    progress can advance directly to that seq without scanning `kv_oplog`.
 - Normal delta sync is live-origin-owned.
 - If a peer is behind on dead-origin data, a live peer serves full sync instead of inventing a non-origin delta stream.
 - Chunked sync rules matter:
@@ -324,6 +333,8 @@ Important:
   - stale marker cleanup for graceful non-handoff shutdown
 - `c_src/ekv_sqlite3_nif.c`
   - combined SQLite transactional primitives, including CAS NIFs
+  - cached helper statements for local origin seq/progress bookkeeping
+  - single-hop local write/promote path with self-origin fast path
 
 ## Tests To Run
 
