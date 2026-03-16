@@ -33,6 +33,8 @@ Do not analyze Byzantine/malicious behavior unless explicitly asked.
 - Modes are per key, not per store:
   - `LWW -> CAS` is allowed.
   - `CAS -> LWW` writes are rejected with `{:error, :cas_managed_key}`.
+- `LWW -> CAS` is an operational migration, not a partition-safe fenced mode switch.
+- A stale/partitioned node that has not yet learned CAS ownership for a key can still accept an eventual write for that key during cutover.
 - Eventual reads on CAS-managed keys are still allowed.
 - `consistent: true` is a barrier read, not a fast-path heuristic.
 
@@ -246,6 +248,11 @@ Important:
 ### CAS key ownership
 - Eventual writes must reject CAS-managed keys.
 - Reads may still be eventual or consistent.
+- Document the migration caveat:
+  - during `LWW -> CAS` cutover, stale/off-quorum nodes may not yet know the key is CAS-managed
+  - such nodes can still accept an eventual LWW write
+  - on heal, that write can win by LWW timestamp ordering if it is newer than what the CAS quorum saw
+  - this is an accepted mixed-mode limitation, not a steady-state CAS bug
 
 ### Quorum and membership
 - Quorum is `floor(cluster_size / 2) + 1`.
@@ -268,6 +275,11 @@ Important:
     into duplicate full snapshots from every eligible peer.
 - Live LWW and CAS replication both carry `(origin_node, origin_seq)` directly.
   - Receivers advance local contiguous progress in the same write/promote transaction.
+- Replay and CAS on the same shard are mailbox-serialized.
+- Chunked sync safety is not just "different tables":
+  - tentative CAS state is in `kv_paxos`
+  - sync applies committed `kv`
+  - once a ballot is accepted, prepares/promotes must read `kv_paxos`
   - Gaps trigger explicit pull repair from the live origin instead of live progress-ack chatter.
 - Local write/promote hot paths still use a single DB NIF hop.
   - The NIF now caches helper statements for local origin-seq allocation and

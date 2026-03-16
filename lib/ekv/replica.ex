@@ -2,14 +2,14 @@ defmodule EKV.Replica do
   @moduledoc false
 
   _archdoc = ~S"""
-  EKV — Eventually Consistent Durable KV Store
-  =============================================
+  EKV — Eventually Consistent Durable KV Store with Compare-And-Swap via CASPaxos
+  ===============================================================================
 
   EKV is a sharded, replicated key-value store where data outlives the node
   that created it. EKV entries survive node restarts, node death, and network
   partitions. Data is only removed by explicit delete or TTL expiry.
 
-  The default consistency model is Last-Writer-Wins (LWW) — every node can
+  The default consistency model is Last-Write-Wins (LWW) — every node can
   read and write independently, and conflicts are resolved by timestamp. For
   keys that need stronger guarantees, an opt-in Compare-And-Swap (CAS) mode
   provides linearizable read-modify-write via CASPaxos consensus.
@@ -17,8 +17,8 @@ defmodule EKV.Replica do
   Member-to-member replica discovery is fully self-contained: shards use
   `:net_kernel.monitor_nodes/1` and `Node.list/0` directly for member handshakes and
   sync. Client routing is separate — client EKV instances discover ready
-  members through :pg region groups published by `EKV.MemberPresence`. Each EKV
-  instance owns its own scoped :pg mesh, isolating routing, subscriptions, and
+  members through `:pg` region groups published by `EKV.MemberPresence`. Each EKV
+  instance owns its own scoped `:pg` mesh, isolating routing, subscriptions, and
   shutdown coordination from other EKV instances and unrelated default-scope
   `:pg` traffic. Zero runtime deps. SQLite is vendored as a C NIF
   (c_src/sqlite3.c amalgamation).
@@ -322,9 +322,9 @@ defmodule EKV.Replica do
 
   Each CAS operation gets a unique ballot `{counter, node_id}`. Counters
   are monotonically increasing per-shard `(max(system_time_ns, prev + 1))`
-  and persisted in kv_meta to survive restarts. The `{counter, node_id}`
-  tuple is compared lexicographically — higher counter wins, ties broken
-  by node_id.
+  and persisted in kv_meta to survive restarts. Ballots are ordered by
+  `(counter, node_id)`: `counter` compares numerically, and equal counters
+  are broken by lexicographic comparison of the normalized string `node_id`.
 
   ### SQLite Table: kv_paxos
 
@@ -513,6 +513,13 @@ defmodule EKV.Replica do
       Reads may still choose eventual or consistent paths based on needs.
     - Eventual writes (`put/delete` without CAS options) to CAS-managed keys
       are rejected with `{:error, :cas_managed_key}`.
+    - Important limitation: `LWW -> CAS` is an operational migration, not a
+      partition-safe fenced mode switch. A stale or partitioned node that has
+      not yet learned CAS ownership for a key can still accept an eventual
+      LWW write for that key during cutover. On heal, that stale LWW write may
+      still win by normal `{timestamp, origin}` ordering if it is newer than
+      the state the CAS quorum saw. This is a mixed-mode migration edge case,
+      not a steady-state CAS race.
     - Sync sends entries from kv (committed state). kv_paxos tentative
       values are not included in sync — they only exist locally until
       committed.
@@ -721,7 +728,10 @@ defmodule EKV.Replica do
 
   Safety under concurrent activity:
     - Write between chunks: LWW is idempotent. Duplicates resolved.
-    - CAS between chunks: independent tables (kv_paxos vs kv).
+    - CAS between chunks: shard mailbox serialization prevents true
+      same-shard races. Tentative CAS state lives in kv_paxos, while sync
+      applies committed kv state. Once a ballot is accepted, later prepares
+      and commits consult kv_paxos rather than stale kv rows.
     - GC between chunks: cursor-based, skips purged entries.
     - Second sync triggered: LWW makes duplicate replay safe.
 

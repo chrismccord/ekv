@@ -176,6 +176,16 @@ Use consistent mode as **key ownership**:
 - Once a key is CAS-managed, eventual writes on that key are rejected
   (`CAS -> LWW` is not supported for writes).
 - Keys managed via CAS should keep using CAS **write** APIs.
+- Important migration caveat: `LWW -> CAS` is an operational cutover, not a
+  partition-safe fenced mode switch. A partitioned or stale node that has not
+  yet learned the key is CAS-managed can still accept an eventual write on that
+  key. After heal, that stale LWW write may win by normal LWW timestamp ordering
+  if it is newer than the state the CAS quorum saw. This is a mixed-mode edge
+  case, not a steady-state CAS behavior.
+- Recommended cutover for a key moving to CAS:
+  - quiesce eventual writers for that key
+  - switch writers to CAS on a healthy cluster
+  - wait for anti-entropy / partition healing to settle before relying on CAS-only ownership
 - Reads for CAS-managed keys can be eventual (`EKV.get/2`, `EKV.lookup/2`) for
   lower latency, or consistent (`EKV.get/3, consistent: true`) when freshness
   matters. `consistent: true` is a barrier/linearizable read.

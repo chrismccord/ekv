@@ -4517,6 +4517,94 @@ defmodule EKVTest do
       assert EKV.get(name, key) == "cas_val"
     end
 
+    test "delta sync chunk on same key before final settlement does not derail CAS", %{
+      name: name,
+      shard_name: shard_name
+    } do
+      key = "order/delta_same_key_cas"
+      sync_origin = :"delta_origin@127.0.0.1"
+      sync_ts = System.system_time(:nanosecond)
+      sync_val = "delta_seen"
+      sync_val_bin = :erlang.term_to_binary(sync_val)
+      sync_origin_str = Atom.to_string(sync_origin)
+
+      send(
+        shard_name,
+        {:ekv_sync, sync_origin, 0, :delta,
+         [{key, sync_val_bin, sync_ts, sync_origin, 1, nil, nil}], %{}}
+      )
+
+      :sys.get_state(shard_name)
+
+      assert EKV.get(name, key) == sync_val
+
+      ref = make_ref()
+      send(shard_name, {:ekv_prepare, ref, self(), key, 100, "2", 0})
+
+      assert_receive {:ekv, 1, :promise, {^ref, _, _, 0, "", kv_row}, %{}}, 1000
+      assert kv_row == [sync_val_bin, sync_ts, sync_origin_str, nil, nil]
+
+      cas_val = "cas_after_delta"
+      cas_val_bin = :erlang.term_to_binary(cas_val)
+      cas_entry = {key, cas_val_bin, sync_ts + 1, Atom.to_string(node()), nil, nil}
+      ref_accept = make_ref()
+
+      send(shard_name, {:ekv_accept, ref_accept, self(), key, 100, "2", cas_entry, 0})
+      assert_receive {:ekv, 1, :accepted, {^ref_accept, _, _}, %{}}, 1000
+
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, node(), 0})
+      :sys.get_state(shard_name)
+
+      send(shard_name, {:ekv_sync, sync_origin, 0, :delta, [], %{sync_origin => 1}})
+      :sys.get_state(shard_name)
+
+      assert EKV.get(name, key) == cas_val
+    end
+
+    test "full sync chunk on same key before final settlement does not derail CAS", %{
+      name: name,
+      shard_name: shard_name
+    } do
+      key = "order/full_same_key_cas"
+      sync_origin = :"full_origin@127.0.0.1"
+      sync_ts = System.system_time(:nanosecond)
+      sync_val = "full_seen"
+      sync_val_bin = :erlang.term_to_binary(sync_val)
+      sync_origin_str = Atom.to_string(sync_origin)
+
+      send(
+        shard_name,
+        {:ekv_sync, sync_origin, 0, :full,
+         [{key, sync_val_bin, sync_ts, sync_origin, 1, nil, nil}], %{}}
+      )
+
+      :sys.get_state(shard_name)
+
+      assert EKV.get(name, key) == sync_val
+
+      ref = make_ref()
+      send(shard_name, {:ekv_prepare, ref, self(), key, 100, "2", 0})
+
+      assert_receive {:ekv, 1, :promise, {^ref, _, _, 0, "", kv_row}, %{}}, 1000
+      assert kv_row == [sync_val_bin, sync_ts, sync_origin_str, nil, nil]
+
+      cas_val = "cas_after_full"
+      cas_val_bin = :erlang.term_to_binary(cas_val)
+      cas_entry = {key, cas_val_bin, sync_ts + 1, Atom.to_string(node()), nil, nil}
+      ref_accept = make_ref()
+
+      send(shard_name, {:ekv_accept, ref_accept, self(), key, 100, "2", cas_entry, 0})
+      assert_receive {:ekv, 1, :accepted, {^ref_accept, _, _}, %{}}, 1000
+
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, node(), 0})
+      :sys.get_state(shard_name)
+
+      send(shard_name, {:ekv_sync, sync_origin, 0, :full, [], %{sync_origin => 1}})
+      :sys.get_state(shard_name)
+
+      assert EKV.get(name, key) == cas_val
+    end
+
     test "commit notification to shard that restarted (kv_paxos survives)", %{
       name: name,
       shard_name: shard_name

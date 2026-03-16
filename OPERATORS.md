@@ -507,6 +507,24 @@ the mismatched node.
 | `{:error, :unavailable}` | Client backend or ambiguity-resolution read was unavailable | Check member availability/routing; retry after route recovers |
 | `{:error, :cas_not_configured}` | `cluster_size` not set | Add `cluster_size` to config |
 
+## CAS Migration Caveat
+
+`LWW -> CAS` is supported as an operational migration, but it is not a
+partition-safe fenced mode switch.
+
+A stale or partitioned node that has not yet learned a key is CAS-managed can
+still accept an eventual write for that key. When the partition heals, that old
+LWW write may still win by normal LWW timestamp ordering if it is newer than
+the state the CAS quorum saw during the cutover window.
+
+Practical guidance:
+
+- Do not treat `LWW -> CAS` as safe for indefinite mixed-mode writing.
+- Quiesce eventual writers for the key before switching that key to CAS writes.
+- Prefer cutover only while the cluster is healthy and converged.
+- If a stale LWW write does surface after heal, a fresh CAS write against the
+  healed state re-establishes CAS ownership.
+
 ## Monitoring Checklist
 
 | Check | How | Healthy |
