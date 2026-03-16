@@ -238,6 +238,11 @@ A periodic GC timer runs three phases per tick:
 
 If a node goes away longer than `tombstone_ttl` and comes back with an old database on disk, other members will have already GC'd the tombstones for entries deleted during the absence. EKV detects this by checking a `last_active_at` timestamp stored in the database. If the database is too stale, EKV fails startup by default instead of trusting that on-disk state. Operators can then wipe that node's data dir so it rebuilds from members, or explicitly set `allow_stale_startup: true` when they intend to trust the old on-disk cluster state.
 
+Each shard DB also persists a named `schema_version` in `kv_meta`. Fresh
+databases stamp the current version on first open. Initialized shard DBs with
+missing or mismatched `schema_version` fail startup closed so EKV does not
+silently boot incompatible on-disk state.
+
 ### Long live-partition protection
 
 A different edge case is when nodes stay up but are partitioned longer than

@@ -471,8 +471,13 @@ but more file descriptors and slightly more memory.
 
 ### Shard Count is Immutable
 
-The shard count is persisted to `kv_meta` on first open. Changing `:shards`
-after data exists raises `ArgumentError` at startup.
+Each shard database also persists a named `schema_version` in `kv_meta`.
+Fresh shard DBs stamp the current version on first open. If EKV sees an
+initialized shard DB with a missing or mismatched `schema_version`, startup
+fails closed instead of guessing compatibility.
+
+The shard count is persisted to `kv_meta` on first open as well. Changing
+`:shards` after data exists raises `ArgumentError` at startup.
 
 There is **no built-in resharding or automatic shard-count migration**.
 Raw shard backups are tied to the original shard count, and member full sync

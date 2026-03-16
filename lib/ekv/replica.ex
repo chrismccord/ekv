@@ -183,8 +183,11 @@ defmodule EKV.Replica do
   Prefix scans (scan/keys) cannot be routed to a single shard because
   the prefix doesn't determine the hash. They fan out to all shards.
 
-  The shard count is immutable — persisted in kv_meta on first open.
-  Changing it raises ArgumentError. Peer connections from nodes with
+  Startup metadata is persisted in `kv_meta` on first open:
+  - `schema_version` gates shard-db compatibility with this build
+  - `num_shards` makes shard count immutable after first open
+
+  Changing shard count raises `ArgumentError`. Peer connections from nodes with
   mismatched shard counts are rejected (logged error, no crash).
 
 

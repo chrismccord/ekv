@@ -10,6 +10,7 @@ defmodule EKV.Store do
   - current committed KV state
   - CAS accept/promote state (`kv_paxos`)
   - anti-entropy replay/progress (`kv_oplog`, `kv_origin_progress`, `kv_member_progress`)
+  - startup schema compatibility via `kv_meta.schema_version`
   - startup stale-db checks (`allow_stale_startup` override)
   - local TTL-expiry bookkeeping via `expired_at`
 
@@ -26,8 +27,9 @@ defmodule EKV.Store do
     the shard allocates self `origin_seq` in-order inside the same transaction.
   - `kv_member_progress` — per-member, per-origin progress for anti-entropy
     summaries, sync settlement, and replay retention/truncation.
-  - `kv_meta` — shard metadata such as `last_active_at`, persisted `node_id`,
-    and long-partition down-since markers.
+  - `kv_meta` — shard metadata such as `schema_version`, `num_shards`,
+    `last_active_at`, persisted `node_id`, and long-partition down-since
+    markers.
   - `kv_paxos` — durable CASPaxos acceptor state per key.
 
   Write/promote primitives still cross the Elixir/NIF boundary once. The
@@ -71,6 +73,8 @@ defmodule EKV.Store do
   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
   ON CONFLICT(origin_node, origin_seq) DO NOTHING
   """
+
+  @schema_version 1
 
   def open(data_dir, shard_index, tombstone_ttl, num_shards, gc_interval, opts \\ []) do
     allow_stale_startup = Keyword.get(opts, :allow_stale_startup, false)
@@ -253,7 +257,8 @@ defmodule EKV.Store do
         "CREATE INDEX IF NOT EXISTS idx_kv_expired_marker ON kv(expired_at) WHERE expired_at IS NOT NULL"
       )
 
-    # Validate shard count — must never change after first open
+    # Validate/startup guards — must never silently open incompatible data.
+    validate_schema_version(db, data_dir, shard_index)
     validate_num_shards(db, num_shards, data_dir, shard_index)
 
     # Mark as active
@@ -1217,6 +1222,52 @@ defmodule EKV.Store do
   # =====================================================================
   # Shard count validation
   # =====================================================================
+
+  defp validate_schema_version(db, data_dir, shard_index) do
+    case get_meta_int(db, "schema_version") do
+      nil ->
+        if initialized_db_without_schema_version?(db) do
+          raise ArgumentError,
+                "EKV schema_version mismatch for #{data_dir}/shard_#{shard_index}.db: " <>
+                  "database has initialized state but no schema_version marker. " <>
+                  "Start with a fresh data dir or migrate it before booting this build."
+        end
+
+        set_meta_int(db, "schema_version", @schema_version)
+
+      @schema_version ->
+        :ok
+
+      other ->
+        raise ArgumentError,
+              "EKV schema_version mismatch for #{data_dir}/shard_#{shard_index}.db: " <>
+                "database schema_version=#{other}, but this build expects schema_version=#{@schema_version}. " <>
+                "Start with a fresh data dir or migrate it before booting this build."
+    end
+  end
+
+  defp initialized_db_without_schema_version?(db) do
+    Enum.any?(
+      [
+        "kv_meta",
+        "kv",
+        "kv_oplog",
+        "kv_origin_progress",
+        "kv_member_progress",
+        "kv_member_hwm",
+        "kv_paxos"
+      ],
+      &table_has_rows?(db, &1)
+    )
+  end
+
+  defp table_has_rows?(db, table) do
+    case EKV.Sqlite3.fetch_all(db, "SELECT 1 FROM #{table} LIMIT 1", []) do
+      {:ok, []} -> false
+      {:ok, [_ | _]} -> true
+      _ -> false
+    end
+  end
 
   defp validate_num_shards(db, num_shards, data_dir, shard_index) do
     {:ok, stmt} =

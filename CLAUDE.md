@@ -302,6 +302,10 @@ Important:
 - Startup stale-db rejection:
   - if idle age exceeds roughly `tombstone_ttl - gc_interval`, startup fails closed by default
   - operator must either wipe that node's data dir or explicitly set `allow_stale_startup: true`
+- Startup schema guard:
+  - each shard DB persists `kv_meta.schema_version`
+  - fresh DBs stamp the current version on first open
+  - initialized DBs with missing or mismatched `schema_version` fail startup closed
 - Live long partition protection:
   - default `partition_ttl_policy: :quarantine`
   - reconnect after downtime > `tombstone_ttl` blocks replication for that member pair

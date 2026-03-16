@@ -922,6 +922,40 @@ defmodule EKVTest do
     end
   end
 
+  describe "schema_version startup guard" do
+    test "Store.open stamps schema_version on first open", %{data_dir: data_dir} do
+      {:ok, db} = EKV.Store.open(data_dir, 96, :timer.hours(24 * 7), 2, :timer.minutes(5))
+      assert EKV.Store.get_meta(db, "schema_version") == 1
+      EKV.Store.close(db)
+
+      {:ok, db} = EKV.Store.open(data_dir, 96, :timer.hours(24 * 7), 2, :timer.minutes(5))
+      assert EKV.Store.get_meta(db, "schema_version") == 1
+      EKV.Store.close(db)
+    end
+
+    test "Store.open raises on incompatible schema_version", %{data_dir: data_dir} do
+      {:ok, db} = EKV.Store.open(data_dir, 97, :timer.hours(24 * 7), 2, :timer.minutes(5))
+      :ok = EKV.Store.set_meta(db, "schema_version", 999)
+      EKV.Store.close(db)
+
+      assert_raise ArgumentError, ~r/schema_version mismatch/, fn ->
+        EKV.Store.open(data_dir, 97, :timer.hours(24 * 7), 2, :timer.minutes(5))
+      end
+    end
+
+    test "Store.open raises when initialized state is missing schema_version", %{
+      data_dir: data_dir
+    } do
+      {:ok, db} = EKV.Store.open(data_dir, 98, :timer.hours(24 * 7), 2, :timer.minutes(5))
+      :ok = EKV.Store.delete_meta_key(db, "schema_version")
+      EKV.Store.close(db)
+
+      assert_raise ArgumentError, ~r/schema_version mismatch/, fn ->
+        EKV.Store.open(data_dir, 98, :timer.hours(24 * 7), 2, :timer.minutes(5))
+      end
+    end
+  end
+
   describe "concurrent put during GC expiry" do
     test "new write wins after GC tombstones an expired LWW entry", %{name: name} do
       config = EKV.Supervisor.get_config(name)
