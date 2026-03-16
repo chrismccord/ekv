@@ -33,6 +33,8 @@ Do not analyze Byzantine/malicious behavior unless explicitly asked.
 - Modes are per key, not per store:
   - `LWW -> CAS` is allowed.
   - `CAS -> LWW` writes are rejected with `{:error, :cas_managed_key}`.
+- `LWW -> CAS` is an operational migration, not a partition-safe fenced mode switch.
+- A stale/partitioned node that has not yet learned CAS ownership for a key can still accept an eventual write for that key during cutover.
 - Eventual reads on CAS-managed keys are still allowed.
 - `consistent: true` is a barrier read, not a fast-path heuristic.
 
@@ -138,6 +140,9 @@ Important:
   - Current advertised features:
     - `:live_progress`
     - `:wire_compression`
+  - `:live_progress` now means the peer understands progress summaries,
+    `:summary_probe` / `:summary_reply`, `:sync_request`, and sync-settlement
+    `:progress_ack`. It does not imply per-write live progress acks.
 - Version determines parse shape.
 - Features determine which optional send-side behaviors are allowed.
 - There is still no support for unversioned/old mixed-member overlap.
@@ -243,39 +248,64 @@ Important:
 ### CAS key ownership
 - Eventual writes must reject CAS-managed keys.
 - Reads may still be eventual or consistent.
+- Document the migration caveat:
+  - during `LWW -> CAS` cutover, stale/off-quorum nodes may not yet know the key is CAS-managed
+  - such nodes can still accept an eventual LWW write
+  - on heal, that write can win by LWW timestamp ordering if it is newer than what the CAS quorum saw
+  - this is an accepted mixed-mode limitation, not a steady-state CAS bug
 
 ### Quorum and membership
 - Quorum is `floor(cluster_size / 2) + 1`.
 - Distinct logical `node_id`s drive quorum and overflow checks.
 - If visible logical members exceed `cluster_size`, CAS must fail with `{:error, :cluster_overflow}`.
 
-### Sync / HWM correctness
-- `kv_member_hwm` is not monotonic by design.
-  - It tracks the sender's latest advertised sequence space exactly.
-  - If a sender restarts/restores to a lower local max seq, the stored HWM must be allowed to move lower too.
-- Sender stores member HWM as sender snapshot `my_seq`, not remote sequence.
-- Delta sync is only valid when the member cursor is still inside the local oplog window.
-- Otherwise force full sync.
+### Sync / replay-progress correctness
+- `kv_origin_progress` is local applied progress per origin stream.
+- `kv_member_progress` is peer progress per origin stream.
+- Progress is exact, not monotonic-by-max.
+  - If a peer restarts/full-syncs to a lower authoritative cursor, the stored peer progress must be allowed to move lower too.
+- Delta sync is only valid when the requester is behind a live origin stream and the requested range is still inside the retained replay window.
+- Otherwise serve full sync.
 - Already-connected members now also run periodic anti-entropy by default.
-  - This is not a second protocol.
-  - It reuses the same HWM-driven delta/full sync path.
+  - The tick is a summary probe/reply exchange, not unsolicited sender push.
+  - The behind receiver decides whether to request delta or full repair.
   - The goal is to heal missed replication without waiting for reconnect.
-- Live replication now advances sender/receiver progress directly.
-  - `sender_seq` is part of the required v1 replication payload.
-  - Receivers ack that progress via `:sync_ack`, even when the merge is a no-op.
-  - Anti-entropy should now repair true misses instead of replaying the healthy recent tail every interval.
-- Delta sync relays only entries this member is authoritative for.
-  - That means local-origin writes, plus writes from origin members that are no longer connected.
-  - Healthy replicas should not continuously replay each other's live traffic in steady state.
+  - Each shard keeps at most one summary probe in flight per peer and one
+    full-sync source in flight at a time, so bootstrap repair cannot fan out
+    into duplicate full snapshots from every eligible peer.
+- Live LWW and CAS replication both carry `(origin_node, origin_seq)` directly.
+  - Receivers advance local contiguous progress in the same write/promote transaction.
+- Replay and CAS on the same shard are mailbox-serialized.
+- Chunked sync safety is not just "different tables":
+  - tentative CAS state is in `kv_paxos`
+  - sync applies committed `kv`
+  - once a ballot is accepted, prepares/promotes must read `kv_paxos`
+  - Gaps trigger explicit pull repair from the live origin instead of live progress-ack chatter.
+- Local write/promote hot paths still use a single DB NIF hop.
+  - The NIF now caches helper statements for local origin-seq allocation and
+    progress maintenance instead of preparing/finalizing them per write.
+  - Self-origin writes/promotes use a safe fast path: once the shard allocates
+    the next `origin_seq` in the same transaction, local contiguous self
+    progress can advance directly to that seq without scanning `kv_oplog`.
+- Normal delta sync is live-origin-owned.
+- If a peer is behind on data from an origin that is explicitly known unavailable
+  (down/quarantined/disconnected at the node level), a live peer serves full sync instead of inventing a
+  non-origin delta stream.
+- Missing shard handshake alone is not enough to trigger that full-sync fallback.
 - Chunked sync rules matter:
-  - intermediate chunks use seq `0`
-  - final chunk must send the real terminal seq
-  - empty full sync and empty delta still need a terminal sync/ack settlement so HWM can move to `0` or another lowered cursor
+  - intermediate chunks use `progress=nil`
+  - final chunk must send the real terminal progress map
+  - `:progress_ack` is sync-settlement only; it is not part of the hot live-write path
+  - empty delta still needs a terminal sync/ack settlement so the requester can advance to the sender's head without replaying extra chunks
 
 ### Long partition protection
 - Startup stale-db rejection:
   - if idle age exceeds roughly `tombstone_ttl - gc_interval`, startup fails closed by default
   - operator must either wipe that node's data dir or explicitly set `allow_stale_startup: true`
+- Startup schema guard:
+  - each shard DB persists `kv_meta.schema_version`
+  - fresh DBs stamp the current version on first open
+  - initialized DBs with missing or mismatched `schema_version` fail startup closed
 - Live long partition protection:
   - default `partition_ttl_policy: :quarantine`
   - reconnect after downtime > `tombstone_ttl` blocks replication for that member pair
@@ -325,6 +355,8 @@ Important:
   - stale marker cleanup for graceful non-handoff shutdown
 - `c_src/ekv_sqlite3_nif.c`
   - combined SQLite transactional primitives, including CAS NIFs
+  - cached helper statements for local origin seq/progress bookkeeping
+  - single-hop local write/promote path with self-origin fast path
 
 ## Tests To Run
 

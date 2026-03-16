@@ -176,6 +176,16 @@ Use consistent mode as **key ownership**:
 - Once a key is CAS-managed, eventual writes on that key are rejected
   (`CAS -> LWW` is not supported for writes).
 - Keys managed via CAS should keep using CAS **write** APIs.
+- Important migration caveat: `LWW -> CAS` is an operational cutover, not a
+  partition-safe fenced mode switch. A partitioned or stale node that has not
+  yet learned the key is CAS-managed can still accept an eventual write on that
+  key. After heal, that stale LWW write may win by normal LWW timestamp ordering
+  if it is newer than the state the CAS quorum saw. This is a mixed-mode edge
+  case, not a steady-state CAS behavior.
+- Recommended cutover for a key moving to CAS:
+  - quiesce eventual writers for that key
+  - switch writers to CAS on a healthy cluster
+  - wait for anti-entropy / partition healing to settle before relying on CAS-only ownership
 - Reads for CAS-managed keys can be eventual (`EKV.get/2`, `EKV.lookup/2`) for
   lower latency, or consistent (`EKV.get/3, consistent: true`) when freshness
   matters. `consistent: true` is a barrier/linearizable read.
@@ -227,6 +237,11 @@ A periodic GC timer runs three phases per tick:
 ### Stale database protection
 
 If a node goes away longer than `tombstone_ttl` and comes back with an old database on disk, other members will have already GC'd the tombstones for entries deleted during the absence. EKV detects this by checking a `last_active_at` timestamp stored in the database. If the database is too stale, EKV fails startup by default instead of trusting that on-disk state. Operators can then wipe that node's data dir so it rebuilds from members, or explicitly set `allow_stale_startup: true` when they intend to trust the old on-disk cluster state.
+
+Each shard DB also persists a named `schema_version` in `kv_meta`. Fresh
+databases stamp the current version on first open. Initialized shard DBs with
+missing or mismatched `schema_version` fail startup closed so EKV does not
+silently boot incompatible on-disk state.
 
 ### Long live-partition protection
 

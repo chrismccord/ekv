@@ -80,10 +80,13 @@ Members run periodic anti-entropy by default:
 {EKV, name: :my_kv, data_dir: "/var/data/ekv", anti_entropy_interval: 30_000}
 ```
 
-- This re-runs the normal member handshake + delta/full sync path for already-connected members.
-- This re-runs the normal HWM-driven delta/full sync path for already-connected members.
+- This sends a lightweight per-shard summary probe to already-connected members.
+- The receiver compares the remote summary with its own local contiguous progress and explicitly requests repair only if it is behind.
 - It is meant to heal a member that missed a prior replication message without waiting for reconnect.
-- In the steady state it should be cheap because delta sync now only relays origin-owned writes, plus writes from origin members that are no longer connected.
+- In the steady state it should be cheap because healthy members only exchange summary metadata; data chunks are sent only in response to an explicit `:sync_request`.
+- Each shard keeps only one summary probe in flight per peer and only one full-sync source in flight at a time, so startup/bootstrap repair should not fan out into duplicate full snapshots from multiple peers.
+- Full sync fallback for third-party origins is reserved for origins that are explicitly known unavailable (down/quarantined/disconnected at the node level), not just shard-handshake lag during startup.
+- In a healthy hot cluster you should mostly see `member_connect` / summary traffic, not steady `sending delta sync` spam.
 - Set `false` only for debugging; the default is the safer production setting.
 
 ## Backups
@@ -128,7 +131,8 @@ If the backup is younger than `tombstone_ttl` (default 7 days):
 
 1. Stop the node
 2. Replace `data_dir` contents with backup files
-3. Restart normally — delta sync from members catches up
+3. Restart normally — after reconnect, the restarted member will pull repair
+   from healthy peers (`delta` if retained replay covers the gap, `full` if it does not)
 
 ### Restoring an Old Backup to the Entire Cluster
 
@@ -234,7 +238,7 @@ from members populates its data.
 
 1. Stop the node being removed
 2. Wait for one GC cycle (`gc_interval`, default 5 min) — the removed node's
-   HWM is pruned, allowing oplog truncation to proceed
+   member progress is pruned, allowing replay-log truncation to proceed
 3. Optionally update `cluster_size` on remaining nodes and rolling restart
 
 ## Client Mode
@@ -467,8 +471,13 @@ but more file descriptors and slightly more memory.
 
 ### Shard Count is Immutable
 
-The shard count is persisted to `kv_meta` on first open. Changing `:shards`
-after data exists raises `ArgumentError` at startup.
+Each shard database also persists a named `schema_version` in `kv_meta`.
+Fresh shard DBs stamp the current version on first open. If EKV sees an
+initialized shard DB with a missing or mismatched `schema_version`, startup
+fails closed instead of guessing compatibility.
+
+The shard count is persisted to `kv_meta` on first open as well. Changing
+`:shards` after data exists raises `ArgumentError` at startup.
 
 There is **no built-in resharding or automatic shard-count migration**.
 Raw shard backups are tied to the original shard count, and member full sync
@@ -502,6 +511,24 @@ the mismatched node.
 | `{:error, :cas_managed_key}` | Eventual `put`/`delete` was attempted on a CAS-managed key | Use CAS write APIs for that key; do not mix CAS -> LWW writes |
 | `{:error, :unavailable}` | Client backend or ambiguity-resolution read was unavailable | Check member availability/routing; retry after route recovers |
 | `{:error, :cas_not_configured}` | `cluster_size` not set | Add `cluster_size` to config |
+
+## CAS Migration Caveat
+
+`LWW -> CAS` is supported as an operational migration, but it is not a
+partition-safe fenced mode switch.
+
+A stale or partitioned node that has not yet learned a key is CAS-managed can
+still accept an eventual write for that key. When the partition heals, that old
+LWW write may still win by normal LWW timestamp ordering if it is newer than
+the state the CAS quorum saw during the cutover window.
+
+Practical guidance:
+
+- Do not treat `LWW -> CAS` as safe for indefinite mixed-mode writing.
+- Quiesce eventual writers for the key before switching that key to CAS writes.
+- Prefer cutover only while the cluster is healthy and converged.
+- If a stale LWW write does surface after heal, a fresh CAS write against the
+  healed state re-establishes CAS ownership.
 
 ## Monitoring Checklist
 

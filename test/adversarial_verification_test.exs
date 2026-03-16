@@ -258,11 +258,16 @@ defmodule EKV.AdversarialVerificationTest do
     config = EKV.Supervisor.get_config(name)
     tombstone_cutoff = System.system_time(:nanosecond) - config.tombstone_ttl * 1_000_000
     state = :sys.get_state(shard_name)
-    my_seq = EKV.Store.max_seq(state.db)
+
+    progress_summary =
+      state.db
+      |> EKV.Store.local_progress_summary()
+      |> Map.put(node(), state.local_origin_seq)
 
     send(
       shard_name,
-      {:continue_full_sync, fake_node, nil, tombstone_cutoff, my_seq, config.sync_chunk_size}
+      {:continue_full_sync, fake_node, nil, tombstone_cutoff, progress_summary,
+       config.sync_chunk_size}
     )
 
     Process.sleep(200)
@@ -270,7 +275,7 @@ defmodule EKV.AdversarialVerificationTest do
 
     :erlang.trace(Process.whereis(shard_name), false, [:send])
 
-    sync_details = collect_trace_sync_details()
+    sync_details = collect_trace_sync_details(node())
 
     assert Enum.any?(sync_details, fn {_count, seq} -> seq > 0 end),
            "expected at least one final chunk with seq>0, got #{inspect(sync_details)}"
@@ -311,37 +316,49 @@ defmodule EKV.AdversarialVerificationTest do
 
     config = EKV.Supervisor.get_config(name)
     state = :sys.get_state(shard_name)
-    my_seq = EKV.Store.max_seq(state.db)
+    my_seq = state.local_origin_seq
 
-    send(shard_name, {:continue_delta_sync, fake_node, 0, my_seq, config.sync_chunk_size})
+    send(
+      shard_name,
+      {:continue_delta_sync, fake_node, node(), 0, my_seq, config.sync_chunk_size}
+    )
 
     Process.sleep(200)
     :sys.get_state(shard_name)
 
     :erlang.trace(Process.whereis(shard_name), false, [:send])
 
-    sync_details = collect_trace_sync_details()
+    sync_details = collect_trace_sync_details(node())
 
     assert Enum.any?(sync_details, fn {_count, seq} -> seq > 0 end),
            "expected at least one final delta chunk with seq>0, got #{inspect(sync_details)}"
   end
 
-  defp collect_trace_sync_details do
-    collect_trace_sync_details([])
+  defp collect_trace_sync_details(origin_node) do
+    collect_trace_sync_details(origin_node, [])
   end
 
-  defp collect_trace_sync_details(acc) do
+  defp collect_trace_sync_details(origin_node, acc) do
     receive do
-      {:trace, _, :send, {:ekv_sync, _, _, entries, seq}, _} ->
-        collect_trace_sync_details([{length(entries), seq} | acc])
+      {:trace, _, :send, {:ekv_sync, _, _, _mode, entries, progress}, _} ->
+        collect_trace_sync_details(origin_node, [
+          {length(entries), progress_seq(progress, origin_node)} | acc
+        ])
 
-      {:trace, _, :send, {:ekv, 1, :sync, {_, _, entries, seq}, _meta}, _} ->
-        collect_trace_sync_details([{length(entries), seq} | acc])
+      {:trace, _, :send, {:ekv, 1, :sync, {_, _, _mode, entries, progress}, _meta}, _} ->
+        collect_trace_sync_details(origin_node, [
+          {length(entries), progress_seq(progress, origin_node)} | acc
+        ])
 
       {:trace, _, :send, _, _} ->
-        collect_trace_sync_details(acc)
+        collect_trace_sync_details(origin_node, acc)
     after
       100 -> Enum.reverse(acc)
     end
   end
+
+  defp progress_seq(progress, origin_node) when is_map(progress),
+    do: Map.get(progress, origin_node, 0)
+
+  defp progress_seq(_progress, _origin_node), do: 0
 end

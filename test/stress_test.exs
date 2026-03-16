@@ -120,7 +120,7 @@ defmodule EKV.StressTest do
       for {_pid, node} <- peers do
         TestCluster.rpc!(node, Kernel, :send, [
           shard_name,
-          {:ekv_put, key, old_value_bin, old_ts, old_origin, nil, 0}
+          {:ekv_put, key, old_value_bin, old_ts, old_origin, 1, nil}
         ])
 
         # Drain shard mailbox so the synthetic write is definitely applied.
@@ -208,7 +208,7 @@ defmodule EKV.StressTest do
 
       TestCluster.rpc!(n1, Kernel, :send, [
         shard_name,
-        {:ekv_put, conflict_key, ahead_bin, ahead_ts, ahead_origin, nil, 0}
+        {:ekv_put, conflict_key, ahead_bin, ahead_ts, ahead_origin, 1, nil}
       ])
 
       TestCluster.rpc!(n1, :sys, :get_state, [shard_name])
@@ -1248,6 +1248,51 @@ defmodule EKV.StressTest do
         fn ->
           vals = Enum.map(all_nodes, fn n -> TestCluster.rpc!(n, EKV, :get, [ekv_name, key]) end)
           Enum.all?(vals, &(&1 == "final"))
+        end,
+        timeout: 5000
+      )
+    end
+
+    test "minority-only pre-CAS LWW write yields to majority CAS after heal" do
+      peers = TestCluster.start_peers(3)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, n1}, {_, n2}, {_, n3}] = peers
+      all_nodes = [n1, n2, n3]
+      ekv_name = unique_name(:minority_lww_then_cas)
+
+      start_stress_cluster(peers, ekv_name, shards: 1)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      key = "mix/minority_lww_then_cas"
+
+      partition([n1, n2], [n3])
+      Process.sleep(300)
+
+      :ok = TestCluster.rpc!(n3, EKV, :put, [ekv_name, key, "minority_lww"])
+
+      assert TestCluster.rpc!(n3, EKV, :get, [ekv_name, key]) == "minority_lww"
+      assert TestCluster.rpc!(n1, EKV, :get, [ekv_name, key]) == nil
+      assert TestCluster.rpc!(n2, EKV, :get, [ekv_name, key]) == nil
+
+      assert {:ok, _} =
+               TestCluster.rpc!(n1, EKV, :put, [ekv_name, key, "majority_cas", [if_vsn: nil]])
+
+      TestCluster.assert_eventually(fn ->
+        Enum.all?([n1, n2], fn node ->
+          TestCluster.rpc!(node, EKV, :get, [ekv_name, key]) == "majority_cas"
+        end)
+      end)
+
+      heal([n1, n2], [n3])
+      Process.sleep(500)
+
+      TestCluster.assert_eventually(
+        fn ->
+          vals =
+            Enum.map(all_nodes, fn node -> TestCluster.rpc!(node, EKV, :get, [ekv_name, key]) end)
+
+          Enum.all?(vals, &(&1 == "majority_cas"))
         end,
         timeout: 5000
       )

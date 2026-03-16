@@ -209,7 +209,7 @@ defmodule EKVTest do
       # Write with ts=1000
       val1 = :erlang.term_to_binary("winner")
 
-      {:ok, true} =
+      {:ok, true, _origin_seq, _local_progress_seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -251,7 +251,7 @@ defmodule EKVTest do
       # Write from node_a
       val_a = :erlang.term_to_binary("from_a")
 
-      {:ok, true} =
+      {:ok, true, _origin_seq, _local_progress_seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -266,7 +266,7 @@ defmodule EKVTest do
       # Write from node_b with same timestamp — node_b > node_a lexicographically, should win
       val_b = :erlang.term_to_binary("from_b")
 
-      {:ok, true} =
+      {:ok, true, _origin_seq, _local_progress_seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -322,7 +322,7 @@ defmodule EKVTest do
         # Write from loser first
         val_l = :erlang.term_to_binary(:loser_val)
 
-        {:ok, true} =
+        {:ok, true, _origin_seq, _local_progress_seq} =
           EKV.Store.write_entry(
             db,
             stmts.kv_upsert,
@@ -337,7 +337,7 @@ defmodule EKVTest do
         # Write from winner with same timestamp — should win
         val_w = :erlang.term_to_binary(:winner_val)
 
-        {:ok, true} =
+        {:ok, true, _origin_seq, _local_progress_seq} =
           EKV.Store.write_entry(
             db,
             stmts.kv_upsert,
@@ -381,7 +381,7 @@ defmodule EKVTest do
       # Put from node_a
       val = :erlang.term_to_binary("alive")
 
-      {:ok, true} =
+      {:ok, true, _origin_seq, _local_progress_seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -394,7 +394,7 @@ defmodule EKVTest do
         )
 
       # Delete from node_b at same timestamp — node_b > node_a, delete wins
-      {:ok, true} =
+      {:ok, true, _origin_seq, _local_progress_seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -432,7 +432,7 @@ defmodule EKVTest do
       %{db: db, stmts: stmts} = :sys.get_state(shard_name)
 
       # Delete at ts=1000
-      {:ok, true} =
+      {:ok, true, _origin_seq, _local_progress_seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -450,7 +450,7 @@ defmodule EKVTest do
       # Put at ts=2000 — higher timestamp, should win
       val = :erlang.term_to_binary("resurrected")
 
-      {:ok, true} =
+      {:ok, true, _origin_seq, _local_progress_seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -473,7 +473,7 @@ defmodule EKVTest do
 
       val1 = :erlang.term_to_binary("first")
 
-      {:ok, true} =
+      {:ok, true, _origin_seq, _local_progress_seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -510,26 +510,26 @@ defmodule EKVTest do
   # Pathological / Jepsen-style unit tests
   # =====================================================================
 
-  describe "HWM updates" do
-    test "HWM tracks the latest advertised sender seq even when it moves lower", %{name: name} do
+  describe "member progress updates" do
+    test "peer progress tracks the latest advertised origin seq even when it moves lower", %{
+      name: name
+    } do
       config = EKV.Supervisor.get_config(name)
       shard = EKV.Replica.shard_index_for("hwm_key", config.num_shards)
       shard_name = EKV.Replica.shard_name(name, shard)
       %{db: db} = :sys.get_state(shard_name)
 
       member = :fake_member@host
+      origin = :origin_a@host
 
-      # Set HWM to 100
-      :ok = EKV.Store.set_hwm(db, member, 100)
-      assert EKV.Store.get_hwm(db, member) == 100
+      :ok = EKV.Store.update_peer_progress(db, member, origin, 100)
+      assert EKV.Store.get_peer_progress(db, member) == %{origin => 100}
 
-      # Sender sequence spaces can legitimately reset lower after restart/restore.
-      :ok = EKV.Store.set_hwm(db, member, 50)
-      assert EKV.Store.get_hwm(db, member) == 50
+      :ok = EKV.Store.replace_peer_progress(db, member, %{origin => 50})
+      assert EKV.Store.get_peer_progress(db, member) == %{origin => 50}
 
-      # Set HWM to 200 — should advance
-      :ok = EKV.Store.set_hwm(db, member, 200)
-      assert EKV.Store.get_hwm(db, member) == 200
+      :ok = EKV.Store.update_peer_progress(db, member, origin, 200)
+      assert EKV.Store.get_peer_progress(db, member) == %{origin => 200}
     end
   end
 
@@ -544,7 +544,7 @@ defmodule EKVTest do
       for i <- 1..3 do
         val = :erlang.term_to_binary("val_#{i}")
 
-        {:ok, true} =
+        {:ok, true, _origin_seq, _local_progress_seq} =
           EKV.Store.write_entry(
             db,
             stmts.kv_upsert,
@@ -580,7 +580,7 @@ defmodule EKVTest do
       entries = EKV.Store.oplog_since(db, 0)
       assert length(entries) == 3
 
-      seqs = Enum.map(entries, fn {seq, _, _, _, _, _, _} -> seq end)
+      seqs = Enum.map(entries, fn {seq, _, _, _, _, _, _, _} -> seq end)
       # Seqs should be contiguous
       assert seqs == Enum.to_list(Enum.min(seqs)..Enum.max(seqs))
     end
@@ -597,7 +597,7 @@ defmodule EKVTest do
       for i <- 1..10 do
         val = :erlang.term_to_binary("val_#{i}")
 
-        {:ok, true} =
+        {:ok, true, _origin_seq, _local_progress_seq} =
           EKV.Store.write_entry(
             db,
             stmts.kv_upsert,
@@ -614,8 +614,8 @@ defmodule EKVTest do
       assert max >= 10
 
       # Set HWMs for 2 fake members — min is at seq 5
-      :ok = EKV.Store.set_hwm(db, :member_a@host, 5)
-      :ok = EKV.Store.set_hwm(db, :member_b@host, 10)
+      :ok = EKV.Store.update_peer_progress(db, :member_a@host, :node_a, 5)
+      :ok = EKV.Store.update_peer_progress(db, :member_b@host, :node_a, 10)
 
       # Truncate oplog
       :ok = EKV.Store.truncate_oplog(db)
@@ -643,7 +643,7 @@ defmodule EKVTest do
       past = now - 1_000_000_000
       val = :erlang.term_to_binary("doomed")
 
-      {:ok, true} =
+      {:ok, true, _origin_seq, _local_progress_seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -694,7 +694,7 @@ defmodule EKVTest do
       now = System.system_time(:nanosecond)
       val = :erlang.term_to_binary("to_be_purged")
 
-      {:ok, true} =
+      {:ok, true, _origin_seq, _local_progress_seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -706,7 +706,7 @@ defmodule EKVTest do
           nil
         )
 
-      {:ok, true} =
+      {:ok, true, _origin_seq, _local_progress_seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -747,7 +747,7 @@ defmodule EKVTest do
       expired_at = now - (config.tombstone_ttl * 1_000_000 + 1_000_000)
       val = :erlang.term_to_binary("old_expired")
 
-      {:ok, true} =
+      {:ok, true, _origin_seq, _local_progress_seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -783,7 +783,7 @@ defmodule EKVTest do
       for i <- 1..10 do
         val = :erlang.term_to_binary("v_#{i}")
 
-        {:ok, true} =
+        {:ok, true, _origin_seq, _local_progress_seq} =
           EKV.Store.write_entry(
             db,
             stmts.kv_upsert,
@@ -797,8 +797,8 @@ defmodule EKVTest do
       end
 
       # Set HWMs for 2 fake members at seq 5 and seq 10
-      :ok = EKV.Store.set_hwm(db, :gc_member_a@host, 5)
-      :ok = EKV.Store.set_hwm(db, :gc_member_b@host, 10)
+      :ok = EKV.Store.update_peer_progress(db, :gc_member_a@host, :node_a, 5)
+      :ok = EKV.Store.update_peer_progress(db, :gc_member_b@host, :node_a, 10)
 
       # Add fake members to remote_shards so their HWMs survive GC pruning
       :sys.replace_state(shard_name, fn state ->
@@ -813,7 +813,7 @@ defmodule EKVTest do
 
       # Entries below seq 5 should be gone
       entries = EKV.Store.oplog_since(db, 0)
-      seqs = Enum.map(entries, fn {seq, _, _, _, _, _, _} -> seq end)
+      seqs = Enum.map(entries, fn {seq, _, _, _, _, _, _, _} -> seq end)
       assert Enum.all?(seqs, &(&1 >= 5))
       # Entries >= 5 should remain
       assert length(entries) >= 6
@@ -922,6 +922,40 @@ defmodule EKVTest do
     end
   end
 
+  describe "schema_version startup guard" do
+    test "Store.open stamps schema_version on first open", %{data_dir: data_dir} do
+      {:ok, db} = EKV.Store.open(data_dir, 96, :timer.hours(24 * 7), 2, :timer.minutes(5))
+      assert EKV.Store.get_meta(db, "schema_version") == 1
+      EKV.Store.close(db)
+
+      {:ok, db} = EKV.Store.open(data_dir, 96, :timer.hours(24 * 7), 2, :timer.minutes(5))
+      assert EKV.Store.get_meta(db, "schema_version") == 1
+      EKV.Store.close(db)
+    end
+
+    test "Store.open raises on incompatible schema_version", %{data_dir: data_dir} do
+      {:ok, db} = EKV.Store.open(data_dir, 97, :timer.hours(24 * 7), 2, :timer.minutes(5))
+      :ok = EKV.Store.set_meta(db, "schema_version", 999)
+      EKV.Store.close(db)
+
+      assert_raise ArgumentError, ~r/schema_version mismatch/, fn ->
+        EKV.Store.open(data_dir, 97, :timer.hours(24 * 7), 2, :timer.minutes(5))
+      end
+    end
+
+    test "Store.open raises when initialized state is missing schema_version", %{
+      data_dir: data_dir
+    } do
+      {:ok, db} = EKV.Store.open(data_dir, 98, :timer.hours(24 * 7), 2, :timer.minutes(5))
+      :ok = EKV.Store.delete_meta_key(db, "schema_version")
+      EKV.Store.close(db)
+
+      assert_raise ArgumentError, ~r/schema_version mismatch/, fn ->
+        EKV.Store.open(data_dir, 98, :timer.hours(24 * 7), 2, :timer.minutes(5))
+      end
+    end
+  end
+
   describe "concurrent put during GC expiry" do
     test "new write wins after GC tombstones an expired LWW entry", %{name: name} do
       config = EKV.Supervisor.get_config(name)
@@ -934,7 +968,7 @@ defmodule EKVTest do
       past = now - 1_000_000_000
       val = :erlang.term_to_binary("expired")
 
-      {:ok, true} =
+      {:ok, true, _origin_seq, _local_progress_seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -961,7 +995,7 @@ defmodule EKVTest do
       future = now + 1_000_000_000
       val2 = :erlang.term_to_binary("resurrected")
 
-      {:ok, true} =
+      {:ok, true, _origin_seq, _local_progress_seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -992,7 +1026,7 @@ defmodule EKVTest do
       for i <- 1..3 do
         val = :erlang.term_to_binary("val_#{i}")
 
-        {:ok, true} =
+        {:ok, true, _origin_seq, _local_progress_seq} =
           EKV.Store.write_entry(
             db,
             stmts.kv_upsert,
@@ -1008,7 +1042,7 @@ defmodule EKVTest do
       # Delete entry 1 with an old tombstone (will be purged)
       old_deleted_at = now - :timer.hours(24 * 14) * 1_000_000
 
-      {:ok, true} =
+      {:ok, true, _origin_seq, _local_progress_seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -1022,7 +1056,7 @@ defmodule EKVTest do
         )
 
       # Delete entry 2 with a recent tombstone (will be kept)
-      {:ok, true} =
+      {:ok, true, _origin_seq, _local_progress_seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -1036,7 +1070,7 @@ defmodule EKVTest do
         )
 
       # Expire entry 3 — it should remain logically absent and stay out of full sync.
-      {:ok, true} =
+      {:ok, true, _origin_seq, _local_progress_seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -1057,7 +1091,7 @@ defmodule EKVTest do
       # - Include entry 2 (recent tombstone, deleted_at > cutoff)
       # - NOT include entry 3 (expired)
       entries = EKV.Store.full_state(db, cutoff)
-      keys = Enum.map(entries, fn {key, _, _, _, _, _} -> key end)
+      keys = Enum.map(entries, fn {key, _, _, _, _, _, _} -> key end)
 
       refute "fs_key_1" in keys
       assert "fs_key_2" in keys
@@ -1215,7 +1249,7 @@ defmodule EKVTest do
       past = now - 1_000_000_000
       val = :erlang.term_to_binary("doomed")
 
-      {:ok, true} =
+      {:ok, true, _origin_seq, _local_progress_seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -1269,11 +1303,15 @@ defmodule EKVTest do
       now = System.system_time(:nanosecond)
 
       entries = [
-        {k1, :erlang.term_to_binary("v1"), now - 2000, :remote@host, nil, nil},
-        {k2, :erlang.term_to_binary("v2"), now - 1000, :remote@host, nil, nil}
+        {k1, :erlang.term_to_binary("v1"), now - 2000, :remote@host, 1, nil, nil},
+        {k2, :erlang.term_to_binary("v2"), now - 1000, :remote@host, 2, nil, nil}
       ]
 
-      send(shard_name, {:ekv_sync, :remote@host, 0, entries, 100})
+      send(
+        shard_name,
+        {:ekv_sync, :remote@host, 0, :full, entries, %{:remote@host => 2}}
+      )
+
       :sys.get_state(shard_name)
       flush_dispatchers(name)
 
@@ -1407,7 +1445,7 @@ defmodule EKVTest do
       now = System.system_time(:nanosecond)
 
       # Create a tombstone
-      {:ok, true} =
+      {:ok, true, _origin_seq, _local_progress_seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -1862,7 +1900,7 @@ defmodule EKVTest do
       {:ok, db} = EKV.Store.open(source_dir, 0, :timer.hours(24 * 7), 2, :timer.minutes(5))
       stmts = EKV.Store.prepare_cached_stmts(db)
 
-      {:ok, true} =
+      {:ok, true, _origin_seq, _local_progress_seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -1905,7 +1943,7 @@ defmodule EKVTest do
       for i <- 1..10 do
         val = :erlang.term_to_binary("delta_val_#{i}")
 
-        {:ok, true} =
+        {:ok, true, _origin_seq, _local_progress_seq} =
           EKV.Store.write_entry(
             db,
             stmts.kv_upsert,
@@ -1923,13 +1961,13 @@ defmodule EKVTest do
       assert length(all) == 10
 
       # Find seq of the 5th entry
-      {fifth_seq, _, _, _, _, _, _} = Enum.at(all, 4)
+      {fifth_seq, _, _, _, _, _, _, _} = Enum.at(all, 4)
 
       # oplog_since(fifth_seq) should return entries 6..10
       delta = EKV.Store.oplog_since(db, fifth_seq)
       assert length(delta) == 5
 
-      delta_keys = Enum.map(delta, fn {_, key, _, _, _, _, _} -> key end)
+      delta_keys = Enum.map(delta, fn {_, key, _, _, _, _, _, _} -> key end)
       for i <- 6..10, do: assert("delta_key_#{i}" in delta_keys)
     end
 
@@ -1942,7 +1980,7 @@ defmodule EKVTest do
       now = System.system_time(:nanosecond)
       expired_at = now - 1_000_000
 
-      {:ok, true} =
+      {:ok, true, _origin_seq, _local_progress_seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -1954,7 +1992,7 @@ defmodule EKVTest do
           expired_at
         )
 
-      {:ok, true} =
+      {:ok, true, _origin_seq, _local_progress_seq} =
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
@@ -1968,13 +2006,13 @@ defmodule EKVTest do
 
       raw = EKV.Store.oplog_since(db, 0)
 
-      assert Enum.map(raw, fn {_, key, _, _, _, _, _} -> key end) == [
+      assert Enum.map(raw, fn {_, key, _, _, _, _, _, _} -> key end) == [
                "delta_expired_key",
                "delta_live_key"
              ]
 
       filtered = EKV.Store.oplog_since_chunk(db, 0, 10)
-      assert Enum.map(filtered, fn {_, key, _, _, _, _, _} -> key end) == ["delta_live_key"]
+      assert Enum.map(filtered, fn {_, key, _, _, _, _, _, _} -> key end) == ["delta_live_key"]
     end
   end
 
@@ -2459,7 +2497,7 @@ defmodule EKVTest do
       %{db: db} = :sys.get_state(shard_name)
 
       entries = EKV.Store.oplog_since(db, 0)
-      oplog_keys = Enum.map(entries, fn {_, key, _, _, _, _, _} -> key end)
+      oplog_keys = Enum.map(entries, fn {_, key, _, _, _, _, _, _} -> key end)
       assert "oplog_cas/1" in oplog_keys
     end
 
@@ -2897,7 +2935,7 @@ defmodule EKVTest do
 
       # oplog should NOT have the value
       entries = EKV.Store.oplog_since(db, 0)
-      pax8_entries = Enum.filter(entries, fn {_, key, _, _, _, _, _} -> key == "pax/8" end)
+      pax8_entries = Enum.filter(entries, fn {_, key, _, _, _, _, _, _} -> key == "pax/8" end)
       assert length(pax8_entries) == 0
     end
 
@@ -2960,7 +2998,7 @@ defmodule EKVTest do
       assert EKV.Store.get(db, "pax/12") == nil
 
       # Promote
-      {:ok, ^val_bin, ^now, ^origin_str, nil, nil, nil} =
+      {:ok, ^val_bin, ^now, ^origin_str, nil, nil, nil, _origin_seq, _local_progress_seq} =
         EKV.Store.paxos_promote(db, stmts.kv_force_upsert, stmts.oplog_insert, "pax/12", 100, "1")
 
       # Now in kv
@@ -2969,7 +3007,7 @@ defmodule EKVTest do
 
       # And in oplog
       entries = EKV.Store.oplog_since(db, 0)
-      assert Enum.any?(entries, fn {_, key, _, _, _, _, _} -> key == "pax/12" end)
+      assert Enum.any?(entries, fn {_, key, _, _, _, _, _, _} -> key == "pax/12" end)
     end
 
     test "promote with stale ballot returns :stale", %{db: db, stmts: stmts} do
@@ -3005,7 +3043,7 @@ defmodule EKVTest do
         EKV.Store.paxos_accept(db, "pax/14", 100, "1", [val_bin, now, origin_str, nil, nil])
 
       # Promote
-      {:ok, _, _, _, _, _, _} =
+      {:ok, _, _, _, _, _, _, _origin_seq, _local_progress_seq} =
         EKV.Store.paxos_promote(db, stmts.kv_force_upsert, stmts.oplog_insert, "pax/14", 100, "1")
 
       # After promote, higher prepare recovers retained accepted state
@@ -3997,7 +4035,7 @@ defmodule EKVTest do
       assert length(all_entries) == 35
 
       # Verify entries are ordered by key
-      keys = Enum.map(all_entries, fn {k, _, _, _, _, _} -> k end)
+      keys = Enum.map(all_entries, fn {k, _, _, _, _, _, _} -> k end)
       assert keys == Enum.sort(keys)
     end
 
@@ -4010,7 +4048,7 @@ defmodule EKVTest do
       tombstone_cutoff = System.system_time(:nanosecond) - :timer.hours(24 * 7) * 1_000_000
 
       entries = EKV.Store.full_state_chunk(state.db, tombstone_cutoff, nil, 10)
-      keys = Enum.map(entries, fn {k, _, _, _, _, _} -> k end)
+      keys = Enum.map(entries, fn {k, _, _, _, _, _, _} -> k end)
 
       assert "chunk/live" in keys
       refute "chunk/expired" in keys
@@ -4034,7 +4072,7 @@ defmodule EKVTest do
       assert length(all_entries) == 25
 
       # Verify entries are ordered by seq
-      seqs = Enum.map(all_entries, fn {seq, _, _, _, _, _, _} -> seq end)
+      seqs = Enum.map(all_entries, fn {seq, _, _, _, _, _, _, _} -> seq end)
       assert seqs == Enum.sort(seqs)
     end
 
@@ -4060,11 +4098,15 @@ defmodule EKVTest do
       config = EKV.Supervisor.get_config(name)
       tombstone_cutoff = System.system_time(:nanosecond) - config.tombstone_ttl * 1_000_000
       state = :sys.get_state(shard_name)
-      my_seq = EKV.Store.max_seq(state.db)
+
+      progress =
+        state.db
+        |> EKV.Store.local_progress_summary()
+        |> Map.put(node(), state.local_origin_seq)
 
       send(
         shard_name,
-        {:continue_full_sync, fake_node, nil, tombstone_cutoff, my_seq, config.sync_chunk_size}
+        {:continue_full_sync, fake_node, nil, tombstone_cutoff, progress, config.sync_chunk_size}
       )
 
       Process.sleep(200)
@@ -4094,10 +4136,13 @@ defmodule EKVTest do
 
       config = EKV.Supervisor.get_config(name)
       state = :sys.get_state(shard_name)
-      my_seq = EKV.Store.max_seq(state.db)
+      my_seq = state.local_origin_seq
 
       # Trigger delta sync starting from seq 0
-      send(shard_name, {:continue_delta_sync, fake_node, 0, my_seq, config.sync_chunk_size})
+      send(
+        shard_name,
+        {:continue_delta_sync, fake_node, node(), 0, my_seq, config.sync_chunk_size}
+      )
 
       Process.sleep(200)
       :sys.get_state(shard_name)
@@ -4125,14 +4170,18 @@ defmodule EKVTest do
       config = EKV.Supervisor.get_config(name)
       tombstone_cutoff = System.system_time(:nanosecond) - config.tombstone_ttl * 1_000_000
       state = :sys.get_state(shard_name)
-      my_seq = EKV.Store.max_seq(state.db)
+
+      progress =
+        state.db
+        |> EKV.Store.local_progress_summary()
+        |> Map.put(node(), state.local_origin_seq)
 
       # Suspend the shard, inject the first continue message, then remove the member
       :sys.suspend(shard_name)
 
       send(
         shard_name,
-        {:continue_full_sync, fake_node, nil, tombstone_cutoff, my_seq, config.sync_chunk_size}
+        {:continue_full_sync, fake_node, nil, tombstone_cutoff, progress, config.sync_chunk_size}
       )
 
       # Resume to process just the first chunk (sends chunk + queues next continuation)
@@ -4177,14 +4226,18 @@ defmodule EKVTest do
       config = EKV.Supervisor.get_config(name)
       tombstone_cutoff = System.system_time(:nanosecond) - config.tombstone_ttl * 1_000_000
       state = :sys.get_state(shard_name)
-      my_seq = EKV.Store.max_seq(state.db)
+
+      progress =
+        state.db
+        |> EKV.Store.local_progress_summary()
+        |> Map.put(node(), state.local_origin_seq)
 
       # Suspend, inject first chunk trigger, resume
       :sys.suspend(shard_name)
 
       send(
         shard_name,
-        {:continue_full_sync, fake_node, nil, tombstone_cutoff, my_seq, config.sync_chunk_size}
+        {:continue_full_sync, fake_node, nil, tombstone_cutoff, progress, config.sync_chunk_size}
       )
 
       :sys.resume(shard_name)
@@ -4222,11 +4275,15 @@ defmodule EKVTest do
       config = EKV.Supervisor.get_config(name)
       tombstone_cutoff = System.system_time(:nanosecond) - config.tombstone_ttl * 1_000_000
       state = :sys.get_state(shard_name)
-      my_seq = EKV.Store.max_seq(state.db)
+
+      progress =
+        state.db
+        |> EKV.Store.local_progress_summary()
+        |> Map.put(node(), state.local_origin_seq)
 
       send(
         shard_name,
-        {:continue_full_sync, fake_node, nil, tombstone_cutoff, my_seq, config.sync_chunk_size}
+        {:continue_full_sync, fake_node, nil, tombstone_cutoff, progress, config.sync_chunk_size}
       )
 
       Process.sleep(200)
@@ -4238,16 +4295,18 @@ defmodule EKVTest do
 
       assert length(sync_messages) == 3
 
-      # Intermediate chunks should have seq=0
+      # Intermediate chunks should have nil progress.
       {intermediate, [final]} = Enum.split(sync_messages, -1)
 
-      for {_entries_count, seq} <- intermediate do
-        assert seq == 0, "intermediate chunk should have seq=0, got #{seq}"
+      for {_entries_count, progress} <- intermediate do
+        assert progress == nil,
+               "intermediate chunk should have nil progress, got #{inspect(progress)}"
       end
 
-      # Final chunk has real seq
-      {_count, final_seq} = final
-      assert final_seq > 0, "final chunk should have non-zero seq"
+      # Final chunk carries a progress summary.
+      {_count, final_progress} = final
+      assert is_map(final_progress)
+      assert map_size(final_progress) > 0
     end
   end
 
@@ -4468,8 +4527,8 @@ defmodule EKVTest do
       origin = node()
       val_binary = :erlang.term_to_binary("synced_val")
 
-      sync_entries = [{sync_key, val_binary, now, origin, nil, nil}]
-      send(shard_name, {:ekv_sync, :some_node@host, 0, sync_entries, 5})
+      sync_entries = [{sync_key, val_binary, now, origin, 1, nil, nil}]
+      send(shard_name, {:ekv_sync, :some_node@host, 0, :delta, sync_entries, %{origin => 1}})
       :sys.get_state(shard_name)
 
       # Synced key should be available
@@ -4490,6 +4549,94 @@ defmodule EKVTest do
       :sys.get_state(shard_name)
 
       assert EKV.get(name, key) == "cas_val"
+    end
+
+    test "delta sync chunk on same key before final settlement does not derail CAS", %{
+      name: name,
+      shard_name: shard_name
+    } do
+      key = "order/delta_same_key_cas"
+      sync_origin = :"delta_origin@127.0.0.1"
+      sync_ts = System.system_time(:nanosecond)
+      sync_val = "delta_seen"
+      sync_val_bin = :erlang.term_to_binary(sync_val)
+      sync_origin_str = Atom.to_string(sync_origin)
+
+      send(
+        shard_name,
+        {:ekv_sync, sync_origin, 0, :delta,
+         [{key, sync_val_bin, sync_ts, sync_origin, 1, nil, nil}], %{}}
+      )
+
+      :sys.get_state(shard_name)
+
+      assert EKV.get(name, key) == sync_val
+
+      ref = make_ref()
+      send(shard_name, {:ekv_prepare, ref, self(), key, 100, "2", 0})
+
+      assert_receive {:ekv, 1, :promise, {^ref, _, _, 0, "", kv_row}, %{}}, 1000
+      assert kv_row == [sync_val_bin, sync_ts, sync_origin_str, nil, nil]
+
+      cas_val = "cas_after_delta"
+      cas_val_bin = :erlang.term_to_binary(cas_val)
+      cas_entry = {key, cas_val_bin, sync_ts + 1, Atom.to_string(node()), nil, nil}
+      ref_accept = make_ref()
+
+      send(shard_name, {:ekv_accept, ref_accept, self(), key, 100, "2", cas_entry, 0})
+      assert_receive {:ekv, 1, :accepted, {^ref_accept, _, _}, %{}}, 1000
+
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, node(), 0})
+      :sys.get_state(shard_name)
+
+      send(shard_name, {:ekv_sync, sync_origin, 0, :delta, [], %{sync_origin => 1}})
+      :sys.get_state(shard_name)
+
+      assert EKV.get(name, key) == cas_val
+    end
+
+    test "full sync chunk on same key before final settlement does not derail CAS", %{
+      name: name,
+      shard_name: shard_name
+    } do
+      key = "order/full_same_key_cas"
+      sync_origin = :"full_origin@127.0.0.1"
+      sync_ts = System.system_time(:nanosecond)
+      sync_val = "full_seen"
+      sync_val_bin = :erlang.term_to_binary(sync_val)
+      sync_origin_str = Atom.to_string(sync_origin)
+
+      send(
+        shard_name,
+        {:ekv_sync, sync_origin, 0, :full,
+         [{key, sync_val_bin, sync_ts, sync_origin, 1, nil, nil}], %{}}
+      )
+
+      :sys.get_state(shard_name)
+
+      assert EKV.get(name, key) == sync_val
+
+      ref = make_ref()
+      send(shard_name, {:ekv_prepare, ref, self(), key, 100, "2", 0})
+
+      assert_receive {:ekv, 1, :promise, {^ref, _, _, 0, "", kv_row}, %{}}, 1000
+      assert kv_row == [sync_val_bin, sync_ts, sync_origin_str, nil, nil]
+
+      cas_val = "cas_after_full"
+      cas_val_bin = :erlang.term_to_binary(cas_val)
+      cas_entry = {key, cas_val_bin, sync_ts + 1, Atom.to_string(node()), nil, nil}
+      ref_accept = make_ref()
+
+      send(shard_name, {:ekv_accept, ref_accept, self(), key, 100, "2", cas_entry, 0})
+      assert_receive {:ekv, 1, :accepted, {^ref_accept, _, _}, %{}}, 1000
+
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, node(), 0})
+      :sys.get_state(shard_name)
+
+      send(shard_name, {:ekv_sync, sync_origin, 0, :full, [], %{sync_origin => 1}})
+      :sys.get_state(shard_name)
+
+      assert EKV.get(name, key) == cas_val
     end
 
     test "commit notification to shard that restarted (kv_paxos survives)", %{
@@ -4570,7 +4717,7 @@ defmodule EKVTest do
         if length(entries) < limit do
           {new_acc, chunk_count + 1}
         else
-          {max_seq, _, _, _, _, _, _} = List.last(entries)
+          {max_seq, _, _, _, _, _, _, _} = List.last(entries)
           collect_oplog_chunks(db, max_seq, limit, new_acc, chunk_count + 1)
         end
     end
@@ -4582,10 +4729,10 @@ defmodule EKVTest do
 
   defp count_trace_sync_messages(count) do
     receive do
-      {:trace, _, :send, {:ekv_sync, _, _, _, _}, _} ->
+      {:trace, _, :send, {:ekv_sync, _, _, _, _, _}, _} ->
         count_trace_sync_messages(count + 1)
 
-      {:trace, _, :send, {:ekv, 1, :sync, {_, _, _, _}, _meta}, _} ->
+      {:trace, _, :send, {:ekv, 1, :sync, {_, _, _, _, _}, _meta}, _} ->
         count_trace_sync_messages(count + 1)
 
       {:trace, _, :send, _, _} ->
@@ -4601,11 +4748,11 @@ defmodule EKVTest do
 
   defp collect_trace_sync_details(acc) do
     receive do
-      {:trace, _, :send, {:ekv_sync, _, _, entries, seq}, _} ->
-        collect_trace_sync_details([{length(entries), seq} | acc])
+      {:trace, _, :send, {:ekv_sync, _, _, _mode, entries, progress}, _} ->
+        collect_trace_sync_details([{length(entries), progress} | acc])
 
-      {:trace, _, :send, {:ekv, 1, :sync, {_, _, entries, seq}, _meta}, _} ->
-        collect_trace_sync_details([{length(entries), seq} | acc])
+      {:trace, _, :send, {:ekv, 1, :sync, {_, _, _mode, entries, progress}, _meta}, _} ->
+        collect_trace_sync_details([{length(entries), progress} | acc])
 
       {:trace, _, :send, _, _} ->
         collect_trace_sync_details(acc)
