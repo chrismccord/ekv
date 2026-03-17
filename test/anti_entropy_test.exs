@@ -20,6 +20,10 @@ defmodule EKV.AntiEntropyTest do
     sync_chunk_size = Keyword.get(opts, :sync_chunk_size, 500)
     gc_interval = Keyword.get(opts, :gc_interval, :timer.hours(1))
     tombstone_ttl = Keyword.get(opts, :tombstone_ttl, :timer.hours(24 * 7))
+
+    unavailable_origin_full_sync_delay =
+      Keyword.get(opts, :unavailable_origin_full_sync_delay, 60_000)
+
     cluster_size = Keyword.fetch!(opts, :cluster_size)
 
     TestCluster.start_ekv(
@@ -33,7 +37,8 @@ defmodule EKV.AntiEntropyTest do
       sync_chunk_size: sync_chunk_size,
       cluster_size: cluster_size,
       node_id: node_id,
-      anti_entropy_interval: anti_entropy_interval
+      anti_entropy_interval: anti_entropy_interval,
+      unavailable_origin_full_sync_delay: unavailable_origin_full_sync_delay
     )
   end
 
@@ -194,7 +199,10 @@ defmodule EKV.AntiEntropyTest do
       on_exit(fn -> TestCluster.stop_peers(peers) end)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      start_cluster(peers, ekv_name, anti_entropy_interval: false)
+      start_cluster(peers, ekv_name,
+        anti_entropy_interval: false,
+        unavailable_origin_full_sync_delay: 0
+      )
 
       assert {:ok, vsn1} =
                TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "disabled/1", "v1", [if_vsn: nil]])
@@ -235,7 +243,10 @@ defmodule EKV.AntiEntropyTest do
       on_exit(fn -> TestCluster.stop_peers(peers) end)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      start_cluster(peers, ekv_name, anti_entropy_interval: false)
+      start_cluster(peers, ekv_name,
+        anti_entropy_interval: false,
+        unavailable_origin_full_sync_delay: 0
+      )
 
       write_many(node_a, ekv_name, "live_lww", 5)
 
@@ -256,7 +267,10 @@ defmodule EKV.AntiEntropyTest do
       on_exit(fn -> TestCluster.stop_peers(peers) end)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      start_cluster(peers, ekv_name, anti_entropy_interval: false)
+      start_cluster(peers, ekv_name,
+        anti_entropy_interval: false,
+        unavailable_origin_full_sync_delay: 0
+      )
 
       write_many(node_a, ekv_name, "remote_origin", 5)
 
@@ -490,7 +504,10 @@ defmodule EKV.AntiEntropyTest do
       on_exit(fn -> TestCluster.stop_peers(peers) end)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      start_cluster(peers, ekv_name, anti_entropy_interval: false)
+      start_cluster(peers, ekv_name,
+        anti_entropy_interval: false,
+        unavailable_origin_full_sync_delay: 0
+      )
 
       assert :ok == TestCluster.rpc!(node_a, EKV, :put, [ekv_name, key1, "v1"])
 
@@ -518,7 +535,7 @@ defmodule EKV.AntiEntropyTest do
       assert :ok = TestCluster.trace_shard_sends(node_c, ekv_name, self())
       assert :ok = TestCluster.trigger_anti_entropy(node_b, ekv_name)
 
-      assert Enum.any?(collect_sync_request_messages([], 500), fn {shard, request, _destination} ->
+      assert Enum.any?(collect_sync_request_messages([], 2_000), fn {shard, request, _destination} ->
                shard == 0 and request == :full
              end)
 
@@ -555,6 +572,102 @@ defmodule EKV.AntiEntropyTest do
       assert :ok = TestCluster.untrace_shard_sends(node_b, ekv_name)
     end
 
+    test "recently unavailable third origin does not trigger immediate full sync" do
+      peers = TestCluster.start_peers(3)
+      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
+      ekv_name = unique_name(:anti_entropy_recent_unavailable_origin)
+      key1 = "recent_unavailable/1"
+      key2 = "recent_unavailable/2"
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      start_cluster(peers, ekv_name,
+        anti_entropy_interval: false,
+        unavailable_origin_full_sync_delay: 60_000
+      )
+
+      assert :ok == TestCluster.rpc!(node_a, EKV, :put, [ekv_name, key1, "v1"])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, EKV, :get, [ekv_name, key1]) == "v1" and
+          TestCluster.rpc!(node_c, EKV, :get, [ekv_name, key1]) == "v1"
+      end)
+
+      TestCluster.disconnect_nodes(node_a, node_c)
+      assert :ok == TestCluster.rpc!(node_a, EKV, :put, [ekv_name, key2, "v2"])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, EKV, :get, [ekv_name, key2]) == "v2"
+      end)
+
+      assert TestCluster.rpc!(node_c, EKV, :get, [ekv_name, key2]) == nil
+
+      assert :ok = TestCluster.stop_ekv(node_a, ekv_name, 10_000)
+
+      TestCluster.assert_eventually(fn ->
+        state = TestCluster.replica_state(node_b, ekv_name)
+        not Map.has_key?(state.remote_shards, node_a)
+      end)
+
+      assert :ok = TestCluster.trace_shard_sends(node_c, ekv_name, self())
+      assert :ok = TestCluster.trigger_anti_entropy(node_b, ekv_name)
+
+      assert collect_sync_request_messages([], 500) == []
+      assert_no_sync_messages(250)
+
+      assert :ok = TestCluster.untrace_shard_sends(node_c, ekv_name)
+    end
+
+    test "unavailable third origin escalates to full sync after grace delay" do
+      peers = TestCluster.start_peers(3)
+      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
+      ekv_name = unique_name(:anti_entropy_unavailable_origin_delay_elapsed)
+      key1 = "delay_elapsed/1"
+      key2 = "delay_elapsed/2"
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      start_cluster(peers, ekv_name,
+        anti_entropy_interval: false,
+        unavailable_origin_full_sync_delay: 60_000
+      )
+
+      assert :ok == TestCluster.rpc!(node_a, EKV, :put, [ekv_name, key1, "v1"])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, EKV, :get, [ekv_name, key1]) == "v1" and
+          TestCluster.rpc!(node_c, EKV, :get, [ekv_name, key1]) == "v1"
+      end)
+
+      TestCluster.disconnect_nodes(node_a, node_c)
+      assert :ok == TestCluster.rpc!(node_a, EKV, :put, [ekv_name, key2, "v2"])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, EKV, :get, [ekv_name, key2]) == "v2"
+      end)
+
+      assert TestCluster.rpc!(node_c, EKV, :get, [ekv_name, key2]) == nil
+
+      assert :ok = TestCluster.stop_ekv(node_a, ekv_name, 10_000)
+
+      TestCluster.assert_eventually(fn ->
+        state = TestCluster.replica_state(node_b, ekv_name)
+        not Map.has_key?(state.remote_shards, node_a)
+      end)
+
+      old_ms = System.system_time(:millisecond) - 120_000
+      assert :ok = TestCluster.set_unavailable_origin_since(node_c, ekv_name, node_a, old_ms)
+
+      assert :ok = TestCluster.trace_shard_sends(node_c, ekv_name, self())
+      assert :ok = TestCluster.trigger_anti_entropy(node_b, ekv_name)
+
+      assert Enum.any?(collect_sync_request_messages([], 2_000), fn {shard, request, _destination} ->
+               shard == 0 and request == :full
+             end)
+
+      assert :ok = TestCluster.untrace_shard_sends(node_c, ekv_name)
+    end
+
     test "dead-origin bootstrap chooses a single full-sync source per shard" do
       peers = TestCluster.start_peers(4)
       [{_, node_a}, {_, node_b}, {_, node_c}, {_, node_d}] = peers
@@ -562,7 +675,10 @@ defmodule EKV.AntiEntropyTest do
       on_exit(fn -> TestCluster.stop_peers(peers) end)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      start_cluster(peers, ekv_name, anti_entropy_interval: false)
+      start_cluster(peers, ekv_name,
+        anti_entropy_interval: false,
+        unavailable_origin_full_sync_delay: 0
+      )
 
       write_many(node_c, ekv_name, "dead_source", 3)
 

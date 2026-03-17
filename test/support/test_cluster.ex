@@ -325,6 +325,16 @@ defmodule EKV.TestCluster do
     rpc!(node, __MODULE__, :do_drop_remote_shard, [name, remote_node, shard_index])
   end
 
+  @doc "Force a replica shard's unavailable_origin_since timer for one origin node"
+  def set_unavailable_origin_since(node, name, origin_node, down_since_ms, shard_index \\ 0) do
+    rpc!(node, __MODULE__, :do_set_unavailable_origin_since, [
+      name,
+      origin_node,
+      down_since_ms,
+      shard_index
+    ])
+  end
+
   @doc "Set a replica shard's handoff_node on a remote node"
   def set_handoff_node(node, name, handoff_node, shard_index \\ 0) do
     rpc!(node, __MODULE__, :do_set_handoff_node, [name, handoff_node, shard_index])
@@ -608,6 +618,7 @@ defmodule EKV.TestCluster do
       state = %{
         state
         | remote_shards: Map.delete(state.remote_shards, remote_node),
+          unavailable_origin_since: Map.delete(state.unavailable_origin_since, remote_node),
           summary_probe_inflight: MapSet.delete(state.summary_probe_inflight, remote_node),
           sync_inflight: MapSet.delete(state.sync_inflight, remote_node)
       }
@@ -617,6 +628,20 @@ defmodule EKV.TestCluster do
       else
         state
       end
+    end)
+
+    :ok
+  end
+
+  def do_set_unavailable_origin_since(name, origin_node, down_since_ms, shard_index) do
+    shard_name = EKV.Replica.shard_name(name, shard_index)
+
+    :sys.replace_state(shard_name, fn state ->
+      %{
+        state
+        | unavailable_origin_since:
+            Map.put(state.unavailable_origin_since, origin_node, down_since_ms)
+      }
     end)
 
     :ok

@@ -288,9 +288,12 @@ Important:
     the next `origin_seq` in the same transaction, local contiguous self
     progress can advance directly to that seq without scanning `kv_oplog`.
 - Normal delta sync is live-origin-owned.
-- If a peer is behind on data from an origin that is explicitly known unavailable
-  (down/quarantined/disconnected at the node level), a live peer serves full sync instead of inventing a
-  non-origin delta stream.
+- Quarantined origins can force immediate full sync from a live peer.
+- If a peer is behind on data from a known member origin that is merely
+  disconnected/unavailable, EKV waits through
+  `:unavailable_origin_full_sync_delay` before falling back to full sync.
+- Unknown/synthetic origins still fall back immediately because there is no
+  live origin stream to wait for.
 - Missing shard handshake alone is not enough to trigger that full-sync fallback.
 - Chunked sync rules matter:
   - intermediate chunks use `progress=nil`

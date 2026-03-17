@@ -613,9 +613,13 @@ defmodule EKV.Replica do
         │           remote origin heads vs local contiguous progress  │
         │         if local side is behind:                            │
         │           request delta from that live origin               │
-        │         if local side is behind on explicitly unavailable   │
-        │         dead-origin state:                                  │
-        │           request full sync from a live peer                │
+        │         if local side is behind on quarantined dead-origin  │
+        │         state:                                              │
+        │           request full sync from a live peer immediately    │
+        │         if local side is behind on a known member origin    │
+        │         that is merely down/disconnected:                   │
+        │           wait through the configured grace window before   │
+        │           falling back to full sync                         │
         │                                                             │
         │ {:ekv, 1, :summary_probe,                                   │
         │  {pid_a, i, progress_a}, %{}}                               │
@@ -655,10 +659,12 @@ defmodule EKV.Replica do
       │                                                                │
       │ Ordinary delta replay remains origin-owned: only the live      │
       │ origin serves its stream. If a requester is behind on data     │
-      │ from an origin that is explicitly unavailable                  │
-      │ (down/quarantined/disconnected at the node level), a           │
-      │ live peer escalates to full sync instead of fabricating a      │
-      │ non-origin delta stream. Mere handshake lag is not enough to   │
+      │ from an origin that is explicitly unavailable, a live peer     │
+      │ can escalate to full sync instead of fabricating a non-origin  │
+      │ delta stream. Quarantine is immediate. For ordinary            │
+      │ disconnects, known-member origins wait through a bounded       │
+      │ grace window before full fallback so short flaps do not        │
+      │ resend the shard. Mere handshake lag is not enough to          │
       │ trigger this fallback.                                         │
       └────────────────────────────────────────────────────────────────┘
 
@@ -821,7 +827,9 @@ defmodule EKV.Replica do
         - If sync proceeds:
             * summary exchange tells each side whether it is behind
             * behind side requests delta from the live origin when possible
-            * otherwise it requests full sync from a live peer
+            * quarantined/unrecoverable origins can trigger immediate full
+            * ordinary disconnected third origins wait through the
+              unavailable-origin grace window before full fallback
             * Both sides repair their own missed mutations independently
             * LWW resolves any conflicts deterministically:
                 - Disjoint keys: union of both sides
@@ -911,7 +919,8 @@ defmodule EKV.Replica do
       Phase 3: Prune stale member progress
         Remove kv_member_progress rows for members not currently connected.
         Prevents dead/decommissioned members from anchoring replay retention
-        forever. Disconnected members get full sync on reconnect.
+        forever. Disconnected members get full sync on reconnect only
+        after the unavailable-origin grace window expires.
 
       Phase 4: Truncate replay log
         For each origin stream, delete kv_oplog rows older than the minimum
@@ -971,6 +980,7 @@ defmodule EKV.Replica do
         summary_probe_inflight: MapSet.t(node()), # peers with a summary probe in flight
         sync_inflight:  MapSet.t(node()), # remote members currently servicing our repair requests
         full_sync_inflight: node() | nil, # single full-bootstrap source for this shard
+        unavailable_origin_since: %{node => non_neg_integer()}, # known unavailable origins first seen at ms
         pending_cas:    %{ref => op},   # in-flight CAS operations
         quorum_waiters: %{ref => waiter} # pending await_quorum callers
       }
@@ -1099,6 +1109,7 @@ defmodule EKV.Replica do
     summary_probe_inflight: MapSet.new(),
     sync_inflight: MapSet.new(),
     full_sync_inflight: nil,
+    unavailable_origin_since: %{},
     pending_cas: %{},
     quorum_waiters: %{},
     handoff_node: nil
@@ -2698,7 +2709,10 @@ defmodule EKV.Replica do
   end
 
   defp maybe_request_repair(%Replica{} = state, remote_node, remote_progress) do
-    case sync_request_for_remote(state, remote_node, normalize_progress_summary(remote_progress)) do
+    {state, request} =
+      sync_request_for_remote(state, remote_node, normalize_progress_summary(remote_progress))
+
+    case request do
       nil -> clear_sync_inflight(state, remote_node)
       request -> request_sync(state, remote_node, request)
     end
@@ -2720,48 +2734,127 @@ defmodule EKV.Replica do
 
   defp sync_request_for_remote(%Replica{} = state, remote_node, remote_progress) do
     local_progress = local_progress_summary_for_wire(state)
+    known_member_nodes = known_member_nodes(state)
     remote_origin_seq = Map.get(remote_progress, remote_node, 0)
     local_origin_seq = Map.get(local_progress, remote_node, 0)
 
     cond do
       remote_origin_seq > local_origin_seq ->
-        {:delta, remote_node, local_origin_seq}
+        {clear_unavailable_origin_since(state, remote_node),
+         {:delta, remote_node, local_origin_seq}}
 
       true ->
-        Enum.find_value(remote_progress, fn {origin_node, remote_seq} ->
+        Enum.reduce_while(remote_progress, {state, nil}, fn {origin_node, remote_seq},
+                                                            {acc, _request} ->
           local_seq = Map.get(local_progress, origin_node, 0)
 
-          if origin_node != node() and origin_node != remote_node and remote_seq > local_seq and
-               origin_unavailable_for_full_sync?(state, origin_node) do
-            :full
+          if origin_node != node() and origin_node != remote_node and remote_seq > local_seq do
+            {acc, allow_full?} =
+              origin_unavailable_for_full_sync?(acc, known_member_nodes, origin_node)
+
+            if allow_full? do
+              {:halt, {acc, :full}}
+            else
+              {:cont, {acc, nil}}
+            end
           else
-            nil
+            {:cont, {clear_unavailable_origin_since(acc, origin_node), nil}}
           end
         end)
     end
   end
 
-  defp origin_unavailable_for_full_sync?(%Replica{} = state, origin_node)
+  defp origin_unavailable_for_full_sync?(%Replica{} = state, known_member_nodes, origin_node)
        when is_atom(origin_node) do
     cond do
       MapSet.member?(state.quarantined_members, origin_node) ->
-        true
-
-      known_down_member?(state, origin_node) ->
-        true
-
-      origin_node not in Node.list() ->
-        true
+        {clear_unavailable_origin_since(state, origin_node), true}
 
       Map.has_key?(state.remote_shards, origin_node) ->
-        false
+        {clear_unavailable_origin_since(state, origin_node), false}
+
+      known_member_origin?(state, known_member_nodes, origin_node) ->
+        delay = unavailable_origin_full_sync_delay(state)
+
+        if delay == 0 do
+          {clear_unavailable_origin_since(state, origin_node), true}
+        else
+          {state, down_since_ms} = unavailable_origin_since(state, origin_node)
+          age_ms = max(0, System.system_time(:millisecond) - down_since_ms)
+          {state, age_ms >= delay}
+        end
+
+      origin_node not in Node.list() ->
+        {clear_unavailable_origin_since(state, origin_node), true}
 
       true ->
-        false
+        {clear_unavailable_origin_since(state, origin_node), false}
     end
   end
 
-  defp origin_unavailable_for_full_sync?(%Replica{} = _state, _origin_node), do: false
+  defp origin_unavailable_for_full_sync?(%Replica{} = state, _known_member_nodes, _origin_node),
+    do: {state, false}
+
+  defp known_member_nodes(%Replica{} = state) do
+    state.name
+    |> EKV.MemberPresence.member_nodes()
+    |> MapSet.new()
+  rescue
+    _ -> MapSet.new()
+  end
+
+  defp known_member_origin?(%Replica{} = state, known_member_nodes, origin_node) do
+    MapSet.member?(known_member_nodes, origin_node) or
+      Map.has_key?(state.remote_shards, origin_node) or
+      Map.has_key?(state.remote_member_progress, origin_node) or
+      Map.has_key?(state.member_node_ids, origin_node) or
+      known_down_member?(state, origin_node)
+  end
+
+  defp unavailable_origin_full_sync_delay(%Replica{} = state) do
+    EKV.Supervisor.get_config(state.name)[:unavailable_origin_full_sync_delay] || 0
+  end
+
+  defp unavailable_origin_since(%Replica{} = state, origin_node) when is_atom(origin_node) do
+    cached_since = Map.get(state.unavailable_origin_since, origin_node)
+
+    {%Replica{} = state, marker_since} =
+      read_member_down_marker(state, member_down_name_key(origin_node))
+
+    down_since_ms =
+      [cached_since, marker_since]
+      |> Enum.filter(&is_integer/1)
+      |> case do
+        [] -> System.system_time(:millisecond)
+        values -> Enum.min(values)
+      end
+
+    state =
+      case cached_since do
+        ^down_since_ms ->
+          state
+
+        _ ->
+          %{
+            state
+            | unavailable_origin_since:
+                Map.put(state.unavailable_origin_since, origin_node, down_since_ms)
+          }
+      end
+
+    {state, down_since_ms}
+  end
+
+  defp unavailable_origin_since(%Replica{} = state, _origin_node) do
+    {state, System.system_time(:millisecond)}
+  end
+
+  defp clear_unavailable_origin_since(%Replica{} = state, origin_node)
+       when is_atom(origin_node) do
+    %{state | unavailable_origin_since: Map.delete(state.unavailable_origin_since, origin_node)}
+  end
+
+  defp clear_unavailable_origin_since(%Replica{} = state, _origin_node), do: state
 
   defp known_down_member?(%Replica{} = state, remote_node) when is_atom(remote_node) do
     marker_key = member_down_name_key(remote_node)
@@ -2897,6 +2990,8 @@ defmodule EKV.Replica do
   # 2. Same pid: no-op
   # 3. Different pid (shard restarted): demonitor old, monitor new, update
   defp track_remote_shard(%Replica{} = state, remote_node, remote_pid) do
+    state = clear_unavailable_origin_since(state, remote_node)
+
     case Map.get(state.remote_shards, remote_node) do
       nil ->
         Process.monitor(remote_pid)
@@ -4164,6 +4259,7 @@ defmodule EKV.Replica do
       state
       |> clear_summary_probe_inflight(remote_node)
       |> clear_sync_inflight(remote_node)
+      |> clear_unavailable_origin_since(remote_node)
 
     {:ok, state}
   end
@@ -4186,6 +4282,7 @@ defmodule EKV.Replica do
           state
           |> clear_summary_probe_inflight(remote_node)
           |> clear_sync_inflight(remote_node)
+          |> clear_unavailable_origin_since(remote_node)
 
         {:ok, state}
 
@@ -4198,7 +4295,10 @@ defmodule EKV.Replica do
             summary_probe_inflight: MapSet.delete(state.summary_probe_inflight, remote_node)
         }
 
-        state = clear_sync_inflight(state, remote_node)
+        state =
+          state
+          |> clear_sync_inflight(remote_node)
+          |> clear_unavailable_origin_since(remote_node)
 
         log_once(state, fn ->
           "#{log_prefix(state)} quarantining #{remote_node}: reconnect downtime exceeded " <>
@@ -4220,6 +4320,7 @@ defmodule EKV.Replica do
           state
           |> clear_summary_probe_inflight(remote_node)
           |> clear_sync_inflight(remote_node)
+          |> clear_unavailable_origin_since(remote_node)
 
         {:ok, state}
     end

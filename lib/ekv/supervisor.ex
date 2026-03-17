@@ -169,6 +169,7 @@ defmodule EKV.Supervisor do
     :node_id,
     :sync_chunk_size,
     :anti_entropy_interval,
+    :unavailable_origin_full_sync_delay,
     :allow_stale_startup,
     :partition_ttl_policy,
     :wire_compression_threshold,
@@ -239,6 +240,10 @@ defmodule EKV.Supervisor do
     node_id = Keyword.get(opts, :node_id)
     sync_chunk_size = Keyword.get(opts, :sync_chunk_size, 500)
     anti_entropy_interval = Keyword.get(opts, :anti_entropy_interval, 30_000)
+
+    unavailable_origin_full_sync_delay =
+      Keyword.get(opts, :unavailable_origin_full_sync_delay, 60_000)
+
     allow_stale_startup = Keyword.get(opts, :allow_stale_startup, false)
     partition_ttl_policy = Keyword.get(opts, :partition_ttl_policy, :quarantine)
     wire_compression_threshold = Keyword.get(opts, :wire_compression_threshold, 256 * 1024)
@@ -253,6 +258,7 @@ defmodule EKV.Supervisor do
     validate_wait_for_route!(wait_for_route, :member)
     validate_shutdown_barrier!(shutdown_barrier)
     validate_anti_entropy_interval!(anti_entropy_interval)
+    validate_unavailable_origin_full_sync_delay!(unavailable_origin_full_sync_delay)
     validate_allow_stale_startup!(allow_stale_startup)
 
     node_id =
@@ -310,6 +316,7 @@ defmodule EKV.Supervisor do
       node_id: effective_node_id,
       sync_chunk_size: sync_chunk_size,
       anti_entropy_interval: anti_entropy_interval,
+      unavailable_origin_full_sync_delay: unavailable_origin_full_sync_delay,
       allow_stale_startup: allow_stale_startup,
       partition_ttl_policy: partition_ttl_policy,
       wire_compression_threshold: wire_compression_threshold
@@ -513,6 +520,7 @@ defmodule EKV.Supervisor do
     reject_client_opt!(opts, :tombstone_ttl, [nil])
     reject_client_opt!(opts, :sync_chunk_size, [nil])
     reject_client_opt!(opts, :anti_entropy_interval, [nil, false])
+    reject_client_opt!(opts, :unavailable_origin_full_sync_delay, [nil])
     reject_client_opt!(opts, :allow_stale_startup, [nil, false])
     reject_client_opt!(opts, :partition_ttl_policy, [nil])
   end
@@ -547,6 +555,15 @@ defmodule EKV.Supervisor do
   defp validate_anti_entropy_interval!(interval) do
     raise ArgumentError,
           "EKV: :anti_entropy_interval must be false/nil or a positive timeout in ms, got: #{inspect(interval)}"
+  end
+
+  defp validate_unavailable_origin_full_sync_delay!(delay)
+       when is_integer(delay) and delay >= 0,
+       do: :ok
+
+  defp validate_unavailable_origin_full_sync_delay!(delay) do
+    raise ArgumentError,
+          "EKV: :unavailable_origin_full_sync_delay must be a non-negative timeout in ms, got: #{inspect(delay)}"
   end
 
   defp validate_region_routing!(region_routing)

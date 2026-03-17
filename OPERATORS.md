@@ -85,7 +85,11 @@ Members run periodic anti-entropy by default:
 - It is meant to heal a member that missed a prior replication message without waiting for reconnect.
 - In the steady state it should be cheap because healthy members only exchange summary metadata; data chunks are sent only in response to an explicit `:sync_request`.
 - Each shard keeps only one summary probe in flight per peer and only one full-sync source in flight at a time, so startup/bootstrap repair should not fan out into duplicate full snapshots from multiple peers.
-- Full sync fallback for third-party origins is reserved for origins that are explicitly known unavailable (down/quarantined/disconnected at the node level), not just shard-handshake lag during startup.
+- Full sync fallback for third-party origins is not immediate for ordinary member flaps.
+- Quarantine still forces immediate full rebuild behavior.
+- Known member origins that are merely down/disconnected wait through
+  `:unavailable_origin_full_sync_delay` before a live peer falls back to full sync.
+- Mere shard-handshake lag during startup is still not enough to trigger full sync.
 - In a healthy hot cluster you should mostly see `member_connect` / summary traffic, not steady `sending delta sync` spam.
 - Set `false` only for debugging; the default is the safer production setting.
 
