@@ -489,6 +489,13 @@ defmodule EKV do
   def start_link(opts), do: EKV.Supervisor.start_link(opts)
 
   @doc """
+  Returns the stored node_id from the data dir.
+  """
+  def read_node_id(data_dir) do
+    EKV.Store.read_node_id(data_dir)
+  end
+
+  @doc """
   Look up a key's value and version.
 
   Returns `{value, vsn}` where `vsn` is the version tuple
