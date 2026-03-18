@@ -14,6 +14,14 @@ defmodule EKV.Store do
   - startup stale-db checks (`allow_stale_startup` override)
   - local TTL-expiry bookkeeping via `expired_at`
 
+  Simple mental model:
+
+  - `kv` is the current dataset
+  - `kv_oplog` is recent per-origin history for delta repair
+  - `kv_origin_progress` is this shard's contiguous applied cursor per origin
+  - `kv_member_progress` is each peer's cursor per origin; GC uses it to
+    decide how much replay history must be kept
+
   ## Tables
 
   - `kv` — current committed state of all keys:
@@ -26,10 +34,12 @@ defmodule EKV.Store do
     per origin. Local-origin writes/promotes can advance this directly because
     the shard allocates self `origin_seq` in-order inside the same transaction.
   - `kv_member_progress` — per-member, per-origin progress for anti-entropy
-    summaries, sync settlement, and replay retention/truncation.
+    summaries, sync settlement, and replay retention/truncation. GC keeps
+    recently disconnected members' rows for `member_progress_retention_ttl`
+    so moderate partitions can still heal by delta.
   - `kv_meta` — shard metadata such as `schema_version`, `num_shards`,
-    `last_active_at`, persisted `node_id`, and long-partition down-since
-    markers.
+    `last_active_at`, persisted `node_id`, member-node identity mappings, and
+    long-partition down-since markers.
   - `kv_paxos` — durable CASPaxos acceptor state per key.
 
   Write/promote primitives still cross the Elixir/NIF boundary once. The
@@ -618,6 +628,13 @@ defmodule EKV.Store do
     :ok
   end
 
+  def member_progress_members(db) do
+    {:ok, rows} =
+      EKV.Sqlite3.fetch_all(db, "SELECT DISTINCT member_node FROM kv_member_progress", [])
+
+    Enum.map(rows, fn [member_node] -> String.to_atom(member_node) end)
+  end
+
   def replay_origin_bounds(db) do
     {:ok, rows} =
       EKV.Sqlite3.fetch_all(
@@ -1108,6 +1125,15 @@ defmodule EKV.Store do
     do: set_meta_int_if_absent(db, key, down_since_ms)
 
   def member_down_marker_clear(db, key), do: delete_meta_key(db, key)
+
+  def member_node_identity_get(db, member_node) when is_atom(member_node) do
+    get_meta_text(db, "member_node_id:" <> Atom.to_string(member_node))
+  end
+
+  def member_node_identity_put(db, member_node, node_id)
+      when is_atom(member_node) and is_binary(node_id) and byte_size(node_id) > 0 do
+    set_meta_text(db, "member_node_id:" <> Atom.to_string(member_node), node_id)
+  end
 
   def prune_member_down_name_markers(db, stale_before_ms, max_entries) do
     {:ok, rows} =

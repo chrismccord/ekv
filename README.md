@@ -104,9 +104,9 @@ Values can be any Erlang term (stored via `:erlang.term_to_binary/1`). Keys are 
 | `:shards` | `8` | Member mode only. Number of shards (each is an independent GenServer + SQLite db) |
 | `:tombstone_ttl` | `604_800_000` (7 days) | Member mode only. How long tombstones are retained in milliseconds |
 | `:gc_interval` | `300_000` (5 min) | Member mode only. GC tick interval in milliseconds |
+| `:member_progress_retention_ttl` | same as `:tombstone_ttl` (`604_800_000`, 7 days by default) | Member mode only. How long disconnected members keep anchoring replay retention before their `kv_member_progress` rows may be pruned. This is the main guard against partitions turning into full syncs after a GC; `0` restores the old immediate-prune behavior. |
 | `:wait_for_quorum` | `false` | Optional startup gate. In member mode, waits for this EKV member to reach CAS quorum. In client mode, waits for the selected backend member to report CAS quorum reachable. |
 | `:anti_entropy_interval` | `30_000` (30 sec) | Member mode only. Periodic background repair for already-connected members. Re-runs the normal HWM-driven delta/full sync path to heal missed replication without waiting for reconnect. `false`/`nil` disables it. |
-| `:unavailable_origin_full_sync_delay` | `60_000` (60 sec) | Member mode only. Grace window before a known but currently unavailable third-party origin can force full-sync fallback from a live peer. Quarantine still escalates immediately; `0` restores the old immediate fallback behavior. |
 | `:wire_compression_threshold` | `262_144` (256 KB) | Optional byte threshold for member-to-member wire compression of large replicated value payloads. `false`/`nil` disables it. Large LWW replication and CAS accept/commit payloads compress on the wire only; values remain uncompressed on disk and on reads. |
 | `:shutdown_barrier` | `false` | Optional graceful-shutdown barrier. Keeps EKV serving during coordinated shutdown for up to the configured timeout so members can finish final writes and replication. |
 | `:allow_stale_startup` | `false` | Member mode only. Dangerous recovery override. If `true`, EKV trusts on-disk data even when stale-db detection would normally refuse startup. Intended only for explicit disaster recovery / full cold-cluster restore cases. |
@@ -150,6 +150,7 @@ separate and use an EKV-instance-specific `:pg` scope.
 When a node connects (or reconnects), each shard pair exchanges a handshake. Based on high-water marks (HWMs), they decide:
 
 - **Delta sync** if the oplog still has entries since the member's last known position (efficient for brief disconnects).
+- **Relayed delta** if a member is behind on some third-party origin that is currently down but a live peer still retains that origin stream.
 - **Full sync** if the oplog has been truncated past that point or the member is new (sends all live entries + recent tombstones; expired rows are omitted).
 
 Connected members also re-run that same handshake periodically by default
@@ -249,6 +250,11 @@ silently boot incompatible on-disk state.
 A different edge case is when nodes stay up but are partitioned longer than
 `tombstone_ttl`. In that window, one side can purge delete tombstones before
 reconnect.
+
+For shorter outages, oplog retention is anchored independently by
+`member_progress_retention_ttl` (default: same as `tombstone_ttl`). If a disconnected member
+rejoins within that window, GC keeps its replay cursor so heal can usually stay
+on delta instead of falling back to a full sync.
 
 With the default `partition_ttl_policy: :quarantine`, EKV detects reconnects
 after a downtime longer than `tombstone_ttl` and quarantines that member pair

@@ -169,6 +169,7 @@ defmodule EKV.Supervisor do
     :node_id,
     :sync_chunk_size,
     :anti_entropy_interval,
+    :member_progress_retention_ttl,
     :unavailable_origin_full_sync_delay,
     :allow_stale_startup,
     :partition_ttl_policy,
@@ -241,7 +242,12 @@ defmodule EKV.Supervisor do
     sync_chunk_size = Keyword.get(opts, :sync_chunk_size, 500)
     anti_entropy_interval = Keyword.get(opts, :anti_entropy_interval, 30_000)
 
-    unavailable_origin_full_sync_delay =
+    member_progress_retention_ttl =
+      Keyword.get(opts, :member_progress_retention_ttl, tombstone_ttl)
+
+    # Accepted for backward compatibility only. Known unavailable member
+    # origins now request relayed delta immediately.
+    legacy_unavailable_origin_full_sync_delay =
       Keyword.get(opts, :unavailable_origin_full_sync_delay, 60_000)
 
     allow_stale_startup = Keyword.get(opts, :allow_stale_startup, false)
@@ -258,7 +264,8 @@ defmodule EKV.Supervisor do
     validate_wait_for_route!(wait_for_route, :member)
     validate_shutdown_barrier!(shutdown_barrier)
     validate_anti_entropy_interval!(anti_entropy_interval)
-    validate_unavailable_origin_full_sync_delay!(unavailable_origin_full_sync_delay)
+    validate_member_progress_retention_ttl!(member_progress_retention_ttl)
+    validate_unavailable_origin_full_sync_delay!(legacy_unavailable_origin_full_sync_delay)
     validate_allow_stale_startup!(allow_stale_startup)
 
     node_id =
@@ -316,7 +323,7 @@ defmodule EKV.Supervisor do
       node_id: effective_node_id,
       sync_chunk_size: sync_chunk_size,
       anti_entropy_interval: anti_entropy_interval,
-      unavailable_origin_full_sync_delay: unavailable_origin_full_sync_delay,
+      member_progress_retention_ttl: member_progress_retention_ttl,
       allow_stale_startup: allow_stale_startup,
       partition_ttl_policy: partition_ttl_policy,
       wire_compression_threshold: wire_compression_threshold
@@ -520,6 +527,7 @@ defmodule EKV.Supervisor do
     reject_client_opt!(opts, :tombstone_ttl, [nil])
     reject_client_opt!(opts, :sync_chunk_size, [nil])
     reject_client_opt!(opts, :anti_entropy_interval, [nil, false])
+    reject_client_opt!(opts, :member_progress_retention_ttl, [nil])
     reject_client_opt!(opts, :unavailable_origin_full_sync_delay, [nil])
     reject_client_opt!(opts, :allow_stale_startup, [nil, false])
     reject_client_opt!(opts, :partition_ttl_policy, [nil])
@@ -555,6 +563,15 @@ defmodule EKV.Supervisor do
   defp validate_anti_entropy_interval!(interval) do
     raise ArgumentError,
           "EKV: :anti_entropy_interval must be false/nil or a positive timeout in ms, got: #{inspect(interval)}"
+  end
+
+  defp validate_member_progress_retention_ttl!(ttl)
+       when is_integer(ttl) and ttl >= 0,
+       do: :ok
+
+  defp validate_member_progress_retention_ttl!(ttl) do
+    raise ArgumentError,
+          "EKV: :member_progress_retention_ttl must be a non-negative timeout in ms, got: #{inspect(ttl)}"
   end
 
   defp validate_unavailable_origin_full_sync_delay!(delay)

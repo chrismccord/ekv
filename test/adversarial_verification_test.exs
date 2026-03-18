@@ -267,7 +267,7 @@ defmodule EKV.AdversarialVerificationTest do
     send(
       shard_name,
       {:continue_full_sync, fake_node, nil, tombstone_cutoff, progress_summary,
-       config.sync_chunk_size}
+       config.sync_chunk_size, :explicit_request}
     )
 
     Process.sleep(200)

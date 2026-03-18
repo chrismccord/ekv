@@ -287,11 +287,15 @@ Important:
   - Self-origin writes/promotes use a safe fast path: once the shard allocates
     the next `origin_seq` in the same transaction, local contiguous self
     progress can advance directly to that seq without scanning `kv_oplog`.
-- Normal delta sync is live-origin-owned.
+- Normal delta sync is origin-ordered, but any live peer with retained oplog can relay that origin stream.
+- Disconnected members keep anchoring replay retention for
+  `:member_progress_retention_ttl` (default: same as `tombstone_ttl`), keyed
+  by stable `node_id` when known, so partitions still inside the normal
+  auto-heal window prefer delta over full sync after GC.
 - Quarantined origins can force immediate full sync from a live peer.
 - If a peer is behind on data from a known member origin that is merely
-  disconnected/unavailable, EKV waits through
-  `:unavailable_origin_full_sync_delay` before falling back to full sync.
+  disconnected/unavailable, EKV requests relayed delta from a live peer immediately.
+- Full sync happens only if that live peer cannot serve the requested retained range.
 - Unknown/synthetic origins still fall back immediately because there is no
   live origin stream to wait for.
 - Missing shard handshake alone is not enough to trigger that full-sync fallback.

@@ -85,10 +85,9 @@ Members run periodic anti-entropy by default:
 - It is meant to heal a member that missed a prior replication message without waiting for reconnect.
 - In the steady state it should be cheap because healthy members only exchange summary metadata; data chunks are sent only in response to an explicit `:sync_request`.
 - Each shard keeps only one summary probe in flight per peer and only one full-sync source in flight at a time, so startup/bootstrap repair should not fan out into duplicate full snapshots from multiple peers.
-- Full sync fallback for third-party origins is not immediate for ordinary member flaps.
+- Known member origins that are merely down/disconnected try relayed delta immediately from a live peer.
 - Quarantine still forces immediate full rebuild behavior.
-- Known member origins that are merely down/disconnected wait through
-  `:unavailable_origin_full_sync_delay` before a live peer falls back to full sync.
+- Full sync happens only if that live peer no longer retains the requested replay range.
 - Mere shard-handshake lag during startup is still not enough to trigger full sync.
 - In a healthy hot cluster you should mostly see `member_connect` / summary traffic, not steady `sending delta sync` spam.
 - Set `false` only for debugging; the default is the safer production setting.
@@ -241,8 +240,10 @@ from members populates its data.
 ### Intentional Scale-Down
 
 1. Stop the node being removed
-2. Wait for one GC cycle (`gc_interval`, default 5 min) — the removed node's
-   member progress is pruned, allowing replay-log truncation to proceed
+2. Wait for the disconnected replay-retention window to expire
+   (`member_progress_retention_ttl`, default same as `tombstone_ttl`), then one GC cycle
+   (`gc_interval`, default 5 min) so the removed node's member progress can be
+   pruned and replay-log truncation can proceed
 3. Optionally update `cluster_size` on remaining nodes and rolling restart
 
 ## Client Mode
@@ -285,8 +286,8 @@ minority side returns `{:error, :no_quorum}` for CAS but LWW still works.
 Nodes automatically reconnect and sync:
 
 - **Short partition** (downtime <= `tombstone_ttl`): automatic sync.
-  - Oplog intact: Delta sync — only mutations since the last known sequence
-    are exchanged
+  - Oplog retained through `member_progress_retention_ttl`: Delta sync — only
+    mutations since the last known sequence are exchanged
   - Oplog truncated: Full sync — the entire live dataset is transferred
 
 - **Very long live partition** (downtime > `tombstone_ttl`):
@@ -377,11 +378,31 @@ truncation opportunities.
 - TTL-expired entries need to disappear faster
 - Oplog is growing too large between truncations
 
+### member_progress_retention_ttl (default: same as tombstone_ttl)
+
+How long a disconnected member keeps anchoring replay retention before GC may
+drop its `kv_member_progress` rows.
+
+**Increase if:**
+- Real-world partitions or deploy flaps should still heal by delta instead of full sync
+- You can afford to retain more oplog history
+
+**Decrease if:**
+- Oplog growth from disconnected members is too high
+- Intentional scale-down should free replay retention sooner
+- You accept that longer-disconnected members may need a full sync on return
+
 ### Interaction
 
 Stale detection threshold = `tombstone_ttl - gc_interval`. If `gc_interval`
 is large relative to `tombstone_ttl`, the safety margin shrinks. Keep
 `gc_interval` well below `tombstone_ttl` (at least 100x smaller).
+
+Replay retention is separately bounded by `member_progress_retention_ttl`.
+The default keeps it equal to `tombstone_ttl`, which means any partition still
+considered auto-healable should prefer delta over full sync. Lower it only if
+you intentionally want disconnected members to stop anchoring oplog history
+earlier than the tombstone/quarantine window.
 
 ## Blue-Green Deployments
 

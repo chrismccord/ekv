@@ -21,8 +21,8 @@ defmodule EKV.AntiEntropyTest do
     gc_interval = Keyword.get(opts, :gc_interval, :timer.hours(1))
     tombstone_ttl = Keyword.get(opts, :tombstone_ttl, :timer.hours(24 * 7))
 
-    unavailable_origin_full_sync_delay =
-      Keyword.get(opts, :unavailable_origin_full_sync_delay, 60_000)
+    member_progress_retention_ttl =
+      Keyword.get(opts, :member_progress_retention_ttl, tombstone_ttl)
 
     cluster_size = Keyword.fetch!(opts, :cluster_size)
 
@@ -34,11 +34,11 @@ defmodule EKV.AntiEntropyTest do
       log: false,
       gc_interval: gc_interval,
       tombstone_ttl: tombstone_ttl,
+      member_progress_retention_ttl: member_progress_retention_ttl,
       sync_chunk_size: sync_chunk_size,
       cluster_size: cluster_size,
       node_id: node_id,
-      anti_entropy_interval: anti_entropy_interval,
-      unavailable_origin_full_sync_delay: unavailable_origin_full_sync_delay
+      anti_entropy_interval: anti_entropy_interval
     )
   end
 
@@ -144,6 +144,43 @@ defmodule EKV.AntiEntropyTest do
     end
   end
 
+  defp collect_trace_messages(acc, timeout) do
+    receive do
+      {:trace, _pid, :send, {:ekv_sync_request, _from_pid, shard, request}, destination} ->
+        collect_trace_messages([{:request, shard, request, destination} | acc], timeout)
+
+      {:trace, _pid, :send, {:ekv, 1, :sync_request, {_from_pid, shard, request}, _meta},
+       destination} ->
+        collect_trace_messages([{:request, shard, request, destination} | acc], timeout)
+
+      {:trace, _pid, :send, {:ekv_sync, from_node, shard, mode, entries, progress}, destination} ->
+        collect_trace_messages(
+          [
+            {:sync, from_node, shard, mode, Enum.map(entries, &elem(&1, 0)), progress,
+             destination}
+            | acc
+          ],
+          timeout
+        )
+
+      {:trace, _pid, :send, {:ekv, 1, :sync, {from_node, shard, mode, entries, progress}, _meta},
+       destination} ->
+        collect_trace_messages(
+          [
+            {:sync, from_node, shard, mode, Enum.map(entries, &elem(&1, 0)), progress,
+             destination}
+            | acc
+          ],
+          timeout
+        )
+
+      {:trace, _pid, :send, _msg, _destination} ->
+        collect_trace_messages(acc, timeout)
+    after
+      timeout -> Enum.reverse(acc)
+    end
+  end
+
   defp assert_no_sync_messages(timeout \\ 250) do
     assert collect_sync_messages([], timeout) == []
   end
@@ -199,10 +236,7 @@ defmodule EKV.AntiEntropyTest do
       on_exit(fn -> TestCluster.stop_peers(peers) end)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      start_cluster(peers, ekv_name,
-        anti_entropy_interval: false,
-        unavailable_origin_full_sync_delay: 0
-      )
+      start_cluster(peers, ekv_name, anti_entropy_interval: false)
 
       assert {:ok, vsn1} =
                TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "disabled/1", "v1", [if_vsn: nil]])
@@ -243,10 +277,7 @@ defmodule EKV.AntiEntropyTest do
       on_exit(fn -> TestCluster.stop_peers(peers) end)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      start_cluster(peers, ekv_name,
-        anti_entropy_interval: false,
-        unavailable_origin_full_sync_delay: 0
-      )
+      start_cluster(peers, ekv_name, anti_entropy_interval: false)
 
       write_many(node_a, ekv_name, "live_lww", 5)
 
@@ -267,10 +298,7 @@ defmodule EKV.AntiEntropyTest do
       on_exit(fn -> TestCluster.stop_peers(peers) end)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      start_cluster(peers, ekv_name,
-        anti_entropy_interval: false,
-        unavailable_origin_full_sync_delay: 0
-      )
+      start_cluster(peers, ekv_name, anti_entropy_interval: false)
 
       write_many(node_a, ekv_name, "remote_origin", 5)
 
@@ -504,10 +532,7 @@ defmodule EKV.AntiEntropyTest do
       on_exit(fn -> TestCluster.stop_peers(peers) end)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      start_cluster(peers, ekv_name,
-        anti_entropy_interval: false,
-        unavailable_origin_full_sync_delay: 0
-      )
+      start_cluster(peers, ekv_name, anti_entropy_interval: false)
 
       assert :ok == TestCluster.rpc!(node_a, EKV, :put, [ekv_name, key1, "v1"])
 
@@ -536,7 +561,7 @@ defmodule EKV.AntiEntropyTest do
       assert :ok = TestCluster.trigger_anti_entropy(node_b, ekv_name)
 
       assert Enum.any?(collect_sync_request_messages([], 2_000), fn {shard, request, _destination} ->
-               shard == 0 and request == :full
+               shard == 0 and request == {:delta, node_a, 1}
              end)
 
       TestCluster.assert_eventually(fn ->
@@ -546,7 +571,7 @@ defmodule EKV.AntiEntropyTest do
       assert :ok = TestCluster.untrace_shard_sends(node_c, ekv_name)
     end
 
-    test "missing third-origin handshake does not trigger premature full sync" do
+    test "missing third-origin handshake relays delta instead of requesting full" do
       peers = TestCluster.start_peers(3)
       [{_, node_a}, {_, node_b}, {_, node_c}] = peers
       ekv_name = unique_name(:anti_entropy_no_premature_full)
@@ -566,13 +591,20 @@ defmodule EKV.AntiEntropyTest do
       assert :ok = TestCluster.trace_shard_sends(node_b, ekv_name, self())
       assert :ok = TestCluster.trigger_anti_entropy(node_b, ekv_name)
 
-      assert collect_sync_request_messages([], 500) == []
-      assert_no_sync_messages(250)
+      requests = collect_sync_request_messages([], 1_000)
+
+      assert Enum.any?(requests, fn {shard, request, _destination} ->
+               shard == 0 and request == {:delta, node_a, 0}
+             end)
+
+      refute Enum.any?(requests, fn {shard, request, _destination} ->
+               shard == 0 and request == :full
+             end)
 
       assert :ok = TestCluster.untrace_shard_sends(node_b, ekv_name)
     end
 
-    test "recently unavailable third origin does not trigger immediate full sync" do
+    test "recently unavailable third origin requests relayed delta immediately" do
       peers = TestCluster.start_peers(3)
       [{_, node_a}, {_, node_b}, {_, node_c}] = peers
       ekv_name = unique_name(:anti_entropy_recent_unavailable_origin)
@@ -581,10 +613,7 @@ defmodule EKV.AntiEntropyTest do
       on_exit(fn -> TestCluster.stop_peers(peers) end)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      start_cluster(peers, ekv_name,
-        anti_entropy_interval: false,
-        unavailable_origin_full_sync_delay: 60_000
-      )
+      start_cluster(peers, ekv_name, anti_entropy_interval: false)
 
       assert :ok == TestCluster.rpc!(node_a, EKV, :put, [ekv_name, key1, "v1"])
 
@@ -612,73 +641,96 @@ defmodule EKV.AntiEntropyTest do
       assert :ok = TestCluster.trace_shard_sends(node_c, ekv_name, self())
       assert :ok = TestCluster.trigger_anti_entropy(node_b, ekv_name)
 
-      assert collect_sync_request_messages([], 500) == []
-      assert_no_sync_messages(250)
+      requests = collect_sync_request_messages([], 2_000)
 
-      assert :ok = TestCluster.untrace_shard_sends(node_c, ekv_name)
-    end
+      assert Enum.any?(requests, fn {shard, request, _destination} ->
+               shard == 0 and request == {:delta, node_a, 1}
+             end)
 
-    test "unavailable third origin escalates to full sync after grace delay" do
-      peers = TestCluster.start_peers(3)
-      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
-      ekv_name = unique_name(:anti_entropy_unavailable_origin_delay_elapsed)
-      key1 = "delay_elapsed/1"
-      key2 = "delay_elapsed/2"
-      on_exit(fn -> TestCluster.stop_peers(peers) end)
-      on_exit(fn -> cleanup_data(peers, ekv_name) end)
-
-      start_cluster(peers, ekv_name,
-        anti_entropy_interval: false,
-        unavailable_origin_full_sync_delay: 60_000
-      )
-
-      assert :ok == TestCluster.rpc!(node_a, EKV, :put, [ekv_name, key1, "v1"])
-
-      TestCluster.assert_eventually(fn ->
-        TestCluster.rpc!(node_b, EKV, :get, [ekv_name, key1]) == "v1" and
-          TestCluster.rpc!(node_c, EKV, :get, [ekv_name, key1]) == "v1"
-      end)
-
-      TestCluster.disconnect_nodes(node_a, node_c)
-      assert :ok == TestCluster.rpc!(node_a, EKV, :put, [ekv_name, key2, "v2"])
-
-      TestCluster.assert_eventually(fn ->
-        TestCluster.rpc!(node_b, EKV, :get, [ekv_name, key2]) == "v2"
-      end)
-
-      assert TestCluster.rpc!(node_c, EKV, :get, [ekv_name, key2]) == nil
-
-      assert :ok = TestCluster.stop_ekv(node_a, ekv_name, 10_000)
-
-      TestCluster.assert_eventually(fn ->
-        state = TestCluster.replica_state(node_b, ekv_name)
-        not Map.has_key?(state.remote_shards, node_a)
-      end)
-
-      old_ms = System.system_time(:millisecond) - 120_000
-      assert :ok = TestCluster.set_unavailable_origin_since(node_c, ekv_name, node_a, old_ms)
-
-      assert :ok = TestCluster.trace_shard_sends(node_c, ekv_name, self())
-      assert :ok = TestCluster.trigger_anti_entropy(node_b, ekv_name)
-
-      assert Enum.any?(collect_sync_request_messages([], 2_000), fn {shard, request, _destination} ->
+      refute Enum.any?(requests, fn {shard, request, _destination} ->
                shard == 0 and request == :full
              end)
 
       assert :ok = TestCluster.untrace_shard_sends(node_c, ekv_name)
     end
 
-    test "dead-origin bootstrap chooses a single full-sync source per shard" do
+    test "relayed third-origin delta falls back to full when retained replay is gone" do
+      peers = TestCluster.start_peers(3)
+      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
+      ekv_name = unique_name(:anti_entropy_third_origin_retained_gap)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      start_cluster(
+        peers,
+        ekv_name,
+        anti_entropy_interval: false,
+        sync_chunk_size: 2
+      )
+
+      write_many(node_a, ekv_name, "relay_trunc", 5)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.keys_count(node_b, ekv_name, "relay_trunc/") == 5 and
+          TestCluster.keys_count(node_c, ekv_name, "relay_trunc/") == 5
+      end)
+
+      assert :ok = TestCluster.prune_origin_replay(node_b, ekv_name, node_a, 3)
+
+      assert :ok = TestCluster.force_local_progress(node_c, ekv_name, node_a, 0)
+      assert :ok = TestCluster.stop_ekv(node_a, ekv_name, 10_000)
+
+      TestCluster.assert_eventually(fn ->
+        state = TestCluster.replica_state(node_b, ekv_name)
+        not Map.has_key?(state.remote_shards, node_a)
+      end)
+
+      assert :ok = TestCluster.trace_shard_sends(node_c, ekv_name, self())
+      assert :ok = TestCluster.trace_shard_sends(node_b, ekv_name, self())
+      assert :ok = TestCluster.trigger_anti_entropy(node_b, ekv_name)
+
+      trace_messages = collect_trace_messages([], 2_000)
+
+      assert Enum.any?(trace_messages, fn
+               {:request, shard, request, _destination} ->
+                 shard == 0 and request == {:delta, node_a, 0}
+
+               _ ->
+                 false
+             end)
+
+      assert Enum.any?(trace_messages, fn
+               {:sync, from_node, shard, mode, _keys, _progress, _destination} ->
+                 from_node == node_b and shard == 0 and mode == :full
+
+               _ ->
+                 false
+             end)
+
+      assert Enum.any?(trace_messages, fn
+               {:sync, from_node, shard, mode, _keys, progress, _destination} ->
+                 from_node == node_b and shard == 0 and mode == :full and is_map(progress)
+
+               _ ->
+                 false
+             end)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.keys_count(node_c, ekv_name, "relay_trunc/") == 5
+      end)
+
+      assert :ok = TestCluster.untrace_shard_sends(node_b, ekv_name)
+      assert :ok = TestCluster.untrace_shard_sends(node_c, ekv_name)
+    end
+
+    test "dead-origin bootstrap prefers relayed delta over full sync" do
       peers = TestCluster.start_peers(4)
       [{_, node_a}, {_, node_b}, {_, node_c}, {_, node_d}] = peers
       ekv_name = unique_name(:anti_entropy_single_full_source)
       on_exit(fn -> TestCluster.stop_peers(peers) end)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      start_cluster(peers, ekv_name,
-        anti_entropy_interval: false,
-        unavailable_origin_full_sync_delay: 0
-      )
+      start_cluster(peers, ekv_name, anti_entropy_interval: false)
 
       write_many(node_c, ekv_name, "dead_source", 3)
 
@@ -699,13 +751,16 @@ defmodule EKV.AntiEntropyTest do
       assert :ok = TestCluster.trace_shard_sends(node_b, ekv_name, self())
       assert :ok = TestCluster.trigger_anti_entropy(node_b, ekv_name)
 
-      full_requests =
-        collect_sync_request_messages([], 1_000)
-        |> Enum.filter(fn {shard, request, _destination} ->
-          shard == 0 and request == :full
-        end)
+      requests = collect_sync_request_messages([], 1_000)
 
-      assert length(full_requests) == 1
+      assert Enum.any?(requests, fn {shard, request, _destination} ->
+               shard == 0 and request == {:delta, node_c, 0}
+             end)
+
+      refute Enum.any?(requests, fn {shard, request, _destination} ->
+               shard == 0 and request == :full
+             end)
+
       assert :ok = TestCluster.untrace_shard_sends(node_b, ekv_name)
     end
 
@@ -1009,6 +1064,89 @@ defmodule EKV.AntiEntropyTest do
       assert :ok = TestCluster.trigger_anti_entropy(node_b, ekv_name)
       assert_no_sync_messages(400)
       assert :ok = TestCluster.untrace_shard_sends(node_a, ekv_name)
+    end
+
+    test "gc retains recently disconnected member progress so reconnect heals by delta" do
+      peers = TestCluster.start_peers(2)
+      [{_, node_a}, {_, node_b}] = peers
+      ekv_name = unique_name(:anti_entropy_recent_disconnect_delta)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      start_cluster(
+        peers,
+        ekv_name,
+        anti_entropy_interval: false,
+        sync_chunk_size: 2,
+        gc_interval: 100,
+        tombstone_ttl: 10_000,
+        member_progress_retention_ttl: 10_000
+      )
+
+      write_many(node_a, ekv_name, "retained_window", 5)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.keys_count(node_b, ekv_name, "retained_window/") == 5
+      end)
+
+      assert :ok = TestCluster.set_peer_progress(node_a, ekv_name, node_b, node_a, 5)
+      assert :ok = TestCluster.set_cached_remote_progress(node_a, ekv_name, node_b, node_a, 5)
+
+      TestCluster.monitor_nodes_on(node_a, self())
+      TestCluster.monitor_nodes_on(node_b, self())
+      TestCluster.disconnect_nodes(node_a, node_b)
+      assert_receive {:nodedown_on_remote, ^node_b}, 5_000
+      assert_receive {:nodedown_on_remote, ^node_a}, 5_000
+
+      for i <- 6..8 do
+        assert :ok ==
+                 TestCluster.rpc!(node_a, EKV, :put, [
+                   ekv_name,
+                   "retained_window/#{i}",
+                   "v#{i}"
+                 ])
+      end
+
+      trigger_gc(node_a, ekv_name, 0, 10_000)
+
+      assert TestCluster.peer_progress(node_a, ekv_name, node_b, node_a) == 5
+
+      assert :ok = TestCluster.trace_shard_sends(node_a, ekv_name, self())
+      assert :ok = TestCluster.trace_shard_sends(node_b, ekv_name, self())
+      TestCluster.reconnect_nodes(node_a, node_b)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.keys_count(node_b, ekv_name, "retained_window/") == 8
+      end)
+
+      trace_messages = collect_trace_messages([], 2_000)
+
+      assert Enum.any?(trace_messages, fn
+               {:request, shard, request, _destination} ->
+                 shard == 0 and request == {:delta, node_a, 5}
+
+               _ ->
+                 false
+             end)
+
+      assert Enum.any?(trace_messages, fn
+               {:sync, from_node, shard, mode, _keys, _progress, _destination} ->
+                 from_node == node_a and shard == 0 and mode == :delta
+
+               _ ->
+                 false
+             end)
+
+      refute Enum.any?(trace_messages, fn
+               {:sync, from_node, shard, mode, _keys, _progress, _destination} ->
+                 from_node == node_a and shard == 0 and mode == :full
+
+               _ ->
+                 false
+             end)
+
+      assert :ok = TestCluster.untrace_shard_sends(node_a, ekv_name)
+      assert :ok = TestCluster.untrace_shard_sends(node_b, ekv_name)
     end
 
     test "restart with reset local history heals once and later anti-entropy stays quiet" do

@@ -325,12 +325,12 @@ defmodule EKV.TestCluster do
     rpc!(node, __MODULE__, :do_drop_remote_shard, [name, remote_node, shard_index])
   end
 
-  @doc "Force a replica shard's unavailable_origin_since timer for one origin node"
-  def set_unavailable_origin_since(node, name, origin_node, down_since_ms, shard_index \\ 0) do
-    rpc!(node, __MODULE__, :do_set_unavailable_origin_since, [
+  @doc "Delete retained oplog rows below keep_from_seq for one origin on a remote shard"
+  def prune_origin_replay(node, name, origin_node, keep_from_seq, shard_index \\ 0) do
+    rpc!(node, __MODULE__, :do_prune_origin_replay, [
       name,
       origin_node,
-      down_since_ms,
+      keep_from_seq,
       shard_index
     ])
   end
@@ -618,7 +618,6 @@ defmodule EKV.TestCluster do
       state = %{
         state
         | remote_shards: Map.delete(state.remote_shards, remote_node),
-          unavailable_origin_since: Map.delete(state.unavailable_origin_since, remote_node),
           summary_probe_inflight: MapSet.delete(state.summary_probe_inflight, remote_node),
           sync_inflight: MapSet.delete(state.sync_inflight, remote_node)
       }
@@ -633,17 +632,19 @@ defmodule EKV.TestCluster do
     :ok
   end
 
-  def do_set_unavailable_origin_since(name, origin_node, down_since_ms, shard_index) do
+  def do_prune_origin_replay(name, origin_node, keep_from_seq, shard_index) do
     shard_name = EKV.Replica.shard_name(name, shard_index)
+    %{db: db} = :sys.get_state(shard_name)
 
-    :sys.replace_state(shard_name, fn state ->
-      %{
-        state
-        | unavailable_origin_since:
-            Map.put(state.unavailable_origin_since, origin_node, down_since_ms)
-      }
-    end)
+    {:ok, stmt} =
+      EKV.Sqlite3.prepare(
+        db,
+        "DELETE FROM kv_oplog WHERE origin_node = ?1 AND origin_seq < ?2"
+      )
 
+    :ok = EKV.Sqlite3.bind(stmt, [Atom.to_string(origin_node), keep_from_seq])
+    :done = EKV.Sqlite3.step(db, stmt)
+    :ok = EKV.Sqlite3.release(db, stmt)
     :ok
   end
 

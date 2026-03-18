@@ -2093,6 +2093,29 @@ defmodule EKVTest do
   # =====================================================================
 
   describe "CAS config validation" do
+    test "member_progress_retention_ttl defaults to tombstone_ttl" do
+      name = :"ekv_cfg_progress_retention_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_cfg_progress_retention_#{name}")
+      tombstone_ttl = :timer.hours(12)
+
+      {:ok, pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: data_dir,
+          shards: 1,
+          tombstone_ttl: tombstone_ttl,
+          log: false
+        )
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      config = EKV.Supervisor.get_config(name)
+      assert config.member_progress_retention_ttl == tombstone_ttl
+    end
+
     test "cluster_size without node_id auto-generates node_id" do
       name = :"ekv_cas_cfg_#{System.unique_integer([:positive])}"
       data_dir = Path.join(System.tmp_dir!(), "ekv_cas_cfg_#{name}")
@@ -4106,7 +4129,8 @@ defmodule EKVTest do
 
       send(
         shard_name,
-        {:continue_full_sync, fake_node, nil, tombstone_cutoff, progress, config.sync_chunk_size}
+        {:continue_full_sync, fake_node, nil, tombstone_cutoff, progress, config.sync_chunk_size,
+         :explicit_request}
       )
 
       Process.sleep(200)
@@ -4181,7 +4205,8 @@ defmodule EKVTest do
 
       send(
         shard_name,
-        {:continue_full_sync, fake_node, nil, tombstone_cutoff, progress, config.sync_chunk_size}
+        {:continue_full_sync, fake_node, nil, tombstone_cutoff, progress, config.sync_chunk_size,
+         :explicit_request}
       )
 
       # Resume to process just the first chunk (sends chunk + queues next continuation)
@@ -4237,7 +4262,8 @@ defmodule EKVTest do
 
       send(
         shard_name,
-        {:continue_full_sync, fake_node, nil, tombstone_cutoff, progress, config.sync_chunk_size}
+        {:continue_full_sync, fake_node, nil, tombstone_cutoff, progress, config.sync_chunk_size,
+         :explicit_request}
       )
 
       :sys.resume(shard_name)
@@ -4283,7 +4309,8 @@ defmodule EKVTest do
 
       send(
         shard_name,
-        {:continue_full_sync, fake_node, nil, tombstone_cutoff, progress, config.sync_chunk_size}
+        {:continue_full_sync, fake_node, nil, tombstone_cutoff, progress, config.sync_chunk_size,
+         :explicit_request}
       )
 
       Process.sleep(200)
