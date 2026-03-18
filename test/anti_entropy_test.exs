@@ -1203,6 +1203,60 @@ defmodule EKV.AntiEntropyTest do
       assert :ok = TestCluster.untrace_shard_sends(node_b, ekv_name)
     end
 
+    test "healthy connected churn prunes hot-key oplog after peers catch up" do
+      peers = TestCluster.start_peers(2)
+      [{_, node_a}, {_, node_b}] = peers
+      ekv_name = unique_name(:anti_entropy_healthy_churn_prunes)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      start_cluster(
+        peers,
+        ekv_name,
+        anti_entropy_interval: false,
+        gc_interval: 100,
+        tombstone_ttl: 10_000,
+        member_progress_retention_ttl: 10_000
+      )
+
+      for i <- 1..200 do
+        assert :ok ==
+                 TestCluster.rpc!(node_a, EKV, :put, [
+                   ekv_name,
+                   "hot_churn/key",
+                   "v#{i}"
+                 ])
+      end
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, EKV, :get, [ekv_name, "hot_churn/key"]) == "v200"
+      end)
+
+      a_max = TestCluster.max_seq(node_a, ekv_name)
+
+      assert :ok = TestCluster.trigger_anti_entropy(node_b, ekv_name)
+
+      TestCluster.assert_eventually(fn ->
+        state = TestCluster.replica_state(node_a, ekv_name)
+        get_in(state.remote_member_progress, [node_b, node_a]) == a_max
+      end)
+
+      count_before_gc = TestCluster.oplog_count(node_a, ekv_name)
+      assert count_before_gc >= 200
+
+      trigger_gc(node_a, ekv_name, 0, 10_000)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.oplog_count(node_a, ekv_name) <= 2
+      end)
+
+      remaining = TestCluster.oplog_since(node_a, ekv_name, 0, 10)
+
+      assert Enum.all?(remaining, fn {_seq, key, _value, _ts, origin, origin_seq, _expires, _del} ->
+               key == "hot_churn/key" and origin == node_a and origin_seq == a_max
+             end)
+    end
+
     test "restart with reset local history heals once and later anti-entropy stays quiet" do
       peers = TestCluster.start_peers(2)
       [{_, node_a}, {_, node_b}] = peers

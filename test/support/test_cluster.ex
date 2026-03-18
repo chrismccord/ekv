@@ -299,6 +299,11 @@ defmodule EKV.TestCluster do
     rpc!(node, __MODULE__, :do_oplog_since, [name, last_seq, limit, shard_index])
   end
 
+  @doc "Count oplog rows on a remote shard"
+  def oplog_count(node, name, shard_index \\ 0) do
+    rpc!(node, __MODULE__, :do_oplog_count, [name, shard_index])
+  end
+
   @doc "Read a shard's min oplog seq on a remote node"
   def min_seq(node, name, shard_index \\ 0) do
     rpc!(node, __MODULE__, :do_min_seq, [name, shard_index])
@@ -612,6 +617,16 @@ defmodule EKV.TestCluster do
     shard_name = EKV.Replica.shard_name(name, shard_index)
     %{db: db} = :sys.get_state(shard_name)
     EKV.Store.min_seq(db)
+  end
+
+  def do_oplog_count(name, shard_index) do
+    shard_name = EKV.Replica.shard_name(name, shard_index)
+    %{db: db} = :sys.get_state(shard_name)
+
+    case EKV.Sqlite3.fetch_all(db, "SELECT COUNT(*) FROM kv_oplog", []) do
+      {:ok, [[count]]} -> count
+      _ -> 0
+    end
   end
 
   def do_set_cached_remote_progress(name, remote_node, origin_node, seq, shard_index) do
