@@ -100,7 +100,7 @@ Values can be any Erlang term (stored via `:erlang.term_to_binary/1`). Keys are 
 | `:wait_for_route` | `false` | Client mode only. Optional startup gate. Blocks startup until the first reachable member in `:region_routing` order is selected. |
 | `:data_dir` | *required in `:member`* | Directory for SQLite database files |
 | `:cluster_size` | `nil` | Member mode only. Required for CAS (`if_vsn`, `consistent: true`, `update/4`). Total number of logical voting members. |
-| `:node_id` | `nil` | Member mode only. Required for CAS. Stable logical member id used in ballots, quorum accounting, and blue-green overlap. |
+| `:node_id` | auto-generated+persistent | Member mode only. Stable logical member id used in ballots, persisted replay origins, quorum accounting, and blue-green overlap. If omitted, EKV generates one on first boot and persists it to the shard DBs. |
 | `:shards` | `8` | Member mode only. Number of shards (each is an independent GenServer + SQLite db) |
 | `:tombstone_ttl` | `604_800_000` (7 days) | Member mode only. How long tombstones are retained in milliseconds |
 | `:gc_interval` | `300_000` (5 min) | Member mode only. GC tick interval in milliseconds |
@@ -159,7 +159,7 @@ repairs itself without waiting for a reconnect.
 
 ### Conflict resolution
 
-Last-Writer-Wins with nanosecond timestamps. Ties are broken deterministically by comparing origin node atoms, so all nodes converge to the same result without coordination.
+Last-Writer-Wins with nanosecond timestamps. Ties are broken deterministically by comparing persisted origin strings, so all nodes converge to the same result without coordination. In current member mode this origin is the stable `node_id`, not the transient blue/green Erlang node name.
 
 A delete is just an entry with `deleted_at` set. Same LWW rules apply -- a put with a higher timestamp beats a delete, and vice versa.
 

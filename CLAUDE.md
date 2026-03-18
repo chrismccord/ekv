@@ -66,7 +66,8 @@ Important:
 
 ## CAS Configuration Reality
 - CAS requires `cluster_size`.
-- `node_id` is logically required for CAS identity, but current code auto-generates and persists one if `cluster_size` is set and `node_id` is omitted.
+- Member mode always resolves a stable `node_id` from disk, config, or first-boot random generation.
+- CAS uses that same stable `node_id`; callers do not need to pass one explicitly unless they want to control the logical identity.
 - Persisted `node_id` on disk wins over a conflicting configured `node_id`.
 - Quorum math is by distinct logical `node_id`, not Erlang node name.
 
@@ -260,6 +261,10 @@ Important:
 - If visible logical members exceed `cluster_size`, CAS must fail with `{:error, :cluster_overflow}`.
 
 ### Sync / replay-progress correctness
+- Persisted member/origin identity should use the CAS logical-member model.
+  - `node_id` is the stable identity for storage, replay origins, member
+    progress, down markers, and quorum/member accounting.
+  - Erlang `node()` names are transport/routing identities only.
 - `kv_origin_progress` is local applied progress per origin stream.
 - `kv_member_progress` is peer progress per origin stream.
 - Progress is exact, not monotonic-by-max.
@@ -274,6 +279,8 @@ Important:
     full-sync source in flight at a time, so bootstrap repair cannot fan out
     into duplicate full snapshots from every eligible peer.
 - Live LWW and CAS replication both carry `(origin_node, origin_seq)` directly.
+  - `origin_node` is persisted as a string; with member identity configured it
+    should be the stable `node_id`, not a transient blue/green node name.
   - Receivers advance local contiguous progress in the same write/promote transaction.
 - Replay and CAS on the same shard are mailbox-serialized.
 - Chunked sync safety is not just "different tables":

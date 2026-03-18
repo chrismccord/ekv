@@ -25,6 +25,8 @@ defmodule EKVTest do
     %{name: name, data_dir: data_dir}
   end
 
+  defp local_origin_id(state), do: state.node_id || Atom.to_string(node())
+
   describe "put/get" do
     test "basic put and get", %{name: name} do
       :ok = EKV.put(name, "key1", "value1")
@@ -96,7 +98,7 @@ defmodule EKVTest do
       assert value == "alice"
       assert {ts, origin} = vsn
       assert is_integer(ts)
-      assert is_atom(origin)
+      assert is_binary(origin)
     end
 
     test "scan is a Stream (lazy)", %{name: name} do
@@ -113,7 +115,8 @@ defmodule EKVTest do
       result = EKV.keys(name, "user/") |> Enum.sort()
 
       assert Enum.map(result, fn {key, _vsn} -> key end) == ["user/1", "user/2"]
-      assert Enum.all?(result, fn {_key, {ts, origin}} -> is_integer(ts) and is_atom(origin) end)
+
+      assert Enum.all?(result, fn {_key, {ts, origin}} -> is_integer(ts) and is_binary(origin) end)
     end
 
     test "keys is a Stream (lazy)", %{name: name} do
@@ -521,15 +524,16 @@ defmodule EKVTest do
 
       member = :fake_member@host
       origin = :origin_a@host
+      origin_id = Atom.to_string(origin)
 
       :ok = EKV.Store.update_peer_progress(db, member, origin, 100)
-      assert EKV.Store.get_peer_progress(db, member) == %{origin => 100}
+      assert EKV.Store.get_peer_progress(db, member) == %{origin_id => 100}
 
       :ok = EKV.Store.replace_peer_progress(db, member, %{origin => 50})
-      assert EKV.Store.get_peer_progress(db, member) == %{origin => 50}
+      assert EKV.Store.get_peer_progress(db, member) == %{origin_id => 50}
 
       :ok = EKV.Store.update_peer_progress(db, member, origin, 200)
-      assert EKV.Store.get_peer_progress(db, member) == %{origin => 200}
+      assert EKV.Store.get_peer_progress(db, member) == %{origin_id => 200}
     end
   end
 
@@ -2116,12 +2120,11 @@ defmodule EKVTest do
       assert config.member_progress_retention_ttl == tombstone_ttl
     end
 
-    test "cluster_size without node_id auto-generates node_id" do
+    test "member mode without node_id auto-generates node_id" do
       name = :"ekv_cas_cfg_#{System.unique_integer([:positive])}"
       data_dir = Path.join(System.tmp_dir!(), "ekv_cas_cfg_#{name}")
 
-      {:ok, pid} =
-        EKV.start_link(name: name, data_dir: data_dir, cluster_size: 3, shards: 1, log: false)
+      {:ok, pid} = EKV.start_link(name: name, data_dir: data_dir, shards: 1, log: false)
 
       on_exit(fn ->
         Process.exit(pid, :shutdown)
@@ -2162,7 +2165,7 @@ defmodule EKVTest do
         File.rm_rf!(data_dir)
       end)
 
-      assert_raise ArgumentError, ~r/await_quorum\/2 requires :cluster_size and :node_id/, fn ->
+      assert_raise ArgumentError, ~r/await_quorum\/2 requires :cluster_size/, fn ->
         EKV.await_quorum(name, 0)
       end
     end
@@ -2380,7 +2383,7 @@ defmodule EKVTest do
       assert value == %{name: "Alice"}
       assert {ts, origin} = vsn
       assert is_integer(ts)
-      assert is_atom(origin)
+      assert is_binary(origin)
     end
 
     test "returns nil for missing key", %{cas_name: name} do
@@ -4125,7 +4128,7 @@ defmodule EKVTest do
       progress =
         state.db
         |> EKV.Store.local_progress_summary()
-        |> Map.put(node(), state.local_origin_seq)
+        |> Map.put(local_origin_id(state), state.local_origin_seq)
 
       send(
         shard_name,
@@ -4165,7 +4168,8 @@ defmodule EKVTest do
       # Trigger delta sync starting from seq 0
       send(
         shard_name,
-        {:continue_delta_sync, fake_node, node(), 0, my_seq, config.sync_chunk_size}
+        {:continue_delta_sync, fake_node, local_origin_id(state), 0, my_seq,
+         config.sync_chunk_size}
       )
 
       Process.sleep(200)
@@ -4198,7 +4202,7 @@ defmodule EKVTest do
       progress =
         state.db
         |> EKV.Store.local_progress_summary()
-        |> Map.put(node(), state.local_origin_seq)
+        |> Map.put(local_origin_id(state), state.local_origin_seq)
 
       # Suspend the shard, inject the first continue message, then remove the member
       :sys.suspend(shard_name)
@@ -4255,7 +4259,7 @@ defmodule EKVTest do
       progress =
         state.db
         |> EKV.Store.local_progress_summary()
-        |> Map.put(node(), state.local_origin_seq)
+        |> Map.put(local_origin_id(state), state.local_origin_seq)
 
       # Suspend, inject first chunk trigger, resume
       :sys.suspend(shard_name)
@@ -4305,7 +4309,7 @@ defmodule EKVTest do
       progress =
         state.db
         |> EKV.Store.local_progress_summary()
-        |> Map.put(node(), state.local_origin_seq)
+        |> Map.put(local_origin_id(state), state.local_origin_seq)
 
       send(
         shard_name,
@@ -4854,6 +4858,43 @@ defmodule EKVTest do
       info = EKV.info(name)
       assert is_binary(info.node_id)
       assert byte_size(info.node_id) > 0
+    end
+
+    test "auto-generated node_id persists across restart without cluster_size" do
+      name = :"ekv_autogen_persist_nid_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+      Process.flag(:trap_exit, true)
+      on_exit(fn -> File.rm_rf!(data_dir) end)
+
+      {:ok, _pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: data_dir,
+          shards: 1,
+          log: false,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      info = EKV.info(name)
+      assert is_binary(info.node_id)
+      assert byte_size(info.node_id) > 0
+
+      Supervisor.stop(:"#{name}_ekv_sup", :shutdown)
+      Process.sleep(100)
+
+      {:ok, _pid2} =
+        EKV.start_link(
+          name: name,
+          data_dir: data_dir,
+          shards: 1,
+          log: false,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      info2 = EKV.info(name)
+      assert info2.node_id == info.node_id
     end
 
     @tag :capture_log

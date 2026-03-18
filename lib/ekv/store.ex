@@ -21,6 +21,9 @@ defmodule EKV.Store do
   - `kv_origin_progress` is this shard's contiguous applied cursor per origin
   - `kv_member_progress` is each peer's cursor per origin; GC uses it to
     decide how much replay history must be kept
+  - persisted `origin_node` / `member_node` values are stable logical member
+    ids (`node_id`); transient Erlang node names are only for transport,
+    routing, and handshake
 
   ## Tables
 
@@ -345,11 +348,17 @@ defmodule EKV.Store do
         origin_node,
         expires_at,
         deleted_at \\ nil,
-        origin_seq \\ nil
+        origin_seq \\ nil,
+        local_origin_override \\ :auto
       ) do
     is_delete = if deleted_at, do: 1, else: 0
-    origin_str = Atom.to_string(origin_node)
-    local_origin = origin_node == node()
+    origin_str = persisted_member_id(origin_node)
+
+    local_origin =
+      case local_origin_override do
+        bool when is_boolean(bool) -> bool
+        _ -> origin_str == Atom.to_string(node())
+      end
 
     kv_args = [key, value_binary, timestamp, origin_str, origin_seq, expires_at, deleted_at]
     oplog_args = [key, value_binary, timestamp, origin_str, origin_seq, expires_at, is_delete]
@@ -373,7 +382,7 @@ defmodule EKV.Store do
     result =
       case EKV.Sqlite3.step(db, stmt) do
         {:row, [value, timestamp, origin_node, expires_at, deleted_at]} ->
-          {value, timestamp, String.to_atom(origin_node), expires_at, deleted_at}
+          {value, timestamp, origin_node, expires_at, deleted_at}
 
         :done ->
           nil
@@ -406,7 +415,7 @@ defmodule EKV.Store do
         nil
 
       {:ok, [value, timestamp, origin_node, expires_at, deleted_at]} ->
-        {value, timestamp, String.to_atom(origin_node), expires_at, deleted_at}
+        {value, timestamp, origin_node, expires_at, deleted_at}
     end
   end
 
@@ -480,8 +489,7 @@ defmodule EKV.Store do
     {:ok, rows} = EKV.Sqlite3.fetch_all(db, @oplog_since_sql, [seq])
 
     Enum.map(rows, fn [seq, key, value, timestamp, origin_node, origin_seq, expires_at, is_delete] ->
-      {seq, key, value, timestamp, String.to_atom(origin_node), origin_seq, expires_at,
-       is_delete == 1}
+      {seq, key, value, timestamp, origin_node, origin_seq, expires_at, is_delete == 1}
     end)
   end
 
@@ -506,7 +514,7 @@ defmodule EKV.Store do
         "SELECT MAX(origin_seq) FROM kv_oplog WHERE origin_node = ?1"
       )
 
-    :ok = EKV.Sqlite3.bind(stmt, [Atom.to_string(origin_node)])
+    :ok = EKV.Sqlite3.bind(stmt, [persisted_member_id(origin_node)])
 
     result =
       case EKV.Sqlite3.step(db, stmt) do
@@ -545,7 +553,7 @@ defmodule EKV.Store do
         []
       )
 
-    Map.new(rows, fn [origin_node, seq] -> {String.to_atom(origin_node), seq} end)
+    Map.new(rows, fn [origin_node, seq] -> {origin_node, seq} end)
   end
 
   def merge_local_progress_summary(_db, progress_map) when progress_map == %{}, do: :ok
@@ -568,7 +576,7 @@ defmodule EKV.Store do
         """
       )
 
-    :ok = EKV.Sqlite3.bind(stmt, [Atom.to_string(origin_node), seq])
+    :ok = EKV.Sqlite3.bind(stmt, [persisted_member_id(origin_node), seq])
     :done = EKV.Sqlite3.step(db, stmt)
     :ok = EKV.Sqlite3.release(db, stmt)
     :ok
@@ -579,16 +587,16 @@ defmodule EKV.Store do
       EKV.Sqlite3.fetch_all(
         db,
         "SELECT origin_node, last_seq FROM kv_member_progress WHERE member_node = ?1 ORDER BY origin_node",
-        [Atom.to_string(member_node)]
+        [persisted_member_id(member_node)]
       )
 
-    Map.new(rows, fn [origin_node, seq] -> {String.to_atom(origin_node), seq} end)
+    Map.new(rows, fn [origin_node, seq] -> {origin_node, seq} end)
   end
 
   def replace_peer_progress(db, member_node, progress_map) when is_map(progress_map) do
     EKV.Sqlite3.replace_peer_progress(
       db,
-      Atom.to_string(member_node),
+      persisted_member_id(member_node),
       encode_progress_entries(progress_map)
     )
   end
@@ -604,14 +612,20 @@ defmodule EKV.Store do
         """
       )
 
-    :ok = EKV.Sqlite3.bind(stmt, [Atom.to_string(member_node), Atom.to_string(origin_node), seq])
+    :ok =
+      EKV.Sqlite3.bind(stmt, [
+        persisted_member_id(member_node),
+        persisted_member_id(origin_node),
+        seq
+      ])
+
     :done = EKV.Sqlite3.step(db, stmt)
     :ok = EKV.Sqlite3.release(db, stmt)
     :ok
   end
 
   def prune_member_progress(db, connected_members) do
-    connected_set = MapSet.new(connected_members, &Atom.to_string/1)
+    connected_set = MapSet.new(connected_members, &persisted_member_id/1)
 
     {:ok, rows} =
       EKV.Sqlite3.fetch_all(db, "SELECT DISTINCT member_node FROM kv_member_progress", [])
@@ -632,7 +646,7 @@ defmodule EKV.Store do
     {:ok, rows} =
       EKV.Sqlite3.fetch_all(db, "SELECT DISTINCT member_node FROM kv_member_progress", [])
 
-    Enum.map(rows, fn [member_node] -> String.to_atom(member_node) end)
+    Enum.map(rows, fn [member_node] -> member_node end)
   end
 
   def replay_origin_bounds(db) do
@@ -648,7 +662,7 @@ defmodule EKV.Store do
       )
 
     Map.new(rows, fn [origin_node, min_seq, max_seq] ->
-      {String.to_atom(origin_node), {min_seq, max_seq}}
+      {origin_node, {min_seq, max_seq}}
     end)
   end
 
@@ -666,20 +680,20 @@ defmodule EKV.Store do
 
     {:ok, rows} =
       EKV.Sqlite3.fetch_all(db, @replay_since_origin_chunk_sql, [
-        Atom.to_string(origin_node),
+        persisted_member_id(origin_node),
         origin_seq,
         now,
         limit
       ])
 
     Enum.map(rows, fn [key, value, timestamp, origin_node, replay_seq, expires_at, is_delete] ->
-      {key, value, timestamp, String.to_atom(origin_node), replay_seq, expires_at, is_delete == 1}
+      {key, value, timestamp, origin_node, replay_seq, expires_at, is_delete == 1}
     end)
   end
 
   defp encode_progress_entries(progress_map) do
     Enum.map(progress_map, fn {origin_node, seq} ->
-      {Atom.to_string(origin_node), seq}
+      {persisted_member_id(origin_node), seq}
     end)
   end
 
@@ -691,7 +705,7 @@ defmodule EKV.Store do
     {:ok, stmt} =
       EKV.Sqlite3.prepare(db, "SELECT last_seq FROM kv_member_hwm WHERE member_node = ?1")
 
-    :ok = EKV.Sqlite3.bind(stmt, [Atom.to_string(member_node)])
+    :ok = EKV.Sqlite3.bind(stmt, [persisted_member_id(member_node)])
 
     result =
       case EKV.Sqlite3.step(db, stmt) do
@@ -710,7 +724,7 @@ defmodule EKV.Store do
       ON CONFLICT(member_node) DO UPDATE SET last_seq = excluded.last_seq
       """)
 
-    :ok = EKV.Sqlite3.bind(stmt, [Atom.to_string(member_node), seq])
+    :ok = EKV.Sqlite3.bind(stmt, [persisted_member_id(member_node), seq])
     :done = EKV.Sqlite3.step(db, stmt)
     :ok = EKV.Sqlite3.release(db, stmt)
     :ok
@@ -736,7 +750,7 @@ defmodule EKV.Store do
     {:ok, rows} = EKV.Sqlite3.fetch_all(db, @find_expired_sql, [now])
 
     Enum.map(rows, fn [key, value, timestamp, origin_node, expires_at] ->
-      {key, value, timestamp, String.to_atom(origin_node), expires_at}
+      {key, value, timestamp, origin_node, expires_at}
     end)
   end
 
@@ -865,7 +879,7 @@ defmodule EKV.Store do
     {:ok, rows} = EKV.Sqlite3.fetch_all(db, @full_state_sql, [tombstone_cutoff, now])
 
     Enum.map(rows, fn [key, value, timestamp, origin_node, origin_seq, expires_at, deleted_at] ->
-      {key, value, timestamp, String.to_atom(origin_node), origin_seq, expires_at, deleted_at}
+      {key, value, timestamp, origin_node, origin_seq, expires_at, deleted_at}
     end)
   end
 
@@ -914,7 +928,7 @@ defmodule EKV.Store do
 
   defp map_full_state_rows(rows) do
     Enum.map(rows, fn [key, value, timestamp, origin_node, origin_seq, expires_at, deleted_at] ->
-      {key, value, timestamp, String.to_atom(origin_node), origin_seq, expires_at, deleted_at}
+      {key, value, timestamp, origin_node, origin_seq, expires_at, deleted_at}
     end)
   end
 
@@ -934,8 +948,7 @@ defmodule EKV.Store do
     {:ok, rows} = EKV.Sqlite3.fetch_all(db, @oplog_since_chunk_sql, [seq, now, limit])
 
     Enum.map(rows, fn [seq, key, value, timestamp, origin_node, origin_seq, expires_at, is_delete] ->
-      {seq, key, value, timestamp, String.to_atom(origin_node), origin_seq, expires_at,
-       is_delete == 1}
+      {seq, key, value, timestamp, origin_node, origin_seq, expires_at, is_delete == 1}
     end)
   end
 
@@ -1130,9 +1143,18 @@ defmodule EKV.Store do
     get_meta_text(db, "member_node_id:" <> Atom.to_string(member_node))
   end
 
+  def member_node_identity_get(db, member_node) when is_binary(member_node) do
+    get_meta_text(db, "member_node_id:" <> member_node)
+  end
+
   def member_node_identity_put(db, member_node, node_id)
       when is_atom(member_node) and is_binary(node_id) and byte_size(node_id) > 0 do
     set_meta_text(db, "member_node_id:" <> Atom.to_string(member_node), node_id)
+  end
+
+  def member_node_identity_put(db, member_node, node_id)
+      when is_binary(member_node) and is_binary(node_id) and byte_size(node_id) > 0 do
+    set_meta_text(db, "member_node_id:" <> member_node, node_id)
   end
 
   def prune_member_down_name_markers(db, stale_before_ms, max_entries) do
@@ -1184,6 +1206,11 @@ defmodule EKV.Store do
       _ -> :ok
     end
   end
+
+  defp persisted_member_id(id) when is_binary(id), do: id
+  defp persisted_member_id(id) when is_atom(id), do: Atom.to_string(id)
+  defp persisted_member_id(id) when is_integer(id), do: Integer.to_string(id)
+  defp persisted_member_id(id), do: to_string(id)
 
   # =====================================================================
   # Paxos

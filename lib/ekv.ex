@@ -43,7 +43,7 @@ defmodule EKV do
       # receive
       # => {:ekv, [%EKV.Event{type: :put, key: "rooms/1", value: %{title: ...}}], %{name: :my_kv}}
 
-      # CAS setup (requires cluster_size + node_id)
+      # CAS setup (requires cluster_size; node_id auto-generates if omitted)
       {EKV,
        name: :my_kv_cas,
        data_dir: "/var/data/ekv_cas",
@@ -223,7 +223,7 @@ defmodule EKV do
   | `:data_dir` | *required in `:member`* | Directory where SQLite database files are stored. Created automatically if it doesn't exist. Each shard gets its own file (`shard_0.db`, `shard_1.db`, etc.). |
   | `:shards` | `8` | Member mode only. Number of shards. See "Choosing a Shard Count" below. |
   | `:cluster_size` | `nil` | Member mode only. Logical cluster size for CAS quorum math. Required for CAS operations (`if_vsn:`, `consistent: true`, `update/4`). |
-  | `:node_id` | `nil` | Member mode only. Stable logical member identity used by CAS ballots. Required for CAS operations. Should remain stable for each logical cluster member. |
+  | `:node_id` | auto-generated+persistent | Member mode only. Stable logical member identity used by CAS ballots, persisted replay origins, member-progress retention, and blue-green overlap. Auto-generated on first boot if omitted, then reused from disk. |
   | `:wait_for_quorum` | `false` | Optional startup gate. In member mode, blocks startup until this EKV member can reach CAS quorum. In client mode, blocks startup until the selected backend member reports CAS quorum reachable. |
   | `:anti_entropy_interval` | `30_000` (30 sec) | Member mode only. Periodic background repair for already-connected members. Re-runs the normal HWM-driven delta/full sync path to heal missed replication without waiting for reconnect. `false`/`nil` disables it. |
   | `:wire_compression_threshold` | `262_144` (256 KB) | Optional byte threshold for member-to-member wire compression of large replicated value payloads. `false`/`nil` disables it. Large `:ekv_put`, CAS accept, and full-payload CAS commit messages compress values on the wire only; values remain uncompressed on disk and on reads. |
@@ -545,12 +545,13 @@ defmodule EKV do
     Returns `{:error, :unconfirmed}` when the write entered accept phase but the
     caller could not confirm final outcome; in this case, issue
     `get(name, key, consistent: true)` to resolve the committed value.
-    Requires `cluster_size` and `node_id` config.
+    Requires `cluster_size` config. Member mode auto-generates/persists
+    `node_id` if omitted.
     Can be used on an existing LWW key to transition it to CAS-managed
     (`LWW -> CAS`).
   - `:consistent` — when `true`, uses CASPaxos consensus for the write
     (quorum-backed CAS write). Mutually exclusive with `:if_vsn`. Requires
-    `cluster_size` and `node_id` config.
+    `cluster_size` config. Member mode auto-generates/persists `node_id` if omitted.
     For strict behavior, keep the key in CAS mode after transition and do not
     mix with eventual `put`/`delete` on the same key (`CAS -> LWW` writes are
     rejected).
@@ -573,7 +574,8 @@ defmodule EKV do
   - Eventual put (`put` without CAS options): `:ok` or
     `{:error, :cas_managed_key}` when the key is CAS-managed
   - CAS put (`if_vsn:` or `consistent: true`): `{:ok, vsn}` where
-    `vsn` is the version tuple `{timestamp, origin_node}`
+    `vsn` is the version tuple `{timestamp, origin_node}` where `origin_node`
+    is the persisted origin string (normally the stable member `node_id`)
   - With `resolve_unconfirmed: true`, CAS put may also return
     `{:error, :unavailable}` if ambiguity resolution cannot complete.
   """
@@ -652,7 +654,8 @@ defmodule EKV do
   - `:consistent` — when `true`, performs a CASPaxos consensus read
     (barrier/linearizable for CAS-managed keys). This read always goes through
     CAS accept+commit to resolve any in-flight accepted value before replying.
-    Requires `cluster_size` and `node_id` config.
+    Requires `cluster_size` config. Member mode auto-generates/persists
+    `node_id` if omitted.
   - `:retries` — non-negative integer max CAS retries (default 5). Only for
     `consistent: true`.
   - `:backoff` — `{min_ms, max_ms}` backoff range in ms where both are
@@ -729,7 +732,8 @@ defmodule EKV do
     Returns `{:error, :unconfirmed}` when the delete entered accept phase but the
     caller could not confirm final outcome; issue `get(name, key, consistent: true)`
     to resolve.
-    Requires `cluster_size` and `node_id` config.
+    Requires `cluster_size` config. Member mode auto-generates/persists
+    `node_id` if omitted.
     For strict behavior, keep the key in CAS mode after transition and do not
     mix with eventual `put`/`delete` on the same key (`CAS -> LWW` writes are
     rejected).
@@ -746,7 +750,8 @@ defmodule EKV do
   - Eventual delete (`delete` without CAS options): `:ok` or
     `{:error, :cas_managed_key}` when the key is CAS-managed
   - CAS delete (`if_vsn:`): `{:ok, vsn}` where `vsn` is the version tuple
-    `{timestamp, origin_node}`
+    `{timestamp, origin_node}` where `origin_node` is the persisted origin
+    string (normally the stable member `node_id`)
   - With `resolve_unconfirmed: true`, CAS delete may also return
     `{:error, :unavailable}` if ambiguity resolution cannot complete.
   """
@@ -798,7 +803,8 @@ defmodule EKV do
   not confirm final outcome; issue `get(name, key, consistent: true)` to
   resolve.
 
-  Requires `cluster_size` and `node_id` config.
+  Requires `cluster_size` config. Member mode auto-generates/persists
+  `node_id` if omitted.
   Can be used to move a key from LWW to CAS-managed mode. After transition,
   do not mix with eventual writes on the same key (`CAS -> LWW` writes are
   rejected).
@@ -910,7 +916,7 @@ defmodule EKV do
 
   Scans all shards using cursor-based streaming. Returns a `Stream` of
   `{key, value, vsn}` tuples where `vsn` is the version tuple
-  `{timestamp, origin_node}`.
+  `{timestamp, origin_node}` and `origin_node` is the persisted origin string.
 
   Results are sorted by key within each shard but not globally sorted
   across shards.
@@ -935,7 +941,8 @@ defmodule EKV do
   cursor-based streaming.
 
   Returns a `Stream` of `{key, vsn}` tuples where `vsn` is
-  the version tuple `{timestamp, origin_node}`.
+  the version tuple `{timestamp, origin_node}` where `origin_node` is the
+  persisted origin string.
 
   This avoids decoding values while still allowing CAS workflows to chain
   `if_vsn:` operations from scan output.
@@ -1200,7 +1207,7 @@ defmodule EKV do
       :member ->
         if is_nil(config.cluster_size) do
           raise ArgumentError,
-                "EKV: await_quorum/2 requires :cluster_size and :node_id to be configured"
+                "EKV: await_quorum/2 requires :cluster_size to be configured"
         else
           call_timeout = timeout_ms + 1_000
           GenServer.call(Replica.shard_name(name, 0), {:await_quorum, timeout_ms}, call_timeout)
@@ -1240,7 +1247,7 @@ defmodule EKV do
 
   defp validate_cas_config!(%{cluster_size: nil}) do
     raise ArgumentError,
-          "EKV: CAS operations require :cluster_size and :node_id to be configured"
+          "EKV: CAS operations require :cluster_size to be configured"
   end
 
   defp validate_cas_config!(_config), do: :ok
@@ -1788,11 +1795,11 @@ defmodule EKV do
   end
 
   defp decode_scan_row([key, value_binary, ts, origin_str]) do
-    {key, :erlang.binary_to_term(value_binary), {ts, String.to_atom(origin_str)}}
+    {key, :erlang.binary_to_term(value_binary), {ts, origin_str}}
   end
 
   defp decode_keys_row([key, ts, origin_str]) do
-    {key, {ts, String.to_atom(origin_str)}}
+    {key, {ts, origin_str}}
   end
 
   defp read_conn(name, shard_index) do

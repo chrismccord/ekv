@@ -397,13 +397,16 @@ defmodule EKV.TestCluster do
     config = EKV.Supervisor.get_config(name)
     shard = EKV.Replica.shard_index_for(key, config.num_shards)
     shard_name = EKV.Replica.shard_name(name, shard)
-    %{db: db, stmts: stmts, local_origin_seq: local_origin_seq} = :sys.get_state(shard_name)
+    state = :sys.get_state(shard_name)
+    %{db: db, stmts: stmts, local_origin_seq: local_origin_seq} = state
     value_binary = :erlang.term_to_binary(value)
     origin = Keyword.get(opts, :origin, node())
+    origin = replay_origin_id(origin, state)
+    local_origin = replay_origin_id(node(), state)
 
     origin_seq =
       Keyword.get_lazy(opts, :origin_seq, fn ->
-        if origin == node() do
+        if origin == local_origin do
           local_origin_seq + 1
         else
           db
@@ -427,14 +430,15 @@ defmodule EKV.TestCluster do
         origin,
         expires_at,
         deleted_at,
-        origin_seq
+        origin_seq,
+        origin == local_origin
       )
 
     :sys.replace_state(shard_name, fn state ->
       local_progress =
         Map.update(state.local_progress, origin, local_progress_seq, &max(&1, local_progress_seq))
 
-      if origin == node() do
+      if origin == replay_origin_id(node(), state) do
         %{
           state
           | local_progress: local_progress,
@@ -455,9 +459,10 @@ defmodule EKV.TestCluster do
     %{db: db} = :sys.get_state(shard_name)
     value_binary = :erlang.term_to_binary(value)
     origin = Keyword.get(opts, :origin, node())
+    origin = replay_origin_id(origin, :sys.get_state(shard_name))
     expires_at = Keyword.get(opts, :expires_at)
     deleted_at = Keyword.get(opts, :deleted_at)
-    origin_str = Atom.to_string(origin)
+    origin_str = origin
 
     {:ok, stmt} =
       EKV.Sqlite3.prepare(
@@ -485,14 +490,19 @@ defmodule EKV.TestCluster do
 
   def do_replica_state(name, shard_index) do
     shard_name = EKV.Replica.shard_name(name, shard_index)
-    :sys.get_state(shard_name)
+
+    shard_name
+    |> :sys.get_state()
+    |> alias_replica_state()
   end
 
   def do_local_progress(name, origin_node, shard_index) do
     shard_name = EKV.Replica.shard_name(name, shard_index)
-    %{db: db, local_origin_seq: local_origin_seq} = :sys.get_state(shard_name)
+    state = :sys.get_state(shard_name)
+    %{db: db, local_origin_seq: local_origin_seq} = state
+    origin_node = replay_origin_id(origin_node, state)
 
-    if origin_node == node() do
+    if origin_node == replay_origin_id(node(), state) do
       local_origin_seq
     else
       db
@@ -503,14 +513,16 @@ defmodule EKV.TestCluster do
 
   def do_set_local_progress(name, origin_node, seq, shard_index) do
     shard_name = EKV.Replica.shard_name(name, shard_index)
-    %{db: db} = :sys.get_state(shard_name)
+    state = :sys.get_state(shard_name)
+    %{db: db} = state
+    origin_node = replay_origin_id(origin_node, state)
     :ok = EKV.Store.merge_local_progress(db, origin_node, seq)
 
     :sys.replace_state(shard_name, fn state ->
       local_progress =
         Map.update(state.local_progress, origin_node, seq, &max(&1, seq))
 
-      if origin_node == node() do
+      if origin_node == replay_origin_id(node(), state) do
         %{
           state
           | local_progress: local_progress,
@@ -526,7 +538,9 @@ defmodule EKV.TestCluster do
 
   def do_force_local_progress(name, origin_node, seq, shard_index) do
     shard_name = EKV.Replica.shard_name(name, shard_index)
-    %{db: db} = :sys.get_state(shard_name)
+    state = :sys.get_state(shard_name)
+    %{db: db} = state
+    origin_node = replay_origin_id(origin_node, state)
 
     progress =
       db
@@ -538,7 +552,7 @@ defmodule EKV.TestCluster do
     :sys.replace_state(shard_name, fn state ->
       local_progress = Map.put(state.local_progress, origin_node, seq)
 
-      if origin_node == node() do
+      if origin_node == replay_origin_id(node(), state) do
         %{state | local_progress: local_progress, local_origin_seq: seq}
       else
         %{state | local_progress: local_progress}
@@ -550,7 +564,10 @@ defmodule EKV.TestCluster do
 
   def do_peer_progress(name, peer_node, origin_node, shard_index) do
     shard_name = EKV.Replica.shard_name(name, shard_index)
-    %{db: db} = :sys.get_state(shard_name)
+    state = :sys.get_state(shard_name)
+    %{db: db} = state
+    peer_node = member_progress_id(peer_node, state)
+    origin_node = replay_origin_id(origin_node, state)
 
     db
     |> EKV.Store.get_peer_progress(peer_node)
@@ -559,7 +576,10 @@ defmodule EKV.TestCluster do
 
   def do_set_peer_progress(name, peer_node, origin_node, seq, shard_index) do
     shard_name = EKV.Replica.shard_name(name, shard_index)
-    %{db: db} = :sys.get_state(shard_name)
+    state = :sys.get_state(shard_name)
+    %{db: db} = state
+    peer_node = member_progress_id(peer_node, state)
+    origin_node = replay_origin_id(origin_node, state)
 
     progress =
       db
@@ -577,8 +597,14 @@ defmodule EKV.TestCluster do
 
   def do_oplog_since(name, last_seq, limit, shard_index) do
     shard_name = EKV.Replica.shard_name(name, shard_index)
-    %{db: db} = :sys.get_state(shard_name)
-    EKV.Store.oplog_since_chunk(db, last_seq, limit)
+    state = :sys.get_state(shard_name)
+    %{db: db} = state
+
+    db
+    |> EKV.Store.oplog_since_chunk(last_seq, limit)
+    |> Enum.map(fn {seq, key, value, ts, origin, origin_seq, expires_at, is_delete} ->
+      {seq, key, value, ts, alias_origin(origin, state), origin_seq, expires_at, is_delete}
+    end)
   end
 
   def do_min_seq(name, shard_index) do
@@ -589,6 +615,8 @@ defmodule EKV.TestCluster do
 
   def do_set_cached_remote_progress(name, remote_node, origin_node, seq, shard_index) do
     shard_name = EKV.Replica.shard_name(name, shard_index)
+    state = :sys.get_state(shard_name)
+    origin_node = replay_origin_id(origin_node, state)
 
     :sys.replace_state(shard_name, fn state ->
       remote_progress = Map.get(state.remote_member_progress, remote_node, %{})
@@ -604,6 +632,28 @@ defmodule EKV.TestCluster do
 
     :ok
   end
+
+  defp replay_origin_id(origin, _state) when is_binary(origin), do: origin
+
+  defp replay_origin_id(origin, state) when is_atom(origin) do
+    cond do
+      origin == node() and is_binary(state.node_id) and byte_size(state.node_id) > 0 ->
+        state.node_id
+
+      is_binary(Map.get(state.member_node_ids, origin)) ->
+        Map.fetch!(state.member_node_ids, origin)
+
+      match?(%{db: _}, state) and is_binary(EKV.Store.member_node_identity_get(state.db, origin)) ->
+        EKV.Store.member_node_identity_get(state.db, origin)
+
+      true ->
+        Atom.to_string(origin)
+    end
+  end
+
+  defp replay_origin_id(origin, _state), do: to_string(origin)
+
+  defp member_progress_id(member_node, state), do: replay_origin_id(member_node, state)
 
   def do_trigger_anti_entropy(name, shard_index) do
     shard_name = EKV.Replica.shard_name(name, shard_index)
@@ -634,7 +684,9 @@ defmodule EKV.TestCluster do
 
   def do_prune_origin_replay(name, origin_node, keep_from_seq, shard_index) do
     shard_name = EKV.Replica.shard_name(name, shard_index)
-    %{db: db} = :sys.get_state(shard_name)
+    state = :sys.get_state(shard_name)
+    %{db: db} = state
+    origin_node = replay_origin_id(origin_node, state)
 
     {:ok, stmt} =
       EKV.Sqlite3.prepare(
@@ -642,7 +694,7 @@ defmodule EKV.TestCluster do
         "DELETE FROM kv_oplog WHERE origin_node = ?1 AND origin_seq < ?2"
       )
 
-    :ok = EKV.Sqlite3.bind(stmt, [Atom.to_string(origin_node), keep_from_seq])
+    :ok = EKV.Sqlite3.bind(stmt, [origin_node, keep_from_seq])
     :done = EKV.Sqlite3.step(db, stmt)
     :ok = EKV.Sqlite3.release(db, stmt)
     :ok
@@ -666,9 +718,11 @@ defmodule EKV.TestCluster do
         {:error, :noproc}
 
       pid ->
+        state = :sys.get_state(shard_name)
+
         tracer =
           spawn(fn ->
-            forward_trace_events(target_pid)
+            forward_trace_events(target_pid, state)
           end)
 
         :erlang.trace(pid, true, [:send, {:tracer, tracer}])
@@ -689,14 +743,95 @@ defmodule EKV.TestCluster do
     end
   end
 
-  defp forward_trace_events(target_pid) do
+  defp forward_trace_events(target_pid, state) do
     receive do
       {:trace, _pid, :send, _message, _destination} = trace ->
-        send(target_pid, trace)
-        forward_trace_events(target_pid)
+        send(target_pid, normalize_trace_event(trace, state))
+        forward_trace_events(target_pid, state)
     after
       30_000 -> :ok
     end
+  end
+
+  defp alias_replica_state(state) do
+    %{
+      state
+      | local_progress: normalize_progress_map(state.local_progress, state),
+        remote_member_progress:
+          Map.new(state.remote_member_progress, fn {remote_node, progress} ->
+            {remote_node, normalize_progress_map(progress, state)}
+          end)
+    }
+  end
+
+  defp normalize_progress_map(progress, state) when is_map(progress) do
+    Map.new(progress, fn {origin, seq} -> {alias_origin(origin, state), seq} end)
+  end
+
+  defp normalize_progress_map(progress, _state), do: progress
+
+  defp alias_origin(origin, state) when is_binary(origin) do
+    cond do
+      is_binary(state.node_id) and origin == state.node_id ->
+        node()
+
+      true ->
+        Enum.find_value(state.member_node_ids, origin, fn {member_node, member_node_id} ->
+          if member_node_id == origin or Atom.to_string(member_node) == origin, do: member_node
+        end) || origin
+    end
+  end
+
+  defp alias_origin(origin, _state), do: origin
+
+  defp normalize_trace_event(
+         {:trace, pid, :send, {:ekv_sync_request, remote_pid, shard, {:delta, origin, seq}},
+          destination},
+         state
+       ) do
+    {:trace, pid, :send,
+     {:ekv_sync_request, remote_pid, shard, {:delta, alias_origin(origin, state), seq}},
+     destination}
+  end
+
+  defp normalize_trace_event(
+         {:trace, pid, :send,
+          {:ekv, version, :sync_request, {remote_pid, shard, {:delta, origin, seq}}, meta},
+          destination},
+         state
+       ) do
+    {:trace, pid, :send,
+     {:ekv, version, :sync_request,
+      {remote_pid, shard, {:delta, alias_origin(origin, state), seq}}, meta}, destination}
+  end
+
+  defp normalize_trace_event(
+         {:trace, pid, :send, {:ekv_sync, from_node, shard, mode, entries, progress},
+          destination},
+         state
+       ) do
+    {:trace, pid, :send,
+     {:ekv_sync, from_node, shard, mode, alias_sync_entries(entries, state),
+      normalize_progress_map(progress, state)}, destination}
+  end
+
+  defp normalize_trace_event(
+         {:trace, pid, :send,
+          {:ekv, version, :sync, {from_node, shard, mode, entries, progress}, meta}, destination},
+         state
+       ) do
+    {:trace, pid, :send,
+     {:ekv, version, :sync,
+      {from_node, shard, mode, alias_sync_entries(entries, state),
+       normalize_progress_map(progress, state)}, meta}, destination}
+  end
+
+  defp normalize_trace_event(trace, _state), do: trace
+
+  defp alias_sync_entries(entries, state) when is_list(entries) do
+    Enum.map(entries, fn {key, value_binary, ts, origin, origin_seq, expires_at, deleted_at} ->
+      {key, value_binary, ts, alias_origin(origin, state), origin_seq, expires_at, deleted_at}
+    end)
   end
 
   def do_scan_to_map(name, prefix),

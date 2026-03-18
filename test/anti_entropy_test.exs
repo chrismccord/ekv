@@ -190,6 +190,48 @@ defmodule EKV.AntiEntropyTest do
 
   defp progress_seq(_from_node, _progress), do: 0
 
+  defp stable_origin_id(node, ekv_name, shard_index \\ 0) do
+    state = TestCluster.replica_state(node, ekv_name, shard_index)
+    state.node_id || Atom.to_string(node)
+  end
+
+  defp assigned_node_id(peers, origin_node) do
+    Enum.find_value(peers |> Enum.with_index(1), fn {{_pid, node}, node_id} ->
+      if node == origin_node, do: Integer.to_string(node_id)
+    end)
+  end
+
+  defp traced_origin_id(observer_node, ekv_name, origin_node, peers, shard_index \\ 0) do
+    state =
+      TestCluster.rpc!(
+        observer_node,
+        :sys,
+        :get_state,
+        [EKV.Replica.shard_name(ekv_name, shard_index)]
+      )
+
+    origin_id =
+      cond do
+        is_binary(origin_node) ->
+          origin_node
+
+        is_atom(origin_node) and origin_node == observer_node and is_binary(state.node_id) ->
+          state.node_id
+
+        is_atom(origin_node) ->
+          Map.get(state.member_node_ids, origin_node) ||
+            assigned_node_id(peers, origin_node) ||
+            Atom.to_string(origin_node)
+
+        true ->
+          to_string(origin_node)
+      end
+
+    Enum.find_value(state.member_node_ids, origin_id, fn {member_node, member_node_id} ->
+      if member_node_id == origin_id or Atom.to_string(member_node) == origin_id, do: member_node
+    end) || origin_id
+  end
+
   describe "anti-entropy healing" do
     test "connected stale member converges without reconnect or consistent read" do
       peers = TestCluster.start_peers(3)
@@ -367,6 +409,7 @@ defmodule EKV.AntiEntropyTest do
       end)
 
       base_ts = System.system_time(:nanosecond) + 1_000_000
+      origin_a = stable_origin_id(node_a, ekv_name)
 
       assert :ok =
                TestCluster.inject_committed_entry(node_a, ekv_name, key2, "v2", base_ts,
@@ -389,13 +432,14 @@ defmodule EKV.AntiEntropyTest do
 
       TestCluster.rpc!(node_b, :erlang, :send, [
         shard_name,
-        {:ekv_put, key3, value_binary, base_ts + 1_000, node_a, 3, nil}
+        {:ekv_put, key3, value_binary, base_ts + 1_000, origin_a, 3, nil}
       ])
 
       requests = collect_sync_request_messages([], 500)
 
       assert Enum.any?(requests, fn {shard, request, _destination} ->
-               shard == 0 and request == {:delta, node_a, 1}
+               shard == 0 and
+                 request == {:delta, traced_origin_id(node_b, ekv_name, node_a, peers), 1}
              end)
 
       TestCluster.assert_eventually(fn ->
@@ -426,6 +470,7 @@ defmodule EKV.AntiEntropyTest do
 
       ts2 = elem(vsn1, 0) + 1_000
       ts3 = ts2 + 1_000
+      origin_a = stable_origin_id(node_a, ekv_name)
 
       assert :ok =
                TestCluster.inject_committed_entry(node_a, ekv_name, key, "v2", ts2,
@@ -448,20 +493,21 @@ defmodule EKV.AntiEntropyTest do
       assert :ok =
                TestCluster.inject_paxos_accept(node_b, ekv_name, key, "v3", ballot_c, ballot_n,
                  timestamp: ts3,
-                 origin: Atom.to_string(node_a)
+                 origin: origin_a
                )
 
-      entry_tuple = {key, :erlang.term_to_binary("v3"), ts3, Atom.to_string(node_a), nil, nil}
+      entry_tuple = {key, :erlang.term_to_binary("v3"), ts3, origin_a, nil, nil}
 
       TestCluster.rpc!(node_b, :erlang, :send, [
         EKV.Replica.shard_name(ekv_name, 0),
-        {:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple, 0, node_a, 3}
+        {:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple, 0, origin_a, 3}
       ])
 
       requests = collect_sync_request_messages([], 500)
 
       assert Enum.any?(requests, fn {shard, request, _destination} ->
-               shard == 0 and request == {:delta, node_a, 1}
+               shard == 0 and
+                 request == {:delta, traced_origin_id(node_b, ekv_name, node_a, peers), 1}
              end)
 
       TestCluster.assert_eventually(fn ->
@@ -561,7 +607,8 @@ defmodule EKV.AntiEntropyTest do
       assert :ok = TestCluster.trigger_anti_entropy(node_b, ekv_name)
 
       assert Enum.any?(collect_sync_request_messages([], 2_000), fn {shard, request, _destination} ->
-               shard == 0 and request == {:delta, node_a, 1}
+               shard == 0 and
+                 request == {:delta, traced_origin_id(node_c, ekv_name, node_a, peers), 1}
              end)
 
       TestCluster.assert_eventually(fn ->
@@ -644,7 +691,8 @@ defmodule EKV.AntiEntropyTest do
       requests = collect_sync_request_messages([], 2_000)
 
       assert Enum.any?(requests, fn {shard, request, _destination} ->
-               shard == 0 and request == {:delta, node_a, 1}
+               shard == 0 and
+                 request == {:delta, traced_origin_id(node_c, ekv_name, node_a, peers), 1}
              end)
 
       refute Enum.any?(requests, fn {shard, request, _destination} ->
@@ -693,7 +741,8 @@ defmodule EKV.AntiEntropyTest do
 
       assert Enum.any?(trace_messages, fn
                {:request, shard, request, _destination} ->
-                 shard == 0 and request == {:delta, node_a, 0}
+                 shard == 0 and
+                   request == {:delta, traced_origin_id(node_c, ekv_name, node_a, peers), 0}
 
                _ ->
                  false
@@ -754,7 +803,8 @@ defmodule EKV.AntiEntropyTest do
       requests = collect_sync_request_messages([], 1_000)
 
       assert Enum.any?(requests, fn {shard, request, _destination} ->
-               shard == 0 and request == {:delta, node_c, 0}
+               shard == 0 and
+                 request == {:delta, traced_origin_id(node_b, ekv_name, node_c, peers), 0}
              end)
 
       refute Enum.any?(requests, fn {shard, request, _destination} ->
@@ -788,6 +838,8 @@ defmodule EKV.AntiEntropyTest do
       end)
 
       base_ts = System.system_time(:nanosecond) + 1_000_000
+      origin_a = stable_origin_id(node_a, ekv_name)
+      origin_b = stable_origin_id(node_b, ekv_name)
 
       assert :ok =
                TestCluster.inject_committed_entry(node_a, ekv_name, a2, "a-v2", base_ts,
@@ -821,22 +873,24 @@ defmodule EKV.AntiEntropyTest do
 
       TestCluster.rpc!(node_c, :erlang, :send, [
         shard_name,
-        {:ekv_put, a3, :erlang.term_to_binary("a-v3"), base_ts + 1_000, node_a, 3, nil}
+        {:ekv_put, a3, :erlang.term_to_binary("a-v3"), base_ts + 1_000, origin_a, 3, nil}
       ])
 
       TestCluster.rpc!(node_c, :erlang, :send, [
         shard_name,
-        {:ekv_put, b3, :erlang.term_to_binary("b-v3"), base_ts + 3_000, node_b, 3, nil}
+        {:ekv_put, b3, :erlang.term_to_binary("b-v3"), base_ts + 3_000, origin_b, 3, nil}
       ])
 
       requests = collect_sync_request_messages([], 500)
 
       assert Enum.any?(requests, fn {shard, request, _destination} ->
-               shard == 0 and request == {:delta, node_a, 1}
+               shard == 0 and
+                 request == {:delta, traced_origin_id(node_c, ekv_name, node_a, peers), 1}
              end)
 
       assert Enum.any?(requests, fn {shard, request, _destination} ->
-               shard == 0 and request == {:delta, node_b, 1}
+               shard == 0 and
+                 request == {:delta, traced_origin_id(node_c, ekv_name, node_b, peers), 1}
              end)
 
       TestCluster.assert_eventually(fn ->
@@ -1123,7 +1177,7 @@ defmodule EKV.AntiEntropyTest do
 
       assert Enum.any?(trace_messages, fn
                {:request, shard, request, _destination} ->
-                 shard == 0 and request == {:delta, node_a, 5}
+                 shard == 0 and request == {:delta, assigned_node_id(peers, node_a), 5}
 
                _ ->
                  false

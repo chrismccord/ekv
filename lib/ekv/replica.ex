@@ -130,6 +130,8 @@ defmodule EKV.Replica do
     stream
   - `kv_member_progress` - how far each peer has consumed each origin stream;
     this drives both repair decisions and oplog truncation
+  - persisted origin/member identity uses stable `node_id`; transient Erlang
+    node names are transport-only and do not define replay streams
 
   Delta sync sends retained `kv_oplog` rows for the missing origin range.
   Full sync copies current `kv` state only when retained history is not
@@ -276,9 +278,11 @@ defmodule EKV.Replica do
 
   ## Conflict Resolution: Last-Writer-Wins (LWW)
 
-  Every entry carries a nanosecond timestamp and origin_node atom. For
-  successive local writes on the same shard, EKV does not reuse a timestamp, so
-  a key will not see the same `{timestamp, origin_node}` from that shard twice.
+  Every entry carries a nanosecond timestamp and persisted `origin_node`
+  string. In current member mode this is the stable logical `node_id`.
+  For successive local writes on the same shard, EKV does not reuse a
+  timestamp, so a key will not see the same `{timestamp, origin_node}` from
+  that shard twice.
 
   LWW is pushed into SQL via ON CONFLICT ... WHERE:
 
@@ -303,9 +307,8 @@ defmodule EKV.Replica do
     - Bulk sync (ekv_sync entries)
     - GC TTL expiry bookkeeping / local `:expired` notification
 
-  The tiebreaker (origin_node atom comparison) is deterministic across
-  all nodes. Atom ordering matches SQLite TEXT ordering for node names
-  (both lexicographic ASCII).
+  The tiebreaker (lexicographic `origin_node` string comparison) is
+  deterministic across all nodes and matches SQLite TEXT ordering.
 
   A delete is just an entry with deleted_at set. Same LWW applies — a
   put with a higher timestamp beats a delete, and vice versa.
@@ -1185,8 +1188,11 @@ defmodule EKV.Replica do
     # future same-node writes never reuse an existing committed timestamp.
     lww_ts_counter = max(System.system_time(:nanosecond), Store.max_timestamp(db) || 0)
     local_max_seq = Store.max_seq(db)
-    local_origin_seq = Store.max_origin_seq(db, node())
-    local_progress = Store.local_progress_summary(db) |> Map.put(node(), local_origin_seq)
+    local_origin_id = config.node_id || Atom.to_string(node())
+    local_origin_seq = Store.max_origin_seq(db, local_origin_id)
+
+    local_progress =
+      Store.local_progress_summary(db) |> Map.put(local_origin_id, local_origin_seq)
 
     # CAS ballot counter — restore from persisted value
     ballot_counter =
@@ -1302,7 +1308,7 @@ defmodule EKV.Replica do
   def handle_call({:put, key, value_binary, opts}, _from, %Replica{} = state) do
     %{db: db, stmts: stmts} = state
     {now, state} = next_lww_ts(state)
-    origin_node = node()
+    origin_node = local_origin_id(state)
 
     if Store.cas_managed_key?(db, key) do
       {:reply, {:error, :cas_managed_key}, state}
@@ -1320,7 +1326,9 @@ defmodule EKV.Replica do
                now,
                origin_node,
                expires_at,
-               nil
+               nil,
+               nil,
+               true
              ) do
           {:ok, true, origin_seq, local_progress_seq} ->
             state =
@@ -1353,7 +1361,7 @@ defmodule EKV.Replica do
   def handle_call({:delete, key}, _from, %Replica{} = state) do
     %{db: db, stmts: stmts} = state
     {now, %Replica{} = state} = next_lww_ts(state)
-    origin_node = node()
+    origin_node = local_origin_id(state)
 
     if Store.cas_managed_key?(db, key) do
       {:reply, {:error, :cas_managed_key}, state}
@@ -1370,7 +1378,9 @@ defmodule EKV.Replica do
                now,
                origin_node,
                nil,
-               now
+               now,
+               nil,
+               true
              ) do
           {:ok, true, origin_seq, local_progress_seq} ->
             state =
@@ -1516,6 +1526,7 @@ defmodule EKV.Replica do
         {:ekv_put, key, value_binary, timestamp, origin_node, origin_seq, expires_at},
         %Replica{} = state
       ) do
+    origin_node = normalize_origin_node(origin_node)
     gap? = origin_gap?(state, origin_node, origin_seq)
     value_binary = wire_decompress_value(value_binary)
 
@@ -1543,6 +1554,7 @@ defmodule EKV.Replica do
   end
 
   def handle_info({:ekv_delete, key, timestamp, origin_node, origin_seq}, %Replica{} = state) do
+    origin_node = normalize_origin_node(origin_node)
     gap? = origin_gap?(state, origin_node, origin_seq)
     prev_value = if has_subscribers?(state), do: read_previous_value(state, key)
 
@@ -1716,6 +1728,8 @@ defmodule EKV.Replica do
       Enum.reduce(entries, {state, []}, fn {key, value_binary, timestamp, origin_node, origin_seq,
                                             expires_at, deleted_at},
                                            {state, acc} ->
+        origin_node = normalize_origin_node(origin_node)
+
         if shard_index_for(key, num_shards) == shard do
           prev_value = if deleted_at && has_subs, do: read_previous_value(state, key)
 
@@ -1991,6 +2005,7 @@ defmodule EKV.Replica do
          origin_seq},
         %Replica{} = state
       ) do
+    origin_node = normalize_origin_node(origin_node)
     gap? = origin_gap?(state, origin_node, origin_seq)
     entry_tuple = wire_decompress_entry_tuple(entry_tuple)
     {state, applied?} = apply_cas_commit(state, key, ballot_c, ballot_n, entry_tuple, origin_seq)
@@ -2164,7 +2179,7 @@ defmodule EKV.Replica do
             {state, acc}
           end
         else
-          origin = node()
+          origin = local_origin_id(state)
 
           case Store.write_entry(
                  db,
@@ -2175,7 +2190,9 @@ defmodule EKV.Replica do
                  now,
                  origin,
                  nil,
-                 now
+                 now,
+                 nil,
+                 true
                ) do
             {:ok, true, origin_seq, local_progress_seq} ->
               state =
@@ -2445,7 +2462,8 @@ defmodule EKV.Replica do
            origin_node,
            expires_at,
            deleted_at,
-           origin_seq
+           origin_seq,
+           false
          ) do
       {:ok, true, applied_origin_seq, local_progress_seq} ->
         {true,
@@ -2461,8 +2479,9 @@ defmodule EKV.Replica do
   end
 
   defp serve_sync_request(%Replica{} = state, remote_node, {:delta, origin_node, from_seq})
-       when is_atom(origin_node) and is_integer(from_seq) and from_seq >= 0 do
+       when is_integer(from_seq) and from_seq >= 0 do
     %{db: db} = state
+    origin_node = normalize_origin_node(origin_node)
     chunk_size = EKV.Supervisor.get_config(state.name).sync_chunk_size
     local_progress = local_progress_summary_for_wire(state)
     my_seq = Map.get(local_progress, origin_node, 0)
@@ -2772,19 +2791,21 @@ defmodule EKV.Replica do
   defp sync_request_for_remote(%Replica{} = state, remote_node, remote_progress) do
     local_progress = local_progress_summary_for_wire(state)
     known_member_nodes = known_member_nodes(state)
-    remote_origin_seq = Map.get(remote_progress, remote_node, 0)
-    local_origin_seq = Map.get(local_progress, remote_node, 0)
+    remote_origin_id = remote_origin_id(state, remote_node, remote_progress)
+    remote_origin_seq = Map.get(remote_progress, remote_origin_id, 0)
+    local_origin_seq = Map.get(local_progress, remote_origin_id, 0)
 
     cond do
       remote_origin_seq > local_origin_seq ->
-        {state, {:delta, remote_node, local_origin_seq}}
+        {state, {:delta, remote_origin_id, local_origin_seq}}
 
       true ->
         Enum.reduce_while(remote_progress, {state, nil}, fn {origin_node, remote_seq},
                                                             {acc, _request} ->
           local_seq = Map.get(local_progress, origin_node, 0)
 
-          if origin_node != node() and origin_node != remote_node and remote_seq > local_seq do
+          if origin_node != local_origin_id(acc) and origin_node != remote_origin_id and
+               remote_seq > local_seq do
             {acc, request} =
               third_origin_sync_request(
                 acc,
@@ -2813,22 +2834,16 @@ defmodule EKV.Replica do
          origin_node,
          local_seq
        )
-       when is_atom(origin_node) do
+       when is_binary(origin_node) do
     cond do
-      MapSet.member?(state.quarantined_members, origin_node) ->
+      known_down_member_quarantined?(state, origin_node) ->
         {state, :full}
-
-      Map.has_key?(state.remote_shards, origin_node) ->
-        {state, nil}
 
       known_member_origin?(state, known_member_nodes, origin_node) ->
         {state, {:delta, origin_node, local_seq}}
 
-      origin_node not in Node.list() ->
-        {state, :full}
-
       true ->
-        {state, nil}
+        {state, :full}
     end
   end
 
@@ -2850,10 +2865,18 @@ defmodule EKV.Replica do
   end
 
   defp known_member_origin?(%Replica{} = state, known_member_nodes, origin_node) do
-    MapSet.member?(known_member_nodes, origin_node) or
-      Map.has_key?(state.remote_shards, origin_node) or
-      Map.has_key?(state.remote_member_progress, origin_node) or
-      Map.has_key?(state.member_node_ids, origin_node) or
+    Enum.any?(known_member_nodes, fn member_node ->
+      Atom.to_string(member_node) == origin_node
+    end) or
+      origin_node == state.node_id or
+      Enum.any?(state.member_node_ids, fn {member_node, member_node_id} ->
+        (is_binary(member_node_id) and member_node_id == origin_node) or
+          Atom.to_string(member_node) == origin_node
+      end) or
+      Enum.any?(Map.keys(state.remote_shards), fn member_node ->
+        remote_origin_id(state, member_node) == origin_node or
+          Atom.to_string(member_node) == origin_node
+      end) or
       known_down_member?(state, origin_node)
   end
 
@@ -2862,7 +2885,7 @@ defmodule EKV.Replica do
   end
 
   defp retained_member_nodes_for_replay_gc(%Replica{} = state) do
-    connected_members = Map.keys(state.remote_shards)
+    connected_members = Enum.map(Map.keys(state.remote_shards), &remote_member_id(state, &1))
     connected_set = MapSet.new(connected_members)
 
     {state, retained_set} =
@@ -2880,21 +2903,30 @@ defmodule EKV.Replica do
   end
 
   defp retain_member_progress_anchor?(%Replica{} = state, member_node)
-       when is_atom(member_node) do
+       when is_atom(member_node) or is_binary(member_node) do
     retention_ttl = member_progress_retention_ttl(state)
 
     if retention_ttl == 0 do
       {state, false}
     else
       now_ms = System.system_time(:millisecond)
-      member_node_id = Store.member_node_identity_get(state.db, member_node)
+      member_node_key = normalize_origin_node(member_node)
+      member_node_id = Store.member_node_identity_get(state.db, member_node_key)
 
       {%Replica{} = state, down_since_ms} =
-        if is_binary(member_node_id) and byte_size(member_node_id) > 0 do
-          read_member_down_marker(state, member_down_id_key(member_node_id))
-        else
-          read_member_down_marker(state, member_down_name_key(member_node))
-        end
+        retained_member_down_marker_keys(member_node_key, member_node_id)
+        |> Enum.reduce({state, nil}, fn marker_key, {acc, best} ->
+          {%Replica{} = acc, down_since} = read_member_down_marker(acc, marker_key)
+
+          merged =
+            cond do
+              is_integer(best) and is_integer(down_since) -> min(best, down_since)
+              is_integer(best) -> best
+              true -> down_since
+            end
+
+          {acc, merged}
+        end)
 
       retain? =
         is_integer(down_since_ms) and max(0, now_ms - down_since_ms) <= retention_ttl
@@ -2903,19 +2935,29 @@ defmodule EKV.Replica do
     end
   end
 
-  defp known_down_member?(%Replica{} = state, remote_node) when is_atom(remote_node) do
-    marker_key = member_down_name_key(remote_node)
-
-    case Map.fetch(state.member_down_at, marker_key) do
-      {:ok, down_since} ->
-        is_integer(down_since)
-
-      :error ->
-        is_integer(Store.member_down_marker_get(state.db, marker_key))
-    end
+  defp known_down_member?(%Replica{} = state, remote_node_or_id)
+       when is_atom(remote_node_or_id) or is_binary(remote_node_or_id) do
+    remote_node_or_id
+    |> known_down_member_marker_keys(state)
+    |> Enum.any?(fn marker_key ->
+      case Map.fetch(state.member_down_at, marker_key) do
+        {:ok, down_since} -> is_integer(down_since)
+        :error -> is_integer(Store.member_down_marker_get(state.db, marker_key))
+      end
+    end)
   end
 
-  defp known_down_member?(%Replica{} = _state, _remote_node), do: false
+  defp known_down_member?(%Replica{} = _state, _remote_node_or_id), do: false
+
+  defp known_down_member_quarantined?(%Replica{} = state, origin_node_id)
+       when is_binary(origin_node_id) do
+    Enum.any?(state.quarantined_members, fn remote_node ->
+      remote_origin_id(state, remote_node) == origin_node_id or
+        Atom.to_string(remote_node) == origin_node_id
+    end)
+  end
+
+  defp known_down_member_quarantined?(%Replica{} = _state, _origin_node_id), do: false
 
   defp progress_ack_summary(%Replica{} = state, :full, _progress) do
     local_progress_summary_for_wire(state)
@@ -2971,7 +3013,9 @@ defmodule EKV.Replica do
   defp replace_remote_member_progress(%Replica{} = state, remote_node, remote_progress)
        when is_map(remote_progress) do
     remote_progress = normalize_progress_summary(remote_progress)
-    :ok = Store.replace_peer_progress(state.db, remote_node, remote_progress)
+
+    :ok =
+      Store.replace_peer_progress(state.db, remote_member_id(state, remote_node), remote_progress)
 
     %{
       state
@@ -2993,7 +3037,7 @@ defmodule EKV.Replica do
       |> Map.merge(remote_progress, fn _origin, current, incoming -> max(current, incoming) end)
 
     Enum.each(remote_progress, fn {origin_node, seq} ->
-      Store.update_peer_progress(state.db, remote_node, origin_node, seq)
+      Store.update_peer_progress(state.db, remote_member_id(state, remote_node), origin_node, seq)
     end)
 
     %{state | remote_member_progress: Map.put(state.remote_member_progress, remote_node, merged)}
@@ -3024,7 +3068,40 @@ defmodule EKV.Replica do
   defp local_progress_summary_for_wire(%Replica{} = state) do
     state.local_progress
     |> normalize_progress_summary()
-    |> Map.put(node(), state.local_origin_seq)
+    |> Map.put(local_origin_id(state), state.local_origin_seq)
+  end
+
+  defp local_origin_id(%Replica{} = state) do
+    state.node_id || Atom.to_string(node())
+  end
+
+  defp remote_member_id(%Replica{} = state, remote_node) when is_atom(remote_node) do
+    Map.get(state.member_node_ids, remote_node) ||
+      Store.member_node_identity_get(state.db, remote_node) ||
+      Atom.to_string(remote_node)
+  end
+
+  defp remote_origin_id(%Replica{} = state, remote_node, remote_progress \\ %{})
+       when is_atom(remote_node) do
+    remote_member_id = remote_member_id(state, remote_node)
+
+    cond do
+      is_binary(remote_member_id) and byte_size(remote_member_id) > 0 ->
+        remote_member_id
+
+      is_map(remote_progress) and Map.has_key?(remote_progress, Atom.to_string(remote_node)) ->
+        Atom.to_string(remote_node)
+
+      true ->
+        Atom.to_string(remote_node)
+    end
+  end
+
+  defp source_node_for_origin(%Replica{} = state, origin_id) when is_binary(origin_id) do
+    Enum.find(Map.keys(state.remote_shards), fn remote_node ->
+      remote_origin_id(state, remote_node) == origin_id or
+        Atom.to_string(remote_node) == origin_id
+    end)
   end
 
   defp send_to_member(%Replica{} = state, target_node, message) do
@@ -3077,8 +3154,8 @@ defmodule EKV.Replica do
       send_to_member(
         state,
         target_node,
-        {:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple, state.shard_index, node(),
-         origin_seq}
+        {:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple, state.shard_index,
+         local_origin_id(state), origin_seq}
       )
     end
   end
@@ -3379,28 +3456,31 @@ defmodule EKV.Replica do
 
   defp normalize_progress_summary(progress) when is_map(progress) do
     Map.new(progress, fn
-      {origin_node, seq} when is_atom(origin_node) and is_integer(seq) and seq >= 0 ->
+      {origin_node, seq} when is_binary(origin_node) and is_integer(seq) and seq >= 0 ->
         {origin_node, seq}
 
-      {origin_node, seq} when is_binary(origin_node) and is_integer(seq) and seq >= 0 ->
-        {String.to_atom(origin_node), seq}
-
-      {origin_node, seq} when is_atom(origin_node) and is_integer(seq) ->
+      {origin_node, seq} when is_binary(origin_node) and is_integer(seq) ->
         {origin_node, max(seq, 0)}
 
-      {origin_node, seq} when is_binary(origin_node) and is_integer(seq) ->
-        {String.to_atom(origin_node), max(seq, 0)}
+      {origin_node, seq} when is_atom(origin_node) and is_integer(seq) and seq >= 0 ->
+        {Atom.to_string(origin_node), seq}
+
+      {origin_node, seq} when is_atom(origin_node) and is_integer(seq) ->
+        {Atom.to_string(origin_node), max(seq, 0)}
     end)
   end
 
   defp normalize_progress_summary(_progress), do: %{}
 
-  defp normalize_origin_node(origin_node) when is_atom(origin_node), do: origin_node
+  defp normalize_origin_node(origin_node) when is_binary(origin_node), do: origin_node
 
-  defp normalize_origin_node(origin_node) when is_binary(origin_node),
-    do: String.to_atom(origin_node)
+  defp normalize_origin_node(origin_node) when is_atom(origin_node),
+    do: Atom.to_string(origin_node)
 
-  defp normalize_origin_node(origin_node), do: origin_node
+  defp normalize_origin_node(origin_node) when is_integer(origin_node),
+    do: Integer.to_string(origin_node)
+
+  defp normalize_origin_node(origin_node), do: to_string(origin_node)
 
   # Runs on the receiver member. Raw and compressed value payloads are both accepted.
   defp wire_decompress_entry_tuple(nil), do: nil
@@ -3564,10 +3644,10 @@ defmodule EKV.Replica do
     apply_result =
       case op.operation do
         {:cas_read, _, _} ->
-          apply_cas_read_recovery(op.key, selected_kv_row, current_value, current_vsn)
+          apply_cas_read_recovery(state, op.key, selected_kv_row, current_value, current_vsn)
 
         _ ->
-          apply_operation(op.operation, op.key, current_value, current_vsn)
+          apply_operation(state, op.operation, op.key, current_value, current_vsn)
       end
 
     case apply_result do
@@ -3684,13 +3764,13 @@ defmodule EKV.Replica do
     end
   end
 
-  defp apply_operation(operation, key, current_value, current_vsn) do
+  defp apply_operation(%Replica{} = state, operation, key, current_value, current_vsn) do
     case operation do
       {:cas_put, expected_vsn, value_binary, opts} ->
         if current_vsn == expected_vsn do
           now = monotonic_cas_ts(current_vsn)
-          origin = node()
-          origin_str = Atom.to_string(origin)
+          origin = local_origin_id(state)
+          origin_str = origin
           ttl = Keyword.get(opts, :ttl)
           expires_at = if ttl, do: now + ttl * 1_000_000
 
@@ -3706,8 +3786,8 @@ defmodule EKV.Replica do
       {:cas_delete, expected_vsn, _opts} ->
         if current_vsn == expected_vsn do
           now = monotonic_cas_ts(current_vsn)
-          origin = node()
-          origin_str = Atom.to_string(origin)
+          origin = local_origin_id(state)
+          origin_str = origin
 
           entry_tuple = {key, nil, now, origin_str, nil, now}
           broadcast_msg = {:ekv_delete, key, now, origin}
@@ -3721,8 +3801,8 @@ defmodule EKV.Replica do
         new_value = apply_update_callback(fun, current_value)
         new_value_binary = :erlang.term_to_binary(new_value)
         now = monotonic_cas_ts(current_vsn)
-        origin = node()
-        origin_str = Atom.to_string(origin)
+        origin = local_origin_id(state)
+        origin_str = origin
         ttl = Keyword.get(opts, :ttl)
         expires_at = if ttl, do: now + ttl * 1_000_000
 
@@ -3764,12 +3844,17 @@ defmodule EKV.Replica do
 
   defp set_local_origin_seq(%Replica{} = state, seq) when is_integer(seq) and seq >= 0 do
     local_progress = normalize_progress_summary(state.local_progress)
+    local_origin = local_origin_id(state)
 
     %{
       state
       | local_origin_seq: seq,
         local_progress:
-          Map.put(local_progress, node(), max(seq, Map.get(local_progress, node(), 0)))
+          Map.put(
+            local_progress,
+            local_origin,
+            max(seq, Map.get(local_progress, local_origin, 0))
+          )
     }
   end
 
@@ -3781,7 +3866,7 @@ defmodule EKV.Replica do
     local_progress = Map.put(local_progress, origin_node, next_seq)
     state = %{state | local_progress: local_progress}
 
-    if origin_node == node() do
+    if origin_node == local_origin_id(state) do
       %{state | local_origin_seq: max(state.local_origin_seq, next_seq)}
     else
       state
@@ -3799,11 +3884,12 @@ defmodule EKV.Replica do
       |> normalize_progress_summary()
       |> Map.merge(progress_summary, fn _origin, current, incoming -> max(current, incoming) end)
 
-    local_origin_seq = max(state.local_origin_seq, Map.get(local_progress, node(), 0))
+    local_origin = local_origin_id(state)
+    local_origin_seq = max(state.local_origin_seq, Map.get(local_progress, local_origin, 0))
 
     %{
       state
-      | local_progress: Map.put(local_progress, node(), local_origin_seq),
+      | local_progress: Map.put(local_progress, local_origin, local_origin_seq),
         local_origin_seq: local_origin_seq
     }
   end
@@ -3811,11 +3897,12 @@ defmodule EKV.Replica do
   defp reconcile_authoritative_origin_head(%Replica{} = state, remote_node, remote_progress)
        when is_atom(remote_node) and is_map(remote_progress) do
     local_progress = normalize_progress_summary(state.local_progress)
-    remote_head = Map.get(remote_progress, remote_node)
-    local_head = Map.get(local_progress, remote_node, 0)
+    remote_origin = remote_origin_id(state, remote_node, remote_progress)
+    remote_head = Map.get(remote_progress, remote_origin)
+    local_head = Map.get(local_progress, remote_origin, 0)
 
     if is_integer(remote_head) and remote_head >= 0 and local_head > remote_head do
-      local_progress = Map.put(local_progress, remote_node, remote_head)
+      local_progress = Map.put(local_progress, remote_origin, remote_head)
       :ok = Store.replace_local_progress_summary(state.db, local_progress)
       %{state | local_progress: local_progress}
     else
@@ -3833,7 +3920,7 @@ defmodule EKV.Replica do
          local_progress_seq
        ) do
     state =
-      if origin_node == node() and is_integer(origin_seq) and origin_seq >= 0 do
+      if origin_node == local_origin_id(state) and is_integer(origin_seq) and origin_seq >= 0 do
         set_local_origin_seq(state, max(state.local_origin_seq, origin_seq))
       else
         state
@@ -3843,7 +3930,7 @@ defmodule EKV.Replica do
   end
 
   defp origin_gap?(%Replica{} = state, origin_node, origin_seq)
-       when is_atom(origin_node) and is_integer(origin_seq) and origin_seq >= 0 do
+       when is_binary(origin_node) and is_integer(origin_seq) and origin_seq >= 0 do
     origin_seq > Map.get(state.local_progress, origin_node, 0) + 1
   end
 
@@ -3853,7 +3940,10 @@ defmodule EKV.Replica do
     from_seq = Map.get(state.local_progress, origin_node, 0)
 
     if origin_seq > from_seq + 1 do
-      request_sync(state, origin_node, {:delta, origin_node, from_seq})
+      case source_node_for_origin(state, origin_node) do
+        nil -> state
+        remote_node -> request_sync(state, remote_node, {:delta, origin_node, from_seq})
+      end
     else
       state
     end
@@ -3878,13 +3968,8 @@ defmodule EKV.Replica do
 
       # Live entry
       true ->
-        origin =
-          if is_binary(origin_node_str),
-            do: String.to_atom(origin_node_str),
-            else: origin_node_str
-
         value = if value_binary, do: :erlang.binary_to_term(value_binary)
-        {value, {timestamp, origin}}
+        {value, {timestamp, normalize_origin_node(origin_node_str)}}
     end
   end
 
@@ -3898,7 +3983,7 @@ defmodule EKV.Replica do
        ) do
     if stale_local_kv_view?(state, op.key, selected_kv_row) do
       {:ok, _value_binary, entry_tuple, _reply_value, broadcast_msg, _events} =
-        apply_cas_read_recovery(op.key, selected_kv_row, current_value, current_vsn)
+        apply_cas_read_recovery(state, op.key, selected_kv_row, current_value, current_vsn)
 
       repair_op =
         op
@@ -3927,42 +4012,38 @@ defmodule EKV.Replica do
   defp normalize_kv_row(nil), do: nil
 
   defp normalize_kv_row({value_binary, ts, origin, expires_at, deleted_at}) do
-    [value_binary, ts, Atom.to_string(origin), expires_at, deleted_at]
-  end
-
-  defp normalize_kv_row([value_binary, ts, origin, expires_at, deleted_at])
-       when is_atom(origin) do
-    [value_binary, ts, Atom.to_string(origin), expires_at, deleted_at]
+    [value_binary, ts, normalize_origin_node(origin), expires_at, deleted_at]
   end
 
   defp normalize_kv_row([value_binary, ts, origin, expires_at, deleted_at]) do
-    [value_binary, ts, to_string(origin), expires_at, deleted_at]
+    [value_binary, ts, normalize_origin_node(origin), expires_at, deleted_at]
   end
 
   # Build entry_tuple for cas_read recovery directly from the raw accepted
   # kv_row columns, preserving expires_at and deleted_at exactly as accepted.
-  defp apply_cas_read_recovery(key, nil, _current_value, _current_vsn) do
+  defp apply_cas_read_recovery(%Replica{} = state, key, nil, _current_value, _current_vsn) do
     # Absent key: barrier read proposes a tombstone marker at a fresh timestamp.
     # This closes outstanding accept-state ambiguity for this key.
     now = System.system_time(:nanosecond)
-    origin = node()
-    origin_str = Atom.to_string(origin)
+    origin = local_origin_id(state)
+    origin_str = origin
     entry_tuple = {key, nil, now, origin_str, nil, now}
     broadcast_msg = {:ekv_delete, key, now, origin}
     {:ok, nil, entry_tuple, {:ok, nil, nil}, broadcast_msg, []}
   end
 
   defp apply_cas_read_recovery(
+         %Replica{} = _state,
          key,
          [value_binary, ts, origin_str, expires_at, deleted_at],
          current_value,
          current_vsn
        ) do
-    origin = if is_binary(origin_str), do: String.to_atom(origin_str), else: origin_str
+    origin = normalize_origin_node(origin_str)
 
     if is_integer(deleted_at) do
       # Tombstone — re-propose as delete with original metadata
-      entry_tuple = {key, nil, ts, to_string(origin), nil, deleted_at}
+      entry_tuple = {key, nil, ts, origin, nil, deleted_at}
       broadcast_msg = {:ekv_delete, key, ts, origin}
       {:ok, nil, entry_tuple, {:ok, nil, nil}, broadcast_msg, []}
     else
@@ -3970,19 +4051,18 @@ defmodule EKV.Replica do
       {final_ts, final_origin} =
         case current_vsn do
           {vsn_ts, vsn_origin} ->
-            {vsn_ts, Atom.to_string(vsn_origin)}
+            {vsn_ts, normalize_origin_node(vsn_origin)}
 
           _ ->
-            {ts, to_string(origin)}
+            {ts, origin}
         end
 
       entry_tuple = {key, value_binary, final_ts, final_origin, expires_at, nil}
 
-      broadcast_msg =
-        {:ekv_put, key, value_binary, final_ts, String.to_atom(final_origin), expires_at}
+      broadcast_msg = {:ekv_put, key, value_binary, final_ts, final_origin, expires_at}
 
-      {:ok, value_binary, entry_tuple,
-       {:ok, current_value, {final_ts, String.to_atom(final_origin)}}, broadcast_msg, []}
+      {:ok, value_binary, entry_tuple, {:ok, current_value, {final_ts, final_origin}},
+       broadcast_msg, []}
     end
   end
 
@@ -4455,10 +4535,31 @@ defmodule EKV.Replica do
     [member_down_id_key(remote_node_id), member_down_name_key(remote_node)]
   end
 
+  defp retained_member_down_marker_keys(member_node_key, nil) do
+    [member_down_id_key(member_node_key), member_down_name_key(member_node_key)]
+  end
+
+  defp retained_member_down_marker_keys(member_node_key, member_node_id) do
+    [member_down_id_key(member_node_id), member_down_name_key(member_node_key)]
+  end
+
+  defp known_down_member_marker_keys(remote_node_or_id, %Replica{} = _state)
+       when is_binary(remote_node_or_id) do
+    [member_down_id_key(remote_node_or_id), member_down_name_key(remote_node_or_id)]
+  end
+
+  defp known_down_member_marker_keys(remote_node_or_id, %Replica{} = _state)
+       when is_atom(remote_node_or_id) do
+    [member_down_name_key(remote_node_or_id)]
+  end
+
   defp member_down_id_key(remote_node_id), do: @member_down_id_prefix <> to_string(remote_node_id)
 
-  defp member_down_name_key(remote_node),
+  defp member_down_name_key(remote_node) when is_atom(remote_node),
     do: @member_down_name_prefix <> Atom.to_string(remote_node)
+
+  defp member_down_name_key(remote_node) when is_binary(remote_node),
+    do: @member_down_name_prefix <> remote_node
 
   defp node_id_connected?(%Replica{} = state, remote_node_id) do
     Enum.any?(state.member_node_ids, fn {member_node, member_node_id} ->

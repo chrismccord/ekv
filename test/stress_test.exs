@@ -77,6 +77,11 @@ defmodule EKV.StressTest do
     :ok
   end
 
+  defp shard_origin_id(shard_name) do
+    state = :sys.get_state(shard_name)
+    state.node_id || Atom.to_string(node())
+  end
+
   defp assert_all_agree(nodes, ekv_name, key, opts) do
     timeout = Keyword.get(opts, :timeout, 5000)
 
@@ -1409,7 +1414,7 @@ defmodule EKV.StressTest do
       # Accept with the original ballot — should succeed because
       # the promised row survived GC
       now = System.system_time(:nanosecond)
-      origin_str = Atom.to_string(node())
+      origin_str = shard_origin_id(shard_name)
       val = :erlang.term_to_binary("gc_survivor")
       entry = {key, val, now, origin_str, nil, nil}
 
@@ -1418,7 +1423,7 @@ defmodule EKV.StressTest do
       assert_receive {:ekv, 1, :accepted, {^ref2, _, _}, %{}}, 2000
 
       # Commit and verify the value
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, node(), 0})
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, shard_origin_id(shard_name), 0})
       :sys.get_state(shard_name)
       assert EKV.get(name, key) == "gc_survivor"
     end
@@ -1431,7 +1436,7 @@ defmodule EKV.StressTest do
 
       # Accept with ballot {100, "2"} — creates row with promised + accepted state
       now = System.system_time(:nanosecond)
-      origin_str = Atom.to_string(node())
+      origin_str = shard_origin_id(shard_name)
       val = :erlang.term_to_binary("accepted")
       entry = {key, val, now, origin_str, nil, nil}
 
@@ -1440,14 +1445,14 @@ defmodule EKV.StressTest do
       assert_receive {:ekv, 1, :accepted, {^ref, _, _}, %{}}, 2000
 
       # Commit — promotes to kv while retaining accepted+promised ballot state
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, node(), 0})
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, shard_origin_id(shard_name), 0})
       :sys.get_state(shard_name)
       assert EKV.get(name, key) == "accepted"
 
       # Delete the key via a replicated delete message so kv row goes away
       # without requiring CAS quorum in this fault-injection setup.
       delete_ts = System.system_time(:nanosecond) + 1
-      send(shard_name, {:ekv_delete, key, delete_ts, node(), 0})
+      send(shard_name, {:ekv_delete, key, delete_ts, shard_origin_id(shard_name), 0})
       :sys.get_state(shard_name)
 
       # Trigger GC with future cutoff to purge the tombstone
@@ -1488,7 +1493,7 @@ defmodule EKV.StressTest do
       key = "fi/commit_no_row"
 
       # Send a commit for a key that was never prepared/accepted on this shard
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, node(), 0})
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, shard_origin_id(shard_name), 0})
       :sys.get_state(shard_name)
 
       # paxos_promote looks up kv_paxos row → no row → should return :stale
@@ -1642,7 +1647,7 @@ defmodule EKV.StressTest do
 
       # Forge promises with different kv_rows (different values, different timestamps)
       now = System.system_time(:nanosecond)
-      origin = Atom.to_string(node())
+      origin = shard_origin_id(shard_name)
 
       # Promise from "2": kv_row with "val_B" at ts=now+100
       kv_row_b = [:erlang.term_to_binary("val_B"), now + 100, origin, nil, nil]
@@ -1685,7 +1690,7 @@ defmodule EKV.StressTest do
 
       # Accept with ballot {100, "2"}
       now = System.system_time(:nanosecond)
-      origin_str = Atom.to_string(node())
+      origin_str = shard_origin_id(shard_name)
       val = :erlang.term_to_binary("accepted_val")
       entry = {key, val, now, origin_str, nil, nil}
 
@@ -1697,7 +1702,7 @@ defmodule EKV.StressTest do
       assert EKV.get(name, key) == nil
 
       # Send commit with WRONG ballot {101, "2"} (doesn't match accepted {100, "2"})
-      send(shard_name, {:ekv_cas_committed, key, 101, "2", nil, 0, node(), 0})
+      send(shard_name, {:ekv_cas_committed, key, 101, "2", nil, 0, shard_origin_id(shard_name), 0})
       :sys.get_state(shard_name)
 
       # paxos_promote checks ballot matches → :stale
@@ -1705,7 +1710,7 @@ defmodule EKV.StressTest do
       assert Process.alive?(Process.whereis(shard_name))
 
       # Correct ballot commit should still work
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, node(), 0})
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, shard_origin_id(shard_name), 0})
       :sys.get_state(shard_name)
       assert EKV.get(name, key) == "accepted_val"
     end
@@ -1733,7 +1738,7 @@ defmodule EKV.StressTest do
 
       # Accept ballot=200 → accepted
       now = System.system_time(:nanosecond)
-      origin_str = Atom.to_string(node())
+      origin_str = shard_origin_id(shard_name)
       val200 = :erlang.term_to_binary("ballot_200_val")
       entry200 = {key, val200, now, origin_str, nil, nil}
 
@@ -1742,7 +1747,7 @@ defmodule EKV.StressTest do
       assert_receive {:ekv, 1, :accepted, {^ref4, _, _}, %{}}, 2000
 
       # Commit ballot=200 → value in kv
-      send(shard_name, {:ekv_cas_committed, key, 200, "3", nil, 0, node(), 0})
+      send(shard_name, {:ekv_cas_committed, key, 200, "3", nil, 0, shard_origin_id(shard_name), 0})
       :sys.get_state(shard_name)
       assert EKV.get(name, key) == "ballot_200_val"
 
@@ -1768,7 +1773,7 @@ defmodule EKV.StressTest do
       mref = Process.monitor(Process.whereis(shard_name))
       key = "fi/reorder_accept_before_prepare"
       now = System.system_time(:nanosecond)
-      origin_str = Atom.to_string(node())
+      origin_str = shard_origin_id(shard_name)
       val = :erlang.term_to_binary("reordered_val")
       entry = {key, val, now, origin_str, nil, nil}
 
@@ -1807,7 +1812,7 @@ defmodule EKV.StressTest do
       mref = Process.monitor(Process.whereis(shard_name))
       key = "fi/delayed_commit"
       now = System.system_time(:nanosecond)
-      origin_str = Atom.to_string(node())
+      origin_str = shard_origin_id(shard_name)
 
       # Round 1: ballot {100, "2"} — prepare + accept
       ref1 = make_ref()
@@ -1835,13 +1840,13 @@ defmodule EKV.StressTest do
       assert_receive {:ekv, 1, :accepted, {^ref4, _, _}, %{}}, 2000
 
       # Commit round 2 — value promoted to kv
-      send(shard_name, {:ekv_cas_committed, key, 200, "3", nil, 0, node(), 0})
+      send(shard_name, {:ekv_cas_committed, key, 200, "3", nil, 0, shard_origin_id(shard_name), 0})
       :sys.get_state(shard_name)
       assert EKV.get(name, key) == "new_val"
 
       # Delayed commit for round 1 arrives — stale because accepted columns
       # were cleared after round 2's commit (ballot {100,"2"} doesn't match)
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, node(), 0})
+      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, shard_origin_id(shard_name), 0})
       :sys.get_state(shard_name)
 
       # Value unchanged — stale commit rejected
@@ -1889,7 +1894,7 @@ defmodule EKV.StressTest do
       # Late accept from proposer A (ballot 100) — must be rejected
       # because promised_counter is now 200
       now = System.system_time(:nanosecond)
-      origin_str = Atom.to_string(node())
+      origin_str = shard_origin_id(shard_name)
       val_a = :erlang.term_to_binary("val_a")
       entry_a = {key, val_a, now, origin_str, nil, nil}
 
@@ -1906,7 +1911,7 @@ defmodule EKV.StressTest do
       assert_receive {:ekv, 1, :accepted, {^ref4, _, _}, %{}}, 2000
 
       # Commit ballot 200 — only B's value committed
-      send(shard_name, {:ekv_cas_committed, key, 200, "3", nil, 0, node(), 0})
+      send(shard_name, {:ekv_cas_committed, key, 200, "3", nil, 0, shard_origin_id(shard_name), 0})
       :sys.get_state(shard_name)
       assert EKV.get(name, key) == "val_b"
       refute_receive {:DOWN, ^mref, :process, _, _}
@@ -1920,7 +1925,7 @@ defmodule EKV.StressTest do
       key_a = "fi/partial_commit_a"
       key_b = "fi/partial_commit_b"
       now = System.system_time(:nanosecond)
-      origin_str = Atom.to_string(node())
+      origin_str = shard_origin_id(shard_name)
 
       # Prepare both keys with ballot {100, "2"}
       ref_a1 = make_ref()
@@ -1945,7 +1950,7 @@ defmodule EKV.StressTest do
       assert_receive {:ekv, 1, :accepted, {^ref_b2, _, _}, %{}}, 2000
 
       # Partial commit: proposer crashes after sending commit for key_a only
-      send(shard_name, {:ekv_cas_committed, key_a, 100, "2", nil, 0, node(), 0})
+      send(shard_name, {:ekv_cas_committed, key_a, 100, "2", nil, 0, shard_origin_id(shard_name), 0})
       :sys.get_state(shard_name)
 
       # key_a committed, key_b NOT committed
@@ -1985,7 +1990,7 @@ defmodule EKV.StressTest do
       assert_receive {:ekv, 1, :accepted, {^ref_b4, _, _}, %{}}, 2000
 
       # Commit ballot 200 — key_b now in kv
-      send(shard_name, {:ekv_cas_committed, key_b, 200, "3", nil, 0, node(), 0})
+      send(shard_name, {:ekv_cas_committed, key_b, 200, "3", nil, 0, shard_origin_id(shard_name), 0})
       :sys.get_state(shard_name)
 
       # Both keys readable and correct
@@ -2006,7 +2011,7 @@ defmodule EKV.StressTest do
       state = :sys.get_state(shard_name)
       db = state.db
       shard_pid = Process.whereis(shard_name)
-      origin = Atom.to_string(node())
+      origin = shard_origin_id(shard_name)
 
       run_consistent_read = fn key ->
         task = Task.async(fn -> EKV.get(name, key, consistent: true) end)
@@ -2058,7 +2063,7 @@ defmodule EKV.StressTest do
 
       assert stored_ttl_val == value_ttl
       assert stored_ttl_ts == ts_ttl
-      assert stored_ttl_origin == String.to_atom(origin)
+      assert stored_ttl_origin == origin
       assert stored_ttl_exp == expires_at
       assert stored_ttl_del == nil
 
@@ -2077,7 +2082,7 @@ defmodule EKV.StressTest do
 
       assert stored_del_val == nil
       assert stored_del_ts == ts_del
-      assert stored_del_origin == String.to_atom(origin)
+      assert stored_del_origin == origin
       assert stored_del_exp == nil
       assert stored_del_deleted_at == ts_del
     end
@@ -2095,7 +2100,7 @@ defmodule EKV.StressTest do
       {:ok, :promise, 0, "", _} = EKV.Store.paxos_prepare(db, key, 100, "n1")
 
       now = System.system_time(:nanosecond)
-      origin = Atom.to_string(node())
+      origin = shard_origin_id(shard_name)
 
       # Accepted-but-not-committed delete (tombstone) in kv_paxos.
       {:ok, true} = EKV.Store.paxos_accept(db, key, 100, "n1", [nil, now, origin, nil, now])
@@ -2131,7 +2136,7 @@ defmodule EKV.StressTest do
 
       stale_value_bin = :erlang.term_to_binary("v1")
       {stale_ts, stale_origin} = stale_vsn
-      stale_origin_str = Atom.to_string(stale_origin)
+      stale_origin_str = stale_origin
       stale_row = [stale_value_bin, stale_ts, stale_origin_str, nil, nil]
 
       fresh_row = [

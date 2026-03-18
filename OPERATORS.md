@@ -155,15 +155,21 @@ startup allowed:
 **Warning:** Entries deleted between the backup timestamp and now will
 reappear ("zombie resurrection"). This is expected when restoring old backups.
 
-## Node Identity (CAS Clusters)
+## Node Identity (Member Clusters)
 
 ### First Deploy
 
-No special configuration needed. Each node auto-generates a unique `node_id`
+No special configuration needed. Each member auto-generates a unique `node_id`
 on first boot and persists it to the data volume:
 
 ```elixir
-# Minimal CAS config:
+# Minimal member config:
+{EKV, name: :my_kv, data_dir: "/var/data/ekv"}
+```
+
+The same mechanism is used for CAS clusters:
+
+```elixir
 {EKV, name: :my_kv, data_dir: "/var/data/ekv", cluster_size: 3}
 ```
 
@@ -446,6 +452,8 @@ files directly. SQLite's WAL recovery handles any incomplete writes.
 - Both VMs must use the **same `node_id`** — from the cluster's perspective,
   it's one member that briefly restarted
 - Each deploy must produce a **different `node()` name**
+- Persisted replay/member identity still stays on the stable `node_id`; the
+  changing `node()` name is only for transport and handoff routing
 
 ### Brief Unavailability
 

@@ -277,33 +277,7 @@ defmodule EKV.Supervisor do
 
     if blue_green, do: perform_handoff(name, data_dir, num_shards)
 
-    effective_node_id =
-      if cluster_size do
-        persisted = EKV.Store.read_node_id(data_dir)
-
-        cond do
-          persisted != nil and node_id != nil and persisted != node_id ->
-            Logger.warning(
-              "[EKV #{name}] configured node_id #{inspect(node_id)} differs from " <>
-                "persisted #{inspect(persisted)} (volume identity) — using persisted"
-            )
-
-            persisted
-
-          persisted != nil ->
-            persisted
-
-          node_id != nil ->
-            node_id
-
-          true ->
-            generated = :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
-            Logger.info("[EKV #{name}] generated node_id: #{generated}")
-            generated
-        end
-      else
-        nil
-      end
+    effective_node_id = resolve_member_node_id(name, data_dir, node_id)
 
     registry_name = :"#{name}_ekv_registry"
     sub_tracker_name = :"#{name}_ekv_sub_tracker"
@@ -423,7 +397,7 @@ defmodule EKV.Supervisor do
             "EKV: :cluster_size must be a positive integer, got: #{inspect(cluster_size)}"
     end
 
-    # node_id is optional (auto-generated if nil)
+    # node_id is optional (auto-generated and persisted if nil)
     # If provided, must be a string or positive integer (converted to string)
     case node_id do
       nil ->
@@ -455,7 +429,7 @@ defmodule EKV.Supervisor do
 
   defp validate_wait_for_quorum!(_timeout, nil) do
     raise ArgumentError,
-          "EKV: :wait_for_quorum requires CAS configuration (:cluster_size and :node_id)"
+          "EKV: :wait_for_quorum requires CAS configuration (:cluster_size)"
   end
 
   defp validate_wait_for_quorum!(timeout, _cluster_size)
@@ -477,6 +451,31 @@ defmodule EKV.Supervisor do
   defp validate_wait_for_route!(timeout, _mode) do
     raise ArgumentError,
           "EKV: :wait_for_route must be false/nil or a non-negative timeout in ms, got: #{inspect(timeout)}"
+  end
+
+  defp resolve_member_node_id(name, data_dir, configured_node_id) do
+    persisted = EKV.Store.read_node_id(data_dir)
+
+    cond do
+      persisted != nil and configured_node_id != nil and persisted != configured_node_id ->
+        Logger.warning(
+          "[EKV #{name}] configured node_id #{inspect(configured_node_id)} differs from " <>
+            "persisted #{inspect(persisted)} (volume identity) — using persisted"
+        )
+
+        persisted
+
+      persisted != nil ->
+        persisted
+
+      configured_node_id != nil ->
+        configured_node_id
+
+      true ->
+        generated = :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
+        Logger.info("[EKV #{name}] generated node_id: #{generated}")
+        generated
+    end
   end
 
   defp validate_shutdown_barrier!(false), do: :ok
