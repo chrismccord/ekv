@@ -11,8 +11,28 @@ defmodule EKV.Sqlite3 do
   def step(db, stmt), do: Sqlite3NIF.ekv_step(db, stmt)
   def release(db, stmt), do: Sqlite3NIF.ekv_release(db, stmt)
 
-  def write_entry(db, kv_stmt, oplog_stmt, kv_args, oplog_args, local_origin),
-    do: Sqlite3NIF.ekv_write_entry(db, kv_stmt, oplog_stmt, kv_args, oplog_args, local_origin)
+  def write_entry(
+        db,
+        kv_stmt,
+        keyref_stmt,
+        oplog_stmt,
+        kv_args,
+        oplog_args,
+        local_origin
+      ),
+      do:
+        Sqlite3NIF.ekv_write_entry(
+          db,
+          kv_stmt,
+          keyref_stmt,
+          oplog_stmt,
+          kv_args,
+          oplog_args,
+          local_origin
+        )
+
+  def write_snapshot_entry(db, kv_stmt, kv_args),
+    do: Sqlite3NIF.ekv_write_snapshot_entry(db, kv_stmt, kv_args)
 
   def read_entry(db, stmt, args), do: Sqlite3NIF.ekv_read_entry(db, stmt, args)
   def fetch_all(db, sql, args), do: Sqlite3NIF.ekv_fetch_all(db, sql, args)
@@ -33,15 +53,25 @@ defmodule EKV.Sqlite3 do
   def paxos_accept(db, key, ballot_c, ballot_n, value_args),
     do: Sqlite3NIF.ekv_paxos_accept(db, key, ballot_c, ballot_n, value_args)
 
-  def paxos_promote(db, kv_force_stmt, oplog_stmt, key, ballot_c, ballot_n, origin_seq \\ nil),
-    do:
-      Sqlite3NIF.ekv_paxos_promote(
+  def paxos_promote(
         db,
         kv_force_stmt,
+        keyref_stmt,
         oplog_stmt,
         key,
         ballot_c,
         ballot_n,
-        origin_seq
-      )
+        origin_seq \\ nil
+      ),
+      do:
+        Sqlite3NIF.ekv_paxos_promote(
+          db,
+          kv_force_stmt,
+          keyref_stmt,
+          oplog_stmt,
+          key,
+          ballot_c,
+          ballot_n,
+          origin_seq
+        )
 end

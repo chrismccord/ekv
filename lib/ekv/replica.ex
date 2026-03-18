@@ -94,8 +94,9 @@ defmodule EKV.Replica do
       │                                                              │
       │ Tables:                                                      │
       │   kv          — current state, PK (key)                      │
+      │   kv_keyrefs  — deduplicated replay-key dictionary           │
       │   kv_oplog    — authoritative replay log keyed by            │
-      │                 (origin_node, origin_seq)                    │
+      │                 (origin_node, origin_seq) using key_id refs  │
       │   kv_origin_progress — local applied replay progress         │
       │   kv_member_progress — per-member, per-origin peer progress  │
       │   kv_meta     — liveness + ballot counter + down markers     │
@@ -106,7 +107,8 @@ defmodule EKV.Replica do
       │   idx_kv_expires  — partial on expires_at (WHERE NOT NULL)   │
       │                                                              │
       │ - Single source of truth. Survives process/node crashes.     │
-      │ - kv + oplog writes are atomic (BEGIN IMMEDIATE / COMMIT).   │
+      │ - normal writes commit kv + replay history atomically.       │
+      │ - full sync rebuilds kv only; it does not seed kv_oplog.     │
       └──────────────────────────────────────────────────────────────┘
 
   Connections per shard:
@@ -126,6 +128,9 @@ defmodule EKV.Replica do
 
   - `kv` - current shard state
   - `kv_oplog` - per-origin write history used for delta repair
+  - `kv_keyrefs` - replay-key dictionary so oplog rows do not repeat full keys;
+    SQLite triggers maintain `oplog_refs`, and GC prunes orphan keyrefs only
+    after replay is gone and the key no longer exists in `kv`
   - `kv_origin_progress` - how far this shard has contiguously applied each origin
     stream
   - `kv_member_progress` - how far each peer has consumed each origin stream;
@@ -135,7 +140,8 @@ defmodule EKV.Replica do
 
   Delta sync sends retained `kv_oplog` rows for the missing origin range.
   Full sync copies current `kv` state only when retained history is not
-  available or a quarantined/explicit rebuild path requires it.
+  available or a quarantined/explicit rebuild path requires it. Receivers do
+  not append those snapshot rows back into `kv_oplog`.
 
 
   ## Custom NIF and Dirty IO Bounces
@@ -152,7 +158,8 @@ defmodule EKV.Replica do
       │ write_entry           │    1    │ BEGIN + local origin seq   │
       │                       │         │ alloc (if needed) + kv     │
       │                       │         │ upsert (LWW) + check       │
-      │                       │         │ changes + oplog + progress │
+      │                       │         │ changes + keyref + oplog + │
+      │                       │         │ progress update + commit    │
       │                       │         │ update + COMMIT/ROLLBACK   │
       │ read_entry            │    1    │ reset + bind + step on     │
       │                       │         │ cached prepared stmt       │
@@ -167,7 +174,9 @@ defmodule EKV.Replica do
       │                       │         │ ballot check + local       │
       │                       │         │ origin seq alloc (if       │
       │                       │         │ needed) + kv upsert +      │
-      │                       │         │ oplog insert + progress    │
+      │                       │         │ keyref ensure + oplog      │
+      │                       │         │ insert +                   │
+      │                       │         │ progress update + commit   │
       │                       │         │ update + clear kv_paxos +  │
       │                       │         │ COMMIT                     │
       └──────────────────────────────────────────────────────────────┘
@@ -176,7 +185,8 @@ defmodule EKV.Replica do
   (begin, upsert, check, oplog, commit). write_entry does it in 1.
 
   Cached prepared statements:
-    - Writer: kv_upsert (LWW), kv_force_upsert (no LWW), oplog_insert
+    - Writer: kv_upsert (LWW), kv_force_upsert (no LWW), keyref_upsert,
+      oplog_insert
     - Readers: get statement (per reader connection)
     - NIF-internal writer helpers: local origin seq/progress statements are
       cached on the connection as well, so the extra replay bookkeeping stays
@@ -235,15 +245,17 @@ defmodule EKV.Replica do
   Delete is identical but sets deleted_at = now and value = nil.
   Broadcast message: `{:ekv_delete, key, ts, origin_node, origin_seq}`.
 
-  On the receiving side, merge_remote_entry calls the same write_entry
-  NIF with the remote's timestamp and `origin_seq`. The write path advances
-  local contiguous replay progress for that origin in the same SQLite
-  transaction. For self-origin writes, the shard allocates `origin_seq`
-  durably in that transaction and can advance self progress directly to the
-  allocated seq without scanning for gaps; remote-origin writes still use
-  contiguous-prefix advancement. Live writes therefore piggyback the sender's
-  current head via `(origin_node, origin_seq)`, and receivers can detect gaps
-  immediately without any extra live progress-ack message.
+  On the receiving side, delta replay uses the same write_entry NIF with the
+  remote's timestamp and `origin_seq`, so replay rows and local contiguous
+  progress advance in the same SQLite transaction. Full-sync receive uses a
+  kv-only snapshot apply path instead: it rebuilds current state and settles
+  progress only from the terminal advertised summary. For self-origin writes,
+  the shard allocates `origin_seq` durably in the write/promote transaction
+  and can advance self progress directly to the allocated seq without scanning
+  for gaps; remote-origin writes still use contiguous-prefix advancement. Live
+  writes therefore piggyback the sender's current head via
+  `(origin_node, origin_seq)`, and receivers can detect gaps immediately
+  without any extra live progress-ack message.
 
   Large replicated value payloads may be compressed on the wire only.
   The message shape stays the same, but the value field may be tagged as
@@ -937,12 +949,16 @@ defmodule EKV.Replica do
         since their last disconnect marker.
         Prevents dead/decommissioned members from anchoring replay retention
         forever while still letting short/moderate partitions reconnect by
-        delta instead of forcing a later full sync.
+        delta instead of forcing a later full sync. The default replay window
+        is intentionally bounded (`min(tombstone_ttl, 6 hours)`) so a dead
+        member does not hold oplog history for the full tombstone/quarantine
+        horizon unless operators opt in.
 
       Phase 4: Truncate replay log
         For each origin stream, delete kv_oplog rows older than the minimum
         retained progress across currently connected members plus recently
-        disconnected members still inside member_progress_retention_ttl.
+        disconnected members still inside member_progress_retention_ttl, then
+        prune orphan `kv_keyrefs`.
         (keeps replay history bounded without conflating different origins)
 
       Phase 5: Bump liveness
@@ -978,6 +994,7 @@ defmodule EKV.Replica do
         stmts:          %{              # cached prepared statements
           kv_upsert:       reference,   #   LWW upsert
           kv_force_upsert: reference,   #   unconditional upsert (CAS commit)
+          keyref_upsert:   reference,   #   ensure replay-key dictionary entry
           oplog_insert:    reference    #   oplog append
         },
         readers:        [{db, stmt}],   # per-scheduler read connections
@@ -1320,6 +1337,7 @@ defmodule EKV.Replica do
         case Store.write_entry(
                db,
                stmts.kv_upsert,
+               stmts.keyref_upsert,
                stmts.oplog_insert,
                key,
                value_binary,
@@ -1372,6 +1390,7 @@ defmodule EKV.Replica do
         case Store.write_entry(
                db,
                stmts.kv_upsert,
+               stmts.keyref_upsert,
                stmts.oplog_insert,
                key,
                nil,
@@ -1734,29 +1753,17 @@ defmodule EKV.Replica do
           prev_value = if deleted_at && has_subs, do: read_previous_value(state, key)
 
           {applied, state} =
-            if deleted_at do
-              merge_remote_entry(
-                state,
-                key,
-                nil,
-                timestamp,
-                origin_node,
-                origin_seq,
-                nil,
-                deleted_at
-              )
-            else
-              merge_remote_entry(
-                state,
-                key,
-                value_binary,
-                timestamp,
-                origin_node,
-                origin_seq,
-                expires_at,
-                nil
-              )
-            end
+            apply_sync_entry(
+              state,
+              mode,
+              key,
+              value_binary,
+              timestamp,
+              origin_node,
+              origin_seq,
+              expires_at,
+              deleted_at
+            )
 
           if applied do
             event =
@@ -2184,6 +2191,7 @@ defmodule EKV.Replica do
           case Store.write_entry(
                  db,
                  state.stmts.kv_upsert,
+                 state.stmts.keyref_upsert,
                  state.stmts.oplog_insert,
                  key,
                  nil,
@@ -2455,6 +2463,7 @@ defmodule EKV.Replica do
     case Store.write_entry(
            db,
            stmts.kv_upsert,
+           stmts.keyref_upsert,
            stmts.oplog_insert,
            key,
            value_binary,
@@ -2475,6 +2484,56 @@ defmodule EKV.Replica do
 
       {:ok, false} ->
         {false, state}
+    end
+  end
+
+  defp apply_sync_entry(
+         %Replica{} = state,
+         :delta,
+         key,
+         value_binary,
+         timestamp,
+         origin_node,
+         origin_seq,
+         expires_at,
+         deleted_at
+       ) do
+    merge_remote_entry(
+      state,
+      key,
+      value_binary,
+      timestamp,
+      origin_node,
+      origin_seq,
+      expires_at,
+      deleted_at
+    )
+  end
+
+  defp apply_sync_entry(
+         %Replica{} = state,
+         :full,
+         key,
+         value_binary,
+         timestamp,
+         origin_node,
+         origin_seq,
+         expires_at,
+         deleted_at
+       ) do
+    case Store.write_snapshot_entry(
+           state.db,
+           state.stmts.kv_upsert,
+           key,
+           value_binary,
+           timestamp,
+           origin_node,
+           origin_seq,
+           expires_at,
+           deleted_at
+         ) do
+      {:ok, true} -> {true, state}
+      {:ok, false} -> {false, state}
     end
   end
 
@@ -3738,6 +3797,7 @@ defmodule EKV.Replica do
     case Store.paxos_promote(
            db,
            stmts.kv_force_upsert,
+           stmts.keyref_upsert,
            stmts.oplog_insert,
            key,
            ballot_c,
@@ -4149,6 +4209,7 @@ defmodule EKV.Replica do
     case Store.paxos_promote(
            db,
            stmts.kv_force_upsert,
+           stmts.keyref_upsert,
            stmts.oplog_insert,
            key,
            ballot_c,
@@ -4174,6 +4235,7 @@ defmodule EKV.Replica do
               case Store.paxos_promote(
                      db,
                      stmts.kv_force_upsert,
+                     stmts.keyref_upsert,
                      stmts.oplog_insert,
                      key,
                      ballot_c,

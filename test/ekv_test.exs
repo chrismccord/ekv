@@ -216,6 +216,7 @@ defmodule EKVTest do
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
+          stmts.keyref_upsert,
           stmts.oplog_insert,
           "lww_key",
           val1,
@@ -231,6 +232,7 @@ defmodule EKVTest do
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
+          stmts.keyref_upsert,
           stmts.oplog_insert,
           "lww_key",
           val2,
@@ -258,6 +260,7 @@ defmodule EKVTest do
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
+          stmts.keyref_upsert,
           stmts.oplog_insert,
           "tie_key",
           val_a,
@@ -273,6 +276,7 @@ defmodule EKVTest do
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
+          stmts.keyref_upsert,
           stmts.oplog_insert,
           "tie_key",
           val_b,
@@ -290,6 +294,7 @@ defmodule EKVTest do
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
+          stmts.keyref_upsert,
           stmts.oplog_insert,
           "tie_key",
           val_a2,
@@ -329,6 +334,7 @@ defmodule EKVTest do
           EKV.Store.write_entry(
             db,
             stmts.kv_upsert,
+            stmts.keyref_upsert,
             stmts.oplog_insert,
             key,
             val_l,
@@ -344,6 +350,7 @@ defmodule EKVTest do
           EKV.Store.write_entry(
             db,
             stmts.kv_upsert,
+            stmts.keyref_upsert,
             stmts.oplog_insert,
             key,
             val_w,
@@ -361,6 +368,7 @@ defmodule EKVTest do
           EKV.Store.write_entry(
             db,
             stmts.kv_upsert,
+            stmts.keyref_upsert,
             stmts.oplog_insert,
             key,
             val_l2,
@@ -388,6 +396,7 @@ defmodule EKVTest do
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
+          stmts.keyref_upsert,
           stmts.oplog_insert,
           "del_tie",
           val,
@@ -401,6 +410,7 @@ defmodule EKVTest do
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
+          stmts.keyref_upsert,
           stmts.oplog_insert,
           "del_tie",
           nil,
@@ -417,6 +427,7 @@ defmodule EKVTest do
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
+          stmts.keyref_upsert,
           stmts.oplog_insert,
           "del_tie",
           val,
@@ -439,6 +450,7 @@ defmodule EKVTest do
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
+          stmts.keyref_upsert,
           stmts.oplog_insert,
           "resurr",
           nil,
@@ -457,6 +469,7 @@ defmodule EKVTest do
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
+          stmts.keyref_upsert,
           stmts.oplog_insert,
           "resurr",
           val,
@@ -480,6 +493,7 @@ defmodule EKVTest do
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
+          stmts.keyref_upsert,
           stmts.oplog_insert,
           "oplog_key",
           val1,
@@ -497,6 +511,7 @@ defmodule EKVTest do
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
+          stmts.keyref_upsert,
           stmts.oplog_insert,
           "oplog_key",
           val2,
@@ -552,6 +567,7 @@ defmodule EKVTest do
           EKV.Store.write_entry(
             db,
             stmts.kv_upsert,
+            stmts.keyref_upsert,
             stmts.oplog_insert,
             "gap_key_#{i}",
             val,
@@ -570,6 +586,7 @@ defmodule EKVTest do
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
+          stmts.keyref_upsert,
           stmts.oplog_insert,
           "gap_key_1",
           val_loser,
@@ -605,6 +622,7 @@ defmodule EKVTest do
           EKV.Store.write_entry(
             db,
             stmts.kv_upsert,
+            stmts.keyref_upsert,
             stmts.oplog_insert,
             "trunc_key_#{i}",
             val,
@@ -633,6 +651,75 @@ defmodule EKVTest do
       entries = EKV.Store.full_state(db, cutoff)
       assert length(entries) == 10
     end
+
+    test "orphaned keyrefs are pruned after kv and oplog retention both drop", %{name: name} do
+      config = EKV.Supervisor.get_config(name)
+      shard = EKV.Replica.shard_index_for("keyref_gc_key", config.num_shards)
+      shard_name = EKV.Replica.shard_name(name, shard)
+      %{db: db, stmts: stmts} = :sys.get_state(shard_name)
+
+      now = System.system_time(:nanosecond)
+
+      {:ok, true, _origin_seq, _local_progress_seq} =
+        EKV.Store.write_entry(
+          db,
+          stmts.kv_upsert,
+          stmts.keyref_upsert,
+          stmts.oplog_insert,
+          "keyref_gc_key",
+          :erlang.term_to_binary("v1"),
+          now - 3_000,
+          :node_a,
+          nil
+        )
+
+      {:ok, true, _origin_seq, _local_progress_seq} =
+        EKV.Store.write_entry(
+          db,
+          stmts.kv_upsert,
+          stmts.keyref_upsert,
+          stmts.oplog_insert,
+          "keyref_gc_key",
+          :erlang.term_to_binary("v2"),
+          now - 2_000,
+          :node_a,
+          nil
+        )
+
+      {:ok, true, _origin_seq, _local_progress_seq} =
+        EKV.Store.write_entry(
+          db,
+          stmts.kv_upsert,
+          stmts.keyref_upsert,
+          stmts.oplog_insert,
+          "keyref_gc_key",
+          nil,
+          now - 1_000,
+          :node_a,
+          nil,
+          now - 1_000
+        )
+
+      assert {:ok, [[3]]} =
+               EKV.Sqlite3.fetch_all(
+                 db,
+                 "SELECT oplog_refs FROM kv_keyrefs WHERE key = ?1",
+                 ["keyref_gc_key"]
+               )
+
+      :ok = EKV.Store.purge_tombstones(db, now)
+      assert EKV.Store.get(db, "keyref_gc_key") == nil
+
+      :ok = EKV.Store.update_peer_progress(db, :member_a@host, :node_a, 4)
+      :ok = EKV.Store.truncate_oplog(db)
+
+      assert {:ok, [[0]]} =
+               EKV.Sqlite3.fetch_all(
+                 db,
+                 "SELECT COUNT(*) FROM kv_keyrefs WHERE key = ?1",
+                 ["keyref_gc_key"]
+               )
+    end
   end
 
   describe "GC expires TTL entries into tombstones" do
@@ -651,6 +738,7 @@ defmodule EKVTest do
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
+          stmts.keyref_upsert,
           stmts.oplog_insert,
           "gc_ttl_key",
           val,
@@ -702,6 +790,7 @@ defmodule EKVTest do
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
+          stmts.keyref_upsert,
           stmts.oplog_insert,
           "gc_purge_key",
           val,
@@ -714,6 +803,7 @@ defmodule EKVTest do
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
+          stmts.keyref_upsert,
           stmts.oplog_insert,
           "gc_purge_key",
           nil,
@@ -755,6 +845,7 @@ defmodule EKVTest do
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
+          stmts.keyref_upsert,
           stmts.oplog_insert,
           "gc_expired_purge_key",
           val,
@@ -791,6 +882,7 @@ defmodule EKVTest do
           EKV.Store.write_entry(
             db,
             stmts.kv_upsert,
+            stmts.keyref_upsert,
             stmts.oplog_insert,
             "gc_oplog_#{i}",
             val,
@@ -929,11 +1021,11 @@ defmodule EKVTest do
   describe "schema_version startup guard" do
     test "Store.open stamps schema_version on first open", %{data_dir: data_dir} do
       {:ok, db} = EKV.Store.open(data_dir, 96, :timer.hours(24 * 7), 2, :timer.minutes(5))
-      assert EKV.Store.get_meta(db, "schema_version") == 1
+      assert EKV.Store.get_meta(db, "schema_version") == 3
       EKV.Store.close(db)
 
       {:ok, db} = EKV.Store.open(data_dir, 96, :timer.hours(24 * 7), 2, :timer.minutes(5))
-      assert EKV.Store.get_meta(db, "schema_version") == 1
+      assert EKV.Store.get_meta(db, "schema_version") == 3
       EKV.Store.close(db)
     end
 
@@ -976,6 +1068,7 @@ defmodule EKVTest do
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
+          stmts.keyref_upsert,
           stmts.oplog_insert,
           "gc_race_key",
           val,
@@ -1003,6 +1096,7 @@ defmodule EKVTest do
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
+          stmts.keyref_upsert,
           stmts.oplog_insert,
           "gc_race_key",
           val2,
@@ -1034,6 +1128,7 @@ defmodule EKVTest do
           EKV.Store.write_entry(
             db,
             stmts.kv_upsert,
+            stmts.keyref_upsert,
             stmts.oplog_insert,
             "fs_key_#{i}",
             val,
@@ -1050,6 +1145,7 @@ defmodule EKVTest do
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
+          stmts.keyref_upsert,
           stmts.oplog_insert,
           "fs_key_1",
           nil,
@@ -1064,6 +1160,7 @@ defmodule EKVTest do
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
+          stmts.keyref_upsert,
           stmts.oplog_insert,
           "fs_key_2",
           nil,
@@ -1078,6 +1175,7 @@ defmodule EKVTest do
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
+          stmts.keyref_upsert,
           stmts.oplog_insert,
           "fs_key_3",
           :erlang.term_to_binary("expired"),
@@ -1257,6 +1355,7 @@ defmodule EKVTest do
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
+          stmts.keyref_upsert,
           stmts.oplog_insert,
           "gc_sub_key",
           val,
@@ -1324,6 +1423,57 @@ defmodule EKVTest do
       keys = Enum.map(events, & &1.key)
       assert k1 in keys
       assert k2 in keys
+    end
+
+    test "full sync applies kv rows without seeding kv_oplog", %{name: name} do
+      config = EKV.Supervisor.get_config(name)
+
+      key1 =
+        Enum.find(1..100, fn i ->
+          EKV.Replica.shard_index_for("full_sync_only/#{i}", config.num_shards) == 0
+        end)
+
+      key2 =
+        Enum.find((key1 + 1)..200, fn i ->
+          EKV.Replica.shard_index_for("full_sync_only/#{i}", config.num_shards) == 0
+        end)
+
+      k1 = "full_sync_only/#{key1}"
+      k2 = "full_sync_only/#{key2}"
+
+      shard_name = EKV.Replica.shard_name(name, 0)
+      %{db: db} = :sys.get_state(shard_name)
+      assert EKV.Store.oplog_since(db, 0) == []
+
+      now = System.system_time(:nanosecond)
+
+      entries = [
+        {k1, :erlang.term_to_binary("v1"), now - 2_000, :remote@host, 1, nil, nil},
+        {k2, :erlang.term_to_binary("v2"), now - 1_000, :remote@host, 2, nil, nil}
+      ]
+
+      send(
+        shard_name,
+        {:ekv_sync, :remote@host, 0, :full, entries, %{:remote@host => 2}}
+      )
+
+      :sys.get_state(shard_name)
+
+      assert EKV.Store.oplog_since(db, 0) == []
+
+      assert {:ok, [[^k1], [^k2]]} =
+               EKV.Sqlite3.fetch_all(
+                 db,
+                 "SELECT key FROM kv WHERE key LIKE 'full_sync_only/%' ORDER BY key",
+                 []
+               )
+
+      assert {:ok, [[0]]} =
+               EKV.Sqlite3.fetch_all(
+                 db,
+                 "SELECT COUNT(*) FROM kv_keyrefs WHERE key LIKE 'full_sync_only/%'",
+                 []
+               )
     end
 
     test "remote put generates event", %{name: name} do
@@ -1453,6 +1603,7 @@ defmodule EKVTest do
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
+          stmts.keyref_upsert,
           stmts.oplog_insert,
           "purge_no_event",
           nil,
@@ -1908,6 +2059,7 @@ defmodule EKVTest do
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
+          stmts.keyref_upsert,
           stmts.oplog_insert,
           "backup_key",
           :erlang.term_to_binary("backup_val"),
@@ -1951,6 +2103,7 @@ defmodule EKVTest do
           EKV.Store.write_entry(
             db,
             stmts.kv_upsert,
+            stmts.keyref_upsert,
             stmts.oplog_insert,
             "delta_key_#{i}",
             val,
@@ -1988,6 +2141,7 @@ defmodule EKVTest do
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
+          stmts.keyref_upsert,
           stmts.oplog_insert,
           "delta_expired_key",
           :erlang.term_to_binary("old"),
@@ -2000,6 +2154,7 @@ defmodule EKVTest do
         EKV.Store.write_entry(
           db,
           stmts.kv_upsert,
+          stmts.keyref_upsert,
           stmts.oplog_insert,
           "delta_live_key",
           :erlang.term_to_binary("live"),
@@ -2097,7 +2252,7 @@ defmodule EKVTest do
   # =====================================================================
 
   describe "CAS config validation" do
-    test "member_progress_retention_ttl defaults to tombstone_ttl" do
+    test "member_progress_retention_ttl defaults to min(tombstone_ttl, 6 hours)" do
       name = :"ekv_cfg_progress_retention_#{System.unique_integer([:positive])}"
       data_dir = Path.join(System.tmp_dir!(), "ekv_cfg_progress_retention_#{name}")
       tombstone_ttl = :timer.hours(12)
@@ -2117,7 +2272,7 @@ defmodule EKVTest do
       end)
 
       config = EKV.Supervisor.get_config(name)
-      assert config.member_progress_retention_ttl == tombstone_ttl
+      assert config.member_progress_retention_ttl == :timer.hours(6)
     end
 
     test "member mode without node_id auto-generates node_id" do
@@ -3025,7 +3180,15 @@ defmodule EKVTest do
 
       # Promote
       {:ok, ^val_bin, ^now, ^origin_str, nil, nil, nil, _origin_seq, _local_progress_seq} =
-        EKV.Store.paxos_promote(db, stmts.kv_force_upsert, stmts.oplog_insert, "pax/12", 100, "1")
+        EKV.Store.paxos_promote(
+          db,
+          stmts.kv_force_upsert,
+          stmts.keyref_upsert,
+          stmts.oplog_insert,
+          "pax/12",
+          100,
+          "1"
+        )
 
       # Now in kv
       {v, _ts, _origin, _exp, _del} = EKV.Store.get(db, "pax/12")
@@ -3055,7 +3218,15 @@ defmodule EKVTest do
 
       # Stale promote for ballot {100, "1"}
       {:ok, :stale} =
-        EKV.Store.paxos_promote(db, stmts.kv_force_upsert, stmts.oplog_insert, "pax/13", 100, "1")
+        EKV.Store.paxos_promote(
+          db,
+          stmts.kv_force_upsert,
+          stmts.keyref_upsert,
+          stmts.oplog_insert,
+          "pax/13",
+          100,
+          "1"
+        )
     end
 
     test "promote retains kv_paxos accepted columns", %{db: db, stmts: stmts} do
@@ -3070,7 +3241,15 @@ defmodule EKVTest do
 
       # Promote
       {:ok, _, _, _, _, _, _, _origin_seq, _local_progress_seq} =
-        EKV.Store.paxos_promote(db, stmts.kv_force_upsert, stmts.oplog_insert, "pax/14", 100, "1")
+        EKV.Store.paxos_promote(
+          db,
+          stmts.kv_force_upsert,
+          stmts.keyref_upsert,
+          stmts.oplog_insert,
+          "pax/14",
+          100,
+          "1"
+        )
 
       # After promote, higher prepare recovers retained accepted state
       {:ok, :promise, 100, "1", [v, _, _, _, _]} =

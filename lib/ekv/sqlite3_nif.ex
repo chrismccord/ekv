@@ -40,7 +40,18 @@ defmodule EKV.Sqlite3NIF do
   def ekv_step(_db, _stmt), do: :erlang.nif_error(:not_loaded)
   def ekv_release(_db, _stmt), do: :erlang.nif_error(:not_loaded)
 
-  def ekv_write_entry(_db, _kv_stmt, _oplog_stmt, _kv_args, _oplog_args, _local_origin),
+  def ekv_write_entry(
+        _db,
+        _kv_stmt,
+        _keyref_stmt,
+        _oplog_stmt,
+        _kv_args,
+        _oplog_args,
+        _local_origin
+      ),
+      do: :erlang.nif_error(:not_loaded)
+
+  def ekv_write_snapshot_entry(_db, _kv_stmt, _kv_args),
     do: :erlang.nif_error(:not_loaded)
 
   def ekv_read_entry(_db, _stmt, _args), do: :erlang.nif_error(:not_loaded)
@@ -61,6 +72,7 @@ defmodule EKV.Sqlite3NIF do
   def ekv_paxos_promote(
         _db,
         _kv_force_stmt,
+        _keyref_stmt,
         _oplog_stmt,
         _key,
         _ballot_c,

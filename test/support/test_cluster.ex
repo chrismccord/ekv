@@ -423,6 +423,7 @@ defmodule EKV.TestCluster do
       EKV.Store.write_entry(
         db,
         stmts.kv_upsert,
+        stmts.keyref_upsert,
         stmts.oplog_insert,
         key,
         value_binary,

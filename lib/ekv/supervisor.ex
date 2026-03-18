@@ -4,6 +4,8 @@ defmodule EKV.Supervisor do
 
   require Logger
 
+  @default_member_progress_retention_ttl :timer.hours(6)
+
   _archdoc = ~S"""
   Top-level EKV supervisor.
 
@@ -243,7 +245,11 @@ defmodule EKV.Supervisor do
     anti_entropy_interval = Keyword.get(opts, :anti_entropy_interval, 30_000)
 
     member_progress_retention_ttl =
-      Keyword.get(opts, :member_progress_retention_ttl, tombstone_ttl)
+      Keyword.get(
+        opts,
+        :member_progress_retention_ttl,
+        default_member_progress_retention_ttl(tombstone_ttl)
+      )
 
     # Accepted for backward compatibility only. Known unavailable member
     # origins now request relayed delta immediately.
@@ -550,6 +556,10 @@ defmodule EKV.Supervisor do
   defp validate_allow_stale_startup!(value) do
     raise ArgumentError,
           "EKV: :allow_stale_startup must be boolean, got: #{inspect(value)}"
+  end
+
+  defp default_member_progress_retention_ttl(tombstone_ttl) do
+    min(tombstone_ttl, @default_member_progress_retention_ttl)
   end
 
   defp validate_anti_entropy_interval!(false), do: :ok

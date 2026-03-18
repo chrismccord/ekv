@@ -408,6 +408,31 @@ static int list_nth_term(ErlNifEnv *env, ERL_NIF_TERM list, unsigned nth, ERL_NI
     return 0;
 }
 
+static int bind_and_step_single_text(
+    sqlite3_stmt *stmt,
+    const char *text,
+    int text_len,
+    int *step_rc
+)
+{
+    int rc;
+
+    sqlite3_reset(stmt);
+    sqlite3_clear_bindings(stmt);
+    rc = sqlite3_bind_text(stmt, 1, text, text_len, SQLITE_TRANSIENT);
+    if (rc != SQLITE_OK)
+        return rc;
+
+    rc = sqlite3_step(stmt);
+    if (step_rc)
+        *step_rc = rc;
+
+    if (rc == SQLITE_DONE)
+        return SQLITE_OK;
+
+    return rc;
+}
+
 static int next_local_origin_seq(connection_t *conn, sqlite3_int64 *out_seq)
 {
     sqlite3_int64 current = 0;
@@ -846,8 +871,8 @@ static ERL_NIF_TERM ekv_release(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
 }
 
 /* ------------------------------------------------------------------ */
-/* NIF: write_entry(db, kv_stmt, oplog_stmt, kv_args, oplog_args,      */
-/*                  local_origin)                                       */
+/* NIF: write_entry(db, kv_stmt, keyref_stmt, oplog_stmt, kv_args,     */
+/*                  oplog_args, local_origin)                          */
 /*   -> {:ok, true, origin_seq} | {:ok, false}                         */
 /*   -> {:ok, false, origin_seq} | {:error, msg}                       */
 /*                                                                     */
@@ -869,11 +894,15 @@ static ERL_NIF_TERM ekv_write_entry(ErlNifEnv *env, int argc, const ERL_NIF_TERM
     if (!enif_get_resource(env, argv[1], statement_type, (void **)&kv_s))
         return enif_make_badarg(env);
 
-    statement_t *oplog_s;
-    if (!enif_get_resource(env, argv[2], statement_type, (void **)&oplog_s))
+    statement_t *keyref_s;
+    if (!enif_get_resource(env, argv[2], statement_type, (void **)&keyref_s))
         return enif_make_badarg(env);
 
-    if (kv_s->conn != conn || oplog_s->conn != conn)
+    statement_t *oplog_s;
+    if (!enif_get_resource(env, argv[3], statement_type, (void **)&oplog_s))
+        return enif_make_badarg(env);
+
+    if (kv_s->conn != conn || keyref_s->conn != conn || oplog_s->conn != conn)
         return make_error(env, "statement does not belong to this connection");
 
     enif_mutex_lock(conn->mutex);
@@ -881,15 +910,23 @@ static ERL_NIF_TERM ekv_write_entry(ErlNifEnv *env, int argc, const ERL_NIF_TERM
         enif_mutex_unlock(conn->mutex);
         return make_error(env, "database closed");
     }
-    if (!kv_s->stmt || !oplog_s->stmt) {
+    if (!kv_s->stmt || !keyref_s->stmt || !oplog_s->stmt) {
         enif_mutex_unlock(conn->mutex);
         return make_error(env, "statement finalized");
     }
 
     ERL_NIF_TERM kv_origin_term;
     ERL_NIF_TERM kv_origin_seq_term;
-    if (!list_nth_term(env, argv[3], 3, &kv_origin_term) ||
-        !list_nth_term(env, argv[3], 4, &kv_origin_seq_term)) {
+    ERL_NIF_TERM key_term;
+    if (!list_nth_term(env, argv[4], 0, &key_term) ||
+        !list_nth_term(env, argv[4], 3, &kv_origin_term) ||
+        !list_nth_term(env, argv[4], 4, &kv_origin_seq_term)) {
+        enif_mutex_unlock(conn->mutex);
+        return enif_make_badarg(env);
+    }
+
+    ErlNifBinary key_bin;
+    if (!enif_inspect_iolist_as_binary(env, key_term, &key_bin)) {
         enif_mutex_unlock(conn->mutex);
         return enif_make_badarg(env);
     }
@@ -903,7 +940,7 @@ static ERL_NIF_TERM ekv_write_entry(ErlNifEnv *env, int argc, const ERL_NIF_TERM
     sqlite3_int64 origin_seq = 0;
     sqlite3_int64 local_progress_seq = 0;
     int origin_seq_provided = !enif_is_identical(kv_origin_seq_term, atom_nil);
-    int local_origin = enif_is_identical(argv[5], atom_true);
+    int local_origin = enif_is_identical(argv[6], atom_true);
     if (origin_seq_provided) {
         if (!enif_get_int64(env, kv_origin_seq_term, (ErlNifSInt64 *)&origin_seq)) {
             enif_mutex_unlock(conn->mutex);
@@ -931,7 +968,7 @@ static ERL_NIF_TERM ekv_write_entry(ErlNifEnv *env, int argc, const ERL_NIF_TERM
     }
 
     /* 3. Bind + step kv upsert */
-    int br = bind_args(env, kv_s->stmt, argv[3]);
+    int br = bind_args(env, kv_s->stmt, argv[4]);
     if (br != 0) {
         sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
         enif_mutex_unlock(conn->mutex);
@@ -961,8 +998,25 @@ static ERL_NIF_TERM ekv_write_entry(ErlNifEnv *env, int argc, const ERL_NIF_TERM
         }
     }
 
-    /* 5. Bind + step oplog */
-    br = bind_args(env, oplog_s->stmt, argv[4]);
+    /* 5. Ensure keyref exists and marks current-state presence. */
+    int step_rc = SQLITE_OK;
+    rc = bind_and_step_single_text(
+        keyref_s->stmt,
+        (const char *)key_bin.data,
+        (int)key_bin.size,
+        &step_rc
+    );
+    if (rc != SQLITE_OK) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        sqlite3_reset(keyref_s->stmt);
+        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
+    sqlite3_reset(keyref_s->stmt);
+
+    /* 6. Bind + step oplog */
+    br = bind_args(env, oplog_s->stmt, argv[5]);
     if (br != 0) {
         sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
         enif_mutex_unlock(conn->mutex);
@@ -1032,6 +1086,74 @@ static ERL_NIF_TERM ekv_write_entry(ErlNifEnv *env, int argc, const ERL_NIF_TERM
         enif_make_int64(env, (ErlNifSInt64)origin_seq),
         enif_make_int64(env, (ErlNifSInt64)local_progress_seq)
     );
+}
+
+/* ------------------------------------------------------------------ */
+/* NIF: write_snapshot_entry(db, kv_stmt, kv_args)                    */
+/*   -> {:ok, true} | {:ok, false} | {:error, msg}                    */
+/*                                                                     */
+/* Full-sync apply updates current state only. It does not append to   */
+/* kv_oplog or advance replay progress.                                */
+/* ------------------------------------------------------------------ */
+
+static ERL_NIF_TERM ekv_write_snapshot_entry(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    (void)argc;
+    connection_t *conn;
+    if (!enif_get_resource(env, argv[0], connection_type, (void **)&conn))
+        return enif_make_badarg(env);
+
+    statement_t *kv_s;
+    if (!enif_get_resource(env, argv[1], statement_type, (void **)&kv_s))
+        return enif_make_badarg(env);
+
+    enif_mutex_lock(conn->mutex);
+    if (!conn->db) {
+        enif_mutex_unlock(conn->mutex);
+        return make_error(env, "database closed");
+    }
+    if (!kv_s->stmt) {
+        enif_mutex_unlock(conn->mutex);
+        return make_error(env, "statement finalized");
+    }
+
+    int rc = sqlite3_exec(conn->db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
+    if (rc != SQLITE_OK) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
+
+    int br = bind_args(env, kv_s->stmt, argv[2]);
+    if (br != 0) {
+        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+        enif_mutex_unlock(conn->mutex);
+        return (br == -1) ? enif_make_badarg(env)
+                          : make_sqlite_error(env, conn->db);
+    }
+
+    rc = sqlite3_step(kv_s->stmt);
+    if (rc != SQLITE_DONE) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        sqlite3_reset(kv_s->stmt);
+        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
+    sqlite3_reset(kv_s->stmt);
+
+    int changes = sqlite3_changes(conn->db);
+
+    rc = sqlite3_exec(conn->db, "COMMIT", NULL, NULL, NULL);
+    if (rc != SQLITE_OK) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
+
+    enif_mutex_unlock(conn->mutex);
+    return enif_make_tuple2(env, atom_ok, changes > 0 ? atom_true : atom_false);
 }
 
 /* ------------------------------------------------------------------ */
@@ -2072,7 +2194,8 @@ static ERL_NIF_TERM ekv_paxos_accept(ErlNifEnv *env, int argc, const ERL_NIF_TER
 }
 
 /* ------------------------------------------------------------------ */
-/* NIF: paxos_promote(db, kv_force_stmt, oplog_stmt, key,             */
+/* NIF: paxos_promote(db, kv_force_stmt, keyref_stmt, oplog_stmt,     */
+/*                    key,                                            */
 /*                    ballot_c, ballot_n, origin_seq)                  */
 /*   -> {:ok, value, ts, origin, expires, deleted, prev_value|nil, origin_seq, local_progress_seq}*/
 /*   -> {:ok, :stale}                                                  */
@@ -2093,30 +2216,34 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
     if (!enif_get_resource(env, argv[1], statement_type, (void **)&kv_s))
         return enif_make_badarg(env);
 
-    statement_t *oplog_s;
-    if (!enif_get_resource(env, argv[2], statement_type, (void **)&oplog_s))
+    statement_t *keyref_s;
+    if (!enif_get_resource(env, argv[2], statement_type, (void **)&keyref_s))
         return enif_make_badarg(env);
 
-    if (kv_s->conn != conn || oplog_s->conn != conn)
+    statement_t *oplog_s;
+    if (!enif_get_resource(env, argv[3], statement_type, (void **)&oplog_s))
+        return enif_make_badarg(env);
+
+    if (kv_s->conn != conn || keyref_s->conn != conn || oplog_s->conn != conn)
         return make_error(env, "statement does not belong to this connection");
 
     ErlNifBinary key_bin;
-    if (!enif_inspect_iolist_as_binary(env, argv[3], &key_bin))
+    if (!enif_inspect_iolist_as_binary(env, argv[4], &key_bin))
         return enif_make_badarg(env);
 
     ErlNifSInt64 ballot_c;
-    if (!enif_get_int64(env, argv[4], &ballot_c))
+    if (!enif_get_int64(env, argv[5], &ballot_c))
         return enif_make_badarg(env);
 
     ErlNifBinary ballot_n_bin;
-    if (!enif_inspect_iolist_as_binary(env, argv[5], &ballot_n_bin))
+    if (!enif_inspect_iolist_as_binary(env, argv[6], &ballot_n_bin))
         return enif_make_badarg(env);
 
     sqlite3_int64 origin_seq = 0;
     sqlite3_int64 local_progress_seq = 0;
-    int origin_seq_provided = !enif_is_identical(argv[6], atom_nil);
+    int origin_seq_provided = !enif_is_identical(argv[7], atom_nil);
     if (origin_seq_provided) {
-        if (!enif_get_int64(env, argv[6], (ErlNifSInt64 *)&origin_seq))
+        if (!enif_get_int64(env, argv[7], (ErlNifSInt64 *)&origin_seq))
             return enif_make_badarg(env);
     }
 
@@ -2132,7 +2259,7 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
         enif_free(ballot_n_str);
         return make_error(env, "database closed");
     }
-    if (!kv_s->stmt || !oplog_s->stmt) {
+    if (!kv_s->stmt || !keyref_s->stmt || !oplog_s->stmt) {
         enif_mutex_unlock(conn->mutex);
         enif_free(ballot_n_str);
         return make_error(env, "statement finalized");
@@ -2321,7 +2448,27 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
     }
     sqlite3_reset(kv_s->stmt);
 
-    /* 6. Bind + step oplog_insert: [key, value, ts, origin, origin_seq, expires, is_delete] */
+    /* 6. Ensure keyref exists and marks current-state presence. */
+    int step_rc = SQLITE_OK;
+    rc = bind_and_step_single_text(
+        keyref_s->stmt,
+        (const char *)key_bin.data,
+        (int)key_bin.size,
+        &step_rc
+    );
+    if (rc != SQLITE_OK) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        sqlite3_reset(keyref_s->stmt);
+        if (value_copy) enif_free(value_copy);
+        if (origin_copy) enif_free(origin_copy);
+        enif_free(ballot_n_str);
+        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+        enif_mutex_unlock(conn->mutex);
+        return err;
+    }
+    sqlite3_reset(keyref_s->stmt);
+
+    /* 7. Bind + step oplog_insert: [key, value, ts, origin, origin_seq, expires, is_delete] */
     sqlite3_reset(oplog_s->stmt);
     sqlite3_clear_bindings(oplog_s->stmt);
     sqlite3_bind_text(oplog_s->stmt, 1, (const char *)key_bin.data, (int)key_bin.size, SQLITE_TRANSIENT);
@@ -2424,7 +2571,8 @@ static ErlNifFunc nif_funcs[] = {
     {"ekv_bind",          2, ekv_bind,          ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_step",          2, ekv_step,          ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_release",       2, ekv_release,       ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"ekv_write_entry",   6, ekv_write_entry,   ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"ekv_write_entry",   7, ekv_write_entry,   ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"ekv_write_snapshot_entry", 3, ekv_write_snapshot_entry, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_read_entry",    3, ekv_read_entry,    ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_fetch_all",     3, ekv_fetch_all,     ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_backup",        2, ekv_backup,        ERL_NIF_DIRTY_JOB_IO_BOUND},
@@ -2436,7 +2584,7 @@ static ErlNifFunc nif_funcs[] = {
         ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_paxos_prepare", 4, ekv_paxos_prepare, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_paxos_accept",  5, ekv_paxos_accept,  ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"ekv_paxos_promote", 7, ekv_paxos_promote, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"ekv_paxos_promote", 8, ekv_paxos_promote, ERL_NIF_DIRTY_JOB_IO_BOUND},
 };
 
 static int on_load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info)

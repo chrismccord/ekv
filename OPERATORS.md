@@ -247,7 +247,7 @@ from members populates its data.
 
 1. Stop the node being removed
 2. Wait for the disconnected replay-retention window to expire
-   (`member_progress_retention_ttl`, default same as `tombstone_ttl`), then one GC cycle
+   (`member_progress_retention_ttl`, default `min(tombstone_ttl, 6 hours)`), then one GC cycle
    (`gc_interval`, default 5 min) so the removed node's member progress can be
    pruned and replay-log truncation can proceed
 3. Optionally update `cluster_size` on remaining nodes and rolling restart
@@ -384,7 +384,7 @@ truncation opportunities.
 - TTL-expired entries need to disappear faster
 - Oplog is growing too large between truncations
 
-### member_progress_retention_ttl (default: same as tombstone_ttl)
+### member_progress_retention_ttl (default: min(tombstone_ttl, 6 hours))
 
 How long a disconnected member keeps anchoring replay retention before GC may
 drop its `kv_member_progress` rows.
@@ -405,10 +405,14 @@ is large relative to `tombstone_ttl`, the safety margin shrinks. Keep
 `gc_interval` well below `tombstone_ttl` (at least 100x smaller).
 
 Replay retention is separately bounded by `member_progress_retention_ttl`.
-The default keeps it equal to `tombstone_ttl`, which means any partition still
-considered auto-healable should prefer delta over full sync. Lower it only if
-you intentionally want disconnected members to stop anchoring oplog history
-earlier than the tombstone/quarantine window.
+The default keeps a bounded replay window instead of the full
+`tombstone_ttl`, which limits oplog growth if a member is simply dead while
+still covering serious but finite partitions. Raise it if your normal
+partitions last longer and you prefer extra oplog growth over later full sync.
+
+Normal writes and CAS commits append retained replay rows. Full sync does not:
+it rebuilds `kv` on the receiver without seeding `kv_oplog`, so bootstrap
+repair should no longer duplicate the entire live dataset into replay history.
 
 ## Blue-Green Deployments
 

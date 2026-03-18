@@ -9,7 +9,7 @@ defmodule EKV.Store do
 
   - current committed KV state
   - CAS accept/promote state (`kv_paxos`)
-  - anti-entropy replay/progress (`kv_oplog`, `kv_origin_progress`, `kv_member_progress`)
+  - anti-entropy replay/progress (`kv_oplog`, `kv_keyrefs`, `kv_origin_progress`, `kv_member_progress`)
   - startup schema compatibility via `kv_meta.schema_version`
   - startup stale-db checks (`allow_stale_startup` override)
   - local TTL-expiry bookkeeping via `expired_at`
@@ -18,6 +18,9 @@ defmodule EKV.Store do
 
   - `kv` is the current dataset
   - `kv_oplog` is recent per-origin history for delta repair
+  - `kv_keyrefs` stores replay keys once so the oplog does not repeat the
+    full key string on every row; `oplog_refs` is maintained by SQLite
+    triggers on `kv_oplog` insert/delete
   - `kv_origin_progress` is this shard's contiguous applied cursor per origin
   - `kv_member_progress` is each peer's cursor per origin; GC uses it to
     decide how much replay history must be kept
@@ -31,8 +34,13 @@ defmodule EKV.Store do
     `(value, timestamp, origin_node, origin_seq, expires_at, deleted_at, expired_at)`
     `expired_at` is local-only bookkeeping so GC emits `:expired` once; it is
     not a replicated tombstone marker.
+  - `kv_keyrefs` — deduplicated replay-key dictionary for `kv_oplog`. SQLite
+    triggers maintain `oplog_refs` on insert/delete so the normal write path
+    does not pay extra refcount statements. GC prunes orphan rows after oplog
+    truncation once replay is gone and the key no longer exists in `kv`.
   - `kv_oplog` — authoritative replay log keyed by `(origin_node, origin_seq)`.
-    Already-expired rows are filtered out when delta sync is built.
+    Stores `key_id` into `kv_keyrefs` instead of repeating the full key text on
+    every replay row. Already-expired rows are filtered out when delta sync is built.
   - `kv_origin_progress` — highest contiguous locally-applied replay progress
     per origin. Local-origin writes/promotes can advance this directly because
     the shard allocates self `origin_seq` in-order inside the same transaction.
@@ -81,13 +89,19 @@ defmodule EKV.Store do
     expired_at = NULL
   """
 
+  @keyref_ensure_sql """
+  INSERT INTO kv_keyrefs (key)
+  VALUES (?1)
+  ON CONFLICT(key) DO NOTHING
+  """
+
   @oplog_insert_sql """
-  INSERT INTO kv_oplog (key, value, timestamp, origin_node, origin_seq, expires_at, is_delete)
-  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+  INSERT INTO kv_oplog (key_id, value, timestamp, origin_node, origin_seq, expires_at, is_delete)
+  VALUES ((SELECT id FROM kv_keyrefs WHERE key = ?1), ?2, ?3, ?4, ?5, ?6, ?7)
   ON CONFLICT(origin_node, origin_seq) DO NOTHING
   """
 
-  @schema_version 1
+  @schema_version 3
 
   def open(data_dir, shard_index, tombstone_ttl, num_shards, gc_interval, opts \\ []) do
     allow_stale_startup = Keyword.get(opts, :allow_stale_startup, false)
@@ -137,15 +151,25 @@ defmodule EKV.Store do
 
     :ok =
       EKV.Sqlite3.execute(db, """
+      CREATE TABLE IF NOT EXISTS kv_keyrefs (
+        id INTEGER PRIMARY KEY,
+        key TEXT NOT NULL UNIQUE,
+        oplog_refs INTEGER NOT NULL DEFAULT 0
+      )
+      """)
+
+    :ok =
+      EKV.Sqlite3.execute(db, """
       CREATE TABLE IF NOT EXISTS kv_oplog (
         seq INTEGER PRIMARY KEY AUTOINCREMENT,
-        key TEXT NOT NULL,
+        key_id INTEGER NOT NULL,
         value BLOB,
         timestamp INTEGER NOT NULL,
         origin_node TEXT NOT NULL,
         origin_seq INTEGER NOT NULL DEFAULT 0,
         expires_at INTEGER,
-        is_delete INTEGER NOT NULL DEFAULT 0
+        is_delete INTEGER NOT NULL DEFAULT 0,
+        FOREIGN KEY (key_id) REFERENCES kv_keyrefs(id)
       )
       """)
 
@@ -153,6 +177,28 @@ defmodule EKV.Store do
       EKV.Sqlite3.execute(db, """
       CREATE UNIQUE INDEX IF NOT EXISTS idx_kv_oplog_origin_seq
       ON kv_oplog(origin_node, origin_seq)
+      """)
+
+    :ok =
+      EKV.Sqlite3.execute(db, """
+      CREATE TRIGGER IF NOT EXISTS kv_oplog_ref_inc
+      AFTER INSERT ON kv_oplog
+      BEGIN
+        UPDATE kv_keyrefs
+        SET oplog_refs = oplog_refs + 1
+        WHERE id = NEW.key_id;
+      END
+      """)
+
+    :ok =
+      EKV.Sqlite3.execute(db, """
+      CREATE TRIGGER IF NOT EXISTS kv_oplog_ref_dec
+      AFTER DELETE ON kv_oplog
+      BEGIN
+        UPDATE kv_keyrefs
+        SET oplog_refs = MAX(oplog_refs - 1, 0)
+        WHERE id = OLD.key_id;
+      END
       """)
 
     :ok =
@@ -304,13 +350,20 @@ defmodule EKV.Store do
   # =====================================================================
 
   @doc """
-  Prepare the 2 hot statements on the writer connection
+  Prepare the hot cached writer statements on the shard connection.
   """
   def prepare_cached_stmts(db) do
     {:ok, kv_stmt} = EKV.Sqlite3.prepare(db, @kv_upsert_sql)
     {:ok, kv_force_stmt} = EKV.Sqlite3.prepare(db, @kv_force_upsert_sql)
+    {:ok, keyref_stmt} = EKV.Sqlite3.prepare(db, @keyref_ensure_sql)
     {:ok, oplog_stmt} = EKV.Sqlite3.prepare(db, @oplog_insert_sql)
-    %{kv_upsert: kv_stmt, kv_force_upsert: kv_force_stmt, oplog_insert: oplog_stmt}
+
+    %{
+      kv_upsert: kv_stmt,
+      kv_force_upsert: kv_force_stmt,
+      keyref_upsert: keyref_stmt,
+      oplog_insert: oplog_stmt
+    }
   end
 
   @doc """
@@ -330,7 +383,8 @@ defmodule EKV.Store do
   end
 
   @doc """
-  Combined write: LWW check + kv upsert + oplog insert in a single NIF call.
+  Combined write: LWW check + kv upsert + keyref maintenance + oplog insert in
+  a single NIF call.
 
   Returns:
     - `{:ok, true, origin_seq, local_progress_seq}` when the write was applied
@@ -341,6 +395,7 @@ defmodule EKV.Store do
   def write_entry(
         db,
         kv_stmt,
+        keyref_stmt,
         oplog_stmt,
         key,
         value_binary,
@@ -357,13 +412,40 @@ defmodule EKV.Store do
     local_origin =
       case local_origin_override do
         bool when is_boolean(bool) -> bool
-        _ -> origin_str == Atom.to_string(node())
+        _ -> is_nil(origin_seq)
       end
 
     kv_args = [key, value_binary, timestamp, origin_str, origin_seq, expires_at, deleted_at]
     oplog_args = [key, value_binary, timestamp, origin_str, origin_seq, expires_at, is_delete]
 
-    EKV.Sqlite3.write_entry(db, kv_stmt, oplog_stmt, kv_args, oplog_args, local_origin)
+    EKV.Sqlite3.write_entry(
+      db,
+      kv_stmt,
+      keyref_stmt,
+      oplog_stmt,
+      kv_args,
+      oplog_args,
+      local_origin
+    )
+  end
+
+  @doc """
+  Apply a full-sync snapshot row to `kv` without appending replay history.
+  """
+  def write_snapshot_entry(
+        db,
+        kv_stmt,
+        key,
+        value_binary,
+        timestamp,
+        origin_node,
+        origin_seq,
+        expires_at,
+        deleted_at \\ nil
+      ) do
+    origin_str = persisted_member_id(origin_node)
+    kv_args = [key, value_binary, timestamp, origin_str, origin_seq, expires_at, deleted_at]
+    EKV.Sqlite3.write_snapshot_entry(db, kv_stmt, kv_args)
   end
 
   # =====================================================================
@@ -481,8 +563,11 @@ defmodule EKV.Store do
   # =====================================================================
 
   @oplog_since_sql """
-  SELECT seq, key, value, timestamp, origin_node, origin_seq, expires_at, is_delete
-  FROM kv_oplog WHERE seq > ?1 ORDER BY seq
+  SELECT o.seq, k.key, o.value, o.timestamp, o.origin_node, o.origin_seq, o.expires_at, o.is_delete
+  FROM kv_oplog AS o
+  JOIN kv_keyrefs AS k ON k.id = o.key_id
+  WHERE o.seq > ?1
+  ORDER BY o.seq
   """
 
   def oplog_since(db, seq) do
@@ -667,12 +752,13 @@ defmodule EKV.Store do
   end
 
   @replay_since_origin_chunk_sql """
-  SELECT key, value, timestamp, origin_node, origin_seq, expires_at, is_delete
-  FROM kv_oplog
-  WHERE origin_node = ?1
-    AND origin_seq > ?2
-    AND (is_delete = 1 OR expires_at IS NULL OR expires_at > ?3)
-  ORDER BY origin_seq LIMIT ?4
+  SELECT k.key, o.value, o.timestamp, o.origin_node, o.origin_seq, o.expires_at, o.is_delete
+  FROM kv_oplog AS o
+  JOIN kv_keyrefs AS k ON k.id = o.key_id
+  WHERE o.origin_node = ?1
+    AND o.origin_seq > ?2
+    AND (o.is_delete = 1 OR o.expires_at IS NULL OR o.expires_at > ?3)
+  ORDER BY o.origin_seq LIMIT ?4
   """
 
   def replay_since_origin_chunk(db, origin_node, origin_seq, limit) do
@@ -780,34 +866,40 @@ defmodule EKV.Store do
   Hard-delete CAS-managed TTL-expired rows older than the retention cutoff.
   """
   def purge_expired(db, cutoff) do
-    {:ok, stmt} =
-      EKV.Sqlite3.prepare(db, """
-      DELETE FROM kv
-      WHERE expires_at IS NOT NULL
-        AND expires_at < ?1
-        AND deleted_at IS NULL
-        AND key IN (SELECT key FROM kv_paxos)
-      """)
+    in_tx(db, fn ->
+      {:ok, del_stmt} =
+        EKV.Sqlite3.prepare(db, """
+        DELETE FROM kv
+        WHERE expires_at IS NOT NULL
+          AND expires_at < ?1
+          AND deleted_at IS NULL
+          AND key IN (SELECT key FROM kv_paxos)
+        """)
 
-    :ok = EKV.Sqlite3.bind(stmt, [cutoff])
-    :done = EKV.Sqlite3.step(db, stmt)
-    :ok = EKV.Sqlite3.release(db, stmt)
-    :ok
+      :ok = EKV.Sqlite3.bind(del_stmt, [cutoff])
+      :done = EKV.Sqlite3.step(db, del_stmt)
+      :ok = EKV.Sqlite3.release(db, del_stmt)
+
+      purge_orphan_keyrefs(db)
+    end)
   end
 
   @doc """
   Hard-delete tombstones older than cutoff
   """
   def purge_tombstones(db, cutoff) do
-    {:ok, stmt} =
-      EKV.Sqlite3.prepare(db, """
-      DELETE FROM kv WHERE deleted_at IS NOT NULL AND deleted_at < ?1
-      """)
+    in_tx(db, fn ->
+      {:ok, del_stmt} =
+        EKV.Sqlite3.prepare(db, """
+        DELETE FROM kv WHERE deleted_at IS NOT NULL AND deleted_at < ?1
+        """)
 
-    :ok = EKV.Sqlite3.bind(stmt, [cutoff])
-    :done = EKV.Sqlite3.step(db, stmt)
-    :ok = EKV.Sqlite3.release(db, stmt)
-    :ok
+      :ok = EKV.Sqlite3.bind(del_stmt, [cutoff])
+      :done = EKV.Sqlite3.step(db, del_stmt)
+      :ok = EKV.Sqlite3.release(db, del_stmt)
+
+      purge_orphan_keyrefs(db)
+    end)
   end
 
   @doc """
@@ -834,30 +926,28 @@ defmodule EKV.Store do
   Truncate replay-log entries below the minimum retained peer progress per origin.
   """
   def truncate_oplog(db) do
-    {:ok, rows} =
-      EKV.Sqlite3.fetch_all(
-        db,
-        """
-        SELECT origin_node, MIN(last_seq)
-        FROM kv_member_progress
-        GROUP BY origin_node
-        """,
-        []
-      )
-
-    Enum.each(rows, fn [origin_node, min_seq] ->
-      {:ok, del_stmt} =
-        EKV.Sqlite3.prepare(
+    in_tx(db, fn ->
+      :ok =
+        EKV.Sqlite3.execute(
           db,
-          "DELETE FROM kv_oplog WHERE origin_node = ?1 AND origin_seq < ?2"
+          """
+          WITH retained AS (
+            SELECT origin_node, MIN(last_seq) AS min_seq
+            FROM kv_member_progress
+            GROUP BY origin_node
+          )
+          DELETE FROM kv_oplog
+          WHERE EXISTS (
+            SELECT 1
+            FROM retained AS r
+            WHERE r.origin_node = kv_oplog.origin_node
+              AND kv_oplog.origin_seq < r.min_seq
+          )
+          """
         )
 
-      :ok = EKV.Sqlite3.bind(del_stmt, [origin_node, min_seq])
-      :done = EKV.Sqlite3.step(db, del_stmt)
-      :ok = EKV.Sqlite3.release(db, del_stmt)
+      purge_orphan_keyrefs(db)
     end)
-
-    :ok
   end
 
   # =====================================================================
@@ -933,11 +1023,12 @@ defmodule EKV.Store do
   end
 
   @oplog_since_chunk_sql """
-  SELECT seq, key, value, timestamp, origin_node, origin_seq, expires_at, is_delete
-  FROM kv_oplog
-  WHERE seq > ?1
-    AND (is_delete = 1 OR expires_at IS NULL OR expires_at > ?2)
-  ORDER BY seq LIMIT ?3
+  SELECT o.seq, k.key, o.value, o.timestamp, o.origin_node, o.origin_seq, o.expires_at, o.is_delete
+  FROM kv_oplog AS o
+  JOIN kv_keyrefs AS k ON k.id = o.key_id
+  WHERE o.seq > ?1
+    AND (o.is_delete = 1 OR o.expires_at IS NULL OR o.expires_at > ?2)
+  ORDER BY o.seq LIMIT ?3
   """
 
   @doc """
@@ -1212,6 +1303,24 @@ defmodule EKV.Store do
   defp persisted_member_id(id) when is_integer(id), do: Integer.to_string(id)
   defp persisted_member_id(id), do: to_string(id)
 
+  defp in_tx(db, fun) when is_function(fun, 0) do
+    :ok = EKV.Sqlite3.execute(db, "BEGIN IMMEDIATE")
+
+    try do
+      result = fun.()
+      :ok = EKV.Sqlite3.execute(db, "COMMIT")
+      result
+    rescue
+      error ->
+        _ = EKV.Sqlite3.execute(db, "ROLLBACK")
+        reraise error, __STACKTRACE__
+    catch
+      kind, reason ->
+        _ = EKV.Sqlite3.execute(db, "ROLLBACK")
+        :erlang.raise(kind, reason, __STACKTRACE__)
+    end
+  end
+
   # =====================================================================
   # Paxos
   # =====================================================================
@@ -1224,8 +1333,26 @@ defmodule EKV.Store do
     EKV.Sqlite3.paxos_accept(db, key, ballot_c, ballot_n, value_args)
   end
 
-  def paxos_promote(db, kv_force_stmt, oplog_stmt, key, ballot_c, ballot_n, origin_seq \\ nil) do
-    EKV.Sqlite3.paxos_promote(db, kv_force_stmt, oplog_stmt, key, ballot_c, ballot_n, origin_seq)
+  def paxos_promote(
+        db,
+        kv_force_stmt,
+        keyref_stmt,
+        oplog_stmt,
+        key,
+        ballot_c,
+        ballot_n,
+        origin_seq \\ nil
+      ) do
+    EKV.Sqlite3.paxos_promote(
+      db,
+      kv_force_stmt,
+      keyref_stmt,
+      oplog_stmt,
+      key,
+      ballot_c,
+      ballot_n,
+      origin_seq
+    )
   end
 
   def cas_managed_key?(db, key) do
@@ -1272,6 +1399,22 @@ defmodule EKV.Store do
       )
   end
 
+  def purge_orphan_keyrefs(db) do
+    :ok =
+      EKV.Sqlite3.execute(
+        db,
+        """
+        DELETE FROM kv_keyrefs
+        WHERE oplog_refs = 0
+          AND NOT EXISTS (
+            SELECT 1
+            FROM kv
+            WHERE kv.key = kv_keyrefs.key
+          )
+        """
+      )
+  end
+
   # =====================================================================
   # Shard count validation
   # =====================================================================
@@ -1304,6 +1447,7 @@ defmodule EKV.Store do
       [
         "kv_meta",
         "kv",
+        "kv_keyrefs",
         "kv_oplog",
         "kv_origin_progress",
         "kv_member_progress",

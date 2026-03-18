@@ -22,7 +22,7 @@ defmodule EKV.AntiEntropyTest do
     tombstone_ttl = Keyword.get(opts, :tombstone_ttl, :timer.hours(24 * 7))
 
     member_progress_retention_ttl =
-      Keyword.get(opts, :member_progress_retention_ttl, tombstone_ttl)
+      Keyword.get(opts, :member_progress_retention_ttl, min(tombstone_ttl, :timer.hours(6)))
 
     cluster_size = Keyword.fetch!(opts, :cluster_size)
 

@@ -104,7 +104,7 @@ Values can be any Erlang term (stored via `:erlang.term_to_binary/1`). Keys are 
 | `:shards` | `8` | Member mode only. Number of shards (each is an independent GenServer + SQLite db) |
 | `:tombstone_ttl` | `604_800_000` (7 days) | Member mode only. How long tombstones are retained in milliseconds |
 | `:gc_interval` | `300_000` (5 min) | Member mode only. GC tick interval in milliseconds |
-| `:member_progress_retention_ttl` | same as `:tombstone_ttl` (`604_800_000`, 7 days by default) | Member mode only. How long disconnected members keep anchoring replay retention before their `kv_member_progress` rows may be pruned. This is the main guard against partitions turning into full syncs after a GC; `0` restores the old immediate-prune behavior. |
+| `:member_progress_retention_ttl` | `min(:tombstone_ttl, 21_600_000)` (6 hours by default) | Member mode only. How long disconnected members keep anchoring replay retention before their `kv_member_progress` rows may be pruned. This is the main guard against partitions turning into full syncs after a GC; `0` restores the old immediate-prune behavior. |
 | `:wait_for_quorum` | `false` | Optional startup gate. In member mode, waits for this EKV member to reach CAS quorum. In client mode, waits for the selected backend member to report CAS quorum reachable. |
 | `:anti_entropy_interval` | `30_000` (30 sec) | Member mode only. Periodic background repair for already-connected members. Re-runs the normal HWM-driven delta/full sync path to heal missed replication without waiting for reconnect. `false`/`nil` disables it. |
 | `:wire_compression_threshold` | `262_144` (256 KB) | Optional byte threshold for member-to-member wire compression of large replicated value payloads. `false`/`nil` disables it. Large LWW replication and CAS accept/commit payloads compress on the wire only; values remain uncompressed on disk and on reads. |
@@ -134,7 +134,7 @@ blue-green machinery on that node.
 
 ### Storage
 
-Each shard has a single SQLite database (WAL mode) as its sole storage layer — no data is held in memory so your dataset is not bound by available system memory. Writes go through the shard GenServer which atomically updates both the `kv` table and `kv_oplog` in a single NIF call. Reads go directly to SQLite via per-scheduler read connections stored in `persistent_term`.
+Each shard has a single SQLite database (WAL mode) as its sole storage layer — no data is held in memory so your dataset is not bound by available system memory. Normal writes go through the shard GenServer and atomically update current state plus retained replay history in a single NIF call. Replay rows use a deduplicated `kv_keyrefs` dictionary so `kv_oplog` does not repeat full key strings on every version, and full sync rebuilds `kv` without seeding replay history on the receiver. Reads go directly to SQLite via per-scheduler read connections stored in `persistent_term`.
 
 Data survives restarts automatically since SQLite is the source of truth.
 
@@ -151,7 +151,7 @@ When a node connects (or reconnects), each shard pair exchanges a handshake. Bas
 
 - **Delta sync** if the oplog still has entries since the member's last known position (efficient for brief disconnects).
 - **Relayed delta** if a member is behind on some third-party origin that is currently down but a live peer still retains that origin stream.
-- **Full sync** if the oplog has been truncated past that point or the member is new (sends all live entries + recent tombstones; expired rows are omitted).
+- **Full sync** if the oplog has been truncated past that point or the member is new (sends all live entries + recent tombstones; expired rows are omitted). Full sync rebuilds `kv` on the receiver but does not seed `kv_oplog`.
 
 Connected members also re-run that same handshake periodically by default
 (`anti_entropy_interval`) so a member that missed a prior update eventually
@@ -252,7 +252,7 @@ A different edge case is when nodes stay up but are partitioned longer than
 reconnect.
 
 For shorter outages, oplog retention is anchored independently by
-`member_progress_retention_ttl` (default: same as `tombstone_ttl`). If a disconnected member
+`member_progress_retention_ttl` (default: `min(tombstone_ttl, 6 hours)`). If a disconnected member
 rejoins within that window, GC keeps its replay cursor so heal can usually stay
 on delta instead of falling back to a full sync.
 

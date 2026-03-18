@@ -267,6 +267,12 @@ Important:
   - Erlang `node()` names are transport/routing identities only.
 - `kv_origin_progress` is local applied progress per origin stream.
 - `kv_member_progress` is peer progress per origin stream.
+- `kv_oplog` stores retained replay history, but uses `kv_keyrefs` so replay
+  rows reference deduplicated keys instead of repeating full key strings.
+  - `kv_keyrefs.oplog_refs` is maintained by SQLite triggers on `kv_oplog`
+    insert/delete so normal writes do not pay a second refcount statement.
+  - GC prunes orphan keyrefs only after replay for that key is gone and the
+    key no longer exists in `kv`.
 - Progress is exact, not monotonic-by-max.
   - If a peer restarts/full-syncs to a lower authoritative cursor, the stored peer progress must be allowed to move lower too.
 - Delta sync is only valid when the requester is behind a live origin stream and the requested range is still inside the retained replay window.
@@ -282,6 +288,9 @@ Important:
   - `origin_node` is persisted as a string; with member identity configured it
     should be the stable `node_id`, not a transient blue/green node name.
   - Receivers advance local contiguous progress in the same write/promote transaction.
+- Full sync rebuilds `kv` only.
+  - Receivers settle progress from the terminal advertised summary.
+  - Receivers must not append full-sync rows back into `kv_oplog`.
 - Replay and CAS on the same shard are mailbox-serialized.
 - Chunked sync safety is not just "different tables":
   - tentative CAS state is in `kv_paxos`
@@ -296,9 +305,10 @@ Important:
     progress can advance directly to that seq without scanning `kv_oplog`.
 - Normal delta sync is origin-ordered, but any live peer with retained oplog can relay that origin stream.
 - Disconnected members keep anchoring replay retention for
-  `:member_progress_retention_ttl` (default: same as `tombstone_ttl`), keyed
-  by stable `node_id` when known, so partitions still inside the normal
-  auto-heal window prefer delta over full sync after GC.
+  `:member_progress_retention_ttl` (default: `min(tombstone_ttl, 6 hours)`),
+  keyed by stable `node_id` when known, so serious but finite partitions can
+  still prefer delta over full sync without retaining oplog history for the
+  full tombstone/quarantine window by default.
 - Quarantined origins can force immediate full sync from a live peer.
 - If a peer is behind on data from a known member origin that is merely
   disconnected/unavailable, EKV requests relayed delta from a live peer immediately.
