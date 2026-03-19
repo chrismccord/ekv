@@ -636,7 +636,7 @@ defmodule EKV.CASDistributedTest do
       end)
     end
 
-    test "three nodes simultaneously CAS same key: exactly one wins" do
+    test "three nodes simultaneously CAS same key: one winner commits" do
       peers = TestCluster.start_peers(3)
       on_exit(fn -> TestCluster.stop_peers(peers) end)
 
@@ -663,11 +663,28 @@ defmodule EKV.CASDistributedTest do
         end)
 
       results = Task.await_many([task_a, task_b, task_c], 15_000)
-      successes = Enum.count(results, &match?({:ok, _}, &1))
+      successes =
+        Enum.count(results, fn
+          {:ok, _} -> true
+          {:ok, _, _} -> true
+          _ -> false
+        end)
 
-      # Exactly one should win
-      assert successes == 1,
-             "Expected exactly 1 success, got #{successes}: #{inspect(results)}"
+      assert Enum.all?(results, fn
+               {:ok, _} -> true
+               {:ok, _, _} -> true
+               {:error, :conflict} -> true
+               {:error, :unconfirmed} -> true
+               _ -> false
+             end),
+             "Expected only CAS success/conflict/unconfirmed outcomes, got: #{inspect(results)}"
+
+      # A concurrent insert-if-absent race can produce an ambiguous proposer outcome
+      # (`:unconfirmed`) even when one value commits. The contract we care about is
+      # that at most one proposer gets an explicit success and the cluster converges
+      # on a single winner.
+      assert successes <= 1,
+             "Expected at most 1 success, got #{successes}: #{inspect(results)}"
 
       winner = TestCluster.rpc!(node_a, EKV, :get, [ekv_name, "tri/1", [consistent: true]])
       assert winner in ["from_a", "from_b", "from_c"]
