@@ -531,7 +531,7 @@ defmodule EKV.Supervisor do
     reject_client_opt!(opts, :gc_interval, [nil])
     reject_client_opt!(opts, :tombstone_ttl, [nil])
     reject_client_opt!(opts, :sync_chunk_size, [nil])
-    reject_client_opt!(opts, :anti_entropy_interval, [nil, false])
+    reject_client_opt!(opts, :anti_entropy_interval, [nil])
     reject_client_opt!(opts, :member_progress_retention_ttl, [nil])
     reject_client_opt!(opts, :unavailable_origin_full_sync_delay, [nil])
     reject_client_opt!(opts, :allow_stale_startup, [nil, false])
@@ -562,16 +562,13 @@ defmodule EKV.Supervisor do
     min(tombstone_ttl, @default_member_progress_retention_ttl)
   end
 
-  defp validate_anti_entropy_interval!(false), do: :ok
-  defp validate_anti_entropy_interval!(nil), do: :ok
-
   defp validate_anti_entropy_interval!(interval)
        when is_integer(interval) and interval > 0,
        do: :ok
 
   defp validate_anti_entropy_interval!(interval) do
     raise ArgumentError,
-          "EKV: :anti_entropy_interval must be false/nil or a positive timeout in ms, got: #{inspect(interval)}"
+          "EKV: :anti_entropy_interval must be a positive timeout in ms, got: #{inspect(interval)}"
   end
 
   defp validate_member_progress_retention_ttl!(ttl)

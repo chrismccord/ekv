@@ -3,6 +3,7 @@ defmodule EKV.CASDistributedTest do
 
   @moduletag :capture_log
   @moduletag timeout: 60_000
+  @manual_anti_entropy_interval :timer.hours(24)
 
   alias EKV.TestCluster
 
@@ -991,7 +992,12 @@ defmodule EKV.CASDistributedTest do
       on_exit(fn -> TestCluster.stop_peers(peers) end)
 
       ekv_name = unique_name(:cas)
-      start_cas_cluster(peers, ekv_name, shards: 1, anti_entropy_interval: false)
+
+      start_cas_cluster(peers, ekv_name,
+        shards: 1,
+        anti_entropy_interval: @manual_anti_entropy_interval
+      )
+
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
       assert {:ok, vsn1} =

@@ -3,6 +3,7 @@ defmodule EKV.AntiEntropyTest do
 
   @moduletag :capture_log
   @moduletag timeout: 60_000
+  @manual_anti_entropy_interval :timer.hours(24)
 
   alias EKV.TestCluster
 
@@ -16,7 +17,10 @@ defmodule EKV.AntiEntropyTest do
 
   defp start_member(node, ekv_name, node_id, opts) do
     shards = Keyword.get(opts, :shards, 1)
-    anti_entropy_interval = Keyword.get(opts, :anti_entropy_interval, false)
+
+    anti_entropy_interval =
+      Keyword.get(opts, :anti_entropy_interval, @manual_anti_entropy_interval)
+
     sync_chunk_size = Keyword.get(opts, :sync_chunk_size, 500)
     gc_interval = Keyword.get(opts, :gc_interval, :timer.hours(1))
     tombstone_ttl = Keyword.get(opts, :tombstone_ttl, :timer.hours(24 * 7))
@@ -278,7 +282,7 @@ defmodule EKV.AntiEntropyTest do
       on_exit(fn -> TestCluster.stop_peers(peers) end)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      start_cluster(peers, ekv_name, anti_entropy_interval: false)
+      start_cluster(peers, ekv_name, anti_entropy_interval: @manual_anti_entropy_interval)
 
       assert {:ok, vsn1} =
                TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "disabled/1", "v1", [if_vsn: nil]])
@@ -319,7 +323,7 @@ defmodule EKV.AntiEntropyTest do
       on_exit(fn -> TestCluster.stop_peers(peers) end)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      start_cluster(peers, ekv_name, anti_entropy_interval: false)
+      start_cluster(peers, ekv_name, anti_entropy_interval: @manual_anti_entropy_interval)
 
       write_many(node_a, ekv_name, "live_lww", 5)
 
@@ -340,7 +344,7 @@ defmodule EKV.AntiEntropyTest do
       on_exit(fn -> TestCluster.stop_peers(peers) end)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      start_cluster(peers, ekv_name, anti_entropy_interval: false)
+      start_cluster(peers, ekv_name, anti_entropy_interval: @manual_anti_entropy_interval)
 
       write_many(node_a, ekv_name, "remote_origin", 5)
 
@@ -369,7 +373,7 @@ defmodule EKV.AntiEntropyTest do
       on_exit(fn -> TestCluster.stop_peers(peers) end)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      start_cluster(peers, ekv_name, anti_entropy_interval: false)
+      start_cluster(peers, ekv_name, anti_entropy_interval: @manual_anti_entropy_interval)
 
       assert {:ok, _vsn} =
                TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "live_cas/1", "v1", [if_vsn: nil]])
@@ -397,7 +401,7 @@ defmodule EKV.AntiEntropyTest do
       on_exit(fn -> TestCluster.stop_peers(peers) end)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      start_cluster(peers, ekv_name, anti_entropy_interval: false)
+      start_cluster(peers, ekv_name, anti_entropy_interval: @manual_anti_entropy_interval)
 
       write_many(node_a, ekv_name, "stale_inflight", 4)
 
@@ -452,7 +456,7 @@ defmodule EKV.AntiEntropyTest do
       on_exit(fn -> TestCluster.stop_peers(peers) end)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      start_cluster(peers, ekv_name, anti_entropy_interval: false)
+      start_cluster(peers, ekv_name, anti_entropy_interval: @manual_anti_entropy_interval)
 
       assert :ok == TestCluster.rpc!(node_a, EKV, :put, [ekv_name, key1, "v1"])
 
@@ -511,7 +515,7 @@ defmodule EKV.AntiEntropyTest do
       on_exit(fn -> TestCluster.stop_peers(peers) end)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      start_cluster(peers, ekv_name, anti_entropy_interval: false)
+      start_cluster(peers, ekv_name, anti_entropy_interval: @manual_anti_entropy_interval)
 
       assert {:ok, vsn1} =
                TestCluster.rpc!(node_a, EKV, :put, [ekv_name, key, "v1", [if_vsn: nil]])
@@ -630,7 +634,7 @@ defmodule EKV.AntiEntropyTest do
       on_exit(fn -> TestCluster.stop_peers(peers) end)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      start_cluster(peers, ekv_name, anti_entropy_interval: false)
+      start_cluster(peers, ekv_name, anti_entropy_interval: @manual_anti_entropy_interval)
 
       assert :ok == TestCluster.rpc!(node_a, EKV, :put, [ekv_name, key1, "v1"])
 
@@ -677,7 +681,7 @@ defmodule EKV.AntiEntropyTest do
       on_exit(fn -> TestCluster.stop_peers(peers) end)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      start_cluster(peers, ekv_name, anti_entropy_interval: false)
+      start_cluster(peers, ekv_name, anti_entropy_interval: @manual_anti_entropy_interval)
 
       write_many(node_a, ekv_name, "startup_gap", 3)
 
@@ -712,7 +716,7 @@ defmodule EKV.AntiEntropyTest do
       on_exit(fn -> TestCluster.stop_peers(peers) end)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      start_cluster(peers, ekv_name, anti_entropy_interval: false)
+      start_cluster(peers, ekv_name, anti_entropy_interval: @manual_anti_entropy_interval)
 
       assert :ok == TestCluster.rpc!(node_a, EKV, :put, [ekv_name, key1, "v1"])
 
@@ -764,7 +768,7 @@ defmodule EKV.AntiEntropyTest do
       start_cluster(
         peers,
         ekv_name,
-        anti_entropy_interval: false,
+        anti_entropy_interval: @manual_anti_entropy_interval,
         sync_chunk_size: 2
       )
 
@@ -831,7 +835,7 @@ defmodule EKV.AntiEntropyTest do
       on_exit(fn -> TestCluster.stop_peers(peers) end)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      start_cluster(peers, ekv_name, anti_entropy_interval: false)
+      start_cluster(peers, ekv_name, anti_entropy_interval: @manual_anti_entropy_interval)
 
       write_many(node_c, ekv_name, "dead_source", 3)
 
@@ -873,7 +877,7 @@ defmodule EKV.AntiEntropyTest do
       on_exit(fn -> TestCluster.stop_peers(peers) end)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      start_cluster(peers, ekv_name, anti_entropy_interval: false)
+      start_cluster(peers, ekv_name, anti_entropy_interval: @manual_anti_entropy_interval)
 
       write_many(node_a, ekv_name, "dedup_relay", 3)
 
@@ -929,7 +933,7 @@ defmodule EKV.AntiEntropyTest do
       on_exit(fn -> TestCluster.stop_peers(peers) end)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      start_cluster(peers, ekv_name, anti_entropy_interval: false)
+      start_cluster(peers, ekv_name, anti_entropy_interval: @manual_anti_entropy_interval)
 
       assert :ok == TestCluster.rpc!(node_a, EKV, :put, [ekv_name, a1, "a-v1"])
       assert :ok == TestCluster.rpc!(node_b, EKV, :put, [ekv_name, b1, "b-v1"])
@@ -1016,7 +1020,7 @@ defmodule EKV.AntiEntropyTest do
       on_exit(fn -> TestCluster.stop_peers(peers) end)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      start_cluster(peers, ekv_name, anti_entropy_interval: false)
+      start_cluster(peers, ekv_name, anti_entropy_interval: @manual_anti_entropy_interval)
 
       assert :ok == TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "zzz/1", "v1"])
       assert :ok == TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "yyy/1", "v2"])
@@ -1046,7 +1050,7 @@ defmodule EKV.AntiEntropyTest do
       on_exit(fn -> TestCluster.stop_peers(peers) end)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      start_cluster(peers, ekv_name, anti_entropy_interval: false)
+      start_cluster(peers, ekv_name, anti_entropy_interval: @manual_anti_entropy_interval)
 
       write_many(node_a, ekv_name, "from_a", 4)
 
@@ -1094,7 +1098,7 @@ defmodule EKV.AntiEntropyTest do
       on_exit(fn -> TestCluster.stop_peers(peers) end)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      start_cluster(peers, ekv_name, anti_entropy_interval: false)
+      start_cluster(peers, ekv_name, anti_entropy_interval: @manual_anti_entropy_interval)
 
       impossible_hwm = 42
 
@@ -1136,7 +1140,7 @@ defmodule EKV.AntiEntropyTest do
       on_exit(fn -> TestCluster.stop_peers(peers) end)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      start_cluster(peers, ekv_name, anti_entropy_interval: false)
+      start_cluster(peers, ekv_name, anti_entropy_interval: @manual_anti_entropy_interval)
 
       write_many(node_a, ekv_name, "stale_low", 3)
 
@@ -1170,7 +1174,7 @@ defmodule EKV.AntiEntropyTest do
       start_cluster(
         peers,
         ekv_name,
-        anti_entropy_interval: false,
+        anti_entropy_interval: @manual_anti_entropy_interval,
         sync_chunk_size: 2,
         gc_interval: 100,
         tombstone_ttl: 700
@@ -1232,7 +1236,7 @@ defmodule EKV.AntiEntropyTest do
       start_cluster(
         peers,
         ekv_name,
-        anti_entropy_interval: false,
+        anti_entropy_interval: @manual_anti_entropy_interval,
         sync_chunk_size: 2,
         gc_interval: 100,
         tombstone_ttl: 10_000,
@@ -1315,7 +1319,7 @@ defmodule EKV.AntiEntropyTest do
       start_cluster(
         peers,
         ekv_name,
-        anti_entropy_interval: false,
+        anti_entropy_interval: @manual_anti_entropy_interval,
         gc_interval: 100,
         tombstone_ttl: 10_000,
         member_progress_retention_ttl: 10_000
@@ -1366,7 +1370,7 @@ defmodule EKV.AntiEntropyTest do
       on_exit(fn -> TestCluster.stop_peers(peers) end)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      start_cluster(peers, ekv_name, anti_entropy_interval: false)
+      start_cluster(peers, ekv_name, anti_entropy_interval: @manual_anti_entropy_interval)
 
       write_many(node_b, ekv_name, "restart", 4)
 
@@ -1412,7 +1416,7 @@ defmodule EKV.AntiEntropyTest do
       start_cluster(
         peers,
         ekv_name,
-        anti_entropy_interval: false,
+        anti_entropy_interval: @manual_anti_entropy_interval,
         tombstone_ttl: 700,
         gc_interval: 100
       )
@@ -1439,7 +1443,7 @@ defmodule EKV.AntiEntropyTest do
       on_exit(fn -> TestCluster.stop_peers(peers) end)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      start_cluster(peers, ekv_name, anti_entropy_interval: false)
+      start_cluster(peers, ekv_name, anti_entropy_interval: @manual_anti_entropy_interval)
 
       assert :ok = TestCluster.set_handoff_node(node_a, ekv_name, node_b)
       assert :ok = TestCluster.trace_shard_sends(node_a, ekv_name, self())
@@ -1455,7 +1459,10 @@ defmodule EKV.AntiEntropyTest do
       on_exit(fn -> TestCluster.stop_peers(peers) end)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      start_cluster(peers, ekv_name, anti_entropy_interval: false, sync_chunk_size: 2)
+      start_cluster(peers, ekv_name,
+        anti_entropy_interval: @manual_anti_entropy_interval,
+        sync_chunk_size: 2
+      )
 
       write_many(node_a, ekv_name, "delta", 5)
 

@@ -2374,6 +2374,26 @@ defmodule EKVTest do
       File.rm_rf!(data_dir)
     end
 
+    test "anti_entropy_interval must be a positive timeout" do
+      for interval <- [false, nil] do
+        name = :"ekv_anti_entropy_cfg_#{System.unique_integer([:positive])}"
+        data_dir = Path.join(System.tmp_dir!(), "ekv_anti_entropy_cfg_#{name}")
+        Process.flag(:trap_exit, true)
+
+        assert {:error, {%ArgumentError{message: msg}, _}} =
+                 EKV.start_link(
+                   name: name,
+                   data_dir: data_dir,
+                   anti_entropy_interval: interval,
+                   log: false
+                 )
+
+        assert msg =~ ":anti_entropy_interval must be a positive timeout in ms"
+
+        File.rm_rf!(data_dir)
+      end
+    end
+
     test "invalid node_id type raises" do
       name = :"ekv_cas_cfg_#{System.unique_integer([:positive])}"
       data_dir = Path.join(System.tmp_dir!(), "ekv_cas_cfg_#{name}")
