@@ -1327,7 +1327,7 @@ defmodule EKV.AntiEntropyTest do
         peers,
         ekv_name,
         anti_entropy_interval: @manual_anti_entropy_interval,
-        gc_interval: 100,
+        gc_interval: @manual_anti_entropy_interval,
         tombstone_ttl: 10_000,
         member_progress_retention_ttl: 10_000
       )
@@ -1345,6 +1345,9 @@ defmodule EKV.AntiEntropyTest do
         TestCluster.rpc!(node_b, EKV, :get, [ekv_name, "hot_churn/key"]) == "v200"
       end)
 
+      count_before_gc = TestCluster.oplog_count(node_a, ekv_name)
+      assert count_before_gc >= 200
+
       a_max = TestCluster.max_seq(node_a, ekv_name)
 
       assert :ok = TestCluster.trigger_anti_entropy(node_b, ekv_name)
@@ -1353,9 +1356,6 @@ defmodule EKV.AntiEntropyTest do
         state = TestCluster.replica_state(node_a, ekv_name)
         get_in(state.remote_member_progress, [node_b, node_a]) == a_max
       end)
-
-      count_before_gc = TestCluster.oplog_count(node_a, ekv_name)
-      assert count_before_gc >= 200
 
       trigger_gc(node_a, ekv_name, 0, 10_000)
 
