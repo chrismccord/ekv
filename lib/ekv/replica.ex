@@ -857,6 +857,11 @@ defmodule EKV.Replica do
             * quarantined/unrecoverable origins can trigger immediate full
             * ordinary disconnected third origins try relayed delta
               immediately and fall back to full only if replay is unavailable
+            * summary-probe and sync in-flight suppression is bounded:
+                - each shard suppresses duplicate probes/repairs per peer
+                - stale in-flight markers expire after a short timeout
+                - dropped sync requests therefore cannot freeze peer-progress
+                  refresh forever
             * Both sides repair their own missed mutations independently
             * LWW resolves any conflicts deterministically:
                 - Disjoint keys: union of both sides
@@ -1012,8 +1017,8 @@ defmodule EKV.Replica do
         ballot_counter: integer,        # monotonic, persisted in kv_meta
         member_node_ids:  %{node => string},  # Erlang node → CAS node_id
         remote_member_progress: %{node => %{origin => seq}},
-        summary_probe_inflight: MapSet.t(node()), # peers with a summary probe in flight
-        sync_inflight:  MapSet.t(node()), # remote members currently servicing our repair requests
+        summary_probe_inflight: %{node => monotonic_ms}, # peers with a summary probe in flight; stale entries expire
+        sync_inflight:  %{node => monotonic_ms}, # remote members currently servicing our repair requests; stale entries expire
         full_sync_inflight: node() | nil, # single full-bootstrap source for this shard
         pending_cas:    %{ref => op},   # in-flight CAS operations
         quorum_waiters: %{ref => waiter} # pending await_quorum callers
@@ -1113,6 +1118,8 @@ defmodule EKV.Replica do
   @wire_compressed_tag :ekv_wire_compressed
   @wire_feature_live_progress :live_progress
   @wire_feature_compression :wire_compression
+  @summary_probe_timeout_ms :timer.minutes(2)
+  @sync_inflight_timeout_ms :timer.minutes(2)
   defstruct [
     :name,
     :shard_index,
@@ -1140,8 +1147,8 @@ defmodule EKV.Replica do
     remote_member_progress: %{},
     remote_member_hwms: %{},
     remote_features: %{},
-    summary_probe_inflight: MapSet.new(),
-    sync_inflight: MapSet.new(),
+    summary_probe_inflight: %{},
+    sync_inflight: %{},
     full_sync_inflight: nil,
     pending_cas: %{},
     quorum_waiters: %{},
@@ -1736,6 +1743,7 @@ defmodule EKV.Replica do
 
   def handle_info({:ekv_sync, from_node, _shard, mode, entries, progress}, %Replica{} = state) do
     %{shard_index: shard, db: db, num_shards: num_shards} = state
+    state = touch_sync_inflight(state, from_node)
 
     log_verbose(state, fn ->
       "#{log_prefix_shard(state)} ekv_sync from #{from_node} (#{length(entries)} entries)"
@@ -1870,7 +1878,7 @@ defmodule EKV.Replica do
         remote_member_progress: Map.delete(state.remote_member_progress, dead_node),
         remote_member_hwms: Map.delete(state.remote_member_hwms, dead_node),
         remote_features: Map.delete(state.remote_features, dead_node),
-        summary_probe_inflight: MapSet.delete(state.summary_probe_inflight, dead_node)
+        summary_probe_inflight: Map.delete(state.summary_probe_inflight, dead_node)
     }
 
     state = clear_sync_inflight(state, dead_node)
@@ -1906,7 +1914,7 @@ defmodule EKV.Replica do
           remote_member_progress: Map.delete(state.remote_member_progress, remote_node),
           remote_member_hwms: Map.delete(state.remote_member_hwms, remote_node),
           remote_features: Map.delete(state.remote_features, remote_node),
-          summary_probe_inflight: MapSet.delete(state.summary_probe_inflight, remote_node)
+          summary_probe_inflight: Map.delete(state.summary_probe_inflight, remote_node)
       }
 
       state = clear_sync_inflight(state, remote_node)
@@ -2254,7 +2262,9 @@ defmodule EKV.Replica do
       if state.handoff_node do
         state
       else
-        trigger_summary_probe(state)
+        state
+        |> expire_stale_inflight()
+        |> trigger_summary_probe()
       end
 
     schedule_anti_entropy_tick(state)
@@ -2771,19 +2781,25 @@ defmodule EKV.Replica do
   end
 
   defp mark_sync_inflight(%Replica{} = state, remote_node, :full) do
+    now_ms = System.monotonic_time(:millisecond)
+
     %{
       state
-      | sync_inflight: MapSet.put(state.sync_inflight, remote_node),
+      | sync_inflight: Map.put(state.sync_inflight, remote_node, now_ms),
         full_sync_inflight: remote_node
     }
   end
 
   defp mark_sync_inflight(%Replica{} = state, remote_node, _request) do
-    %{state | sync_inflight: MapSet.put(state.sync_inflight, remote_node)}
+    %{
+      state
+      | sync_inflight:
+          Map.put(state.sync_inflight, remote_node, System.monotonic_time(:millisecond))
+    }
   end
 
   defp clear_sync_inflight(%Replica{} = state, remote_node) do
-    state = %{state | sync_inflight: MapSet.delete(state.sync_inflight, remote_node)}
+    state = %{state | sync_inflight: Map.delete(state.sync_inflight, remote_node)}
 
     if state.full_sync_inflight == remote_node do
       %{state | full_sync_inflight: nil}
@@ -2792,7 +2808,23 @@ defmodule EKV.Replica do
     end
   end
 
+  defp touch_sync_inflight(%Replica{} = state, remote_node) when is_atom(remote_node) do
+    if Map.has_key?(state.sync_inflight, remote_node) do
+      %{
+        state
+        | sync_inflight:
+            Map.put(state.sync_inflight, remote_node, System.monotonic_time(:millisecond))
+      }
+    else
+      state
+    end
+  end
+
+  defp touch_sync_inflight(%Replica{} = state, _remote_node), do: state
+
   defp request_sync(%Replica{} = state, remote_node, request) do
+    state = expire_stale_sync_inflight(state, remote_node)
+
     cond do
       state.handoff_node != nil ->
         state
@@ -2809,7 +2841,7 @@ defmodule EKV.Replica do
       request == :full and not is_nil(state.full_sync_inflight) ->
         state
 
-      MapSet.member?(state.sync_inflight, remote_node) ->
+      Map.has_key?(state.sync_inflight, remote_node) ->
         state
 
       true ->
@@ -2840,11 +2872,15 @@ defmodule EKV.Replica do
   end
 
   defp mark_summary_probe_inflight(%Replica{} = state, remote_node) do
-    %{state | summary_probe_inflight: MapSet.put(state.summary_probe_inflight, remote_node)}
+    %{
+      state
+      | summary_probe_inflight:
+          Map.put(state.summary_probe_inflight, remote_node, System.monotonic_time(:millisecond))
+    }
   end
 
   defp clear_summary_probe_inflight(%Replica{} = state, remote_node) do
-    %{state | summary_probe_inflight: MapSet.delete(state.summary_probe_inflight, remote_node)}
+    %{state | summary_probe_inflight: Map.delete(state.summary_probe_inflight, remote_node)}
   end
 
   defp sync_request_for_remote(%Replica{} = state, remote_node, remote_progress) do
@@ -3033,8 +3069,8 @@ defmodule EKV.Replica do
   defp trigger_summary_probe(%Replica{} = state) do
     Enum.reduce(Map.keys(state.remote_shards), state, fn remote_node, acc ->
       if MapSet.member?(acc.quarantined_members, remote_node) or
-           MapSet.member?(acc.sync_inflight, remote_node) or
-           MapSet.member?(acc.summary_probe_inflight, remote_node) do
+           Map.has_key?(acc.sync_inflight, remote_node) or
+           Map.has_key?(acc.summary_probe_inflight, remote_node) do
         acc
       else
         send_to_member(
@@ -3047,6 +3083,72 @@ defmodule EKV.Replica do
       end
     end)
   end
+
+  defp expire_stale_inflight(%Replica{} = state) do
+    now_ms = System.monotonic_time(:millisecond)
+
+    stale_summary =
+      state.summary_probe_inflight
+      |> Enum.filter(fn {_remote_node, sent_at_ms} ->
+        is_integer(sent_at_ms) and now_ms - sent_at_ms > @summary_probe_timeout_ms
+      end)
+      |> Enum.map(&elem(&1, 0))
+
+    stale_sync =
+      state.sync_inflight
+      |> Enum.filter(fn {_remote_node, activity_at_ms} ->
+        is_integer(activity_at_ms) and now_ms - activity_at_ms > @sync_inflight_timeout_ms
+      end)
+      |> Enum.map(&elem(&1, 0))
+
+    state =
+      Enum.reduce(stale_summary, state, fn remote_node, acc ->
+        sent_at_ms = Map.get(acc.summary_probe_inflight, remote_node)
+        age_ms = if is_integer(sent_at_ms), do: max(0, now_ms - sent_at_ms), else: nil
+
+        log(acc, fn ->
+          "#{log_prefix_shard(acc)} expiring stale summary probe for #{remote_node}" <>
+            format_inflight_age(age_ms)
+        end)
+
+        clear_summary_probe_inflight(acc, remote_node)
+      end)
+
+    Enum.reduce(stale_sync, state, fn remote_node, acc ->
+      activity_at_ms = Map.get(acc.sync_inflight, remote_node)
+      age_ms = if is_integer(activity_at_ms), do: max(0, now_ms - activity_at_ms), else: nil
+
+      log(acc, fn ->
+        "#{log_prefix_shard(acc)} expiring stale sync inflight for #{remote_node}" <>
+          format_inflight_age(age_ms)
+      end)
+
+      clear_sync_inflight(acc, remote_node)
+    end)
+  end
+
+  defp expire_stale_sync_inflight(%Replica{} = state, remote_node) do
+    now_ms = System.monotonic_time(:millisecond)
+
+    case Map.get(state.sync_inflight, remote_node) do
+      activity_at_ms
+      when is_integer(activity_at_ms) and now_ms - activity_at_ms > @sync_inflight_timeout_ms ->
+        age_ms = max(0, now_ms - activity_at_ms)
+
+        log(state, fn ->
+          "#{log_prefix_shard(state)} expiring stale sync inflight for #{remote_node}" <>
+            format_inflight_age(age_ms)
+        end)
+
+        clear_sync_inflight(state, remote_node)
+
+      _ ->
+        state
+    end
+  end
+
+  defp format_inflight_age(age_ms) when is_integer(age_ms), do: " age_ms=#{age_ms}"
+  defp format_inflight_age(_age_ms), do: ""
 
   defp schedule_anti_entropy_tick(%Replica{} = state) do
     case EKV.Supervisor.get_config(state.name)[:anti_entropy_interval] do
@@ -4484,7 +4586,7 @@ defmodule EKV.Replica do
           | quarantined_members: MapSet.put(state.quarantined_members, remote_node),
             remote_shards: Map.delete(state.remote_shards, remote_node),
             member_node_ids: Map.delete(state.member_node_ids, remote_node),
-            summary_probe_inflight: MapSet.delete(state.summary_probe_inflight, remote_node)
+            summary_probe_inflight: Map.delete(state.summary_probe_inflight, remote_node)
         }
 
         state =

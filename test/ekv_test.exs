@@ -27,6 +27,11 @@ defmodule EKVTest do
 
   defp local_origin_id(state), do: state.node_id || Atom.to_string(node())
 
+  defp auto_vacuum_mode(db) do
+    {:ok, [[mode]]} = EKV.Sqlite3.fetch_all(db, "PRAGMA auto_vacuum", [])
+    mode
+  end
+
   describe "put/get" do
     test "basic put and get", %{name: name} do
       :ok = EKV.put(name, "key1", "value1")
@@ -1022,10 +1027,34 @@ defmodule EKVTest do
     test "Store.open stamps schema_version on first open", %{data_dir: data_dir} do
       {:ok, db} = EKV.Store.open(data_dir, 96, :timer.hours(24 * 7), 2, :timer.minutes(5))
       assert EKV.Store.get_meta(db, "schema_version") == 3
+      assert auto_vacuum_mode(db) == 2
       EKV.Store.close(db)
 
       {:ok, db} = EKV.Store.open(data_dir, 96, :timer.hours(24 * 7), 2, :timer.minutes(5))
       assert EKV.Store.get_meta(db, "schema_version") == 3
+      assert auto_vacuum_mode(db) == 2
+      EKV.Store.close(db)
+    end
+
+    test "Store.open leaves pre-existing auto_vacuum mode unchanged", %{data_dir: data_dir} do
+      db_path = Path.join(data_dir, "shard_95.db")
+      {:ok, raw_db} = EKV.Sqlite3.open(db_path)
+      :ok = EKV.Sqlite3.execute(raw_db, "PRAGMA auto_vacuum=NONE")
+      :ok = EKV.Sqlite3.execute(raw_db, "CREATE TABLE sentinel (id INTEGER PRIMARY KEY)")
+      EKV.Sqlite3.close(raw_db)
+
+      {:ok, db} =
+        EKV.Store.open(
+          data_dir,
+          95,
+          :timer.hours(24 * 7),
+          2,
+          :timer.minutes(5),
+          allow_stale_startup: true
+        )
+
+      assert EKV.Store.get_meta(db, "schema_version") == 3
+      assert auto_vacuum_mode(db) == 0
       EKV.Store.close(db)
     end
 

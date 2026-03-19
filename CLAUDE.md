@@ -284,6 +284,10 @@ Important:
   - Each shard keeps at most one summary probe in flight per peer and one
     full-sync source in flight at a time, so bootstrap repair cannot fan out
     into duplicate full snapshots from every eligible peer.
+  - Summary-probe and sync in-flight suppression is time-bounded.
+    - stale inflight entries expire after a short timeout
+    - a silently dropped sync request must not freeze peer-progress refresh
+      or oplog truncation indefinitely
 - Live LWW and CAS replication both carry `(origin_node, origin_seq)` directly.
   - `origin_node` is persisted as a string; with member identity configured it
     should be the stable `node_id`, not a transient blue/green node name.
@@ -330,6 +334,7 @@ Important:
   - each shard DB persists `kv_meta.schema_version`
   - fresh DBs stamp the current version on first open
   - initialized DBs with missing or mismatched `schema_version` fail startup closed
+  - fresh shard DBs also set SQLite `auto_vacuum=INCREMENTAL`; existing DBs are not rebuilt on normal startup to change that mode
 - Live long partition protection:
   - default `partition_ttl_policy: :quarantine`
   - reconnect after downtime > `tombstone_ttl` blocks replication for that member pair

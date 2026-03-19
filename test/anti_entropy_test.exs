@@ -390,6 +390,58 @@ defmodule EKV.AntiEntropyTest do
       assert :ok = TestCluster.untrace_shard_sends(node_a, ekv_name)
     end
 
+    test "stale inflight markers expire so summary refresh resumes" do
+      peers = TestCluster.start_peers(2)
+      [{_, node_a}, {_, node_b}] = peers
+      ekv_name = unique_name(:anti_entropy_stale_inflight)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      start_cluster(peers, ekv_name, anti_entropy_interval: false)
+
+      write_many(node_a, ekv_name, "stale_inflight", 4)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.keys_count(node_b, ekv_name, "stale_inflight/") == 4
+      end)
+
+      a_max = TestCluster.max_seq(node_a, ekv_name)
+      stale_age_ms = :timer.minutes(5)
+
+      assert :ok = TestCluster.set_peer_progress(node_a, ekv_name, node_b, node_a, 0)
+      assert :ok = TestCluster.set_cached_remote_progress(node_a, ekv_name, node_b, node_a, 0)
+      assert :ok = TestCluster.set_sync_inflight_age(node_a, ekv_name, node_b, stale_age_ms)
+
+      assert :ok =
+               TestCluster.set_summary_probe_inflight_age(
+                 node_a,
+                 ekv_name,
+                 node_b,
+                 stale_age_ms
+               )
+
+      assert :ok = TestCluster.trace_shard_sends(node_a, ekv_name, self())
+      assert :ok = TestCluster.trigger_anti_entropy(node_a, ekv_name)
+
+      shard_name = EKV.Replica.shard_name(ekv_name, 0)
+
+      assert_receive {:trace, _pid, :send,
+                      {:ekv, 1, :summary_probe, {_from_pid, 0, _progress}, %{}},
+                      {^shard_name, ^node_b}},
+                     1_500
+
+      TestCluster.assert_eventually(fn ->
+        state = TestCluster.replica_state(node_a, ekv_name)
+
+        get_in(state.remote_member_progress, [node_b, node_a]) == a_max and
+          TestCluster.peer_progress(node_a, ekv_name, node_b, node_a) == a_max and
+          not Map.has_key?(state.sync_inflight, node_b) and
+          not Map.has_key?(state.summary_probe_inflight, node_b)
+      end)
+
+      assert :ok = TestCluster.untrace_shard_sends(node_a, ekv_name)
+    end
+
     test "live LWW gap triggers immediate delta request and repair" do
       peers = TestCluster.start_peers(2)
       [{_, node_a}, {_, node_b}] = peers

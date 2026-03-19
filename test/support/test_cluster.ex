@@ -320,6 +320,21 @@ defmodule EKV.TestCluster do
     ])
   end
 
+  @doc "Force a stale sync_inflight marker age for one remote member on a remote shard"
+  def set_sync_inflight_age(node, name, remote_node, age_ms, shard_index \\ 0) do
+    rpc!(node, __MODULE__, :do_set_sync_inflight_age, [name, remote_node, age_ms, shard_index])
+  end
+
+  @doc "Force a stale summary_probe_inflight marker age for one remote member on a remote shard"
+  def set_summary_probe_inflight_age(node, name, remote_node, age_ms, shard_index \\ 0) do
+    rpc!(node, __MODULE__, :do_set_summary_probe_inflight_age, [
+      name,
+      remote_node,
+      age_ms,
+      shard_index
+    ])
+  end
+
   @doc "Trigger one anti-entropy tick on a remote shard"
   def trigger_anti_entropy(node, name, shard_index \\ 0) do
     rpc!(node, __MODULE__, :do_trigger_anti_entropy, [name, shard_index])
@@ -649,6 +664,32 @@ defmodule EKV.TestCluster do
     :ok
   end
 
+  def do_set_sync_inflight_age(name, remote_node, age_ms, shard_index) do
+    shard_name = EKV.Replica.shard_name(name, shard_index)
+
+    :sys.replace_state(shard_name, fn state ->
+      sent_at_ms = System.monotonic_time(:millisecond) - max(age_ms, 0)
+      %{state | sync_inflight: Map.put(state.sync_inflight, remote_node, sent_at_ms)}
+    end)
+
+    :ok
+  end
+
+  def do_set_summary_probe_inflight_age(name, remote_node, age_ms, shard_index) do
+    shard_name = EKV.Replica.shard_name(name, shard_index)
+
+    :sys.replace_state(shard_name, fn state ->
+      sent_at_ms = System.monotonic_time(:millisecond) - max(age_ms, 0)
+
+      %{
+        state
+        | summary_probe_inflight: Map.put(state.summary_probe_inflight, remote_node, sent_at_ms)
+      }
+    end)
+
+    :ok
+  end
+
   defp replay_origin_id(origin, _state) when is_binary(origin), do: origin
 
   defp replay_origin_id(origin, state) when is_atom(origin) do
@@ -684,8 +725,8 @@ defmodule EKV.TestCluster do
       state = %{
         state
         | remote_shards: Map.delete(state.remote_shards, remote_node),
-          summary_probe_inflight: MapSet.delete(state.summary_probe_inflight, remote_node),
-          sync_inflight: MapSet.delete(state.sync_inflight, remote_node)
+          summary_probe_inflight: Map.delete(state.summary_probe_inflight, remote_node),
+          sync_inflight: Map.delete(state.sync_inflight, remote_node)
       }
 
       if state.full_sync_inflight == remote_node do

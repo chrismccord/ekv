@@ -11,6 +11,8 @@ defmodule EKV.Store do
   - CAS accept/promote state (`kv_paxos`)
   - anti-entropy replay/progress (`kv_oplog`, `kv_keyrefs`, `kv_origin_progress`, `kv_member_progress`)
   - startup schema compatibility via `kv_meta.schema_version`
+  - fresh-db SQLite `auto_vacuum=INCREMENTAL` so reclaimed pages can be
+    returned gradually later without full `VACUUM`
   - startup stale-db checks (`allow_stale_startup` override)
   - local TTL-expiry bookkeeping via `expired_at`
 
@@ -126,9 +128,14 @@ defmodule EKV.Store do
   end
 
   defp do_open(path, num_shards, data_dir, shard_index) do
+    fresh_db? = fresh_database_file?(path)
     {:ok, db} = EKV.Sqlite3.open(path)
 
     # PRAGMAs
+    # auto_vacuum mode is only configured on fresh shard DBs. Converting an
+    # existing SQLite file from NONE to INCREMENTAL requires a VACUUM rebuild,
+    # which we intentionally do not do on ordinary startup.
+    if fresh_db?, do: :ok = EKV.Sqlite3.execute(db, "PRAGMA auto_vacuum=INCREMENTAL")
     :ok = EKV.Sqlite3.execute(db, "PRAGMA journal_mode=WAL")
     :ok = EKV.Sqlite3.execute(db, "PRAGMA synchronous=NORMAL")
     :ok = EKV.Sqlite3.execute(db, "PRAGMA busy_timeout=5000")
@@ -324,6 +331,14 @@ defmodule EKV.Store do
     touch_last_active(db)
 
     {:ok, db}
+  end
+
+  defp fresh_database_file?(path) do
+    case File.stat(path) do
+      {:ok, %File.Stat{size: size}} -> size == 0
+      {:error, :enoent} -> true
+      {:error, _} -> false
+    end
   end
 
   def open_reader(path) do

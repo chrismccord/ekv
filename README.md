@@ -245,6 +245,10 @@ databases stamp the current version on first open. Initialized shard DBs with
 missing or mismatched `schema_version` fail startup closed so EKV does not
 silently boot incompatible on-disk state.
 
+Fresh shard DBs also enable SQLite `auto_vacuum=INCREMENTAL`. This only
+applies at creation time; EKV does not rewrite existing shard DBs on normal
+startup just to change SQLite vacuum mode.
+
 ### Long live-partition protection
 
 A different edge case is when nodes stay up but are partitioned longer than

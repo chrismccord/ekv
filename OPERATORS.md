@@ -513,6 +513,9 @@ Fresh shard DBs stamp the current version on first open. If EKV sees an
 initialized shard DB with a missing or mismatched `schema_version`, startup
 fails closed instead of guessing compatibility.
 
+Fresh shard DBs also enable SQLite `auto_vacuum=INCREMENTAL`. Existing shard
+DBs are not rebuilt on ordinary startup just to change SQLite vacuum mode.
+
 The shard count is persisted to `kv_meta` on first open as well. Changing
 `:shards` after data exists raises `ArgumentError` at startup.
 
