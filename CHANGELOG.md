@@ -1,3 +1,6 @@
+## 0.2.0 (2026-03-19)
+- Add CAS support
+
 ## 0.1.6 (2026-02-26)
 - Add blue_green support
 
