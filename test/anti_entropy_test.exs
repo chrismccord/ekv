@@ -21,6 +21,10 @@ defmodule EKV.AntiEntropyTest do
     anti_entropy_interval =
       Keyword.get(opts, :anti_entropy_interval, @manual_anti_entropy_interval)
 
+    delta_sync_log_min_entries = Keyword.get(opts, :delta_sync_log_min_entries, 8)
+    delta_sync_storm_window = Keyword.get(opts, :delta_sync_storm_window, :timer.minutes(1))
+    delta_sync_storm_threshold = Keyword.get(opts, :delta_sync_storm_threshold, 100)
+
     sync_chunk_size = Keyword.get(opts, :sync_chunk_size, 500)
     gc_interval = Keyword.get(opts, :gc_interval, :timer.hours(1))
     tombstone_ttl = Keyword.get(opts, :tombstone_ttl, :timer.hours(24 * 7))
@@ -42,7 +46,10 @@ defmodule EKV.AntiEntropyTest do
       sync_chunk_size: sync_chunk_size,
       cluster_size: cluster_size,
       node_id: node_id,
-      anti_entropy_interval: anti_entropy_interval
+      anti_entropy_interval: anti_entropy_interval,
+      delta_sync_log_min_entries: delta_sync_log_min_entries,
+      delta_sync_storm_window: delta_sync_storm_window,
+      delta_sync_storm_threshold: delta_sync_storm_threshold
     )
   end
 
@@ -1361,6 +1368,45 @@ defmodule EKV.AntiEntropyTest do
       assert Enum.all?(remaining, fn {_seq, key, _value, _ts, origin, origin_seq, _expires, _del} ->
                key == "hot_churn/key" and origin == node_a and origin_seq == a_max
              end)
+    end
+
+    test "delta sync storm counters aggregate repeated tiny repairs" do
+      peers = TestCluster.start_peers(2)
+      [{_, node_a}, {_, node_b}] = peers
+      ekv_name = unique_name(:anti_entropy_delta_storm)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      start_cluster(
+        peers,
+        ekv_name,
+        anti_entropy_interval: @manual_anti_entropy_interval,
+        delta_sync_log_min_entries: 100,
+        delta_sync_storm_threshold: 3,
+        delta_sync_storm_window: :timer.minutes(1)
+      )
+
+      assert :ok == TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "storm/key", "v1"])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, EKV, :get, [ekv_name, "storm/key"]) == "v1"
+      end)
+
+      for _ <- 1..3 do
+        assert :ok = TestCluster.force_local_progress(node_b, ekv_name, node_a, 0)
+        assert :ok = TestCluster.trigger_anti_entropy(node_b, ekv_name)
+
+        TestCluster.assert_eventually(fn ->
+          TestCluster.local_progress(node_b, ekv_name, node_a) == 1
+        end)
+      end
+
+      state = TestCluster.replica_state(node_a, ekv_name)
+
+      assert state.delta_sync_storm_count >= 3
+      assert state.delta_sync_storm_entries >= 3
+      assert MapSet.size(state.delta_sync_storm_peers) == 1
+      assert state.delta_sync_storm_logged?
     end
 
     test "restart with reset local history heals once and later anti-entropy stays quiet" do

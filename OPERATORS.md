@@ -84,6 +84,8 @@ Members run periodic anti-entropy by default:
 - The receiver compares the remote summary with its own local contiguous progress and explicitly requests repair only if it is behind.
 - It is meant to heal a member that missed a prior replication message without waiting for reconnect.
 - In the steady state it should be cheap because healthy members only exchange summary metadata; data chunks are sent only in response to an explicit `:sync_request`.
+- Tiny successful terminal delta repairs are suppressed from normal `info` logs below `delta_sync_log_min_entries` (default `8`). Set `log: :verbose` to see every delta.
+- If a shard sends too many deltas in one rolling window, EKV emits a single `delta_sync_storm` warning for that shard. Tune with `delta_sync_storm_window` and `delta_sync_storm_threshold`.
 - Each shard keeps only one summary probe in flight per peer and only one full-sync source in flight at a time, so startup/bootstrap repair should not fan out into duplicate full snapshots from multiple peers.
 - Known member origins that are merely down/disconnected try relayed delta immediately from a live peer.
 - Quarantine still forces immediate full rebuild behavior.

@@ -1452,6 +1452,73 @@ defmodule EKVTest do
       keys = Enum.map(events, & &1.key)
       assert k1 in keys
       assert k2 in keys
+
+      send(
+        shard_name,
+        {:ekv_sync, :remote@host, 0, :full, entries, %{:remote@host => 2}}
+      )
+
+      :sys.get_state(shard_name)
+      flush_dispatchers(name)
+      refute_receive {:ekv, _, _}, 100
+    end
+
+    test "delta sync emits once and suppresses duplicate or stale repairs", %{name: name} do
+      config = EKV.Supervisor.get_config(name)
+
+      key_index =
+        Enum.find(1..100, fn i ->
+          EKV.Replica.shard_index_for("sync_delta_sub/#{i}", config.num_shards) == 0
+        end)
+
+      key = "sync_delta_sub/#{key_index}"
+      shard_name = EKV.Replica.shard_name(name, 0)
+
+      :ok = EKV.subscribe(name, "sync_delta_sub/")
+
+      now = System.system_time(:nanosecond)
+
+      fresh_entry = {
+        key,
+        :erlang.term_to_binary("fresh"),
+        now,
+        :remote_origin@host,
+        1,
+        nil,
+        nil
+      }
+
+      send(shard_name, {:ekv_sync, :relay@host, 0, :delta, [fresh_entry], %{}})
+
+      :sys.get_state(shard_name)
+      flush_dispatchers(name)
+
+      assert_receive {:ekv, [%EKV.Event{type: :put, key: ^key, value: "fresh"}], %{name: ^name}}
+      assert EKV.get(name, key) == "fresh"
+
+      send(shard_name, {:ekv_sync, :relay@host, 0, :delta, [fresh_entry], %{}})
+
+      :sys.get_state(shard_name)
+      flush_dispatchers(name)
+      refute_receive {:ekv, _, _}, 100
+      assert EKV.get(name, key) == "fresh"
+
+      stale_entry = {
+        key,
+        :erlang.term_to_binary("stale"),
+        now - 1_000,
+        :older_origin@host,
+        1,
+        nil,
+        nil
+      }
+
+      send(shard_name, {:ekv_sync, :relay@host, 0, :delta, [stale_entry], %{}})
+
+      :sys.get_state(shard_name)
+      flush_dispatchers(name)
+      refute_receive {:ekv, _, _}, 100
+      assert EKV.get(name, key) == "fresh"
     end
 
     test "full sync applies kv rows without seeding kv_oplog", %{name: name} do
@@ -2392,6 +2459,44 @@ defmodule EKVTest do
 
         File.rm_rf!(data_dir)
       end
+    end
+
+    test "delta sync logging config must be valid" do
+      invalid_opts = [
+        [
+          delta_sync_log_min_entries: -1,
+          expected: ":delta_sync_log_min_entries must be a non-negative integer"
+        ],
+        [
+          delta_sync_storm_window: 0,
+          expected: ":delta_sync_storm_window must be a positive timeout in ms"
+        ],
+        [
+          delta_sync_storm_threshold: 0,
+          expected: ":delta_sync_storm_threshold must be false/nil or a positive integer"
+        ]
+      ]
+
+      Enum.each(invalid_opts, fn opts ->
+        name = :"ekv_delta_sync_cfg_#{System.unique_integer([:positive])}"
+        data_dir = Path.join(System.tmp_dir!(), "ekv_delta_sync_cfg_#{name}")
+        Process.flag(:trap_exit, true)
+
+        expected = Keyword.fetch!(opts, :expected)
+        start_opts = Keyword.drop(opts, [:expected])
+
+        assert {:error, {%ArgumentError{message: msg}, _}} =
+                 EKV.start_link(
+                   Keyword.merge(
+                     [name: name, data_dir: data_dir, log: false],
+                     start_opts
+                   )
+                 )
+
+        assert msg =~ expected
+
+        File.rm_rf!(data_dir)
+      end)
     end
 
     test "invalid node_id type raises" do

@@ -18,6 +18,9 @@ defmodule EKV.CASDistributedTest do
     await_quorum? = Keyword.get(opts, :await_quorum, length(peers) >= quorum_size)
     shutdown_barrier = Keyword.get(opts, :shutdown_barrier, false)
     anti_entropy_interval = Keyword.get(opts, :anti_entropy_interval, 30_000)
+    delta_sync_log_min_entries = Keyword.get(opts, :delta_sync_log_min_entries, 8)
+    delta_sync_storm_window = Keyword.get(opts, :delta_sync_storm_window, :timer.minutes(1))
+    delta_sync_storm_threshold = Keyword.get(opts, :delta_sync_storm_threshold, 100)
 
     peers
     |> Enum.with_index(1)
@@ -36,6 +39,9 @@ defmodule EKV.CASDistributedTest do
         cluster_size: cluster_size,
         node_id: node_id,
         anti_entropy_interval: anti_entropy_interval,
+        delta_sync_log_min_entries: delta_sync_log_min_entries,
+        delta_sync_storm_window: delta_sync_storm_window,
+        delta_sync_storm_threshold: delta_sync_storm_threshold,
         shutdown_barrier: shutdown_barrier
       )
     end)

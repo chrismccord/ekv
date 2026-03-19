@@ -1020,6 +1020,11 @@ defmodule EKV.Replica do
         summary_probe_inflight: %{node => monotonic_ms}, # peers with a summary probe in flight; stale entries expire
         sync_inflight:  %{node => monotonic_ms}, # remote members currently servicing our repair requests; stale entries expire
         delta_origin_inflight: %{origin => {node, monotonic_ms}}, # one delta repair per missing origin at a time
+        delta_sync_storm_started_at_ms: integer | nil,
+        delta_sync_storm_count: non_neg_integer,
+        delta_sync_storm_entries: non_neg_integer,
+        delta_sync_storm_peers: MapSet.t(node),
+        delta_sync_storm_logged?: boolean,
         full_sync_inflight: node() | nil, # single full-bootstrap source for this shard
         pending_cas:    %{ref => op},   # in-flight CAS operations
         quorum_waiters: %{ref => waiter} # pending await_quorum callers
@@ -1151,6 +1156,11 @@ defmodule EKV.Replica do
     summary_probe_inflight: %{},
     sync_inflight: %{},
     delta_origin_inflight: %{},
+    delta_sync_storm_started_at_ms: nil,
+    delta_sync_storm_count: 0,
+    delta_sync_storm_entries: 0,
+    delta_sync_storm_peers: MapSet.new(),
+    delta_sync_storm_logged?: false,
     full_sync_inflight: nil,
     pending_cas: %{},
     quorum_waiters: %{},
@@ -2560,6 +2570,9 @@ defmodule EKV.Replica do
 
     cond do
       my_seq <= from_seq ->
+        state = record_delta_sync_send(state, remote_node, 0)
+        maybe_log_empty_terminal_delta_sync(state, remote_node, origin_node, from_seq, my_seq)
+
         send_to_member(
           state,
           remote_node,
@@ -2699,10 +2712,8 @@ defmodule EKV.Replica do
     case fetched do
       [] ->
         if my_seq > last_seq do
-          log(state, fn ->
-            "#{log_prefix_shard(state)} sending empty terminal delta sync to #{remote_node} " <>
-              "from_seq=#{last_seq} to_seq=#{my_seq}"
-          end)
+          state = record_delta_sync_send(state, remote_node, 0)
+          maybe_log_empty_terminal_delta_sync(state, remote_node, origin_node, last_seq, my_seq)
 
           send_to_member(
             state,
@@ -2729,10 +2740,8 @@ defmodule EKV.Replica do
 
         cond do
           entries == [] and final? ->
-            log(state, fn ->
-              "#{log_prefix_shard(state)} sending empty terminal delta sync to #{remote_node} " <>
-                "from_seq=#{last_seq} to_seq=#{my_seq}"
-            end)
+            state = record_delta_sync_send(state, remote_node, 0)
+            maybe_log_empty_terminal_delta_sync(state, remote_node, origin_node, last_seq, my_seq)
 
             send_to_member(
               state,
@@ -2753,11 +2762,18 @@ defmodule EKV.Replica do
             state
 
           true ->
-            log(state, fn ->
-              "#{log_prefix_shard(state)} sending delta sync to #{remote_node} " <>
-                "entries=#{length(entries)} from_seq=#{last_seq} final=#{final?} " <>
-                "origin=#{origin_node} to_seq=#{my_seq}"
-            end)
+            entry_count = length(entries)
+            state = record_delta_sync_send(state, remote_node, entry_count)
+
+            maybe_log_delta_sync(
+              state,
+              remote_node,
+              origin_node,
+              last_seq,
+              my_seq,
+              entry_count,
+              final?
+            )
 
             send_to_member(
               state,
@@ -2799,6 +2815,113 @@ defmodule EKV.Replica do
           Map.put(state.sync_inflight, remote_node, System.monotonic_time(:millisecond))
     }
   end
+
+  defp maybe_log_empty_terminal_delta_sync(
+         %Replica{} = state,
+         remote_node,
+         origin_node,
+         from_seq,
+         to_seq
+       ) do
+    if should_log_delta_sync?(state, 0, true) do
+      log(state, fn ->
+        "#{log_prefix_shard(state)} sending empty terminal delta sync to #{remote_node} " <>
+          "from_seq=#{from_seq} origin=#{origin_node} to_seq=#{to_seq}"
+      end)
+    end
+
+    state
+  end
+
+  defp maybe_log_delta_sync(
+         %Replica{} = state,
+         remote_node,
+         origin_node,
+         from_seq,
+         to_seq,
+         entry_count,
+         final?
+       ) do
+    if should_log_delta_sync?(state, entry_count, final?) do
+      log(state, fn ->
+        "#{log_prefix_shard(state)} sending delta sync to #{remote_node} " <>
+          "entries=#{entry_count} from_seq=#{from_seq} final=#{final?} " <>
+          "origin=#{origin_node} to_seq=#{to_seq}"
+      end)
+    end
+
+    state
+  end
+
+  defp should_log_delta_sync?(%Replica{} = state, entry_count, final?)
+       when is_integer(entry_count) and is_boolean(final?) do
+    case EKV.Supervisor.get_config(state.name) do
+      %{log: false} ->
+        false
+
+      %{log: :verbose} ->
+        true
+
+      %{delta_sync_log_min_entries: min_entries} when final? ->
+        entry_count >= min_entries
+
+      _ ->
+        true
+    end
+  end
+
+  defp record_delta_sync_send(%Replica{} = state, remote_node, entry_count)
+       when is_atom(remote_node) and is_integer(entry_count) and entry_count >= 0 do
+    config = EKV.Supervisor.get_config(state.name)
+    threshold = Map.get(config, :delta_sync_storm_threshold)
+    window_ms = Map.get(config, :delta_sync_storm_window, :timer.minutes(1))
+
+    if is_integer(threshold) and threshold > 0 do
+      now_ms = System.monotonic_time(:millisecond)
+
+      state =
+        case state.delta_sync_storm_started_at_ms do
+          nil ->
+            %{state | delta_sync_storm_started_at_ms: now_ms}
+
+          started_at_ms when now_ms - started_at_ms >= window_ms ->
+            %{
+              state
+              | delta_sync_storm_started_at_ms: now_ms,
+                delta_sync_storm_count: 0,
+                delta_sync_storm_entries: 0,
+                delta_sync_storm_peers: MapSet.new(),
+                delta_sync_storm_logged?: false
+            }
+
+          _ ->
+            state
+        end
+
+      state = %{
+        state
+        | delta_sync_storm_count: state.delta_sync_storm_count + 1,
+          delta_sync_storm_entries: state.delta_sync_storm_entries + entry_count,
+          delta_sync_storm_peers: MapSet.put(state.delta_sync_storm_peers, remote_node)
+      }
+
+      if not state.delta_sync_storm_logged? and state.delta_sync_storm_count >= threshold do
+        log_warn(state, fn ->
+          "#{log_prefix_shard(state)} delta_sync_storm count=#{state.delta_sync_storm_count} " <>
+            "entries=#{state.delta_sync_storm_entries} peers=#{MapSet.size(state.delta_sync_storm_peers)} " <>
+            "window_ms=#{window_ms}"
+        end)
+
+        %{state | delta_sync_storm_logged?: true}
+      else
+        state
+      end
+    else
+      state
+    end
+  end
+
+  defp record_delta_sync_send(%Replica{} = state, _remote_node, _entry_count), do: state
 
   defp clear_sync_inflight(%Replica{} = state, remote_node) do
     state = %{
@@ -4888,6 +5011,13 @@ defmodule EKV.Replica do
     case EKV.Supervisor.get_config(state.name) do
       %{log: false} -> :ok
       _ -> Logger.info(message_fn)
+    end
+  end
+
+  defp log_warn(%Replica{} = state, message_fn) when is_function(message_fn, 0) do
+    case EKV.Supervisor.get_config(state.name) do
+      %{log: false} -> :ok
+      _ -> Logger.warning(message_fn)
     end
   end
 

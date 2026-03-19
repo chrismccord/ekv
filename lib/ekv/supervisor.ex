@@ -171,6 +171,9 @@ defmodule EKV.Supervisor do
     :node_id,
     :sync_chunk_size,
     :anti_entropy_interval,
+    :delta_sync_log_min_entries,
+    :delta_sync_storm_window,
+    :delta_sync_storm_threshold,
     :member_progress_retention_ttl,
     :unavailable_origin_full_sync_delay,
     :allow_stale_startup,
@@ -243,6 +246,9 @@ defmodule EKV.Supervisor do
     node_id = Keyword.get(opts, :node_id)
     sync_chunk_size = Keyword.get(opts, :sync_chunk_size, 500)
     anti_entropy_interval = Keyword.get(opts, :anti_entropy_interval, 30_000)
+    delta_sync_log_min_entries = Keyword.get(opts, :delta_sync_log_min_entries, 8)
+    delta_sync_storm_window = Keyword.get(opts, :delta_sync_storm_window, :timer.minutes(1))
+    delta_sync_storm_threshold = Keyword.get(opts, :delta_sync_storm_threshold, 100)
 
     member_progress_retention_ttl =
       Keyword.get(
@@ -270,6 +276,9 @@ defmodule EKV.Supervisor do
     validate_wait_for_route!(wait_for_route, :member)
     validate_shutdown_barrier!(shutdown_barrier)
     validate_anti_entropy_interval!(anti_entropy_interval)
+    validate_delta_sync_log_min_entries!(delta_sync_log_min_entries)
+    validate_delta_sync_storm_window!(delta_sync_storm_window)
+    validate_delta_sync_storm_threshold!(delta_sync_storm_threshold)
     validate_member_progress_retention_ttl!(member_progress_retention_ttl)
     validate_unavailable_origin_full_sync_delay!(legacy_unavailable_origin_full_sync_delay)
     validate_allow_stale_startup!(allow_stale_startup)
@@ -303,6 +312,9 @@ defmodule EKV.Supervisor do
       node_id: effective_node_id,
       sync_chunk_size: sync_chunk_size,
       anti_entropy_interval: anti_entropy_interval,
+      delta_sync_log_min_entries: delta_sync_log_min_entries,
+      delta_sync_storm_window: delta_sync_storm_window,
+      delta_sync_storm_threshold: delta_sync_storm_threshold,
       member_progress_retention_ttl: member_progress_retention_ttl,
       allow_stale_startup: allow_stale_startup,
       partition_ttl_policy: partition_ttl_policy,
@@ -532,6 +544,9 @@ defmodule EKV.Supervisor do
     reject_client_opt!(opts, :tombstone_ttl, [nil])
     reject_client_opt!(opts, :sync_chunk_size, [nil])
     reject_client_opt!(opts, :anti_entropy_interval, [nil])
+    reject_client_opt!(opts, :delta_sync_log_min_entries, [nil])
+    reject_client_opt!(opts, :delta_sync_storm_window, [nil])
+    reject_client_opt!(opts, :delta_sync_storm_threshold, [nil, false])
     reject_client_opt!(opts, :member_progress_retention_ttl, [nil])
     reject_client_opt!(opts, :unavailable_origin_full_sync_delay, [nil])
     reject_client_opt!(opts, :allow_stale_startup, [nil, false])
@@ -569,6 +584,36 @@ defmodule EKV.Supervisor do
   defp validate_anti_entropy_interval!(interval) do
     raise ArgumentError,
           "EKV: :anti_entropy_interval must be a positive timeout in ms, got: #{inspect(interval)}"
+  end
+
+  defp validate_delta_sync_log_min_entries!(entries)
+       when is_integer(entries) and entries >= 0,
+       do: :ok
+
+  defp validate_delta_sync_log_min_entries!(entries) do
+    raise ArgumentError,
+          "EKV: :delta_sync_log_min_entries must be a non-negative integer, got: #{inspect(entries)}"
+  end
+
+  defp validate_delta_sync_storm_window!(window)
+       when is_integer(window) and window > 0,
+       do: :ok
+
+  defp validate_delta_sync_storm_window!(window) do
+    raise ArgumentError,
+          "EKV: :delta_sync_storm_window must be a positive timeout in ms, got: #{inspect(window)}"
+  end
+
+  defp validate_delta_sync_storm_threshold!(false), do: :ok
+  defp validate_delta_sync_storm_threshold!(nil), do: :ok
+
+  defp validate_delta_sync_storm_threshold!(threshold)
+       when is_integer(threshold) and threshold > 0,
+       do: :ok
+
+  defp validate_delta_sync_storm_threshold!(threshold) do
+    raise ArgumentError,
+          "EKV: :delta_sync_storm_threshold must be false/nil or a positive integer, got: #{inspect(threshold)}"
   end
 
   defp validate_member_progress_retention_ttl!(ttl)
