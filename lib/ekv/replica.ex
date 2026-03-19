@@ -1019,6 +1019,7 @@ defmodule EKV.Replica do
         remote_member_progress: %{node => %{origin => seq}},
         summary_probe_inflight: %{node => monotonic_ms}, # peers with a summary probe in flight; stale entries expire
         sync_inflight:  %{node => monotonic_ms}, # remote members currently servicing our repair requests; stale entries expire
+        delta_origin_inflight: %{origin => {node, monotonic_ms}}, # one delta repair per missing origin at a time
         full_sync_inflight: node() | nil, # single full-bootstrap source for this shard
         pending_cas:    %{ref => op},   # in-flight CAS operations
         quorum_waiters: %{ref => waiter} # pending await_quorum callers
@@ -1149,6 +1150,7 @@ defmodule EKV.Replica do
     remote_features: %{},
     summary_probe_inflight: %{},
     sync_inflight: %{},
+    delta_origin_inflight: %{},
     full_sync_inflight: nil,
     pending_cas: %{},
     quorum_waiters: %{},
@@ -2799,7 +2801,16 @@ defmodule EKV.Replica do
   end
 
   defp clear_sync_inflight(%Replica{} = state, remote_node) do
-    state = %{state | sync_inflight: Map.delete(state.sync_inflight, remote_node)}
+    state = %{
+      state
+      | sync_inflight: Map.delete(state.sync_inflight, remote_node),
+        delta_origin_inflight:
+          state.delta_origin_inflight
+          |> Enum.reject(fn {_origin_node, {source_node, _activity_at_ms}} ->
+            source_node == remote_node
+          end)
+          |> Map.new()
+    }
 
     if state.full_sync_inflight == remote_node do
       %{state | full_sync_inflight: nil}
@@ -2810,10 +2821,21 @@ defmodule EKV.Replica do
 
   defp touch_sync_inflight(%Replica{} = state, remote_node) when is_atom(remote_node) do
     if Map.has_key?(state.sync_inflight, remote_node) do
+      now_ms = System.monotonic_time(:millisecond)
+
       %{
         state
-        | sync_inflight:
-            Map.put(state.sync_inflight, remote_node, System.monotonic_time(:millisecond))
+        | sync_inflight: Map.put(state.sync_inflight, remote_node, now_ms),
+          delta_origin_inflight:
+            state.delta_origin_inflight
+            |> Enum.map(fn
+              {origin_node, {^remote_node, _activity_at_ms}} ->
+                {origin_node, {remote_node, now_ms}}
+
+              other ->
+                other
+            end)
+            |> Map.new()
       }
     else
       state
@@ -2824,6 +2846,7 @@ defmodule EKV.Replica do
 
   defp request_sync(%Replica{} = state, remote_node, request) do
     state = expire_stale_sync_inflight(state, remote_node)
+    state = expire_stale_delta_origin_inflight(state, remote_node, request)
 
     cond do
       state.handoff_node != nil ->
@@ -2841,6 +2864,9 @@ defmodule EKV.Replica do
       request == :full and not is_nil(state.full_sync_inflight) ->
         state
 
+      delta_origin_inflight?(state, remote_node, request) ->
+        state
+
       Map.has_key?(state.sync_inflight, remote_node) ->
         state
 
@@ -2851,7 +2877,9 @@ defmodule EKV.Replica do
           {:ekv_sync_request, self(), state.shard_index, request}
         )
 
-        mark_sync_inflight(state, remote_node, request)
+        state
+        |> mark_sync_inflight(remote_node, request)
+        |> mark_delta_origin_inflight(remote_node, request)
     end
   end
 
@@ -2870,6 +2898,44 @@ defmodule EKV.Replica do
       maybe_request_repair(acc, remote_node, remote_progress)
     end)
   end
+
+  defp delta_origin_inflight?(%Replica{} = state, remote_node, {:delta, origin_node, _from_seq})
+       when is_atom(remote_node) and is_binary(origin_node) do
+    relayed_delta_request?(state, remote_node, origin_node) and
+      Map.has_key?(state.delta_origin_inflight, origin_node)
+  end
+
+  defp delta_origin_inflight?(%Replica{} = _state, _remote_node, _request), do: false
+
+  defp mark_delta_origin_inflight(
+         %Replica{} = state,
+         remote_node,
+         {:delta, origin_node, _from_seq}
+       )
+       when is_atom(remote_node) and is_binary(origin_node) do
+    if relayed_delta_request?(state, remote_node, origin_node) do
+      %{
+        state
+        | delta_origin_inflight:
+            Map.put(
+              state.delta_origin_inflight,
+              origin_node,
+              {remote_node, System.monotonic_time(:millisecond)}
+            )
+      }
+    else
+      state
+    end
+  end
+
+  defp mark_delta_origin_inflight(%Replica{} = state, _remote_node, _request), do: state
+
+  defp relayed_delta_request?(%Replica{} = state, remote_node, origin_node)
+       when is_atom(remote_node) and is_binary(origin_node) do
+    remote_origin_id(state, remote_node) != origin_node
+  end
+
+  defp relayed_delta_request?(%Replica{} = _state, _remote_node, _origin_node), do: false
 
   defp mark_summary_probe_inflight(%Replica{} = state, remote_node) do
     %{
@@ -3146,6 +3212,38 @@ defmodule EKV.Replica do
         state
     end
   end
+
+  defp expire_stale_delta_origin_inflight(
+         %Replica{} = state,
+         remote_node,
+         {:delta, origin_node, _from_seq}
+       )
+       when is_atom(remote_node) and is_binary(origin_node) do
+    if relayed_delta_request?(state, remote_node, origin_node) do
+      now_ms = System.monotonic_time(:millisecond)
+
+      case Map.get(state.delta_origin_inflight, origin_node) do
+        {source_node, activity_at_ms}
+        when is_atom(source_node) and is_integer(activity_at_ms) and
+               now_ms - activity_at_ms > @sync_inflight_timeout_ms ->
+          age_ms = max(0, now_ms - activity_at_ms)
+
+          log(state, fn ->
+            "#{log_prefix_shard(state)} expiring stale delta origin inflight for #{origin_node} via #{source_node}" <>
+              format_inflight_age(age_ms)
+          end)
+
+          clear_sync_inflight(state, source_node)
+
+        _ ->
+          state
+      end
+    else
+      state
+    end
+  end
+
+  defp expire_stale_delta_origin_inflight(%Replica{} = state, _remote_node, _request), do: state
 
   defp format_inflight_age(age_ms) when is_integer(age_ms), do: " age_ms=#{age_ms}"
   defp format_inflight_age(_age_ms), do: ""

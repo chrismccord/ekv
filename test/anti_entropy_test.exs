@@ -866,6 +866,56 @@ defmodule EKV.AntiEntropyTest do
       assert :ok = TestCluster.untrace_shard_sends(node_b, ekv_name)
     end
 
+    test "requester dedupes duplicate relayed delta repairs for the same missing origin" do
+      peers = TestCluster.start_peers(4)
+      [{_, node_a}, {_, node_b}, {_, node_c}, {_, node_d}] = peers
+      ekv_name = unique_name(:anti_entropy_dedup_relayed_delta)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      start_cluster(peers, ekv_name, anti_entropy_interval: false)
+
+      write_many(node_a, ekv_name, "dedup_relay", 3)
+
+      TestCluster.assert_eventually(fn ->
+        Enum.all?([node_b, node_c, node_d], fn node ->
+          TestCluster.keys_count(node, ekv_name, "dedup_relay/") == 3
+        end)
+      end)
+
+      assert :ok = TestCluster.force_local_progress(node_d, ekv_name, node_a, 0)
+      assert :ok = TestCluster.stop_ekv(node_a, ekv_name, 10_000)
+
+      TestCluster.assert_eventually(fn ->
+        state = TestCluster.replica_state(node_d, ekv_name)
+        not Map.has_key?(state.remote_shards, node_a)
+      end)
+
+      assert :ok = TestCluster.trace_shard_sends(node_d, ekv_name, self())
+      assert :ok = TestCluster.trigger_anti_entropy(node_b, ekv_name)
+      assert :ok = TestCluster.trigger_anti_entropy(node_c, ekv_name)
+
+      origin_id = traced_origin_id(node_d, ekv_name, node_a, peers)
+      requests = collect_sync_request_messages([], 2_000)
+
+      relay_requests =
+        Enum.filter(requests, fn {shard, request, _destination} ->
+          shard == 0 and request == {:delta, origin_id, 0}
+        end)
+
+      assert length(relay_requests) == 1, "requests=#{inspect(requests)}"
+
+      refute Enum.any?(requests, fn {_shard, request, _destination} ->
+               request == :full
+             end)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.keys_count(node_d, ekv_name, "dedup_relay/") == 3
+      end)
+
+      assert :ok = TestCluster.untrace_shard_sends(node_d, ekv_name)
+    end
+
     test "same-shard gaps from multiple origins trigger overlapping repairs" do
       peers = TestCluster.start_peers(3)
       [{_, node_a}, {_, node_b}, {_, node_c}] = peers
