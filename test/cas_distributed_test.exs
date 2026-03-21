@@ -663,6 +663,7 @@ defmodule EKV.CASDistributedTest do
         end)
 
       results = Task.await_many([task_a, task_b, task_c], 15_000)
+
       successes =
         Enum.count(results, fn
           {:ok, _} -> true
@@ -2140,6 +2141,35 @@ defmodule EKV.CASDistributedTest do
       # CAS should complete successfully
       assert match?({:ok, _}, Task.await(task, 10_000))
       assert TestCluster.rpc!(node_a, EKV, :get, [ekv_name, "slow/1"]) == "val1"
+    end
+
+    test "custom CAS timeout budget can outlast the old fixed 5s phase timeout" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      ekv_name = unique_name(:cas)
+
+      start_cas_cluster(peers, ekv_name)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      TestCluster.suspend_shards(node_b, ekv_name)
+
+      task =
+        Task.async(fn ->
+          TestCluster.rpc!(node_a, EKV, :put, [
+            ekv_name,
+            "slow/custom_timeout",
+            "val",
+            [if_vsn: nil, timeout: 8_000]
+          ])
+        end)
+
+      Process.sleep(5_500)
+      TestCluster.resume_shards(node_b, ekv_name)
+
+      assert match?({:ok, _}, Task.await(task, 12_000))
+      assert TestCluster.rpc!(node_a, EKV, :get, [ekv_name, "slow/custom_timeout"]) == "val"
     end
 
     test "CAS succeeds after slow acceptor resumes (suspend during accept phase)" do

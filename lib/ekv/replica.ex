@@ -488,7 +488,8 @@ defmodule EKV.Replica do
   Failure modes:
     - Nack in prepare: ballot too low. If can't reach quorum → fail.
     - Nack in accept: ballot superseded. If can't reach quorum → fail.
-    - Timeout (5s): no response from enough members → `{:error, :quorum_timeout}`
+    - Timeout (call deadline): no response from enough members before the
+      CAS call's `:timeout` budget expires → `{:error, :quorum_timeout}`
     - Node death during CAS: `fail_pending_cas_if_no_quorum/1` checks all
       pending ops and fails those that can no longer reach quorum.
 
@@ -1447,25 +1448,24 @@ defmodule EKV.Replica do
 
   def handle_call({:cas_put, key, value_binary, expected_vsn, opts}, from, %Replica{} = state) do
     operation = {:cas_put, expected_vsn, value_binary, opts}
-    {:noreply, start_cas(state, key, operation, from)}
+    {:noreply, start_cas(state, key, operation, from, cas_deadline_from_opts(opts))}
   end
 
   def handle_call({:cas_delete, key, expected_vsn, opts}, from, %Replica{} = state) do
     operation = {:cas_delete, expected_vsn, opts}
-    {:noreply, start_cas(state, key, operation, from)}
+    {:noreply, start_cas(state, key, operation, from, cas_deadline_from_opts(opts))}
   end
 
   def handle_call({:update, key, fun, opts}, from, %Replica{} = state) do
     retries = Keyword.get(opts, :retries, 5)
     operation = {:update, fun, opts, retries}
-    {:noreply, start_cas(state, key, operation, from)}
+    {:noreply, start_cas(state, key, operation, from, cas_deadline_from_opts(opts))}
   end
 
   def handle_call({:cas_read, key, opts}, from, %Replica{} = state) do
     retries = Keyword.get(opts, :retries, 5)
-    backoff = Keyword.get(opts, :backoff, {10, 60})
-    operation = {:cas_read, [backoff: backoff], retries}
-    {:noreply, start_cas(state, key, operation, from)}
+    operation = {:cas_read, opts, retries}
+    {:noreply, start_cas(state, key, operation, from, cas_deadline_from_opts(opts))}
   end
 
   def handle_call({:await_quorum, timeout_ms}, from, %Replica{} = state) do
@@ -2164,8 +2164,7 @@ defmodule EKV.Replica do
         {:noreply, state}
 
       {op, pending_cas} ->
-        GenServer.reply(op.from, {:error, :quorum_timeout})
-        {:noreply, %{state | pending_cas: pending_cas}}
+        {:noreply, reply_cas_timeout(%{state | pending_cas: pending_cas}, op)}
     end
   end
 
@@ -2178,7 +2177,7 @@ defmodule EKV.Replica do
 
       {old_op, pending_cas} ->
         state = %{state | pending_cas: pending_cas}
-        {:noreply, start_cas(state, key, operation, old_op.from)}
+        {:noreply, start_cas(state, key, operation, old_op.from, old_op.deadline_ms)}
     end
   end
 
@@ -3895,7 +3894,7 @@ defmodule EKV.Replica do
   # CAS helpers
   # =====================================================================
 
-  defp start_cas(%Replica{} = state, key, operation, from) do
+  defp start_cas(%Replica{} = state, key, operation, from, deadline_ms) do
     %{db: db, cluster_size: cluster_size, node_id: node_id} = state
     quorum = div(cluster_size, 2) + 1
 
@@ -3925,69 +3924,77 @@ defmodule EKV.Replica do
         GenServer.reply(from, {:error, :no_quorum})
         state
 
+      cas_deadline_expired?(deadline_ms) ->
+        GenServer.reply(from, {:error, :quorum_timeout})
+        state
+
       true ->
-        # Generate ballot
-        {ballot_c, ballot_n, %Replica{} = state} = next_ballot(state)
-        ref = make_ref()
+        timer = arm_cas_timeout(ref = make_ref(), deadline_ms)
 
-        # Local prepare (this node is always an acceptor)
-        local_result = Store.paxos_prepare(db, key, ballot_c, ballot_n)
+        if timer == :expired do
+          GenServer.reply(from, {:error, :quorum_timeout})
+          state
+        else
+          # Generate ballot
+          {ballot_c, ballot_n, %Replica{} = state} = next_ballot(state)
 
-        {local_promise, local_nack} =
-          case local_result do
-            {:ok, :promise, acc_c, acc_n, kv_row} ->
-              {[{node_id, acc_c, acc_n, kv_row}], 0}
+          # Local prepare (this node is always an acceptor)
+          local_result = Store.paxos_prepare(db, key, ballot_c, ballot_n)
 
-            {:ok, :nack, _prom_c, _prom_n} ->
-              {[], 1}
+          {local_promise, local_nack} =
+            case local_result do
+              {:ok, :promise, acc_c, acc_n, kv_row} ->
+                {[{node_id, acc_c, acc_n, kv_row}], 0}
+
+              {:ok, :nack, _prom_c, _prom_n} ->
+                {[], 1}
+            end
+
+          # Send prepare to all members
+          for {remote_node, _pid} <- state.remote_shards do
+            send_to_member(
+              state,
+              remote_node,
+              {:ekv_prepare, ref, self(), key, ballot_c, ballot_n, state.shard_index}
+            )
           end
 
-        # Send prepare to all members
-        for {remote_node, _pid} <- state.remote_shards do
-          send_to_member(
-            state,
-            remote_node,
-            {:ekv_prepare, ref, self(), key, ballot_c, ballot_n, state.shard_index}
-          )
-        end
+          op = %{
+            ref: ref,
+            from: from,
+            key: key,
+            ballot: {ballot_c, ballot_n},
+            phase: :prepare,
+            operation: operation,
+            promises: local_promise,
+            nacks: local_nack,
+            accepts: MapSet.new(),
+            accept_nacks: 0,
+            responded: MapSet.new([node_id]),
+            quorum: quorum,
+            timer: timer,
+            deadline_ms: deadline_ms,
+            reply_value: nil,
+            broadcast_msg: nil,
+            entry_tuple: nil,
+            events: []
+          }
 
-        # Start timeout timer
-        timer = Process.send_after(self(), {:cas_timeout, ref}, 5_000)
+          # Check if local promise already gave us quorum (cluster_size: 1)
+          cond do
+            length(op.promises) >= quorum ->
+              state = %{state | pending_cas: Map.put(state.pending_cas, ref, op)}
+              enter_accept_phase(state, ref, op)
 
-        op = %{
-          ref: ref,
-          from: from,
-          key: key,
-          ballot: {ballot_c, ballot_n},
-          phase: :prepare,
-          operation: operation,
-          promises: local_promise,
-          nacks: local_nack,
-          accepts: MapSet.new(),
-          accept_nacks: 0,
-          responded: MapSet.new([node_id]),
-          quorum: quorum,
-          timer: timer,
-          reply_value: nil,
-          broadcast_msg: nil,
-          entry_tuple: nil,
-          events: []
-        }
+            local_nack > 0 and alive_count - local_nack < quorum ->
+              # Can't reach quorum
+              cancel_timer(timer)
+              new_state = %{state | pending_cas: Map.put(state.pending_cas, ref, op)}
+              handle_cas_failure(new_state, ref, op)
 
-        # Check if local promise already gave us quorum (cluster_size: 1)
-        cond do
-          length(op.promises) >= quorum ->
-            state = %{state | pending_cas: Map.put(state.pending_cas, ref, op)}
-            enter_accept_phase(state, ref, op)
-
-          local_nack > 0 and alive_count - local_nack < quorum ->
-            # Can't reach quorum
-            cancel_timer(timer)
-            new_state = %{state | pending_cas: Map.put(state.pending_cas, ref, op)}
-            handle_cas_failure(new_state, ref, op)
-
-          true ->
-            %{state | pending_cas: Map.put(state.pending_cas, ref, op)}
+            true ->
+              %{state | pending_cas: Map.put(state.pending_cas, ref, op)}
+          end
         end
     end
   end
@@ -4000,59 +4007,63 @@ defmodule EKV.Replica do
   defp enter_accept_phase(%Replica{} = state, ref, op) do
     cancel_timer(op.timer)
 
-    # Find highest accepted ballot from promises
-    {_best_node_id, best_acc_c, best_acc_n, best_kv_row} =
-      Enum.max_by(op.promises, fn {_nid, acc_c, acc_n, _row} -> {acc_c, acc_n} end)
+    if cas_deadline_expired?(op.deadline_ms) do
+      handle_cas_timeout_now(state, ref, %{op | timer: nil})
+    else
+      # Find highest accepted ballot from promises
+      {_best_node_id, best_acc_c, best_acc_n, best_kv_row} =
+        Enum.max_by(op.promises, fn {_nid, acc_c, acc_n, _row} -> {acc_c, acc_n} end)
 
-    # The value with the highest accepted ballot is the current state.
-    # If all accepted ballots are {0, 0}, no value was ever accepted —
-    # pick the kv_row with the highest {timestamp, origin} to match LWW
-    # ordering. This ensures deterministic selection regardless of message
-    # arrival order.
-    selected_kv_row =
-      if best_acc_c == 0 and best_acc_n in ["", nil] do
-        op.promises
-        |> Enum.map(fn {_, _, _, row} -> row end)
-        |> Enum.reject(&is_nil/1)
-        |> Enum.max_by(fn [_val, ts, origin | _] -> {ts, origin} end, fn -> nil end)
-      else
-        best_kv_row
+      # The value with the highest accepted ballot is the current state.
+      # If all accepted ballots are {0, 0}, no value was ever accepted —
+      # pick the kv_row with the highest {timestamp, origin} to match LWW
+      # ordering. This ensures deterministic selection regardless of message
+      # arrival order.
+      selected_kv_row =
+        if best_acc_c == 0 and best_acc_n in ["", nil] do
+          op.promises
+          |> Enum.map(fn {_, _, _, row} -> row end)
+          |> Enum.reject(&is_nil/1)
+          |> Enum.max_by(fn [_val, ts, origin | _] -> {ts, origin} end, fn -> nil end)
+        else
+          best_kv_row
+        end
+
+      {current_value, current_vsn} = decode_kv_row(selected_kv_row)
+
+      # Apply operation. For :cas_read recovery, pass the raw kv_row so
+      # metadata (expires_at, deleted_at) is preserved.
+      apply_result =
+        case op.operation do
+          {:cas_read, _, _} ->
+            apply_cas_read_recovery(state, op.key, selected_kv_row, current_value, current_vsn)
+
+          _ ->
+            apply_operation(state, op.operation, op.key, current_value, current_vsn)
+        end
+
+      case apply_result do
+        {:ok, _new_value_binary, new_entry_tuple, reply_value, broadcast_msg, events} ->
+          enter_accept_phase_with_entry(
+            state,
+            ref,
+            op,
+            new_entry_tuple,
+            reply_value,
+            broadcast_msg,
+            events
+          )
+
+        {:error, :conflict} ->
+          maybe_repair_conflict_visibility(
+            state,
+            ref,
+            op,
+            selected_kv_row,
+            current_value,
+            current_vsn
+          )
       end
-
-    {current_value, current_vsn} = decode_kv_row(selected_kv_row)
-
-    # Apply operation. For :cas_read recovery, pass the raw kv_row so
-    # metadata (expires_at, deleted_at) is preserved.
-    apply_result =
-      case op.operation do
-        {:cas_read, _, _} ->
-          apply_cas_read_recovery(state, op.key, selected_kv_row, current_value, current_vsn)
-
-        _ ->
-          apply_operation(state, op.operation, op.key, current_value, current_vsn)
-      end
-
-    case apply_result do
-      {:ok, _new_value_binary, new_entry_tuple, reply_value, broadcast_msg, events} ->
-        enter_accept_phase_with_entry(
-          state,
-          ref,
-          op,
-          new_entry_tuple,
-          reply_value,
-          broadcast_msg,
-          events
-        )
-
-      {:error, :conflict} ->
-        maybe_repair_conflict_visibility(
-          state,
-          ref,
-          op,
-          selected_kv_row,
-          current_value,
-          current_vsn
-        )
     end
   end
 
@@ -4086,26 +4097,33 @@ defmodule EKV.Replica do
           )
         end
 
-        timer = Process.send_after(self(), {:cas_timeout, ref}, 5_000)
-
         op = %{
           op
           | phase: :accept,
             accepts: MapSet.new([state.node_id]),
             accept_nacks: 0,
             responded: MapSet.new([state.node_id]),
-            timer: timer,
+            timer: nil,
             reply_value: reply_value,
             broadcast_msg: broadcast_msg,
             entry_tuple: new_entry_tuple,
             events: events
         }
 
-        # For cluster_size: 1 (no members), or if local accept already meets quorum.
-        if MapSet.size(op.accepts) >= op.quorum do
-          commit_cas(state, ref, op)
-        else
-          %{state | pending_cas: Map.put(state.pending_cas, ref, op)}
+        case arm_cas_timeout(ref, op.deadline_ms) do
+          :expired ->
+            state = %{state | pending_cas: Map.put(state.pending_cas, ref, op)}
+            handle_cas_timeout_now(state, ref, op)
+
+          timer ->
+            op = %{op | timer: timer}
+
+            # For cluster_size: 1 (no members), or if local accept already meets quorum.
+            if MapSet.size(op.accepts) >= op.quorum do
+              commit_cas(state, ref, op)
+            else
+              %{state | pending_cas: Map.put(state.pending_cas, ref, op)}
+            end
         end
     end
   end
@@ -4524,6 +4542,48 @@ defmodule EKV.Replica do
   defp reply_unconfirmed_or_resolve(op, %Replica{} = state) do
     GenServer.reply(op.from, {:error, :unconfirmed, op.reply_value})
     state
+  end
+
+  defp cas_deadline_from_opts(opts) when is_list(opts) do
+    case Keyword.get(opts, :timeout, 10_000) do
+      :infinity ->
+        :infinity
+
+      timeout when is_integer(timeout) and timeout > 0 ->
+        System.monotonic_time(:millisecond) + timeout
+    end
+  end
+
+  defp cas_deadline_expired?(:infinity), do: false
+
+  defp cas_deadline_expired?(deadline_ms) when is_integer(deadline_ms) do
+    deadline_ms <= System.monotonic_time(:millisecond)
+  end
+
+  defp arm_cas_timeout(_ref, :infinity), do: nil
+
+  defp arm_cas_timeout(ref, deadline_ms) when is_integer(deadline_ms) do
+    remaining_ms = deadline_ms - System.monotonic_time(:millisecond)
+
+    if remaining_ms > 0 do
+      Process.send_after(self(), {:cas_timeout, ref}, remaining_ms)
+    else
+      :expired
+    end
+  end
+
+  defp handle_cas_timeout_now(%Replica{} = state, ref, op) do
+    cancel_timer(op.timer)
+    reply_cas_timeout(%{state | pending_cas: Map.delete(state.pending_cas, ref)}, op)
+  end
+
+  defp reply_cas_timeout(%Replica{} = state, op) do
+    if op.phase == :accept and writes_operation?(op.operation) do
+      reply_unconfirmed_or_resolve(op, state)
+    else
+      GenServer.reply(op.from, {:error, :quorum_timeout})
+      state
+    end
   end
 
   defp apply_cas_commit(%Replica{} = state, key, ballot_c, ballot_n, entry_tuple, origin_seq) do

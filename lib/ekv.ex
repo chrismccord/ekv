@@ -690,7 +690,7 @@ defmodule EKV do
         if consistent? do
           validate_cas_config!(config)
           shard_index = Replica.shard_index_for(key, config.num_shards)
-          cas_opts = Keyword.take(opts, [:retries, :backoff])
+          cas_opts = Keyword.take(opts, [:retries, :backoff, :timeout])
 
           case GenServer.call(
                  Replica.shard_name(name, shard_index),
