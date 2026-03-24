@@ -1552,7 +1552,7 @@ defmodule EKV.Replica do
     # 1. Drain pending CAS ops
     for {_ref, op} <- state.pending_cas do
       cancel_timer(op.timer)
-      GenServer.reply(op.from, {:error, :shutting_down})
+      reply_cas_error(op, {:error, :shutting_down})
     end
 
     %Replica{} = state = fail_quorum_waiters(state, {:error, :shutting_down})
@@ -2252,7 +2252,16 @@ defmodule EKV.Replica do
 
       {old_op, pending_cas} ->
         state = %{state | pending_cas: pending_cas}
-        {:noreply, start_cas(state, key, operation, old_op.from, old_op.deadline_ms)}
+
+        {:noreply,
+         start_cas(
+           state,
+           key,
+           operation,
+           old_op.from,
+           old_op.deadline_ms,
+           Map.get(old_op, :reply_mode, :normal)
+         )}
     end
   end
 
@@ -4002,7 +4011,7 @@ defmodule EKV.Replica do
             "but cluster_size=#{cluster_size}. IDs: #{inspect(all_ids)}"
         )
 
-        GenServer.reply(from, {:error, :cluster_overflow})
+        reply_cas_reply(from, reply_mode, {:error, :cluster_overflow})
         state
 
       alive_count < quorum ->
@@ -4011,18 +4020,18 @@ defmodule EKV.Replica do
             "node_ids reachable, need #{quorum}"
         end)
 
-        GenServer.reply(from, {:error, :no_quorum})
+        reply_cas_reply(from, reply_mode, {:error, :no_quorum})
         state
 
       cas_deadline_expired?(deadline_ms) ->
-        GenServer.reply(from, {:error, :quorum_timeout})
+        reply_cas_reply(from, reply_mode, {:error, :quorum_timeout})
         state
 
       true ->
         timer = arm_cas_timeout(ref = make_ref(), deadline_ms)
 
         if timer == :expired do
-          GenServer.reply(from, {:error, :quorum_timeout})
+          reply_cas_reply(from, reply_mode, {:error, :quorum_timeout})
           state
         else
           # Generate ballot
@@ -4257,21 +4266,15 @@ defmodule EKV.Replica do
   end
 
   defp reply_cas_commit(%{reply_mode: :observer_write} = op, %Replica{} = state, origin_seq) do
-    GenServer.reply(
-      op.from,
-      {:observer_result, op.reply_value, commit_message(state, op, origin_seq)}
-    )
+    reply_cas_reply(op.from, op.reply_mode, op.reply_value, commit_message(state, op, origin_seq))
   end
 
   defp reply_cas_commit(%{reply_mode: :observer_read} = op, %Replica{} = state, origin_seq) do
-    GenServer.reply(
-      op.from,
-      {:observer_result, op.reply_value, commit_message(state, op, origin_seq)}
-    )
+    reply_cas_reply(op.from, op.reply_mode, op.reply_value, commit_message(state, op, origin_seq))
   end
 
   defp reply_cas_commit(op, _state, _origin_seq) do
-    GenServer.reply(op.from, op.reply_value)
+    reply_cas_reply(op.from, op.reply_mode, op.reply_value)
   end
 
   defp apply_operation(%Replica{} = state, operation, key, current_value, current_vsn) do
@@ -4650,15 +4653,18 @@ defmodule EKV.Replica do
 
   defp reply_cas_error(%{reply_mode: mode, from: from}, reply)
        when mode in [:observer_write, :observer_read] do
-    GenServer.reply(from, {:observer_result, reply, nil})
+    reply_cas_reply(from, mode, reply)
   end
 
-  defp reply_cas_error(%{from: from}, reply), do: GenServer.reply(from, reply)
+  defp reply_cas_error(%{reply_mode: mode, from: from}, reply),
+    do: reply_cas_reply(from, mode, reply)
+
+  defp reply_cas_error(%{from: from}, reply), do: reply_cas_reply(from, :normal, reply)
 
   defp reply_unconfirmed_or_resolve(op, %Replica{} = state) do
     case op.reply_mode do
       mode when mode in [:observer_write, :observer_read] ->
-        GenServer.reply(op.from, {:observer_result, {:error, :unconfirmed}, nil})
+        reply_cas_reply(op.from, mode, {:error, :unconfirmed})
 
       _ ->
         GenServer.reply(op.from, {:error, :unconfirmed, op.reply_value})
@@ -4916,7 +4922,7 @@ defmodule EKV.Replica do
 
       for {_ref, op} <- to_fail do
         cancel_timer(op.timer)
-        GenServer.reply(op.from, {:error, :no_quorum})
+        reply_cas_error(op, {:error, :no_quorum})
       end
 
       %{state | pending_cas: Map.new(to_keep)}
@@ -4934,6 +4940,17 @@ defmodule EKV.Replica do
   defp persist_member_node_identity(%Replica{} = state, remote_node, remote_node_id) do
     Store.member_node_identity_put(state.db, remote_node, remote_node_id)
     state
+  end
+
+  defp reply_cas_reply(from, mode, reply, commit_payload \\ nil)
+
+  defp reply_cas_reply(from, mode, reply, commit_payload)
+       when mode in [:observer_write, :observer_read] do
+    GenServer.reply(from, {:observer_result, reply, commit_payload})
+  end
+
+  defp reply_cas_reply(from, _mode, reply, _commit_payload) do
+    GenServer.reply(from, reply)
   end
 
   defp mark_member_down(%Replica{} = state, remote_node, nil) do
