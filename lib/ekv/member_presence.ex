@@ -20,7 +20,7 @@ defmodule EKV.MemberPresence do
   use GenServer
 
   def start_link(opts) do
-    opts = Keyword.validate!(opts, [:name, :region])
+    opts = Keyword.validate!(opts, [:name, :region, :voter])
     name = Keyword.fetch!(opts, :name)
     GenServer.start_link(__MODULE__, opts, name: server_name(name))
   end
@@ -28,6 +28,7 @@ defmodule EKV.MemberPresence do
   def server_name(name), do: :"#{name}_ekv_member_presence"
 
   def region_group(name, region), do: {:ekv_members, name, region}
+  def voter_region_group(name, region), do: {:ekv_voters, name, region}
 
   def advertised?(name) do
     case Process.whereis(server_name(name)) do
@@ -63,7 +64,8 @@ defmodule EKV.MemberPresence do
   def init(opts) do
     name = Keyword.fetch!(opts, :name)
     region = Keyword.fetch!(opts, :region)
-    state = %{name: name, region: region, joined?: false}
+    voter? = Keyword.get(opts, :voter, false)
+    state = %{name: name, region: region, voter?: voter?, joined?: false, voter_joined?: false}
     {:ok, join_groups(state)}
   end
 
@@ -85,6 +87,20 @@ defmodule EKV.MemberPresence do
         self()
       )
 
+    state =
+      if state.voter? do
+        :ok =
+          :pg.join(
+            EKV.Supervisor.pg_scope(state.name),
+            voter_region_group(state.name, state.region),
+            self()
+          )
+
+        %{state | voter_joined?: true}
+      else
+        state
+      end
+
     %{state | joined?: true}
   end
 
@@ -97,6 +113,20 @@ defmodule EKV.MemberPresence do
         region_group(state.name, state.region),
         self()
       )
+
+    state =
+      if state.voter_joined? do
+        :ok =
+          :pg.leave(
+            EKV.Supervisor.pg_scope(state.name),
+            voter_region_group(state.name, state.region),
+            self()
+          )
+
+        %{state | voter_joined?: false}
+      else
+        state
+      end
 
     %{state | joined?: false}
   end

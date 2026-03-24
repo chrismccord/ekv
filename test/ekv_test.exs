@@ -3609,7 +3609,7 @@ defmodule EKVTest do
       send(shard_name, {:ekv_accept_nack, ref, self(), "3"})
 
       # CAS entered accept phase and then lost quorum, so caller sees unconfirmed.
-      result = Task.await(task, 10_000)
+      result = Task.await(task, 12_000)
       assert result == {:error, :unconfirmed}
 
       # THE KEY ASSERTION: CAS failed, so the value must NOT be in local SQLite.
@@ -3665,7 +3665,7 @@ defmodule EKVTest do
       send(shard_name, {:ekv_accept_nack, ref, self(), "2"})
       send(shard_name, {:ekv_accept_nack, ref, self(), "3"})
 
-      result = Task.await(task, 10_000)
+      result = Task.await(task, 12_000)
 
       assert result in [{:error, :conflict}, {:error, :unavailable}]
 

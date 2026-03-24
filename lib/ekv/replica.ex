@@ -1125,6 +1125,7 @@ defmodule EKV.Replica do
   @wire_compressed_tag :ekv_wire_compressed
   @wire_feature_live_progress :live_progress
   @wire_feature_compression :wire_compression
+  @wire_feature_observer :observer
   @summary_probe_timeout_ms :timer.minutes(2)
   @sync_inflight_timeout_ms :timer.minutes(2)
   defstruct [
@@ -1144,6 +1145,7 @@ defmodule EKV.Replica do
     # CAS fields
     node_id: nil,
     cluster_size: nil,
+    cas_voter?: true,
     lww_ts_counter: 0,
     local_max_seq: 0,
     local_origin_seq: 0,
@@ -1255,6 +1257,7 @@ defmodule EKV.Replica do
       partition_ttl_policy: config.partition_ttl_policy,
       node_id: config.node_id,
       cluster_size: config.cluster_size,
+      cas_voter?: Map.get(config, :cas_voter, true),
       wire_compression_threshold: config[:wire_compression_threshold],
       lww_ts_counter: lww_ts_counter,
       local_max_seq: local_max_seq,
@@ -1451,9 +1454,27 @@ defmodule EKV.Replica do
     {:noreply, start_cas(state, key, operation, from, cas_deadline_from_opts(opts))}
   end
 
+  def handle_call(
+        {:observer_cas_put, key, value_binary, expected_vsn, opts},
+        from,
+        %Replica{} = state
+      ) do
+    operation = {:cas_put, expected_vsn, value_binary, opts}
+
+    {:noreply,
+     start_cas(state, key, operation, from, cas_deadline_from_opts(opts), :observer_write)}
+  end
+
   def handle_call({:cas_delete, key, expected_vsn, opts}, from, %Replica{} = state) do
     operation = {:cas_delete, expected_vsn, opts}
     {:noreply, start_cas(state, key, operation, from, cas_deadline_from_opts(opts))}
+  end
+
+  def handle_call({:observer_cas_delete, key, expected_vsn, opts}, from, %Replica{} = state) do
+    operation = {:cas_delete, expected_vsn, opts}
+
+    {:noreply,
+     start_cas(state, key, operation, from, cas_deadline_from_opts(opts), :observer_write)}
   end
 
   def handle_call({:update, key, fun, opts}, from, %Replica{} = state) do
@@ -1462,10 +1483,38 @@ defmodule EKV.Replica do
     {:noreply, start_cas(state, key, operation, from, cas_deadline_from_opts(opts))}
   end
 
+  def handle_call({:observer_update, key, fun, opts}, from, %Replica{} = state) do
+    retries = Keyword.get(opts, :retries, 5)
+    operation = {:update, fun, opts, retries}
+
+    {:noreply,
+     start_cas(state, key, operation, from, cas_deadline_from_opts(opts), :observer_write)}
+  end
+
   def handle_call({:cas_read, key, opts}, from, %Replica{} = state) do
     retries = Keyword.get(opts, :retries, 5)
     operation = {:cas_read, opts, retries}
     {:noreply, start_cas(state, key, operation, from, cas_deadline_from_opts(opts))}
+  end
+
+  def handle_call({:observer_cas_read, key, opts}, from, %Replica{} = state) do
+    retries = Keyword.get(opts, :retries, 5)
+    operation = {:cas_read, opts, retries}
+
+    {:noreply,
+     start_cas(state, key, operation, from, cas_deadline_from_opts(opts), :observer_read)}
+  end
+
+  def handle_call(
+        {:apply_observer_commit, key, ballot_c, ballot_n, entry_tuple, origin_node, origin_seq},
+        _from,
+        %Replica{} = state
+      ) do
+    origin_node = normalize_origin_node(origin_node)
+    gap? = origin_gap?(state, origin_node, origin_seq)
+    {state, applied?} = apply_cas_commit(state, key, ballot_c, ballot_n, entry_tuple, origin_seq)
+    state = maybe_request_origin_gap_repair(state, origin_node, origin_seq, gap? and applied?)
+    {:reply, :ok, state}
   end
 
   def handle_call({:await_quorum, timeout_ms}, from, %Replica{} = state) do
@@ -1962,68 +2011,94 @@ defmodule EKV.Replica do
         {:ekv_prepare, ref, proposer_pid, key, ballot_c, ballot_n, _shard},
         %Replica{} = state
       ) do
-    %{db: db} = state
-
-    case Store.paxos_prepare(db, key, ballot_c, ballot_n) do
-      {:ok, :promise, acc_c, acc_n, kv_row} ->
-        send(
-          proposer_pid,
-          wire_encode_message(
-            state,
-            node(proposer_pid),
-            {:ekv_promise, ref, self(), state.node_id, acc_c, acc_n, kv_row}
-          )
+    if not local_cas_voter?(state) do
+      send(
+        proposer_pid,
+        wire_encode_message(
+          state,
+          node(proposer_pid),
+          {:ekv_nack, ref, self(), state.node_id, 0, ""}
         )
+      )
 
-      {:ok, :nack, prom_c, prom_n} ->
-        send(
-          proposer_pid,
-          wire_encode_message(
-            state,
-            node(proposer_pid),
-            {:ekv_nack, ref, self(), state.node_id, prom_c, prom_n}
+      {:noreply, state}
+    else
+      %{db: db} = state
+
+      case Store.paxos_prepare(db, key, ballot_c, ballot_n) do
+        {:ok, :promise, acc_c, acc_n, kv_row} ->
+          send(
+            proposer_pid,
+            wire_encode_message(
+              state,
+              node(proposer_pid),
+              {:ekv_promise, ref, self(), state.node_id, acc_c, acc_n, kv_row}
+            )
           )
-        )
+
+        {:ok, :nack, prom_c, prom_n} ->
+          send(
+            proposer_pid,
+            wire_encode_message(
+              state,
+              node(proposer_pid),
+              {:ekv_nack, ref, self(), state.node_id, prom_c, prom_n}
+            )
+          )
+      end
+
+      {:noreply, state}
     end
-
-    {:noreply, state}
   end
 
   def handle_info(
         {:ekv_accept, ref, proposer_pid, key, ballot_c, ballot_n, entry_tuple, _shard},
         %Replica{} = state
       ) do
-    %{db: db} = state
-    entry_tuple = wire_decompress_entry_tuple(entry_tuple)
-
-    {_key, value_binary, timestamp, origin_node_str, expires_at, deleted_at} = entry_tuple
-    value_args = [value_binary, timestamp, origin_node_str, expires_at, deleted_at]
-
-    # Write to kv_paxos only — no kv write, no oplog, no events.
-    # The proposer will send {:ekv_cas_committed, ..., entry_tuple, ...} after quorum.
-    case Store.paxos_accept(db, key, ballot_c, ballot_n, value_args) do
-      {:ok, true} ->
-        send(
-          proposer_pid,
-          wire_encode_message(
-            state,
-            node(proposer_pid),
-            {:ekv_accepted, ref, self(), state.node_id}
-          )
+    if not local_cas_voter?(state) do
+      send(
+        proposer_pid,
+        wire_encode_message(
+          state,
+          node(proposer_pid),
+          {:ekv_accept_nack, ref, self(), state.node_id}
         )
+      )
 
-      {:ok, false} ->
-        send(
-          proposer_pid,
-          wire_encode_message(
-            state,
-            node(proposer_pid),
-            {:ekv_accept_nack, ref, self(), state.node_id}
+      {:noreply, state}
+    else
+      %{db: db} = state
+      entry_tuple = wire_decompress_entry_tuple(entry_tuple)
+
+      {_key, value_binary, timestamp, origin_node_str, expires_at, deleted_at} = entry_tuple
+      value_args = [value_binary, timestamp, origin_node_str, expires_at, deleted_at]
+
+      # Write to kv_paxos only — no kv write, no oplog, no events.
+      # The proposer will send {:ekv_cas_committed, ..., entry_tuple, ...} after quorum.
+      case Store.paxos_accept(db, key, ballot_c, ballot_n, value_args) do
+        {:ok, true} ->
+          send(
+            proposer_pid,
+            wire_encode_message(
+              state,
+              node(proposer_pid),
+              {:ekv_accepted, ref, self(), state.node_id}
+            )
           )
-        )
+
+        {:ok, false} ->
+          send(
+            proposer_pid,
+            wire_encode_message(
+              state,
+              node(proposer_pid),
+              {:ekv_accept_nack, ref, self(), state.node_id}
+            )
+          )
+      end
+
+      {:noreply, state}
     end
-
-    {:noreply, state}
   end
 
   # CAS commit notification carries committed entry tuple.
@@ -3541,6 +3616,15 @@ defmodule EKV.Replica do
     end
   end
 
+  defp commit_message(
+         %Replica{} = state,
+         %{key: key, ballot: {ballot_c, ballot_n}, entry_tuple: entry_tuple},
+         origin_seq
+       ) do
+    {:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple, state.shard_index,
+     local_origin_id(state), origin_seq}
+  end
+
   # Runs on the sender member. Only large replicated value payloads are compressed.
   # Message tuple shapes stay stable; only the value field is tagged.
   defp wire_encode_message(
@@ -3595,21 +3679,23 @@ defmodule EKV.Replica do
   end
 
   defp wire_encode_message(
-         %Replica{} = _state,
+         %Replica{} = state,
          _target_node,
          {:ekv_member_connect, pid, shard, num_shards, remote_progress, remote_node_id}
        ) do
     {:ekv, @wire_protocol_version, :member_connect,
-     {pid, shard, num_shards, remote_progress, remote_node_id}, %{features: wire_features_meta()}}
+     {pid, shard, num_shards, remote_progress, remote_node_id},
+     %{features: wire_features_meta(state)}}
   end
 
   defp wire_encode_message(
-         %Replica{} = _state,
+         %Replica{} = state,
          _target_node,
          {:ekv_member_connect_ack, pid, shard, num_shards, remote_progress, remote_node_id}
        ) do
     {:ekv, @wire_protocol_version, :member_connect_ack,
-     {pid, shard, num_shards, remote_progress, remote_node_id}, %{features: wire_features_meta()}}
+     {pid, shard, num_shards, remote_progress, remote_node_id},
+     %{features: wire_features_meta(state)}}
   end
 
   defp wire_encode_message(
@@ -3822,8 +3908,12 @@ defmodule EKV.Replica do
     end
   end
 
-  defp wire_features_meta do
-    %{@wire_feature_live_progress => true, @wire_feature_compression => true}
+  defp wire_features_meta(%Replica{} = state) do
+    %{
+      @wire_feature_live_progress => true,
+      @wire_feature_compression => true,
+      @wire_feature_observer => not state.cas_voter?
+    }
   end
 
   defp normalize_wire_features(%{features: features}) when is_map(features) do
@@ -3894,7 +3984,7 @@ defmodule EKV.Replica do
   # CAS helpers
   # =====================================================================
 
-  defp start_cas(%Replica{} = state, key, operation, from, deadline_ms) do
+  defp start_cas(%Replica{} = state, key, operation, from, deadline_ms, reply_mode \\ :normal) do
     %{db: db, cluster_size: cluster_size, node_id: node_id} = state
     quorum = div(cluster_size, 2) + 1
 
@@ -3950,8 +4040,8 @@ defmodule EKV.Replica do
                 {[], 1}
             end
 
-          # Send prepare to all members
-          for {remote_node, _pid} <- state.remote_shards do
+          # Send prepare to voter members only.
+          for {remote_node, _pid} <- state.remote_shards, remote_cas_voter?(state, remote_node) do
             send_to_member(
               state,
               remote_node,
@@ -3974,6 +4064,7 @@ defmodule EKV.Replica do
             quorum: quorum,
             timer: timer,
             deadline_ms: deadline_ms,
+            reply_mode: reply_mode,
             reply_value: nil,
             broadcast_msg: nil,
             entry_tuple: nil,
@@ -4087,8 +4178,8 @@ defmodule EKV.Replica do
         handle_cas_failure(state, ref, op)
 
       {:ok, true} ->
-        # Send accept to all members.
-        for {remote_node, _pid} <- state.remote_shards do
+        # Send accept to voter members only.
+        for {remote_node, _pid} <- state.remote_shards, remote_cas_voter?(state, remote_node) do
           send_to_member(
             state,
             remote_node,
@@ -4155,7 +4246,7 @@ defmodule EKV.Replica do
 
         cancel_timer(op.timer)
         dispatch_events(state, op.events)
-        GenServer.reply(op.from, op.reply_value)
+        reply_cas_commit(op, state, origin_seq)
         broadcast_cas_commit(state, op, origin_seq)
         %{state | pending_cas: Map.delete(state.pending_cas, ref)}
 
@@ -4163,6 +4254,24 @@ defmodule EKV.Replica do
         # Local accepted ballot was superseded before commit.
         handle_cas_failure(state, ref, op)
     end
+  end
+
+  defp reply_cas_commit(%{reply_mode: :observer_write} = op, %Replica{} = state, origin_seq) do
+    GenServer.reply(
+      op.from,
+      {:observer_result, op.reply_value, commit_message(state, op, origin_seq)}
+    )
+  end
+
+  defp reply_cas_commit(%{reply_mode: :observer_read} = op, %Replica{} = state, origin_seq) do
+    GenServer.reply(
+      op.from,
+      {:observer_result, op.reply_value, commit_message(state, op, origin_seq)}
+    )
+  end
+
+  defp reply_cas_commit(op, _state, _origin_seq) do
+    GenServer.reply(op.from, op.reply_value)
   end
 
   defp apply_operation(%Replica{} = state, operation, key, current_value, current_vsn) do
@@ -4514,7 +4623,7 @@ defmodule EKV.Replica do
         if reason == :unconfirmed do
           reply_unconfirmed_or_resolve(op, state)
         else
-          GenServer.reply(op.from, {:error, reason})
+          reply_cas_error(op, {:error, reason})
         end
 
         %{state | pending_cas: Map.delete(state.pending_cas, ref)}
@@ -4539,8 +4648,22 @@ defmodule EKV.Replica do
   defp writes_operation?({:update, _, _, _}), do: true
   defp writes_operation?(_), do: false
 
+  defp reply_cas_error(%{reply_mode: mode, from: from}, reply)
+       when mode in [:observer_write, :observer_read] do
+    GenServer.reply(from, {:observer_result, reply, nil})
+  end
+
+  defp reply_cas_error(%{from: from}, reply), do: GenServer.reply(from, reply)
+
   defp reply_unconfirmed_or_resolve(op, %Replica{} = state) do
-    GenServer.reply(op.from, {:error, :unconfirmed, op.reply_value})
+    case op.reply_mode do
+      mode when mode in [:observer_write, :observer_read] ->
+        GenServer.reply(op.from, {:observer_result, {:error, :unconfirmed}, nil})
+
+      _ ->
+        GenServer.reply(op.from, {:error, :unconfirmed, op.reply_value})
+    end
+
     state
   end
 
@@ -4581,7 +4704,7 @@ defmodule EKV.Replica do
     if op.phase == :accept and writes_operation?(op.operation) do
       reply_unconfirmed_or_resolve(op, state)
     else
-      GenServer.reply(op.from, {:error, :quorum_timeout})
+      reply_cas_error(op, {:error, :quorum_timeout})
       state
     end
   end
@@ -4708,13 +4831,23 @@ defmodule EKV.Replica do
     end)
   end
 
+  @doc false
+  def remote_cas_voter?(%Replica{} = state, remote_node) when is_atom(remote_node) do
+    Map.has_key?(state.remote_shards, remote_node) and
+      not remote_supports_feature?(state, remote_node, @wire_feature_observer)
+  end
+
+  defp local_cas_voter?(%Replica{} = state), do: state.cas_voter?
+
   def alive_node_id_count(%Replica{} = state) do
-    if state.cluster_size do
-      # Our own node_id + distinct member node_ids
+    if is_integer(state.cluster_size) and local_cas_voter?(state) do
+      # Our own node_id + distinct voter member node_ids.
       member_ids =
         state.member_node_ids
-        |> Map.values()
-        |> Enum.reject(&is_nil/1)
+        |> Enum.filter(fn {remote_node, remote_node_id} ->
+          is_binary(remote_node_id) and remote_cas_voter?(state, remote_node)
+        end)
+        |> Enum.map(fn {_remote_node, remote_node_id} -> remote_node_id end)
         |> MapSet.new()
 
       MapSet.size(MapSet.put(member_ids, state.node_id))

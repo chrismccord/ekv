@@ -26,7 +26,7 @@ children = [
 ]
 ```
 
-Or start a stateless client that routes to members by region preference:
+Or start a stateless client that routes to voting members by region preference:
 
 ```elixir
 children = [
@@ -34,6 +34,23 @@ children = [
    name: :my_kv_client,
    mode: :client,
    region: "ord",
+   region_routing: ["iad", "dfw", "lhr"],
+   wait_for_route: :timer.seconds(10),
+   wait_for_quorum: :timer.seconds(10)}
+]
+```
+
+Or start an observer that keeps a local durable replica but routes CAS to
+voting members:
+
+```elixir
+children = [
+  {EKV,
+   name: :my_kv_observer,
+   mode: :observer,
+   data_dir: "data/ekv/my_kv_observer",
+   cluster_size: 3,
+   region: "lhr",
    region_routing: ["iad", "dfw", "lhr"],
    wait_for_route: :timer.seconds(10),
    wait_for_quorum: :timer.seconds(10)}
@@ -94,35 +111,35 @@ Values can be any Erlang term (stored via `:erlang.term_to_binary/1`). Keys are 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `:name` | *required* | Atom identifying this EKV instance |
-| `:mode` | `:member` | `:member` stores/replicates data and participates in CAS quorum. `:client` is stateless and routes requests to members. |
-| `:region` | `"default"` | Region label exposed by members and used by clients for routing preference. |
-| `:region_routing` | `nil` | Client mode only. Ordered list of preferred member regions. |
-| `:wait_for_route` | `false` | Client mode only. Optional startup gate. Blocks startup until the first reachable member in `:region_routing` order is selected. |
-| `:data_dir` | *required in `:member`* | Directory for SQLite database files |
-| `:cluster_size` | `nil` | Member mode only. Required for CAS (`if_vsn`, `consistent: true`, `update/4`). Total number of logical voting members. |
-| `:node_id` | auto-generated+persistent | Member mode only. Stable logical member id used in ballots, persisted replay origins, quorum accounting, and blue-green overlap. If omitted, EKV generates one on first boot and persists it to the shard DBs. |
-| `:shards` | `8` | Member mode only. Number of shards (each is an independent GenServer + SQLite db) |
-| `:tombstone_ttl` | `604_800_000` (7 days) | Member mode only. How long tombstones are retained in milliseconds |
-| `:gc_interval` | `300_000` (5 min) | Member mode only. GC tick interval in milliseconds |
-| `:member_progress_retention_ttl` | `min(:tombstone_ttl, 21_600_000)` (6 hours by default) | Member mode only. How long disconnected members keep anchoring replay retention before their `kv_member_progress` rows may be pruned. This is the main guard against partitions turning into full syncs after a GC; `0` restores the old immediate-prune behavior. |
-| `:wait_for_quorum` | `false` | Optional startup gate. In member mode, waits for this EKV member to reach CAS quorum. In client mode, waits for the selected backend member to report CAS quorum reachable. |
-| `:anti_entropy_interval` | `30_000` (30 sec) | Member mode only. Periodic background repair for already-connected members. Re-runs the normal HWM-driven delta/full sync path to heal missed replication without waiting for reconnect. Must be a positive timeout in ms. |
-| `:delta_sync_log_min_entries` | `8` | Member mode only. Suppresses per-delta `info` logs for successful terminal delta syncs smaller than this many entries. `:verbose` logging still prints all deltas. |
-| `:delta_sync_storm_window` | `60_000` (60 sec) | Member mode only. Rolling per-shard window used to aggregate delta sync activity for storm detection. |
-| `:delta_sync_storm_threshold` | `100` | Member mode only. When a shard sends at least this many delta syncs inside one storm window, EKV emits a single aggregated warning for that window. `false`/`nil` disables storm warnings. |
+| `:mode` | `:member` | `:member` stores/replicates data and votes in CAS quorum. `:observer` stores/replicates data and routes CAS to voters. `:client` is stateless and routes requests to voters. |
+| `:region` | `"default"` | Region label exposed by durable replicas and used by routing. |
+| `:region_routing` | `nil` | Observer and client mode only. Ordered list of preferred voter regions. |
+| `:wait_for_route` | `false` | Observer and client mode only. Optional startup gate. Blocks startup until the first reachable voter in `:region_routing` order is selected. |
+| `:data_dir` | *required in `:member` and `:observer`* | Directory for SQLite database files |
+| `:cluster_size` | `nil` | Member and observer mode only. Logical voting cluster size for CAS quorum math. Required for CAS-capable durable replica deployments. |
+| `:node_id` | auto-generated+persistent | Member and observer mode only. Stable logical durable-replica id used in ballots, persisted replay origins, quorum accounting, and blue-green overlap. If omitted, EKV generates one on first boot and persists it to the shard DBs. |
+| `:shards` | `8` | Member and observer mode only. Number of shards (each is an independent GenServer + SQLite db) |
+| `:tombstone_ttl` | `604_800_000` (7 days) | Member and observer mode only. How long tombstones are retained in milliseconds |
+| `:gc_interval` | `300_000` (5 min) | Member and observer mode only. GC tick interval in milliseconds |
+| `:member_progress_retention_ttl` | `min(:tombstone_ttl, 21_600_000)` (6 hours by default) | Member and observer mode only. How long disconnected durable replicas keep anchoring replay retention before their `kv_member_progress` rows may be pruned. This is the main guard against partitions turning into full syncs after a GC; `0` restores the old immediate-prune behavior. |
+| `:wait_for_quorum` | `false` | Optional startup gate. In member mode, waits for this EKV member to reach CAS quorum. In observer and client mode, waits for the selected backend voter to report CAS quorum reachable. |
+| `:anti_entropy_interval` | `30_000` (30 sec) | Member and observer mode only. Periodic background repair for already-connected durable replicas. Re-runs the normal HWM-driven delta/full sync path to heal missed replication without waiting for reconnect. Must be a positive timeout in ms. |
+| `:delta_sync_log_min_entries` | `8` | Member and observer mode only. Suppresses per-delta `info` logs for successful terminal delta syncs smaller than this many entries. `:verbose` logging still prints all deltas. |
+| `:delta_sync_storm_window` | `60_000` (60 sec) | Member and observer mode only. Rolling per-shard window used to aggregate delta sync activity for storm detection. |
+| `:delta_sync_storm_threshold` | `100` | Member and observer mode only. When a shard sends at least this many delta syncs inside one storm window, EKV emits a single aggregated warning for that window. `false`/`nil` disables storm warnings. |
 | `:wire_compression_threshold` | `262_144` (256 KB) | Optional byte threshold for member-to-member wire compression of large replicated value payloads. `false`/`nil` disables it. Large LWW replication and CAS accept/commit payloads compress on the wire only; values remain uncompressed on disk and on reads. |
 | `:shutdown_barrier` | `false` | Optional graceful-shutdown barrier. Keeps EKV serving during coordinated shutdown for up to the configured timeout so members can finish final writes and replication. |
-| `:allow_stale_startup` | `false` | Member mode only. Dangerous recovery override. If `true`, EKV trusts on-disk data even when stale-db detection would normally refuse startup. Intended only for explicit disaster recovery / full cold-cluster restore cases. |
-| `:blue_green` | `false` | Member mode only. Enable blue-green deployment handoff for shared-volume replacement nodes. |
+| `:allow_stale_startup` | `false` | Member and observer mode only. Dangerous recovery override. If `true`, EKV trusts on-disk data even when stale-db detection would normally refuse startup. Intended only for explicit disaster recovery / full cold-cluster restore cases. |
+| `:blue_green` | `false` | Member and observer mode only. Enable blue-green deployment handoff for shared-volume replacement nodes. |
 | `:log` | `:info` | `:info`, `false` (silent), or `:verbose` |
-| `:partition_ttl_policy` | `:quarantine` | Member mode only. Policy when a member identity reconnects after being disconnected longer than `tombstone_ttl`. `:quarantine` blocks replication with that member until operator intervention. `:ignore` disables that quarantine and allows reconnect/sync anyway. |
+| `:partition_ttl_policy` | `:quarantine` | Member and observer mode only. Policy when a durable-replica identity reconnects after being disconnected longer than `tombstone_ttl`. `:quarantine` blocks replication with that member until operator intervention. `:ignore` disables that quarantine and allows reconnect/sync anyway. |
 
 ### Client mode
 
 Client mode keeps the EKV API but does not start SQLite, replication, GC, or
 blue-green machinery on that node.
 
-- Eventual reads become remote reads against the selected member.
+- Eventual reads become remote reads against the selected voter.
 - `wait_for_route` can hold startup until a backend route is selected.
 - `wait_for_quorum` can additionally hold startup until that backend reports CAS quorum reachable.
 - `scan/2` and `keys/2` still return Elixir streams, but are backed by paged RPC.
@@ -132,6 +149,21 @@ blue-green machinery on that node.
   control traffic.
 - After backend failover, eventual reads may observe an older replica view.
   Use `consistent: true` when freshness matters.
+
+### Observer mode
+
+Observer mode is for nodes that should keep a full local durable replica and
+low-latency eventual reads locally, but should not increase the CAS voter set.
+
+- Observers start SQLite, replication, GC, subscriptions, and anti-entropy.
+- Eventual reads and eventual writes stay local on the observer.
+- CAS reads and writes route to voters selected by `region_routing`.
+- Successful observer CAS calls apply the committed result locally before
+  replying, so immediate local eventual read-your-CAS-writes is preserved.
+- Observers do not count toward CAS quorum, and clients do not route to them.
+- `{:error, :unconfirmed}` on an observer still means "do a consistent read
+  before trusting local eventual state"; the ambiguity may be remote CAS
+  outcome or local observer visibility.
 
 ## How It Works
 
@@ -213,7 +245,9 @@ CAS writes (`put` with `if_vsn:` or `consistent: true`, `delete` with `if_vsn:`,
     or it may have lost to a competing ballot and never committed.
 
 On `:unconfirmed`, resolve with `EKV.get(name, key, consistent: true)` before
-taking follow-up actions.
+taking follow-up actions. On observers, the same recovery rule applies if the
+remote CAS may have committed but the observer could not confirm local
+visibility before replying.
 
 You can opt in to internal resolution per call with
 `resolve_unconfirmed: true` on CAS write APIs. In that mode, EKV performs one
