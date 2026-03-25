@@ -2671,6 +2671,34 @@ defmodule EKVTest do
   end
 
   describe "observer CAS reply shaping" do
+    test "consistent read on clean absent key returns nil without committing a tombstone" do
+      name = :"consistent_absent_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+
+      {:ok, pid} = start_single_node_cas_ekv(name, data_dir, 1)
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      assert EKV.get(name, "obs/absent", consistent: true) == nil
+      assert EKV.get(name, "obs/absent", consistent: true) == nil
+
+      state = :sys.get_state(EKV.Replica.shard_name(name, 0))
+
+      assert EKV.Store.get(state.db, "obs/absent") == nil
+
+      {:ok, [[0, nil, nil]]} =
+        EKV.Sqlite3.fetch_all(
+          state.db,
+          "SELECT accepted_counter, accepted_value, accepted_deleted_at FROM kv_paxos WHERE key = ?1",
+          ["obs/absent"]
+        )
+
+      {:ok, [[0]]} = EKV.Sqlite3.fetch_all(state.db, "SELECT COUNT(*) FROM kv_oplog", [])
+    end
+
     test "observer consistent read retry preserves observer envelope" do
       name = :"observer_retry_#{System.unique_integer([:positive])}"
       data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
@@ -2718,6 +2746,21 @@ defmodule EKVTest do
 
       assert {:observer_read_result, {:error, :no_quorum}, :absent, nil} =
                EKV.__observer_consistent_get__(name, "obs/no_quorum", [])
+    end
+
+    test "observer helper returns nil for clean absent key without commit payload" do
+      name = :"observer_absent_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+
+      {:ok, pid} = start_single_node_cas_ekv(name, data_dir, 1)
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      assert {:observer_read_result, {:ok, nil, nil}, :absent, nil} =
+               EKV.__observer_consistent_get__(name, "obs/absent", [])
     end
   end
 

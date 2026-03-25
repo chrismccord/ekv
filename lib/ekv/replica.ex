@@ -4129,40 +4129,45 @@ defmodule EKV.Replica do
           best_kv_row
         end
 
-      {current_value, current_vsn} = decode_kv_row(selected_kv_row)
+      if clean_absent_cas_read?(op.operation, best_acc_c, best_acc_n, selected_kv_row) do
+        reply_cas_reply(op.from, op.reply_mode, {:ok, nil, nil})
+        %{state | pending_cas: Map.delete(state.pending_cas, ref)}
+      else
+        {current_value, current_vsn} = decode_kv_row(selected_kv_row)
 
-      # Apply operation. For :cas_read recovery, pass the raw kv_row so
-      # metadata (expires_at, deleted_at) is preserved.
-      apply_result =
-        case op.operation do
-          {:cas_read, _, _} ->
-            apply_cas_read_recovery(state, op.key, selected_kv_row, current_value, current_vsn)
+        # Apply operation. For :cas_read recovery, pass the raw kv_row so
+        # metadata (expires_at, deleted_at) is preserved.
+        apply_result =
+          case op.operation do
+            {:cas_read, _, _} ->
+              apply_cas_read_recovery(state, op.key, selected_kv_row, current_value, current_vsn)
 
-          _ ->
-            apply_operation(state, op.operation, op.key, current_value, current_vsn)
+            _ ->
+              apply_operation(state, op.operation, op.key, current_value, current_vsn)
+          end
+
+        case apply_result do
+          {:ok, _new_value_binary, new_entry_tuple, reply_value, broadcast_msg, events} ->
+            enter_accept_phase_with_entry(
+              state,
+              ref,
+              op,
+              new_entry_tuple,
+              reply_value,
+              broadcast_msg,
+              events
+            )
+
+          {:error, :conflict} ->
+            maybe_repair_conflict_visibility(
+              state,
+              ref,
+              op,
+              selected_kv_row,
+              current_value,
+              current_vsn
+            )
         end
-
-      case apply_result do
-        {:ok, _new_value_binary, new_entry_tuple, reply_value, broadcast_msg, events} ->
-          enter_accept_phase_with_entry(
-            state,
-            ref,
-            op,
-            new_entry_tuple,
-            reply_value,
-            broadcast_msg,
-            events
-          )
-
-        {:error, :conflict} ->
-          maybe_repair_conflict_visibility(
-            state,
-            ref,
-            op,
-            selected_kv_row,
-            current_value,
-            current_vsn
-          )
       end
     end
   end
@@ -4578,6 +4583,12 @@ defmodule EKV.Replica do
        broadcast_msg, []}
     end
   end
+
+  defp clean_absent_cas_read?({:cas_read, _, _}, best_acc_c, best_acc_n, selected_kv_row) do
+    best_acc_c == 0 and best_acc_n in ["", nil] and is_nil(selected_kv_row)
+  end
+
+  defp clean_absent_cas_read?(_operation, _best_acc_c, _best_acc_n, _selected_kv_row), do: false
 
   defp handle_cas_failure(%Replica{} = state, ref, op) do
     cancel_timer(op.timer)

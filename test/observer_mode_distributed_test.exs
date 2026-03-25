@@ -326,4 +326,55 @@ defmodule EKV.ObserverModeDistributedTest do
       TestCluster.rpc!(observer_b, EKV, :info, [ekv_name]).current_backend == expected_b
     end)
   end
+
+  test "observer consistent read on clean absent key returns nil repeatedly" do
+    peers = TestCluster.start_peers(2)
+    on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+    [{_, voter_node}, {_, observer_node}] = peers
+    ekv_name = unique_name(:observer_absent_consistent_read)
+    on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+    TestCluster.rpc!(voter_node, File, :rm_rf!, [data_dir(voter_node, ekv_name)])
+
+    {:ok, _pid} =
+      TestCluster.start_ekv(
+        voter_node,
+        name: ekv_name,
+        data_dir: data_dir(voter_node, ekv_name),
+        shards: 1,
+        log: false,
+        region: "iad",
+        cluster_size: 1,
+        node_id: "v1",
+        gc_interval: :timer.hours(1),
+        tombstone_ttl: :timer.hours(24 * 7)
+      )
+
+    {:ok, _observer_pid} =
+      TestCluster.start_ekv(
+        observer_node,
+        name: ekv_name,
+        mode: :observer,
+        data_dir: data_dir(observer_node, ekv_name),
+        shards: 1,
+        log: false,
+        region: "ord",
+        region_routing: ["iad"],
+        cluster_size: 1,
+        node_id: "obs1",
+        gc_interval: :timer.hours(1),
+        tombstone_ttl: :timer.hours(24 * 7)
+      )
+
+    TestCluster.assert_eventually(fn ->
+      TestCluster.rpc!(observer_node, EKV, :info, [ekv_name]).current_backend == voter_node
+    end)
+
+    assert TestCluster.rpc!(observer_node, EKV, :get, [ekv_name, "hb/dead", [consistent: true]]) ==
+             nil
+
+    assert TestCluster.rpc!(observer_node, EKV, :get, [ekv_name, "hb/dead", [consistent: true]]) ==
+             nil
+  end
 end
