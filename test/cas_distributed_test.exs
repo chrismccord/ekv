@@ -481,7 +481,7 @@ defmodule EKV.CASDistributedTest do
   # =====================================================================
 
   describe "concurrent CAS" do
-    test "two nodes CAS-put same key concurrently: exactly one succeeds" do
+    test "two nodes CAS-put same key concurrently: one winner commits" do
       peers = TestCluster.start_peers(2)
       on_exit(fn -> TestCluster.stop_peers(peers) end)
 
@@ -503,17 +503,41 @@ defmodule EKV.CASDistributedTest do
         end)
 
       results = Task.await_many([task_a, task_b], 10_000)
-      successes = Enum.count(results, &match?({:ok, _}, &1))
 
-      failures =
+      successes =
         Enum.count(results, fn
-          {:error, :conflict} -> true
-          {:error, :unconfirmed} -> true
+          {:ok, _} -> true
+          {:ok, _, _} -> true
           _ -> false
         end)
 
-      assert successes == 1
-      assert failures == 1
+      assert Enum.all?(results, fn
+               {:ok, _} -> true
+               {:ok, _, _} -> true
+               {:error, :conflict} -> true
+               {:error, :unconfirmed} -> true
+               _ -> false
+             end),
+             "Expected only CAS success/conflict/unconfirmed outcomes, got: #{inspect(results)}"
+
+      # A concurrent insert-if-absent race can produce an ambiguous proposer outcome
+      # (`:unconfirmed`) even when one value commits. The contract we care about is
+      # that at most one proposer gets an explicit success and the cluster converges
+      # on a single winner.
+      assert successes <= 1,
+             "Expected at most 1 success, got #{successes}: #{inspect(results)}"
+
+      winner = TestCluster.rpc!(node_a, EKV, :get, [ekv_name, "race/1", [consistent: true]])
+      assert winner in ["from_a", "from_b"]
+
+      TestCluster.assert_eventually(
+        fn ->
+          Enum.all?([node_a, node_b], fn node ->
+            TestCluster.rpc!(node, EKV, :get, [ekv_name, "race/1"]) == winner
+          end)
+        end,
+        timeout: 10_000
+      )
     end
 
     test "CAS failure does not leave phantom write on proposer node" do
