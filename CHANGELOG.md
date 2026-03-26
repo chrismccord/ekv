@@ -1,3 +1,7 @@
+## 0.3.0 (2026-03-19)
+- Add `:observer` mode
+- Fix barrier reads on non-existing keys
+
 ## 0.2.0 (2026-03-19)
 - Add CAS support
 
