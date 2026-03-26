@@ -1750,7 +1750,9 @@ defmodule EKV do
            false
          ) do
       {:ok, {:observer_result, reply, commit_payload}} ->
-        finalize_observer_write(name, commit_payload, timeout, reply)
+        reply
+        |> finalize_observer_write(name, commit_payload, timeout)
+        |> maybe_resolve_unconfirmed_write(name, key, opts, :cas_put)
 
       {:raise, exception} ->
         raise exception
@@ -1772,7 +1774,9 @@ defmodule EKV do
            false
          ) do
       {:ok, {:observer_result, reply, commit_payload}} ->
-        finalize_observer_write(name, commit_payload, timeout, reply)
+        reply
+        |> finalize_observer_write(name, commit_payload, timeout)
+        |> maybe_resolve_unconfirmed_write(name, key, opts, :cas_delete)
 
       {:raise, exception} ->
         raise exception
@@ -1796,7 +1800,9 @@ defmodule EKV do
            false
          ) do
       {:ok, {:observer_result, reply, commit_payload}} ->
-        finalize_observer_write(name, commit_payload, timeout, reply)
+        reply
+        |> finalize_observer_write(name, commit_payload, timeout)
+        |> maybe_resolve_unconfirmed_write(name, key, opts, :update)
 
       {:raise, exception} ->
         raise exception
@@ -1832,12 +1838,24 @@ defmodule EKV do
   defp extract_consistent_get_reply({:error, reason}),
     do: raise("EKV: consistent read failed: #{inspect(reason)}")
 
-  defp finalize_observer_write(name, commit_payload, timeout, reply) do
+  defp finalize_observer_write(reply, name, commit_payload, timeout) do
     case apply_observer_commit(name, commit_payload, timeout, :strict) do
       :ok -> reply
-      {:error, _reason} -> {:error, :unconfirmed}
+      {:error, _reason} -> observer_unconfirmed_reply(reply)
     end
   end
+
+  defp observer_unconfirmed_reply({:error, :unconfirmed, reply_value}),
+    do: {:error, :unconfirmed, reply_value}
+
+  defp observer_unconfirmed_reply({:ok, _vsn} = reply),
+    do: {:error, :unconfirmed, reply}
+
+  defp observer_unconfirmed_reply({:ok, _value, _vsn} = reply),
+    do: {:error, :unconfirmed, reply}
+
+  defp observer_unconfirmed_reply(_reply),
+    do: {:error, :unconfirmed}
 
   defp apply_observer_commit(_name, nil, _timeout, _mode), do: :ok
 

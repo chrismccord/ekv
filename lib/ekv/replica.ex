@@ -4715,8 +4715,17 @@ defmodule EKV.Replica do
 
   defp reply_unconfirmed_or_resolve(op, %Replica{} = state) do
     case op.reply_mode do
-      mode when mode in [:observer_write, :observer_read] ->
-        reply_cas_reply(op.from, mode, {:error, :unconfirmed})
+      :observer_write ->
+        reply =
+          case op.reply_value do
+            nil -> {:error, :unconfirmed}
+            reply_value -> {:error, :unconfirmed, reply_value}
+          end
+
+        reply_cas_reply(op.from, :observer_write, reply)
+
+      :observer_read ->
+        reply_cas_reply(op.from, :observer_read, {:error, :unconfirmed})
 
       _ ->
         GenServer.reply(op.from, {:error, :unconfirmed, op.reply_value})

@@ -2769,6 +2769,45 @@ defmodule EKVTest do
       )
     end
 
+    test "observer write timeout preserves unconfirmed reply_value envelope" do
+      name = :"observer_write_unconfirmed_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+
+      {:ok, pid} = start_single_node_cas_ekv(name, data_dir, 1)
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      replica = EKV.Replica.shard_name(name, 0)
+      ref = make_ref()
+      tag = make_ref()
+      test_pid = self()
+      deadline_ms = System.monotonic_time(:millisecond) + 5_000
+
+      :sys.replace_state(replica, fn state ->
+        op = %{
+          from: {test_pid, tag},
+          phase: :accept,
+          operation: {:cas_put, nil, <<131, 100, 0, 2, 111, 107>>, []},
+          reply_mode: :observer_write,
+          reply_value: {:ok, {123, "n1"}},
+          deadline_ms: deadline_ms,
+          timer: nil
+        }
+
+        %{state | pending_cas: Map.put(state.pending_cas, ref, op)}
+      end)
+
+      send(replica, {:cas_timeout, ref})
+
+      assert_receive(
+        {^tag, {:observer_result, {:error, :unconfirmed, {:ok, {123, "n1"}}}, nil}},
+        1_000
+      )
+    end
+
     test "observer helper preserves early no-quorum errors" do
       name = :"observer_no_quorum_#{System.unique_integer([:positive])}"
       data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")

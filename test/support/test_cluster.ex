@@ -96,6 +96,29 @@ defmodule EKV.TestCluster do
     end
   end
 
+  @doc "Suspend a shard on a remote node while performing EKV.put/4"
+  def suspend_shard_and_put(node, name, shard_index, key, value, opts) do
+    :erpc.call(node, __MODULE__, :do_suspend_shard_and_put, [
+      name,
+      shard_index,
+      key,
+      value,
+      opts
+    ])
+  end
+
+  @doc false
+  def do_suspend_shard_and_put(name, shard_index, key, value, opts) do
+    shard = EKV.Replica.shard_name(name, shard_index)
+    :sys.suspend(shard)
+
+    try do
+      EKV.put(name, key, value, opts)
+    after
+      :sys.resume(shard)
+    end
+  end
+
   @doc "True when no registered EKV names remain for the given instance"
   def ekv_stopped?(node, name) do
     prefix = "#{name}_ekv_"

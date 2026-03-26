@@ -245,6 +245,61 @@ defmodule EKV.ObserverModeDistributedTest do
              ])
   end
 
+  test "observer resolve_unconfirmed confirms or returns unavailable on local apply failure" do
+    peers = TestCluster.start_peers(2)
+    on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+    [{_, voter_node}, {_, observer_node}] = peers
+    ekv_name = unique_name(:observer_resolve_unconfirmed)
+    on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+    {:ok, _pid} =
+      TestCluster.start_ekv(
+        voter_node,
+        name: ekv_name,
+        data_dir: data_dir(voter_node, ekv_name),
+        shards: 1,
+        log: false,
+        region: "iad",
+        cluster_size: 1,
+        node_id: "v1",
+        gc_interval: :timer.hours(1),
+        tombstone_ttl: :timer.hours(24 * 7)
+      )
+
+    {:ok, _observer_pid} =
+      TestCluster.start_ekv(
+        observer_node,
+        name: ekv_name,
+        mode: :observer,
+        data_dir: data_dir(observer_node, ekv_name),
+        shards: 1,
+        log: false,
+        region: "ord",
+        region_routing: ["iad"],
+        cluster_size: 1,
+        node_id: "obs1",
+        gc_interval: :timer.hours(1),
+        tombstone_ttl: :timer.hours(24 * 7)
+      )
+
+    TestCluster.assert_eventually(fn ->
+      TestCluster.rpc!(observer_node, EKV, :info, [ekv_name]).current_backend == voter_node
+    end)
+
+    assert {:error, :unavailable} =
+             TestCluster.suspend_shard_and_put(
+               observer_node,
+               ekv_name,
+               0,
+               "obs/resolve",
+               "v1",
+               if_vsn: nil,
+               resolve_unconfirmed: true,
+               timeout: 200
+             )
+  end
+
   test "observers spread across same-region voters using stable hashed routing" do
     peers = TestCluster.start_peers(4)
     on_exit(fn -> TestCluster.stop_peers(peers) end)
