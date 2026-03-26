@@ -32,6 +32,19 @@ defmodule EKVTest do
     mode
   end
 
+  defp start_single_node_cas_ekv(name, data_dir, cluster_size) do
+    EKV.start_link(
+      name: name,
+      data_dir: data_dir,
+      shards: 1,
+      log: false,
+      gc_interval: :timer.hours(1),
+      tombstone_ttl: :timer.hours(24 * 7),
+      cluster_size: cluster_size,
+      node_id: "v1"
+    )
+  end
+
   describe "put/get" do
     test "basic put and get", %{name: name} do
       :ok = EKV.put(name, "key1", "value1")
@@ -2474,6 +2487,14 @@ defmodule EKVTest do
         [
           delta_sync_storm_threshold: 0,
           expected: ":delta_sync_storm_threshold must be false/nil or a positive integer"
+        ],
+        [
+          write_admission_queue_limit: -1,
+          expected: ":write_admission_queue_limit must be false/nil or a non-negative integer"
+        ],
+        [
+          write_admission_poll_ms: 0,
+          expected: ":write_admission_poll_ms must be a positive timeout in ms"
         ]
       ]
 
@@ -2654,6 +2675,195 @@ defmodule EKVTest do
       assert_raise ArgumentError, ~r/CAS operations require/, fn ->
         EKV.update(name, "key", fn v -> v end)
       end
+    end
+  end
+
+  describe "observer CAS reply shaping" do
+    test "consistent read on clean absent key returns nil without committing a tombstone" do
+      name = :"consistent_absent_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+
+      {:ok, pid} = start_single_node_cas_ekv(name, data_dir, 1)
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      assert EKV.get(name, "obs/absent", consistent: true) == nil
+      assert EKV.get(name, "obs/absent", consistent: true) == nil
+
+      state = :sys.get_state(EKV.Replica.shard_name(name, 0))
+
+      assert EKV.Store.get(state.db, "obs/absent") == nil
+
+      {:ok, [[0, nil, nil]]} =
+        EKV.Sqlite3.fetch_all(
+          state.db,
+          "SELECT accepted_counter, accepted_value, accepted_deleted_at FROM kv_paxos WHERE key = ?1",
+          ["obs/absent"]
+        )
+
+      {:ok, [[0]]} = EKV.Sqlite3.fetch_all(state.db, "SELECT COUNT(*) FROM kv_oplog", [])
+    end
+
+    test "consistent read on committed tombstone returns nil without reproposing delete" do
+      name = :"consistent_tombstone_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+
+      {:ok, pid} = start_single_node_cas_ekv(name, data_dir, 1)
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      assert {:ok, vsn} = EKV.put(name, "obs/dead", "value", if_vsn: nil)
+      assert {:ok, _} = EKV.delete(name, "obs/dead", if_vsn: vsn)
+
+      state = :sys.get_state(EKV.Replica.shard_name(name, 0))
+      seq_before = EKV.Store.max_seq(state.db)
+
+      assert EKV.get(name, "obs/dead", consistent: true) == nil
+      assert EKV.get(name, "obs/dead", consistent: true) == nil
+
+      assert EKV.Store.max_seq(state.db) == seq_before
+
+      assert match?(
+               {_value, _ts, _origin, _expires, deleted_at} when is_integer(deleted_at),
+               EKV.Store.get(state.db, "obs/dead")
+             )
+    end
+
+    test "observer consistent read retry preserves observer envelope" do
+      name = :"observer_retry_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+
+      {:ok, pid} = start_single_node_cas_ekv(name, data_dir, 1)
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      assert {:ok, _vsn} = EKV.put(name, "obs/retry", "value", if_vsn: nil)
+
+      replica = EKV.Replica.shard_name(name, 0)
+      ref = make_ref()
+      tag = make_ref()
+      test_pid = self()
+      deadline_ms = System.monotonic_time(:millisecond) + 5_000
+
+      :sys.replace_state(replica, fn state ->
+        old_op = %{from: {test_pid, tag}, deadline_ms: deadline_ms, reply_mode: :observer_read}
+        %{state | pending_cas: Map.put(state.pending_cas, ref, old_op)}
+      end)
+
+      send(replica, {:cas_retry, ref, "obs/retry", {:cas_read, [], 0}})
+
+      assert_receive(
+        {^tag,
+         {:observer_result, {:ok, "value", _vsn},
+          {:ekv_cas_committed, "obs/retry", _, _, _, 0, _, _}}},
+        1_000
+      )
+    end
+
+    test "observer helper preserves early no-quorum errors" do
+      name = :"observer_no_quorum_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+
+      {:ok, pid} = start_single_node_cas_ekv(name, data_dir, 2)
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      assert {:observer_read_result, {:error, :no_quorum}, :absent, nil} =
+               EKV.__observer_consistent_get__(name, "obs/no_quorum", [])
+    end
+
+    test "observer helper returns nil for clean absent key without commit payload" do
+      name = :"observer_absent_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+
+      {:ok, pid} = start_single_node_cas_ekv(name, data_dir, 1)
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      assert {:observer_read_result, {:ok, nil, nil}, :absent, nil} =
+               EKV.__observer_consistent_get__(name, "obs/absent", [])
+    end
+
+    test "observer helper returns nil for committed tombstone without commit payload" do
+      name = :"observer_tombstone_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+
+      {:ok, pid} = start_single_node_cas_ekv(name, data_dir, 1)
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      assert {:ok, vsn} = EKV.put(name, "obs/dead", "value", if_vsn: nil)
+      assert {:ok, _} = EKV.delete(name, "obs/dead", if_vsn: vsn)
+
+      assert {:observer_read_result, {:ok, nil, nil}, {:deleted, _vsn}, nil} =
+               EKV.__observer_consistent_get__(name, "obs/dead", [])
+    end
+  end
+
+  describe "write admission gating" do
+    test "eventual put times out before entering an overloaded shard mailbox" do
+      name = :"write_gate_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+
+      {:ok, pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: data_dir,
+          shards: 1,
+          log: false,
+          write_admission_queue_limit: 0,
+          write_admission_poll_ms: 1
+        )
+
+      shard = EKV.Replica.shard_name(name, 0)
+
+      on_exit(fn ->
+        case GenServer.whereis(shard) do
+          shard_pid when is_pid(shard_pid) ->
+            :sys.resume(shard)
+
+          _ ->
+            :ok
+        end
+
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      :sys.suspend(shard)
+      send(shard, :queued)
+
+      assert {:message_queue_len, 1} = Process.info(Process.whereis(shard), :message_queue_len)
+
+      assert match?(
+               {:timeout,
+                {GenServer, :call, [^shard, {:put, "gate/1", _value_binary, []}, 5000]}},
+               catch_exit(EKV.put(name, "gate/1", "value"))
+             )
+
+      assert {:message_queue_len, 1} = Process.info(Process.whereis(shard), :message_queue_len)
+
+      :sys.resume(shard)
+
+      assert EKV.get(name, "gate/1") == nil
     end
   end
 
@@ -3609,7 +3819,7 @@ defmodule EKVTest do
       send(shard_name, {:ekv_accept_nack, ref, self(), "3"})
 
       # CAS entered accept phase and then lost quorum, so caller sees unconfirmed.
-      result = Task.await(task, 10_000)
+      result = Task.await(task, 12_000)
       assert result == {:error, :unconfirmed}
 
       # THE KEY ASSERTION: CAS failed, so the value must NOT be in local SQLite.
@@ -3665,7 +3875,7 @@ defmodule EKVTest do
       send(shard_name, {:ekv_accept_nack, ref, self(), "2"})
       send(shard_name, {:ekv_accept_nack, ref, self(), "3"})
 
-      result = Task.await(task, 10_000)
+      result = Task.await(task, 12_000)
 
       assert result in [{:error, :conflict}, {:error, :unavailable}]
 

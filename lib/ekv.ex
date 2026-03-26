@@ -2,20 +2,26 @@ defmodule EKV do
   @moduledoc """
   Eventually consistent durable KV store with opt-in per-key linearizable CAS.
 
-  EKV supports two runtime roles:
+  EKV supports three runtime roles:
 
   - **member mode** — the default. Stores data on disk, replicates to other
     members, serves eventual reads locally, and participates in CAS quorum.
+  - **observer mode** — stores data on disk, replicates to other durable
+    replicas, serves eventual reads and eventual writes locally, but routes CAS
+    operations to voting members.
   - **client mode** — stateless. Uses the same public API, but forwards
-    operations to a selected member based on configured region preference.
+    operations to a selected voting member based on configured region
+    preference.
 
-  In member mode, EKV stores data on disk (survives restarts and node death)
-  and replicates across all connected Erlang nodes automatically. There is no
-  leader in either mode: every member serves eventual reads and writes at all
-  times, including during network partitions, and any member can propose CAS
-  operations. CAS writes (`if_vsn:`, `consistent: true`, `update/4`) still
-  require quorum and may fail when quorum is unavailable. When connectivity is
-  restored, members converge to the same state.
+  In member and observer mode, EKV stores data on disk (survives restarts and
+  node death) and replicates across all connected durable replicas
+  automatically. There is no leader: every durable replica serves eventual
+  reads and writes at all times, including during network partitions.
+  CAS writes (`if_vsn:`, `consistent: true`, `update/4`) still require quorum
+  and may fail when quorum is unavailable. Voting members execute CAS locally;
+  observers route CAS to voting members and apply the committed result locally
+  before replying on success. When connectivity is restored, durable replicas
+  converge to the same state.
 
   ## Quick Start
 
@@ -51,7 +57,7 @@ defmodule EKV do
        node_id: 1,
        wait_for_quorum: :timer.seconds(30)}
 
-      # Client mode — stateless EKV API that routes to members by region order
+      # Client mode — stateless EKV API that routes to voters by region order
       {EKV,
        name: :my_kv_client,
        mode: :client,
@@ -60,6 +66,17 @@ defmodule EKV do
        wait_for_route: :timer.seconds(10),
        wait_for_quorum: :timer.seconds(10),
        shutdown_barrier: :timer.seconds(5)}
+
+      # Observer mode — local eventual reads/writes, CAS routed to voters
+      {EKV,
+       name: :my_kv_observer,
+       mode: :observer,
+       data_dir: "/var/data/ekv_observer",
+       cluster_size: 3,
+       region: "lhr",
+       region_routing: ["iad", "dfw", "lhr"],
+       wait_for_route: :timer.seconds(10),
+       wait_for_quorum: :timer.seconds(10)}
 
       # CAS put via lookup + if_vsn
       case EKV.lookup(:my_kv_cas, "lock/job-123") do
@@ -204,6 +221,17 @@ defmodule EKV do
         gc_interval: :timer.minutes(5),
         log: :info}
 
+  Observer mode:
+
+      {EKV,
+        name: :my_kv_observer,
+        mode: :observer,
+        data_dir: "/var/data/ekv_observer",
+        cluster_size: 3,
+        region: "lhr",
+        region_routing: ["iad", "dfw", "lhr"],
+        log: :info}
+
   Client mode:
 
       {EKV,
@@ -216,27 +244,47 @@ defmodule EKV do
   | Option | Default | Description |
   |--------|---------|-------------|
   | `:name` | *required* | Atom identifying this EKV instance. Used to register processes and as the first argument to all API functions. |
-  | `:mode` | `:member` | Runtime role. `:member` stores/replicates data and participates in CAS quorum. `:client` is stateless and routes operations to members. |
-  | `:region` | `"default"` | Region label for this EKV instance. Members expose it for client routing. Clients may set it for observability. |
-  | `:region_routing` | `nil` | Client mode only. Ordered list of preferred member regions, e.g. `["iad", "dfw", "lhr"]`. |
-  | `:wait_for_route` | `false` | Client mode only. Optional startup gate. Blocks `EKV.start_link/1` until the first reachable member in `:region_routing` order is selected, or fails startup on timeout. |
-  | `:data_dir` | *required in `:member`* | Directory where SQLite database files are stored. Created automatically if it doesn't exist. Each shard gets its own file (`shard_0.db`, `shard_1.db`, etc.). |
-  | `:shards` | `8` | Member mode only. Number of shards. See "Choosing a Shard Count" below. |
-  | `:cluster_size` | `nil` | Member mode only. Logical cluster size for CAS quorum math. Required for CAS operations (`if_vsn:`, `consistent: true`, `update/4`). |
-  | `:node_id` | auto-generated+persistent | Member mode only. Stable logical member identity used by CAS ballots, persisted replay origins, member-progress retention, and blue-green overlap. Auto-generated on first boot if omitted, then reused from disk. |
-  | `:wait_for_quorum` | `false` | Optional startup gate. In member mode, blocks startup until this EKV member can reach CAS quorum. In client mode, blocks startup until the selected backend member reports CAS quorum reachable. |
-  | `:anti_entropy_interval` | `30_000` (30 sec) | Member mode only. Periodic background repair for already-connected members. Re-runs the normal HWM-driven delta/full sync path to heal missed replication without waiting for reconnect. Must be a positive timeout in ms. |
-  | `:delta_sync_log_min_entries` | `8` | Member mode only. Suppresses per-delta `info` logs for successful terminal delta syncs smaller than this many entries. `:verbose` logging still prints all deltas. |
-  | `:delta_sync_storm_window` | `60_000` (60 sec) | Member mode only. Rolling per-shard window used to aggregate delta sync activity for storm detection. |
-  | `:delta_sync_storm_threshold` | `100` | Member mode only. When a shard sends at least this many delta syncs inside one storm window, EKV emits a single aggregated warning for that window. `false`/`nil` disables storm warnings. |
+  | `:mode` | `:member` | Runtime role. `:member` stores/replicates data and votes in CAS quorum. `:observer` stores/replicates data and routes CAS to voters. `:client` is stateless and routes operations to voters. |
+  | `:region` | `"default"` | Region label for this EKV instance. Durable replicas expose it for routing. Clients may set it for observability. |
+  | `:region_routing` | `nil` | Observer and client mode only. Ordered list of preferred voter regions, e.g. `["iad", "dfw", "lhr"]`. |
+  | `:wait_for_route` | `false` | Observer and client mode only. Optional startup gate. Blocks `EKV.start_link/1` until the first reachable voter in `:region_routing` order is selected, or fails startup on timeout. |
+  | `:data_dir` | *required in `:member` and `:observer`* | Directory where SQLite database files are stored. Created automatically if it doesn't exist. Each shard gets its own file (`shard_0.db`, `shard_1.db`, etc.). |
+  | `:shards` | `8` | Member and observer mode only. Number of shards. See "Choosing a Shard Count" below. |
+  | `:cluster_size` | `nil` | Member and observer mode only. Logical voting cluster size for CAS quorum math. Required for CAS-capable durable replica deployments. |
+  | `:node_id` | auto-generated+persistent | Member and observer mode only. Stable logical durable-replica identity used by CAS ballots, persisted replay origins, member-progress retention, and blue-green overlap. Auto-generated on first boot if omitted, then reused from disk. |
+  | `:wait_for_quorum` | `false` | Optional startup gate. In member mode, blocks startup until this EKV member can reach CAS quorum. In observer and client mode, blocks startup until the selected backend voter reports CAS quorum reachable. |
+  | `:anti_entropy_interval` | `30_000` (30 sec) | Member and observer mode only. Periodic background repair for already-connected durable replicas. Re-runs the normal HWM-driven delta/full sync path to heal missed replication without waiting for reconnect. Must be a positive timeout in ms. |
+  | `:delta_sync_log_min_entries` | `8` | Member and observer mode only. Suppresses per-delta `info` logs for successful terminal delta syncs smaller than this many entries. `:verbose` logging still prints all deltas. |
+  | `:delta_sync_storm_window` | `60_000` (60 sec) | Member and observer mode only. Rolling per-shard window used to aggregate delta sync activity for storm detection. |
+  | `:delta_sync_storm_threshold` | `100` | Member and observer mode only. When a shard sends at least this many delta syncs inside one storm window, EKV emits a single aggregated warning for that window. `false`/`nil` disables storm warnings. |
+  | `:write_admission_queue_limit` | `false` | Member and observer mode only. Optional pre-admission gate for write-like shard calls. When set to a non-negative integer, callers wait outside the shard mailbox while `message_queue_len` is above the limit and time out within their own deadline instead of amplifying shard backlog. |
+  | `:write_admission_poll_ms` | `5` | Member and observer mode only. Poll interval in milliseconds for the write admission gate while waiting for shard queue pressure to fall below `:write_admission_queue_limit`. |
   | `:wire_compression_threshold` | `262_144` (256 KB) | Optional byte threshold for member-to-member wire compression of large replicated value payloads. `false`/`nil` disables it. Large `:ekv_put`, CAS accept, and full-payload CAS commit messages compress values on the wire only; values remain uncompressed on disk and on reads. |
   | `:shutdown_barrier` | `false` | Optional graceful-shutdown barrier. Keeps EKV serving during coordinated shutdown for up to the configured timeout so members can finish final writes and replication. |
-  | `:allow_stale_startup` | `false` | Member mode only. Dangerous recovery override. If `true`, EKV trusts on-disk data even when stale-db detection would normally refuse startup. Intended only for explicit disaster recovery / full cold-cluster restore cases. |
-  | `:tombstone_ttl` | `604_800_000` (7 days) | Member mode only. How long tombstones (deleted entries) are kept before being permanently purged, in milliseconds. See "Tombstone Lifetime" below. |
-  | `:gc_interval` | `300_000` (5 min) | Member mode only. How often garbage collection runs, in milliseconds. GC emits `:expired` events for TTL expiry, tombstones expired LWW rows, lazily purges expired CAS rows, and truncates the replication oplog. |
+  | `:allow_stale_startup` | `false` | Member and observer mode only. Dangerous recovery override. If `true`, EKV trusts on-disk data even when stale-db detection would normally refuse startup. Intended only for explicit disaster recovery / full cold-cluster restore cases. |
+  | `:tombstone_ttl` | `604_800_000` (7 days) | Member and observer mode only. How long tombstones (deleted entries) are kept before being permanently purged, in milliseconds. See "Tombstone Lifetime" below. |
+  | `:gc_interval` | `300_000` (5 min) | Member and observer mode only. How often garbage collection runs, in milliseconds. GC emits `:expired` events for TTL expiry, tombstones expired LWW rows, lazily purges expired CAS rows, and truncates the replication oplog. |
   | `:log` | `:info` | Logging level. `:info` logs cluster events (connects, syncs). `false` disables logging. `:verbose` logs per-shard detail. |
-  | `:partition_ttl_policy` | `:quarantine` | Member mode only. Policy for reconnects after downtime longer than `tombstone_ttl`. `:quarantine` blocks replication with that member identity until operator rebuild. `:ignore` disables that quarantine and allows reconnect/sync anyway. |
-  | `:blue_green` | `false` | Member mode only. Enable blue-green deployment mode. See "Blue-Green Deployment" below. |
+  | `:partition_ttl_policy` | `:quarantine` | Member and observer mode only. Policy for reconnects after downtime longer than `tombstone_ttl`. `:quarantine` blocks replication with that member identity until operator rebuild. `:ignore` disables that quarantine and allows reconnect/sync anyway. |
+  | `:blue_green` | `false` | Member and observer mode only. Enable blue-green deployment mode. See "Blue-Green Deployment" below. |
+
+  ### Observer Mode
+
+  Observer mode is for nodes that should keep a full local durable replica and
+  serve low-latency eventual reads locally, but should not expand the CAS voter
+  set.
+
+  - Observers start SQLite, replication, GC, subscriptions, and anti-entropy.
+  - Eventual reads and eventual writes are local on the observer.
+  - CAS reads/writes route to a selected voting member based on
+    `:region_routing`.
+  - Successful observer CAS calls apply the committed result locally before
+    replying, so immediate local eventual read-your-CAS-writes is preserved.
+  - Observers do not count toward CAS quorum and clients do not route to them.
+  - `{:error, :unconfirmed}` on an observer means EKV could not confirm the
+    committed state was safely visible for the caller's current path; resolve
+    with `get(name, key, consistent: true)` before trusting local eventual
+    state.
 
   ### Client Mode
 
@@ -245,14 +293,14 @@ defmodule EKV do
 
   - Clients do not start SQLite, replication, GC, or blue-green machinery.
   - Eventual reads are no longer local SQLite reads; they are routed to the
-    selected member.
-  - `wait_for_route` can delay startup until a member route is selected.
-  - `wait_for_quorum` can additionally delay startup until that selected member
+    selected voter.
+  - `wait_for_route` can delay startup until a voter route is selected.
+  - `wait_for_quorum` can additionally delay startup until that selected voter
     reports CAS quorum reachable.
   - Members run periodic anti-entropy by default so a connected member that
     missed a prior update eventually replays the normal sync path and heals.
   - `scan/2` and `keys/2` still return Elixir streams, but are backed by paged
-    RPC to the selected member.
+    RPC to the selected voter.
   - `subscribe/2` works in client mode; client subscribers are delivered
     cluster-wide via `:pg`.
   - If no backend is reachable, read APIs raise and write APIs return
@@ -478,6 +526,7 @@ defmodule EKV do
 
   alias EKV.Replica
 
+  @default_local_shard_call_timeout 5_000
   @client_rpc_timeout_margin 1_000
 
   # ===========================================================================
@@ -515,7 +564,7 @@ defmodule EKV do
       :client ->
         client_read_call!(name, :lookup, [name, key], 10_000)
 
-      :member ->
+      mode when mode in [:member, :observer] ->
         shard_index = Replica.shard_index_for(key, config.num_shards)
         {db, get_stmt} = read_conn(name, shard_index)
 
@@ -614,6 +663,31 @@ defmodule EKV do
       :client ->
         client_write_call(name, :put, [name, key, value, opts], timeout)
 
+      :observer ->
+        shard_index = Replica.shard_index_for(key, config.num_shards)
+
+        case {Keyword.fetch(opts, :if_vsn), consistent?} do
+          {_, true} ->
+            if Keyword.has_key?(opts, :if_vsn) do
+              raise ArgumentError, "EKV: :consistent and :if_vsn are mutually exclusive"
+            end
+
+            update_opts =
+              Keyword.take(opts, [:ttl, :retries, :backoff, :timeout, :resolve_unconfirmed])
+
+            case observer_update(name, key, fn _ -> value end, update_opts) do
+              {:ok, _new_value, vsn} -> {:ok, vsn}
+              error -> error
+            end
+
+          {{:ok, expected_vsn}, false} ->
+            observer_cas_put(name, key, value, expected_vsn, opts, shard_index, timeout)
+
+          {:error, false} ->
+            value_binary = :erlang.term_to_binary(value)
+            call_shard_write(name, shard_index, {:put, key, value_binary, opts})
+        end
+
       :member ->
         shard_index = Replica.shard_index_for(key, config.num_shards)
 
@@ -638,8 +712,9 @@ defmodule EKV do
             value_binary = :erlang.term_to_binary(value)
 
             result =
-              GenServer.call(
-                Replica.shard_name(name, shard_index),
+              call_shard_write(
+                name,
+                shard_index,
                 {:cas_put, key, value_binary, expected_vsn, opts},
                 timeout
               )
@@ -648,7 +723,7 @@ defmodule EKV do
 
           {:error, false} ->
             value_binary = :erlang.term_to_binary(value)
-            GenServer.call(Replica.shard_name(name, shard_index), {:put, key, value_binary, opts})
+            call_shard_write(name, shard_index, {:put, key, value_binary, opts})
         end
     end
   end
@@ -686,17 +761,41 @@ defmodule EKV do
       :client ->
         client_read_call!(name, :get, [name, key, opts], timeout)
 
+      :observer ->
+        if consistent? do
+          observer_consistent_get(name, key, opts, config, timeout)
+        else
+          shard_index = Replica.shard_index_for(key, config.num_shards)
+          {db, get_stmt} = read_conn(name, shard_index)
+
+          case EKV.Store.get_cached(db, get_stmt, key) do
+            nil ->
+              nil
+
+            {_value_binary, _ts, _origin, _expires_at, deleted_at} when is_integer(deleted_at) ->
+              nil
+
+            {value_binary, _ts, _origin, expires_at, nil} when is_integer(expires_at) ->
+              now = System.system_time(:nanosecond)
+
+              if expires_at <= now do
+                nil
+              else
+                :erlang.binary_to_term(value_binary)
+              end
+
+            {value_binary, _ts, _origin, _expires_at, nil} ->
+              :erlang.binary_to_term(value_binary)
+          end
+        end
+
       :member ->
         if consistent? do
           validate_cas_config!(config)
           shard_index = Replica.shard_index_for(key, config.num_shards)
           cas_opts = Keyword.take(opts, [:retries, :backoff, :timeout])
 
-          case GenServer.call(
-                 Replica.shard_name(name, shard_index),
-                 {:cas_read, key, cas_opts},
-                 timeout
-               ) do
+          case call_shard(name, shard_index, {:cas_read, key, cas_opts}, timeout) do
             {:ok, value} -> value
             {:ok, value, _vsn} -> value
             {:error, reason} -> raise "EKV: consistent read failed: #{inspect(reason)}"
@@ -776,6 +875,17 @@ defmodule EKV do
       :client ->
         client_write_call(name, :delete, [name, key, opts], timeout)
 
+      :observer ->
+        shard_index = Replica.shard_index_for(key, config.num_shards)
+
+        case Keyword.fetch(opts, :if_vsn) do
+          {:ok, expected_vsn} ->
+            observer_cas_delete(name, key, expected_vsn, opts, shard_index, timeout)
+
+          :error ->
+            call_shard_write(name, shard_index, {:delete, key})
+        end
+
       :member ->
         shard_index = Replica.shard_index_for(key, config.num_shards)
 
@@ -784,8 +894,9 @@ defmodule EKV do
             validate_cas_config!(config)
 
             result =
-              GenServer.call(
-                Replica.shard_name(name, shard_index),
+              call_shard_write(
+                name,
+                shard_index,
                 {:cas_delete, key, expected_vsn, opts},
                 timeout
               )
@@ -793,7 +904,7 @@ defmodule EKV do
             maybe_resolve_unconfirmed_write(result, name, key, opts, :cas_delete)
 
           :error ->
-            GenServer.call(Replica.shard_name(name, shard_index), {:delete, key})
+            call_shard_write(name, shard_index, {:delete, key})
         end
     end
   end
@@ -839,8 +950,8 @@ defmodule EKV do
   - an MFA tuple `{Mod, fun, extra_args}` which is invoked as
     `apply(Mod, fun, [current_value | extra_args])`
 
-  In client mode, the callback is executed on the selected member, so prefer a
-  named function capture like `&MyModule.bump/1` or an MFA tuple.
+  In observer and client mode, the callback is executed on the selected voter,
+  so prefer a named function capture like `&MyModule.bump/1` or an MFA tuple.
   """
   def update(name, key, callback, opts \\ [])
 
@@ -872,16 +983,15 @@ defmodule EKV do
       :client ->
         client_write_call(name, :update, [name, key, update_callback, opts], timeout)
 
+      :observer ->
+        observer_update(name, key, update_callback, opts)
+
       :member ->
         validate_cas_config!(config)
         shard_index = Replica.shard_index_for(key, config.num_shards)
 
         result =
-          GenServer.call(
-            Replica.shard_name(name, shard_index),
-            {:update, key, update_callback, opts},
-            timeout
-          )
+          call_shard_write(name, shard_index, {:update, key, update_callback, opts}, timeout)
 
         maybe_resolve_unconfirmed_write(result, name, key, opts, :update)
     end
@@ -932,7 +1042,7 @@ defmodule EKV do
   across shards.
 
   In client mode, the returned stream is still local to the caller, but each
-  chunk is fetched from the selected member via paged RPC.
+  chunk is fetched from the selected voter via paged RPC.
   """
   def scan(name, prefix) do
     config = EKV.Supervisor.get_config(name)
@@ -941,7 +1051,7 @@ defmodule EKV do
       :client ->
         remote_page_stream(name, prefix, :__scan_page__)
 
-      :member ->
+      mode when mode in [:member, :observer] ->
         member_scan_stream(name, prefix)
     end
   end
@@ -961,7 +1071,7 @@ defmodule EKV do
   shards.
 
   In client mode, the returned stream is still local to the caller, but each
-  chunk is fetched from the selected member via paged RPC.
+  chunk is fetched from the selected voter via paged RPC.
   """
   def keys(name, prefix) do
     config = EKV.Supervisor.get_config(name)
@@ -970,17 +1080,17 @@ defmodule EKV do
       :client ->
         remote_page_stream(name, prefix, :__keys_page__)
 
-      :member ->
+      mode when mode in [:member, :observer] ->
         member_keys_stream(name, prefix)
     end
   end
 
-  # Invoked by a client-originated paged scan RPC; runs on the selected member node.
+  # Invoked by a client-originated paged scan RPC; runs on the selected voter node.
   @doc false
   def __scan_page__(name, prefix, cursor, limit)
       when is_binary(prefix) and is_integer(limit) and limit >= 1 do
     config = EKV.Supervisor.get_config(name)
-    ensure_member_mode!(config, :__scan_page__)
+    ensure_durable_mode!(config, :__scan_page__)
 
     page_results(
       name,
@@ -994,12 +1104,12 @@ defmodule EKV do
     )
   end
 
-  # Invoked by a client-originated paged keys RPC; runs on the selected member node.
+  # Invoked by a client-originated paged keys RPC; runs on the selected voter node.
   @doc false
   def __keys_page__(name, prefix, cursor, limit)
       when is_binary(prefix) and is_integer(limit) and limit >= 1 do
     config = EKV.Supervisor.get_config(name)
-    ensure_member_mode!(config, :__keys_page__)
+    ensure_durable_mode!(config, :__keys_page__)
 
     page_results(
       name,
@@ -1061,7 +1171,7 @@ defmodule EKV do
       :client ->
         EKV.ClientSubscriptions.subscribe(name, prefix)
 
-      :member ->
+      mode when mode in [:member, :observer] ->
         case Registry.register(config.registry, prefix, nil) do
           {:ok, _} ->
             :atomics.add(config.sub_count, 1, 1)
@@ -1081,7 +1191,7 @@ defmodule EKV do
 
     case mode(config) do
       :client -> EKV.ClientSubscriptions.unsubscribe(name, prefix)
-      :member -> Registry.unregister(config.registry, prefix)
+      mode when mode in [:member, :observer] -> Registry.unregister(config.registry, prefix)
     end
 
     :ok
@@ -1093,11 +1203,11 @@ defmodule EKV do
   Uses SQLite's online backup API — safe to call while EKV is running.
   Returns `:ok` on success or `{:error, reason}` on failure.
 
-  Member mode only.
+  Member and observer mode only.
   """
   def backup(name, dest_dir) do
     config = EKV.Supervisor.get_config(name)
-    ensure_member_mode!(config, :backup)
+    ensure_durable_mode!(config, :backup)
     File.mkdir_p!(dest_dir)
 
     0..(config.num_shards - 1)
@@ -1165,22 +1275,38 @@ defmodule EKV do
             end
         }
 
-      :member ->
+      mode when mode in [:member, :observer] ->
         shard_state = :sys.get_state(Replica.shard_name(name, 0))
 
         connected_members =
           for {node, _pid} <- shard_state.remote_shards do
-            %{node: node, node_id: Map.get(shard_state.member_node_ids, node)}
+            %{
+              node: node,
+              node_id: Map.get(shard_state.member_node_ids, node),
+              cas_voter: Replica.remote_cas_voter?(shard_state, node)
+            }
           end
 
         %{
           name: name,
-          mode: :member,
+          mode: mode,
           region: config.region,
+          region_routing: config.region_routing,
           node_id: config.node_id,
           cluster_size: config.cluster_size,
           shards: config.num_shards,
           data_dir: config.data_dir,
+          current_backend:
+            case mode do
+              :observer ->
+                case EKV.ClientRouter.backend(name) do
+                  {:ok, backend} -> backend
+                  {:error, :unavailable} -> nil
+                end
+
+              :member ->
+                nil
+            end,
           connected_members: connected_members
         }
     end
@@ -1192,8 +1318,8 @@ defmodule EKV do
   In member mode, this checks the same member-reachability predicate that CAS
   writes use for early `:no_quorum` rejection.
 
-  In client mode, this first waits for a backend route and then asks the
-  selected member to perform the quorum readiness check.
+  In observer and client mode, this first waits for a backend route and then
+  asks the selected voter to perform the quorum readiness check.
 
   It is primarily useful for startup orchestration and other cases where callers
   want a bounded wait before issuing CAS traffic.
@@ -1214,13 +1340,16 @@ defmodule EKV do
       :client ->
         client_await_quorum(name, timeout_ms)
 
+      :observer ->
+        client_await_quorum(name, timeout_ms)
+
       :member ->
         if is_nil(config.cluster_size) do
           raise ArgumentError,
                 "EKV: await_quorum/2 requires :cluster_size to be configured"
         else
           call_timeout = timeout_ms + 1_000
-          GenServer.call(Replica.shard_name(name, 0), {:await_quorum, timeout_ms}, call_timeout)
+          call_shard(name, 0, {:await_quorum, timeout_ms}, call_timeout)
         end
     end
   end
@@ -1230,7 +1359,7 @@ defmodule EKV do
           "EKV: await_quorum/2 timeout must be a non-negative integer, got: #{inspect(timeout_ms)}"
   end
 
-  # Invoked by a client-originated RPC; runs on the selected member node.
+  # Invoked by a routed RPC; runs on the selected voter node.
   @doc false
   def __client_invoke__(fun, args) when is_atom(fun) and is_list(args) do
     try do
@@ -1242,7 +1371,74 @@ defmodule EKV do
     end
   end
 
-  # Runs on the client node; issues the cross-node erpc call to a member.
+  @doc false
+  def __observer_cas_put__(name, key, value, expected_vsn, opts) do
+    config = EKV.Supervisor.get_config(name)
+    ensure_voter_member_mode!(config, :__observer_cas_put__)
+    shard_index = Replica.shard_index_for(key, config.num_shards)
+    value_binary = :erlang.term_to_binary(value)
+    timeout = rpc_timeout_from_opts(opts)
+
+    call_shard_write(
+      name,
+      shard_index,
+      {:observer_cas_put, key, value_binary, expected_vsn, opts},
+      timeout
+    )
+  end
+
+  @doc false
+  def __observer_cas_delete__(name, key, expected_vsn, opts) do
+    config = EKV.Supervisor.get_config(name)
+    ensure_voter_member_mode!(config, :__observer_cas_delete__)
+    shard_index = Replica.shard_index_for(key, config.num_shards)
+    timeout = rpc_timeout_from_opts(opts)
+
+    call_shard_write(
+      name,
+      shard_index,
+      {:observer_cas_delete, key, expected_vsn, opts},
+      timeout
+    )
+  end
+
+  @doc false
+  def __observer_update__(name, key, update_callback, opts) do
+    config = EKV.Supervisor.get_config(name)
+    ensure_voter_member_mode!(config, :__observer_update__)
+    shard_index = Replica.shard_index_for(key, config.num_shards)
+    timeout = rpc_timeout_from_opts(opts)
+
+    call_shard_write(
+      name,
+      shard_index,
+      {:observer_update, key, update_callback, opts},
+      timeout
+    )
+  end
+
+  @doc false
+  def __observer_consistent_get__(name, key, opts) do
+    config = EKV.Supervisor.get_config(name)
+    ensure_voter_member_mode!(config, :__observer_consistent_get__)
+    shard_index = Replica.shard_index_for(key, config.num_shards)
+    timeout = rpc_timeout_from_opts(opts)
+    cas_opts = Keyword.take(opts, [:retries, :backoff, :timeout])
+
+    result =
+      call_shard(name, shard_index, {:observer_cas_read, key, cas_opts}, timeout)
+
+    case result do
+      {:observer_result, reply, commit_payload} ->
+        row_state = current_row_state(name, shard_index, key)
+        {:observer_read_result, reply, row_state, commit_payload}
+
+      other ->
+        other
+    end
+  end
+
+  # Runs on the routed caller node; issues the cross-node erpc call to a voter.
   defp remote_invoke(node, fun, args, timeout) do
     try do
       case :erpc.call(node, __MODULE__, :__client_invoke__, [fun, args], timeout) do
@@ -1261,6 +1457,13 @@ defmodule EKV do
   end
 
   defp validate_cas_config!(_config), do: :ok
+
+  defp ensure_voter_member_mode!(config, fun_name) do
+    if mode(config) != :member or not Map.get(config, :cas_voter, true) do
+      raise ArgumentError,
+            "EKV: #{fun_name} requires a voting :member backend"
+    end
+  end
 
   defp validate_boolean_opt!(opts, key) do
     case Keyword.get(opts, key, false) do
@@ -1333,10 +1536,10 @@ defmodule EKV do
 
   defp mode(config), do: Map.get(config, :mode, :member)
 
-  defp ensure_member_mode!(config, fun_name) do
+  defp ensure_durable_mode!(config, fun_name) do
     if mode(config) == :client do
       raise ArgumentError,
-            "EKV: #{fun_name} is only available on :member instances"
+            "EKV: #{fun_name} is only available on durable replica instances (:member or :observer)"
     end
   end
 
@@ -1344,6 +1547,67 @@ defmodule EKV do
     case Keyword.get(opts, :timeout, default) do
       :infinity -> :infinity
       timeout when is_integer(timeout) -> timeout + @client_rpc_timeout_margin
+    end
+  end
+
+  defp call_shard(name, shard_index, request, timeout) do
+    GenServer.call(Replica.shard_name(name, shard_index), request, timeout)
+  end
+
+  defp call_shard_write(
+         name,
+         shard_index,
+         request,
+         timeout \\ @default_local_shard_call_timeout
+       ) do
+    timeout = await_write_admission(name, shard_index, request, timeout)
+    call_shard(name, shard_index, request, timeout)
+  end
+
+  defp await_write_admission(_name, _shard_index, _request, :infinity), do: :infinity
+
+  defp await_write_admission(name, shard_index, request, timeout) when is_integer(timeout) do
+    config = EKV.Supervisor.get_config(name)
+
+    case Map.get(config, :write_admission_queue_limit) do
+      limit when is_integer(limit) and limit >= 0 ->
+        poll_ms = Map.get(config, :write_admission_poll_ms, 5)
+        target = Replica.shard_name(name, shard_index)
+        deadline_ms = System.monotonic_time(:millisecond) + timeout
+        wait_for_write_admission(target, request, timeout, deadline_ms, limit, poll_ms)
+
+      _ ->
+        timeout
+    end
+  end
+
+  defp wait_for_write_admission(target, request, original_timeout, deadline_ms, limit, poll_ms) do
+    now_ms = System.monotonic_time(:millisecond)
+    queue_len = shard_message_queue_len(target)
+
+    cond do
+      queue_len <= limit ->
+        max(deadline_ms - now_ms, 1)
+
+      now_ms >= deadline_ms ->
+        exit({:timeout, {GenServer, :call, [target, request, original_timeout]}})
+
+      true ->
+        Process.sleep(min(poll_ms, max(deadline_ms - now_ms, 1)))
+        wait_for_write_admission(target, request, original_timeout, deadline_ms, limit, poll_ms)
+    end
+  end
+
+  defp shard_message_queue_len(target) do
+    case GenServer.whereis(target) do
+      pid when is_pid(pid) ->
+        case Process.info(pid, :message_queue_len) do
+          {:message_queue_len, len} when is_integer(len) -> len
+          _ -> 0
+        end
+
+      _ ->
+        0
     end
   end
 
@@ -1425,24 +1689,40 @@ defmodule EKV do
 
   defp resolved_current_row(name, key, opts) do
     config = EKV.Supervisor.get_config(name)
-    validate_cas_config!(config)
-    shard_index = Replica.shard_index_for(key, config.num_shards)
     timeout = Keyword.get(opts, :timeout, 10_000)
-    cas_opts = Keyword.take(opts, [:retries, :backoff])
 
-    case GenServer.call(
-           Replica.shard_name(name, shard_index),
-           {:cas_read, key, cas_opts},
-           timeout
-         ) do
-      {:ok, _value} ->
-        {:ok, current_row_state(name, shard_index, key)}
+    case mode(config) do
+      :observer ->
+        case client_rpc(name, :__observer_consistent_get__, [name, key, opts], timeout, true) do
+          {:ok, {:observer_read_result, _reply, row_state, commit_payload}} ->
+            case apply_observer_commit(name, commit_payload, timeout, :strict) do
+              :ok -> {:ok, row_state}
+              {:error, _reason} -> {:error, :unavailable}
+            end
 
-      {:ok, _value, _vsn} ->
-        {:ok, current_row_state(name, shard_index, key)}
+          _ ->
+            {:error, :unavailable}
+        end
 
-      {:error, _reason} ->
-        {:error, :unavailable}
+      _ ->
+        validate_cas_config!(config)
+        shard_index = Replica.shard_index_for(key, config.num_shards)
+        cas_opts = Keyword.take(opts, [:retries, :backoff])
+
+        case GenServer.call(
+               Replica.shard_name(name, shard_index),
+               {:cas_read, key, cas_opts},
+               timeout
+             ) do
+          {:ok, _value} ->
+            {:ok, current_row_state(name, shard_index, key)}
+
+          {:ok, _value, _vsn} ->
+            {:ok, current_row_state(name, shard_index, key)}
+
+          {:error, _reason} ->
+            {:error, :unavailable}
+        end
     end
   end
 
@@ -1461,7 +1741,130 @@ defmodule EKV do
     end
   end
 
-  # Runs on the client node; selects a member backend, performs the RPC, and optionally retries safe calls.
+  defp observer_cas_put(name, key, value, expected_vsn, opts, _shard_index, timeout) do
+    case client_rpc(
+           name,
+           :__observer_cas_put__,
+           [name, key, value, expected_vsn, opts],
+           timeout,
+           false
+         ) do
+      {:ok, {:observer_result, reply, commit_payload}} ->
+        finalize_observer_write(name, commit_payload, timeout, reply)
+
+      {:raise, exception} ->
+        raise exception
+
+      {:exit, reason} ->
+        raise "EKV: client call exited: #{inspect(reason)}"
+
+      {:error, :unavailable} ->
+        {:error, :unavailable}
+    end
+  end
+
+  defp observer_cas_delete(name, key, expected_vsn, opts, _shard_index, timeout) do
+    case client_rpc(
+           name,
+           :__observer_cas_delete__,
+           [name, key, expected_vsn, opts],
+           timeout,
+           false
+         ) do
+      {:ok, {:observer_result, reply, commit_payload}} ->
+        finalize_observer_write(name, commit_payload, timeout, reply)
+
+      {:raise, exception} ->
+        raise exception
+
+      {:exit, reason} ->
+        raise "EKV: client call exited: #{inspect(reason)}"
+
+      {:error, :unavailable} ->
+        {:error, :unavailable}
+    end
+  end
+
+  defp observer_update(name, key, update_callback, opts) do
+    timeout = rpc_timeout_from_opts(opts)
+
+    case client_rpc(
+           name,
+           :__observer_update__,
+           [name, key, update_callback, opts],
+           timeout,
+           false
+         ) do
+      {:ok, {:observer_result, reply, commit_payload}} ->
+        finalize_observer_write(name, commit_payload, timeout, reply)
+
+      {:raise, exception} ->
+        raise exception
+
+      {:exit, reason} ->
+        raise "EKV: client call exited: #{inspect(reason)}"
+
+      {:error, :unavailable} ->
+        {:error, :unavailable}
+    end
+  end
+
+  defp observer_consistent_get(name, key, opts, _config, timeout) do
+    case client_rpc(name, :__observer_consistent_get__, [name, key, opts], timeout, true) do
+      {:ok, {:observer_read_result, reply, _row_state, commit_payload}} ->
+        _ = apply_observer_commit(name, commit_payload, timeout, :best_effort)
+        extract_consistent_get_reply(reply)
+
+      {:raise, exception} ->
+        raise exception
+
+      {:exit, reason} ->
+        raise "EKV: client call exited: #{inspect(reason)}"
+
+      {:error, :unavailable} ->
+        raise "EKV: client backend unavailable"
+    end
+  end
+
+  defp extract_consistent_get_reply({:ok, value}), do: value
+  defp extract_consistent_get_reply({:ok, value, _vsn}), do: value
+
+  defp extract_consistent_get_reply({:error, reason}),
+    do: raise("EKV: consistent read failed: #{inspect(reason)}")
+
+  defp finalize_observer_write(name, commit_payload, timeout, reply) do
+    case apply_observer_commit(name, commit_payload, timeout, :strict) do
+      :ok -> reply
+      {:error, _reason} -> {:error, :unconfirmed}
+    end
+  end
+
+  defp apply_observer_commit(_name, nil, _timeout, _mode), do: :ok
+
+  defp apply_observer_commit(
+         name,
+         {:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple, shard, origin_node,
+          origin_seq},
+         timeout,
+         mode
+       ) do
+    case call_shard_write(
+           name,
+           shard,
+           {:apply_observer_commit, key, ballot_c, ballot_n, entry_tuple, origin_node,
+            origin_seq},
+           timeout
+         ) do
+      :ok ->
+        :ok
+    end
+  catch
+    :exit, _reason ->
+      if mode == :best_effort, do: :ok, else: {:error, :unavailable}
+  end
+
+  # Runs on the routed caller node; selects a voter backend, performs the RPC,
+  # and optionally retries safe calls.
   defp client_rpc(name, fun, args, timeout, retryable?) do
     with {:ok, backend} <- EKV.ClientRouter.backend(name) do
       case remote_invoke(backend, fun, args, timeout) do
@@ -1488,7 +1891,8 @@ defmodule EKV do
     end
   end
 
-  # Runs on the client node; retries a failed safe RPC against the next selected member.
+  # Runs on the routed caller node; retries a failed safe RPC against the next
+  # selected voter.
   defp retry_client_rpc(name, failed_backend, fun, args, timeout) do
     with {:ok, backend} <- EKV.ClientRouter.next_backend(name, failed_backend),
          false <- backend == failed_backend,

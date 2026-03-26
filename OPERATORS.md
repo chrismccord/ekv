@@ -47,6 +47,14 @@ Member mode:
  cluster_size: 3, wait_for_quorum: 30_000}
 ```
 
+Observer mode:
+
+```elixir
+{EKV, name: :my_kv, mode: :observer,
+ data_dir: "/var/data/ekv_observer",
+ cluster_size: 3, region_routing: ["iad", "dfw"], wait_for_quorum: 30_000}
+```
+
 Client mode:
 
 ```elixir
@@ -55,44 +63,46 @@ Client mode:
 ```
 
 - Member mode blocks startup until that EKV member can reach CAS quorum.
-- Client mode blocks startup until the selected backend member reports quorum.
+- Observer and client mode block startup until the selected backend voter reports quorum.
 - This is only a startup gate. Quorum can still be lost later during runtime.
-- In client mode, `wait_for_quorum` implicitly waits for route selection first.
+- In observer and client mode, `wait_for_quorum` implicitly waits for route
+  selection first.
 
 Use it when downstream supervisors perform CAS writes during their own init.
 Leave it disabled if the workload is LWW-only and startup should not wait for
 quorum.
 
-### wait_for_route (Client Mode)
+### wait_for_route (Observer / Client Mode)
 
-Use `wait_for_route: timeout_ms` on clients when startup should wait for a
-usable backend route before the app continues.
+Use `wait_for_route: timeout_ms` on observers or clients when startup should
+wait for a usable CAS backend route before the app continues.
 
-- The client picks the first reachable member in `region_routing` order.
+- The router picks the first reachable voter in `region_routing` order.
 - The chosen backend stays sticky until failure.
 - `wait_for_route` is about routing readiness, not quorum.
 
 ### anti_entropy_interval
 
-Members run periodic anti-entropy by default:
+Durable replicas run periodic anti-entropy by default:
 
 ```elixir
 {EKV, name: :my_kv, data_dir: "/var/data/ekv", anti_entropy_interval: 30_000}
 ```
 
-- This sends a lightweight per-shard summary probe to already-connected members.
+- This sends a lightweight per-shard summary probe to already-connected durable replicas.
 - The receiver compares the remote summary with its own local contiguous progress and explicitly requests repair only if it is behind.
 - It is meant to heal a member that missed a prior replication message without waiting for reconnect.
 - In the steady state it should be cheap because healthy members only exchange summary metadata; data chunks are sent only in response to an explicit `:sync_request`.
 - Tiny successful terminal delta repairs are suppressed from normal `info` logs below `delta_sync_log_min_entries` (default `8`). Set `log: :verbose` to see every delta.
 - If a shard sends too many deltas in one rolling window, EKV emits a single `delta_sync_storm` warning for that shard. Tune with `delta_sync_storm_window` and `delta_sync_storm_threshold`.
+- `write_admission_queue_limit` can be used as a coarse overload brake for write-like shard calls. When enabled, callers wait outside the shard mailbox while queue depth is above the configured limit and exhaust their own timeout budget there instead of deepening shard backlog.
 - Each shard keeps only one summary probe in flight per peer and only one full-sync source in flight at a time, so startup/bootstrap repair should not fan out into duplicate full snapshots from multiple peers.
 - Known member origins that are merely down/disconnected try relayed delta immediately from a live peer.
 - Quarantine still forces immediate full rebuild behavior.
 - Full sync happens only if that live peer no longer retains the requested replay range.
 - Mere shard-handshake lag during startup is still not enough to trigger full sync.
 - In a healthy hot cluster you should mostly see `member_connect` / summary traffic, not steady `sending delta sync` spam.
-- Set `false` only for debugging; the default is the safer production setting.
+- Tune the interval upward if you want less background repair traffic; do not disable it in production.
 
 ## Backups
 
@@ -266,11 +276,34 @@ replicas or CAS voters.
 
 - Clients do not store data locally.
 - Clients do not increase replication fan-out or quorum size.
-- Reads and writes are forwarded to a selected member.
+- Reads and writes are forwarded to a selected voter.
 - Eventual reads in client mode are remote reads, not local SQLite reads.
 
 Use member mode for the durable replica set. Use client mode for horizontally
 scaled app nodes that should route into that replica set.
+
+## Observer Mode
+
+Observer mode is for nodes that should keep a local durable replica but should
+not increase the CAS voter set.
+
+```elixir
+{EKV, name: :my_kv, mode: :observer,
+ data_dir: "/var/data/ekv_observer",
+ region: "lhr", region_routing: ["iad", "dfw", "lhr"],
+ cluster_size: 3}
+```
+
+- Observers store data locally and participate in replication, anti-entropy,
+  GC, and subscriptions just like members.
+- Eventual reads and eventual writes are local on the observer.
+- CAS reads and writes are routed to voting members only.
+- Successful observer CAS calls apply the committed result locally before
+  replying, so immediate local eventual read-your-CAS-writes is preserved.
+- Observers do not count toward quorum and clients do not route to them.
+
+Use observer mode when you want low-latency stale/local reads in a region but
+do not want that region to sit in the CAS quorum path.
 
 Startup guidance:
 
@@ -548,7 +581,7 @@ the mismatched node.
 | `{:error, :conflict}` | Version mismatch — value changed between `fetch` and `put` | Retry with `EKV.update/3` (auto-retries 5x) or re-fetch and retry manually |
 | `{:error, :no_quorum}` | Not enough members reachable for consensus | Check connectivity; wait for partition to heal; verify `cluster_size` matches actual cluster |
 | `{:error, :quorum_timeout}` | Quorum may exist, but consensus did not finish before the call timeout | Check cluster latency / load; increase timeout if needed; verify members are healthy |
-| `{:error, :unconfirmed}` | CAS write entered accept phase but final outcome was ambiguous to the caller | Resolve with `EKV.get(name, key, consistent: true)` or use `resolve_unconfirmed: true` |
+| `{:error, :unconfirmed}` | CAS write entered accept phase but final outcome was ambiguous to the caller, or an observer could not confirm local visibility for a remotely committed CAS result | Resolve with `EKV.get(name, key, consistent: true)` or use `resolve_unconfirmed: true` |
 | `{:error, :cluster_overflow}` | More distinct node_ids reachable than `cluster_size` | Remove extra nodes or increase `cluster_size` on all nodes |
 | `{:error, :cas_managed_key}` | Eventual `put`/`delete` was attempted on a CAS-managed key | Use CAS write APIs for that key; do not mix CAS -> LWW writes |
 | `{:error, :unavailable}` | Client backend or ambiguity-resolution read was unavailable | Check member availability/routing; retry after route recovers |

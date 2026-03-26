@@ -19,7 +19,7 @@ defmodule EKV.ClientRouter do
     - handles failure notifications and route waiters
   - candidate selection is local and deterministic:
     - first configured region with available members
-    - stable node-name ordering within the region
+    - stable per-instance hashed ordering within the region
   - route discovery only trusts EKV's scoped `:pg` membership
     - it does not probe arbitrary `Node.list/0` peers
   """
@@ -32,7 +32,14 @@ defmodule EKV.ClientRouter do
   @await_timeout_margin 1_000
   @route_probe_timeout 2_000
 
-  defstruct [:name, :region_routing, waiters: %{}, monitors: %{}, members_by_region: %{}]
+  defstruct [
+    :name,
+    :region_routing,
+    :routing_seed,
+    waiters: %{},
+    monitors: %{},
+    members_by_region: %{}
+  ]
 
   def start_link(opts) do
     opts = Keyword.validate!(opts, [:name])
@@ -95,6 +102,7 @@ defmodule EKV.ClientRouter do
      %ClientRouter{
        name: name,
        region_routing: config.region_routing,
+       routing_seed: routing_seed(name, config),
        monitors: monitors,
        members_by_region: members_by_region
      }}
@@ -177,7 +185,7 @@ defmodule EKV.ClientRouter do
     scope = EKV.Supervisor.pg_scope(name)
 
     Enum.reduce(region_routing, {%{}, %{}}, fn region, {monitors, members_by_region} ->
-      group = EKV.MemberPresence.region_group(name, region)
+      group = EKV.MemberPresence.voter_region_group(name, region)
       {ref, members} = :pg.monitor(scope, group)
       nodes = members |> Enum.map(&node/1) |> MapSet.new()
       new_monitors = Map.put(monitors, ref, %{region: region})
@@ -436,8 +444,18 @@ defmodule EKV.ClientRouter do
       |> Enum.reject(fn node ->
         respect_cooldown? and cooled_down?(table, node)
       end)
-      |> Enum.sort_by(&Atom.to_string/1)
+      |> Enum.sort_by(fn node ->
+        {routing_score(state.routing_seed, node), Atom.to_string(node)}
+      end)
     end)
+  end
+
+  defp routing_seed(name, config) do
+    {name, Map.get(config, :node_id) || node()}
+  end
+
+  defp routing_score(seed, node) do
+    :erlang.phash2({seed, node})
   end
 
   defp now_ms, do: System.monotonic_time(:millisecond)

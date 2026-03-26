@@ -17,6 +17,7 @@ defmodule EKV.Supervisor do
   `EKV.Supervisor` is also where runtime mode splits happen:
 
   - `:member` mode starts durable storage/replication/CAS children
+  - `:observer` mode starts durable storage/replication children plus CAS routing
   - `:client` mode starts only routing/subscription/readiness children
 
   Member mode child order:
@@ -27,6 +28,21 @@ defmodule EKV.Supervisor do
       Registry
       SubDispatcher.Supervisor
       Replica.Supervisor
+      QuorumGate?
+      MemberPresence
+      GC
+      ShutdownBarrier?
+
+  Observer mode child order:
+
+      :pg scope
+      BlueGreenMarker?
+      SubTracker
+      Registry
+      SubDispatcher.Supervisor
+      Replica.Supervisor
+      ClientRouter
+      RouteGate?
       QuorumGate?
       MemberPresence
       GC
@@ -45,28 +61,28 @@ defmodule EKV.Supervisor do
 
   - `RouteGate` / `QuorumGate` block startup before the instance is considered
     ready
-  - `MemberPresence` is started only after member readiness, so new clients do
-    not route to an unready member
+  - `MemberPresence` is started only after durable-replica readiness, so new
+    clients and observers do not route CAS to an unready voter
   - `ShutdownBarrier` is last so supervisor shutdown reaches it first while the
     rest of EKV is still alive
 
   ## Startup Safety
 
-  Member mode opens shard databases fail-closed by default. If on-disk state is
-  older than the tombstone safety window, startup is rejected unless
-  `allow_stale_startup: true` is explicitly set.
+  Member and observer mode open shard databases fail-closed by default. If
+  on-disk state is older than the tombstone safety window, startup is rejected
+  unless `allow_stale_startup: true` is explicitly set.
 
   Optional startup gates:
 
-  - `wait_for_quorum` — member mode, and client mode via the selected backend
-  - `wait_for_route` — client mode only
+  - `wait_for_quorum` — member mode, and observer/client mode via the selected backend
+  - `wait_for_route` — observer/client mode only
 
   These are readiness aids only. They do not guarantee the route or quorum will
   remain available after startup completes.
 
-  Member replicas also run periodic background anti-entropy by default
+  Durable replicas also run periodic background anti-entropy by default
   (`anti_entropy_interval`, default 30s). This reuses the normal HWM-driven
-  chunked sync path so an already-connected member that missed a prior
+  chunked sync path so an already-connected durable replica that missed a prior
   replication message eventually heals without needing a reconnect, restart,
   or explicit consistent read.
 
@@ -174,6 +190,8 @@ defmodule EKV.Supervisor do
     :delta_sync_log_min_entries,
     :delta_sync_storm_window,
     :delta_sync_storm_threshold,
+    :write_admission_queue_limit,
+    :write_admission_poll_ms,
     :member_progress_retention_ttl,
     :unavailable_origin_full_sync_delay,
     :allow_stale_startup,
@@ -231,6 +249,9 @@ defmodule EKV.Supervisor do
       :member ->
         init_member(name, region, log, opts)
 
+      :observer ->
+        init_observer(name, region, log, opts)
+
       :client ->
         init_client(name, region, log, opts)
     end
@@ -249,6 +270,8 @@ defmodule EKV.Supervisor do
     delta_sync_log_min_entries = Keyword.get(opts, :delta_sync_log_min_entries, 8)
     delta_sync_storm_window = Keyword.get(opts, :delta_sync_storm_window, :timer.minutes(1))
     delta_sync_storm_threshold = Keyword.get(opts, :delta_sync_storm_threshold, 100)
+    write_admission_queue_limit = Keyword.get(opts, :write_admission_queue_limit, false)
+    write_admission_poll_ms = Keyword.get(opts, :write_admission_poll_ms, 5)
 
     member_progress_retention_ttl =
       Keyword.get(
@@ -279,6 +302,8 @@ defmodule EKV.Supervisor do
     validate_delta_sync_log_min_entries!(delta_sync_log_min_entries)
     validate_delta_sync_storm_window!(delta_sync_storm_window)
     validate_delta_sync_storm_threshold!(delta_sync_storm_threshold)
+    validate_write_admission_queue_limit!(write_admission_queue_limit)
+    validate_write_admission_poll_ms!(write_admission_poll_ms)
     validate_member_progress_retention_ttl!(member_progress_retention_ttl)
     validate_unavailable_origin_full_sync_delay!(legacy_unavailable_origin_full_sync_delay)
     validate_allow_stale_startup!(allow_stale_startup)
@@ -300,7 +325,9 @@ defmodule EKV.Supervisor do
 
     config = %{
       mode: :member,
+      cas_voter: true,
       region: region,
+      region_routing: nil,
       num_shards: num_shards,
       data_dir: data_dir,
       log: log,
@@ -315,6 +342,8 @@ defmodule EKV.Supervisor do
       delta_sync_log_min_entries: delta_sync_log_min_entries,
       delta_sync_storm_window: delta_sync_storm_window,
       delta_sync_storm_threshold: delta_sync_storm_threshold,
+      write_admission_queue_limit: write_admission_queue_limit,
+      write_admission_poll_ms: write_admission_poll_ms,
       member_progress_retention_ttl: member_progress_retention_ttl,
       allow_stale_startup: allow_stale_startup,
       partition_ttl_policy: partition_ttl_policy,
@@ -334,7 +363,132 @@ defmodule EKV.Supervisor do
         if(is_integer(wait_for_quorum),
           do: {EKV.QuorumGate, name: name, timeout: wait_for_quorum, log: log}
         ),
-        {EKV.MemberPresence, name: name, region: region},
+        {EKV.MemberPresence, name: name, region: region, voter: true},
+        {EKV.GC, name: name},
+        if(is_integer(shutdown_barrier),
+          do:
+            Supervisor.child_spec(
+              {EKV.ShutdownBarrier, name: name, timeout: shutdown_barrier, log: log},
+              shutdown: shutdown_barrier + 1_000
+            )
+        )
+      ]
+      |> Enum.filter(& &1)
+
+    Supervisor.init(children, strategy: :rest_for_one)
+  end
+
+  defp init_observer(name, region, log, opts) do
+    data_dir = Keyword.fetch!(opts, :data_dir)
+    num_shards = Keyword.get(opts, :shards, 8)
+    blue_green = Keyword.get(opts, :blue_green, false)
+    tombstone_ttl = Keyword.get(opts, :tombstone_ttl, :timer.hours(24 * 7))
+    gc_interval = Keyword.get(opts, :gc_interval, :timer.minutes(5))
+    cluster_size = Keyword.get(opts, :cluster_size)
+    node_id = Keyword.get(opts, :node_id)
+    sync_chunk_size = Keyword.get(opts, :sync_chunk_size, 500)
+    anti_entropy_interval = Keyword.get(opts, :anti_entropy_interval, 30_000)
+    delta_sync_log_min_entries = Keyword.get(opts, :delta_sync_log_min_entries, 8)
+    delta_sync_storm_window = Keyword.get(opts, :delta_sync_storm_window, :timer.minutes(1))
+    delta_sync_storm_threshold = Keyword.get(opts, :delta_sync_storm_threshold, 100)
+    write_admission_queue_limit = Keyword.get(opts, :write_admission_queue_limit, false)
+    write_admission_poll_ms = Keyword.get(opts, :write_admission_poll_ms, 5)
+    region_routing = Keyword.get(opts, :region_routing)
+
+    member_progress_retention_ttl =
+      Keyword.get(
+        opts,
+        :member_progress_retention_ttl,
+        default_member_progress_retention_ttl(tombstone_ttl)
+      )
+
+    legacy_unavailable_origin_full_sync_delay =
+      Keyword.get(opts, :unavailable_origin_full_sync_delay, 60_000)
+
+    allow_stale_startup = Keyword.get(opts, :allow_stale_startup, false)
+    partition_ttl_policy = Keyword.get(opts, :partition_ttl_policy, :quarantine)
+    wire_compression_threshold = Keyword.get(opts, :wire_compression_threshold, 256 * 1024)
+    wait_for_quorum = Keyword.get(opts, :wait_for_quorum, false)
+    wait_for_route = Keyword.get(opts, :wait_for_route, false)
+    shutdown_barrier = Keyword.get(opts, :shutdown_barrier, false)
+
+    validate_region_routing!(region_routing)
+    validate_cas_config!(cluster_size, node_id)
+    validate_partition_ttl_policy!(partition_ttl_policy)
+    validate_wire_compression_threshold!(wire_compression_threshold)
+    validate_wait_for_quorum!(wait_for_quorum, 1)
+    validate_wait_for_route!(wait_for_route, :observer)
+    validate_shutdown_barrier!(shutdown_barrier)
+    validate_anti_entropy_interval!(anti_entropy_interval)
+    validate_delta_sync_log_min_entries!(delta_sync_log_min_entries)
+    validate_delta_sync_storm_window!(delta_sync_storm_window)
+    validate_delta_sync_storm_threshold!(delta_sync_storm_threshold)
+    validate_write_admission_queue_limit!(write_admission_queue_limit)
+    validate_write_admission_poll_ms!(write_admission_poll_ms)
+    validate_member_progress_retention_ttl!(member_progress_retention_ttl)
+    validate_unavailable_origin_full_sync_delay!(legacy_unavailable_origin_full_sync_delay)
+    validate_allow_stale_startup!(allow_stale_startup)
+
+    node_id =
+      case node_id do
+        nil -> nil
+        id when is_integer(id) -> Integer.to_string(id)
+        id when is_binary(id) -> id
+      end
+
+    if blue_green, do: perform_handoff(name, data_dir, num_shards)
+
+    effective_node_id = resolve_member_node_id(name, data_dir, node_id)
+
+    registry_name = :"#{name}_ekv_registry"
+    sub_tracker_name = :"#{name}_ekv_sub_tracker"
+    sub_count = :atomics.new(1, signed: true)
+
+    config = %{
+      mode: :observer,
+      cas_voter: false,
+      region: region,
+      region_routing: region_routing,
+      num_shards: num_shards,
+      data_dir: data_dir,
+      log: log,
+      tombstone_ttl: tombstone_ttl,
+      gc_interval: gc_interval,
+      registry: registry_name,
+      sub_count: sub_count,
+      cluster_size: cluster_size,
+      node_id: effective_node_id,
+      sync_chunk_size: sync_chunk_size,
+      anti_entropy_interval: anti_entropy_interval,
+      delta_sync_log_min_entries: delta_sync_log_min_entries,
+      delta_sync_storm_window: delta_sync_storm_window,
+      delta_sync_storm_threshold: delta_sync_storm_threshold,
+      write_admission_queue_limit: write_admission_queue_limit,
+      write_admission_poll_ms: write_admission_poll_ms,
+      member_progress_retention_ttl: member_progress_retention_ttl,
+      allow_stale_startup: allow_stale_startup,
+      partition_ttl_policy: partition_ttl_policy,
+      wire_compression_threshold: wire_compression_threshold
+    }
+
+    :persistent_term.put({EKV, name}, config)
+
+    children =
+      [
+        pg_scope_child(name),
+        if(blue_green, do: {EKV.BlueGreenMarker, name: name, data_dir: data_dir, log: log}),
+        {EKV.SubTracker, name: sub_tracker_name, sub_count: sub_count},
+        {Registry, keys: :duplicate, name: registry_name, listeners: [sub_tracker_name]},
+        {EKV.SubDispatcher.Supervisor, name: name, num_shards: num_shards},
+        {EKV.Replica.Supervisor, name: name, num_shards: num_shards, data_dir: data_dir},
+        {EKV.ClientRouter, name: name},
+        if(is_integer(wait_for_route),
+          do: {EKV.RouteGate, name: name, timeout: wait_for_route, log: log}
+        ),
+        if(is_integer(wait_for_quorum),
+          do: {EKV.QuorumGate, name: name, timeout: wait_for_quorum, log: log}
+        ),
+        {EKV.MemberPresence, name: name, region: region, voter: false},
         {EKV.GC, name: name},
         if(is_integer(shutdown_barrier),
           do:
@@ -367,6 +521,7 @@ defmodule EKV.Supervisor do
 
     config = %{
       mode: :client,
+      cas_voter: false,
       region: region,
       region_routing: region_routing,
       log: log,
@@ -508,10 +663,11 @@ defmodule EKV.Supervisor do
           "EKV: :shutdown_barrier must be false/nil or a non-negative timeout in ms, got: #{inspect(timeout)}"
   end
 
-  defp validate_mode!(mode) when mode in [:member, :client], do: :ok
+  defp validate_mode!(mode) when mode in [:member, :observer, :client], do: :ok
 
   defp validate_mode!(mode) do
-    raise ArgumentError, "EKV: :mode must be :member or :client, got: #{inspect(mode)}"
+    raise ArgumentError,
+          "EKV: :mode must be :member, :observer, or :client, got: #{inspect(mode)}"
   end
 
   defp validate_region!(region, _key) when is_binary(region) and byte_size(region) > 0, do: :ok
@@ -547,6 +703,8 @@ defmodule EKV.Supervisor do
     reject_client_opt!(opts, :delta_sync_log_min_entries, [nil])
     reject_client_opt!(opts, :delta_sync_storm_window, [nil])
     reject_client_opt!(opts, :delta_sync_storm_threshold, [nil, false])
+    reject_client_opt!(opts, :write_admission_queue_limit, [nil, false])
+    reject_client_opt!(opts, :write_admission_poll_ms, [nil])
     reject_client_opt!(opts, :member_progress_retention_ttl, [nil])
     reject_client_opt!(opts, :unavailable_origin_full_sync_delay, [nil])
     reject_client_opt!(opts, :allow_stale_startup, [nil, false])
@@ -614,6 +772,27 @@ defmodule EKV.Supervisor do
   defp validate_delta_sync_storm_threshold!(threshold) do
     raise ArgumentError,
           "EKV: :delta_sync_storm_threshold must be false/nil or a positive integer, got: #{inspect(threshold)}"
+  end
+
+  defp validate_write_admission_queue_limit!(false), do: :ok
+  defp validate_write_admission_queue_limit!(nil), do: :ok
+
+  defp validate_write_admission_queue_limit!(limit)
+       when is_integer(limit) and limit >= 0,
+       do: :ok
+
+  defp validate_write_admission_queue_limit!(limit) do
+    raise ArgumentError,
+          "EKV: :write_admission_queue_limit must be false/nil or a non-negative integer, got: #{inspect(limit)}"
+  end
+
+  defp validate_write_admission_poll_ms!(poll_ms)
+       when is_integer(poll_ms) and poll_ms > 0,
+       do: :ok
+
+  defp validate_write_admission_poll_ms!(poll_ms) do
+    raise ArgumentError,
+          "EKV: :write_admission_poll_ms must be a positive timeout in ms, got: #{inspect(poll_ms)}"
   end
 
   defp validate_member_progress_retention_ttl!(ttl)
