@@ -2699,6 +2699,34 @@ defmodule EKVTest do
       {:ok, [[0]]} = EKV.Sqlite3.fetch_all(state.db, "SELECT COUNT(*) FROM kv_oplog", [])
     end
 
+    test "consistent read on committed tombstone returns nil without reproposing delete" do
+      name = :"consistent_tombstone_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+
+      {:ok, pid} = start_single_node_cas_ekv(name, data_dir, 1)
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      assert {:ok, vsn} = EKV.put(name, "obs/dead", "value", if_vsn: nil)
+      assert {:ok, _} = EKV.delete(name, "obs/dead", if_vsn: vsn)
+
+      state = :sys.get_state(EKV.Replica.shard_name(name, 0))
+      seq_before = EKV.Store.max_seq(state.db)
+
+      assert EKV.get(name, "obs/dead", consistent: true) == nil
+      assert EKV.get(name, "obs/dead", consistent: true) == nil
+
+      assert EKV.Store.max_seq(state.db) == seq_before
+
+      assert match?(
+               {_value, _ts, _origin, _expires, deleted_at} when is_integer(deleted_at),
+               EKV.Store.get(state.db, "obs/dead")
+             )
+    end
+
     test "observer consistent read retry preserves observer envelope" do
       name = :"observer_retry_#{System.unique_integer([:positive])}"
       data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
@@ -2761,6 +2789,24 @@ defmodule EKVTest do
 
       assert {:observer_read_result, {:ok, nil, nil}, :absent, nil} =
                EKV.__observer_consistent_get__(name, "obs/absent", [])
+    end
+
+    test "observer helper returns nil for committed tombstone without commit payload" do
+      name = :"observer_tombstone_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+
+      {:ok, pid} = start_single_node_cas_ekv(name, data_dir, 1)
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      assert {:ok, vsn} = EKV.put(name, "obs/dead", "value", if_vsn: nil)
+      assert {:ok, _} = EKV.delete(name, "obs/dead", if_vsn: vsn)
+
+      assert {:observer_read_result, {:ok, nil, nil}, {:deleted, _vsn}, nil} =
+               EKV.__observer_consistent_get__(name, "obs/dead", [])
     end
   end
 

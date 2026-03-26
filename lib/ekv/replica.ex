@@ -4129,7 +4129,14 @@ defmodule EKV.Replica do
           best_kv_row
         end
 
-      if clean_absent_cas_read?(op.operation, best_acc_c, best_acc_n, selected_kv_row) do
+      if cas_read_returns_committed_absent?(
+           state,
+           op.operation,
+           op.key,
+           best_acc_c,
+           best_acc_n,
+           selected_kv_row
+         ) do
         reply_cas_reply(op.from, op.reply_mode, {:ok, nil, nil})
         %{state | pending_cas: Map.delete(state.pending_cas, ref)}
       else
@@ -4584,11 +4591,45 @@ defmodule EKV.Replica do
     end
   end
 
-  defp clean_absent_cas_read?({:cas_read, _, _}, best_acc_c, best_acc_n, selected_kv_row) do
+  defp cas_read_returns_committed_absent?(
+         %Replica{} = state,
+         {:cas_read, _, _},
+         key,
+         best_acc_c,
+         best_acc_n,
+         selected_kv_row
+       ) do
+    clean_absent_cas_read?(best_acc_c, best_acc_n, selected_kv_row) or
+      committed_absent_matches_selected?(state, key, selected_kv_row)
+  end
+
+  defp cas_read_returns_committed_absent?(
+         %Replica{} = _state,
+         _operation,
+         _key,
+         _best_acc_c,
+         _best_acc_n,
+         _selected_kv_row
+       ),
+       do: false
+
+  defp clean_absent_cas_read?(best_acc_c, best_acc_n, selected_kv_row) do
     best_acc_c == 0 and best_acc_n in ["", nil] and is_nil(selected_kv_row)
   end
 
-  defp clean_absent_cas_read?(_operation, _best_acc_c, _best_acc_n, _selected_kv_row), do: false
+  defp committed_absent_matches_selected?(%Replica{} = state, key, selected_kv_row)
+       when is_list(selected_kv_row) do
+    logically_absent_kv_row?(selected_kv_row) and
+      normalize_kv_row(Store.get(state.db, key)) == normalize_kv_row(selected_kv_row)
+  end
+
+  defp committed_absent_matches_selected?(%Replica{} = _state, _key, _selected_kv_row),
+    do: false
+
+  defp logically_absent_kv_row?([_value_binary, _ts, _origin, expires_at, deleted_at]) do
+    now = System.system_time(:nanosecond)
+    is_integer(deleted_at) or (is_integer(expires_at) and expires_at <= now)
+  end
 
   defp handle_cas_failure(%Replica{} = state, ref, op) do
     cancel_timer(op.timer)
