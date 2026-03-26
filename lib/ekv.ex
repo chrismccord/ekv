@@ -257,6 +257,8 @@ defmodule EKV do
   | `:delta_sync_log_min_entries` | `8` | Member and observer mode only. Suppresses per-delta `info` logs for successful terminal delta syncs smaller than this many entries. `:verbose` logging still prints all deltas. |
   | `:delta_sync_storm_window` | `60_000` (60 sec) | Member and observer mode only. Rolling per-shard window used to aggregate delta sync activity for storm detection. |
   | `:delta_sync_storm_threshold` | `100` | Member and observer mode only. When a shard sends at least this many delta syncs inside one storm window, EKV emits a single aggregated warning for that window. `false`/`nil` disables storm warnings. |
+  | `:write_admission_queue_limit` | `false` | Member and observer mode only. Optional pre-admission gate for write-like shard calls. When set to a non-negative integer, callers wait outside the shard mailbox while `message_queue_len` is above the limit and time out within their own deadline instead of amplifying shard backlog. |
+  | `:write_admission_poll_ms` | `5` | Member and observer mode only. Poll interval in milliseconds for the write admission gate while waiting for shard queue pressure to fall below `:write_admission_queue_limit`. |
   | `:wire_compression_threshold` | `262_144` (256 KB) | Optional byte threshold for member-to-member wire compression of large replicated value payloads. `false`/`nil` disables it. Large `:ekv_put`, CAS accept, and full-payload CAS commit messages compress values on the wire only; values remain uncompressed on disk and on reads. |
   | `:shutdown_barrier` | `false` | Optional graceful-shutdown barrier. Keeps EKV serving during coordinated shutdown for up to the configured timeout so members can finish final writes and replication. |
   | `:allow_stale_startup` | `false` | Member and observer mode only. Dangerous recovery override. If `true`, EKV trusts on-disk data even when stale-db detection would normally refuse startup. Intended only for explicit disaster recovery / full cold-cluster restore cases. |
@@ -524,6 +526,7 @@ defmodule EKV do
 
   alias EKV.Replica
 
+  @default_local_shard_call_timeout 5_000
   @client_rpc_timeout_margin 1_000
 
   # ===========================================================================
@@ -682,7 +685,7 @@ defmodule EKV do
 
           {:error, false} ->
             value_binary = :erlang.term_to_binary(value)
-            GenServer.call(Replica.shard_name(name, shard_index), {:put, key, value_binary, opts})
+            call_shard_write(name, shard_index, {:put, key, value_binary, opts})
         end
 
       :member ->
@@ -709,8 +712,9 @@ defmodule EKV do
             value_binary = :erlang.term_to_binary(value)
 
             result =
-              GenServer.call(
-                Replica.shard_name(name, shard_index),
+              call_shard_write(
+                name,
+                shard_index,
                 {:cas_put, key, value_binary, expected_vsn, opts},
                 timeout
               )
@@ -719,7 +723,7 @@ defmodule EKV do
 
           {:error, false} ->
             value_binary = :erlang.term_to_binary(value)
-            GenServer.call(Replica.shard_name(name, shard_index), {:put, key, value_binary, opts})
+            call_shard_write(name, shard_index, {:put, key, value_binary, opts})
         end
     end
   end
@@ -791,11 +795,7 @@ defmodule EKV do
           shard_index = Replica.shard_index_for(key, config.num_shards)
           cas_opts = Keyword.take(opts, [:retries, :backoff, :timeout])
 
-          case GenServer.call(
-                 Replica.shard_name(name, shard_index),
-                 {:cas_read, key, cas_opts},
-                 timeout
-               ) do
+          case call_shard(name, shard_index, {:cas_read, key, cas_opts}, timeout) do
             {:ok, value} -> value
             {:ok, value, _vsn} -> value
             {:error, reason} -> raise "EKV: consistent read failed: #{inspect(reason)}"
@@ -883,7 +883,7 @@ defmodule EKV do
             observer_cas_delete(name, key, expected_vsn, opts, shard_index, timeout)
 
           :error ->
-            GenServer.call(Replica.shard_name(name, shard_index), {:delete, key})
+            call_shard_write(name, shard_index, {:delete, key})
         end
 
       :member ->
@@ -894,8 +894,9 @@ defmodule EKV do
             validate_cas_config!(config)
 
             result =
-              GenServer.call(
-                Replica.shard_name(name, shard_index),
+              call_shard_write(
+                name,
+                shard_index,
                 {:cas_delete, key, expected_vsn, opts},
                 timeout
               )
@@ -903,7 +904,7 @@ defmodule EKV do
             maybe_resolve_unconfirmed_write(result, name, key, opts, :cas_delete)
 
           :error ->
-            GenServer.call(Replica.shard_name(name, shard_index), {:delete, key})
+            call_shard_write(name, shard_index, {:delete, key})
         end
     end
   end
@@ -990,11 +991,7 @@ defmodule EKV do
         shard_index = Replica.shard_index_for(key, config.num_shards)
 
         result =
-          GenServer.call(
-            Replica.shard_name(name, shard_index),
-            {:update, key, update_callback, opts},
-            timeout
-          )
+          call_shard_write(name, shard_index, {:update, key, update_callback, opts}, timeout)
 
         maybe_resolve_unconfirmed_write(result, name, key, opts, :update)
     end
@@ -1352,7 +1349,7 @@ defmodule EKV do
                 "EKV: await_quorum/2 requires :cluster_size to be configured"
         else
           call_timeout = timeout_ms + 1_000
-          GenServer.call(Replica.shard_name(name, 0), {:await_quorum, timeout_ms}, call_timeout)
+          call_shard(name, 0, {:await_quorum, timeout_ms}, call_timeout)
         end
     end
   end
@@ -1382,8 +1379,9 @@ defmodule EKV do
     value_binary = :erlang.term_to_binary(value)
     timeout = rpc_timeout_from_opts(opts)
 
-    GenServer.call(
-      Replica.shard_name(name, shard_index),
+    call_shard_write(
+      name,
+      shard_index,
       {:observer_cas_put, key, value_binary, expected_vsn, opts},
       timeout
     )
@@ -1396,8 +1394,9 @@ defmodule EKV do
     shard_index = Replica.shard_index_for(key, config.num_shards)
     timeout = rpc_timeout_from_opts(opts)
 
-    GenServer.call(
-      Replica.shard_name(name, shard_index),
+    call_shard_write(
+      name,
+      shard_index,
       {:observer_cas_delete, key, expected_vsn, opts},
       timeout
     )
@@ -1410,8 +1409,9 @@ defmodule EKV do
     shard_index = Replica.shard_index_for(key, config.num_shards)
     timeout = rpc_timeout_from_opts(opts)
 
-    GenServer.call(
-      Replica.shard_name(name, shard_index),
+    call_shard_write(
+      name,
+      shard_index,
       {:observer_update, key, update_callback, opts},
       timeout
     )
@@ -1426,11 +1426,7 @@ defmodule EKV do
     cas_opts = Keyword.take(opts, [:retries, :backoff, :timeout])
 
     result =
-      GenServer.call(
-        Replica.shard_name(name, shard_index),
-        {:observer_cas_read, key, cas_opts},
-        timeout
-      )
+      call_shard(name, shard_index, {:observer_cas_read, key, cas_opts}, timeout)
 
     case result do
       {:observer_result, reply, commit_payload} ->
@@ -1551,6 +1547,67 @@ defmodule EKV do
     case Keyword.get(opts, :timeout, default) do
       :infinity -> :infinity
       timeout when is_integer(timeout) -> timeout + @client_rpc_timeout_margin
+    end
+  end
+
+  defp call_shard(name, shard_index, request, timeout) do
+    GenServer.call(Replica.shard_name(name, shard_index), request, timeout)
+  end
+
+  defp call_shard_write(
+         name,
+         shard_index,
+         request,
+         timeout \\ @default_local_shard_call_timeout
+       ) do
+    timeout = await_write_admission(name, shard_index, request, timeout)
+    call_shard(name, shard_index, request, timeout)
+  end
+
+  defp await_write_admission(_name, _shard_index, _request, :infinity), do: :infinity
+
+  defp await_write_admission(name, shard_index, request, timeout) when is_integer(timeout) do
+    config = EKV.Supervisor.get_config(name)
+
+    case Map.get(config, :write_admission_queue_limit) do
+      limit when is_integer(limit) and limit >= 0 ->
+        poll_ms = Map.get(config, :write_admission_poll_ms, 5)
+        target = Replica.shard_name(name, shard_index)
+        deadline_ms = System.monotonic_time(:millisecond) + timeout
+        wait_for_write_admission(target, request, timeout, deadline_ms, limit, poll_ms)
+
+      _ ->
+        timeout
+    end
+  end
+
+  defp wait_for_write_admission(target, request, original_timeout, deadline_ms, limit, poll_ms) do
+    now_ms = System.monotonic_time(:millisecond)
+    queue_len = shard_message_queue_len(target)
+
+    cond do
+      queue_len <= limit ->
+        max(deadline_ms - now_ms, 1)
+
+      now_ms >= deadline_ms ->
+        exit({:timeout, {GenServer, :call, [target, request, original_timeout]}})
+
+      true ->
+        Process.sleep(min(poll_ms, max(deadline_ms - now_ms, 1)))
+        wait_for_write_admission(target, request, original_timeout, deadline_ms, limit, poll_ms)
+    end
+  end
+
+  defp shard_message_queue_len(target) do
+    case GenServer.whereis(target) do
+      pid when is_pid(pid) ->
+        case Process.info(pid, :message_queue_len) do
+          {:message_queue_len, len} when is_integer(len) -> len
+          _ -> 0
+        end
+
+      _ ->
+        0
     end
   end
 
@@ -1791,8 +1848,9 @@ defmodule EKV do
          timeout,
          mode
        ) do
-    case GenServer.call(
-           Replica.shard_name(name, shard),
+    case call_shard_write(
+           name,
+           shard,
            {:apply_observer_commit, key, ballot_c, ballot_n, entry_tuple, origin_node,
             origin_seq},
            timeout

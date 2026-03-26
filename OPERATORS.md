@@ -95,6 +95,7 @@ Durable replicas run periodic anti-entropy by default:
 - In the steady state it should be cheap because healthy members only exchange summary metadata; data chunks are sent only in response to an explicit `:sync_request`.
 - Tiny successful terminal delta repairs are suppressed from normal `info` logs below `delta_sync_log_min_entries` (default `8`). Set `log: :verbose` to see every delta.
 - If a shard sends too many deltas in one rolling window, EKV emits a single `delta_sync_storm` warning for that shard. Tune with `delta_sync_storm_window` and `delta_sync_storm_threshold`.
+- `write_admission_queue_limit` can be used as a coarse overload brake for write-like shard calls. When enabled, callers wait outside the shard mailbox while queue depth is above the configured limit and exhaust their own timeout budget there instead of deepening shard backlog.
 - Each shard keeps only one summary probe in flight per peer and only one full-sync source in flight at a time, so startup/bootstrap repair should not fan out into duplicate full snapshots from multiple peers.
 - Known member origins that are merely down/disconnected try relayed delta immediately from a live peer.
 - Quarantine still forces immediate full rebuild behavior.
