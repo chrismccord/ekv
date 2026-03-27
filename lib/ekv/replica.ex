@@ -3224,20 +3224,20 @@ defmodule EKV.Replica do
   end
 
   defp known_member_origin?(%Replica{} = state, known_member_nodes, origin_node) do
-    Enum.any?(known_member_nodes, fn member_node ->
-      Atom.to_string(member_node) == origin_node
-    end) or
+    Enum.any?(known_member_nodes, &member_matches_origin?(state, &1, origin_node)) or
       origin_node == state.node_id or
-      Enum.any?(state.member_node_ids, fn {member_node, member_node_id} ->
-        (is_binary(member_node_id) and member_node_id == origin_node) or
-          Atom.to_string(member_node) == origin_node
-      end) or
-      Enum.any?(Map.keys(state.remote_shards), fn member_node ->
-        remote_origin_id(state, member_node) == origin_node or
-          Atom.to_string(member_node) == origin_node
-      end) or
+      Enum.any?(Map.keys(state.member_node_ids), &member_matches_origin?(state, &1, origin_node)) or
+      Enum.any?(Map.keys(state.remote_shards), &member_matches_origin?(state, &1, origin_node)) or
       known_down_member?(state, origin_node)
   end
+
+  defp member_matches_origin?(%Replica{} = state, member_node, origin_node)
+       when is_atom(member_node) and is_binary(origin_node) do
+    remote_member_id(state, member_node) == origin_node or
+      Atom.to_string(member_node) == origin_node
+  end
+
+  defp member_matches_origin?(%Replica{} = _state, _member_node, _origin_node), do: false
 
   defp member_progress_retention_ttl(%Replica{} = state) do
     EKV.Supervisor.get_config(state.name)[:member_progress_retention_ttl] || 0
@@ -3555,10 +3555,7 @@ defmodule EKV.Replica do
   end
 
   defp source_node_for_origin(%Replica{} = state, origin_id) when is_binary(origin_id) do
-    Enum.find(Map.keys(state.remote_shards), fn remote_node ->
-      remote_origin_id(state, remote_node) == origin_id or
-        Atom.to_string(remote_node) == origin_id
-    end)
+    Enum.find(Map.keys(state.remote_shards), &member_matches_origin?(state, &1, origin_id))
   end
 
   defp send_to_member(%Replica{} = state, target_node, message) do

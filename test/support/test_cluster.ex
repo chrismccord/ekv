@@ -368,6 +368,16 @@ defmodule EKV.TestCluster do
     rpc!(node, __MODULE__, :do_drop_remote_shard, [name, remote_node, shard_index])
   end
 
+  @doc "Delete one in-memory member-node identity mapping from a remote shard state"
+  def clear_member_node_id(node, name, remote_node, shard_index \\ 0) do
+    rpc!(node, __MODULE__, :do_clear_member_node_id, [name, remote_node, shard_index])
+  end
+
+  @doc "Read the persisted member-node identity for one remote shard"
+  def member_node_identity(node, name, remote_node, shard_index \\ 0) do
+    rpc!(node, __MODULE__, :do_member_node_identity, [name, remote_node, shard_index])
+  end
+
   @doc "Delete retained oplog rows below keep_from_seq for one origin on a remote shard"
   def prune_origin_replay(node, name, origin_node, keep_from_seq, shard_index \\ 0) do
     rpc!(node, __MODULE__, :do_prune_origin_replay, [
@@ -760,6 +770,22 @@ defmodule EKV.TestCluster do
     end)
 
     :ok
+  end
+
+  def do_clear_member_node_id(name, remote_node, shard_index) do
+    shard_name = EKV.Replica.shard_name(name, shard_index)
+
+    :sys.replace_state(shard_name, fn state ->
+      %{state | member_node_ids: Map.delete(state.member_node_ids, remote_node)}
+    end)
+
+    :ok
+  end
+
+  def do_member_node_identity(name, remote_node, shard_index) do
+    shard_name = EKV.Replica.shard_name(name, shard_index)
+    %{db: db} = :sys.get_state(shard_name)
+    EKV.Store.member_node_identity_get(db, remote_node)
   end
 
   def do_prune_origin_replay(name, origin_node, keep_from_seq, shard_index) do
