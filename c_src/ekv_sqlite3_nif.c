@@ -15,6 +15,7 @@ typedef struct {
     sqlite3_stmt *select_origin_progress_stmt;
     sqlite3_stmt *upsert_origin_progress_stmt;
     sqlite3_stmt *scan_origin_oplog_stmt;
+    sqlite3_stmt *cas_managed_key_check_stmt;
 } connection_t;
 
 typedef struct {
@@ -33,6 +34,7 @@ static ERL_NIF_TERM atom_row;
 static ERL_NIF_TERM atom_done;
 static ERL_NIF_TERM atom_true;
 static ERL_NIF_TERM atom_false;
+static ERL_NIF_TERM atom_cas_managed_key;
 static ERL_NIF_TERM atom_promise;
 static ERL_NIF_TERM atom_nack;
 static ERL_NIF_TERM atom_stale;
@@ -114,6 +116,7 @@ static void finalize_cached_connection_stmts(connection_t *conn)
     finalize_stmt(&conn->select_origin_progress_stmt);
     finalize_stmt(&conn->upsert_origin_progress_stmt);
     finalize_stmt(&conn->scan_origin_oplog_stmt);
+    finalize_stmt(&conn->cas_managed_key_check_stmt);
 }
 
 static int ensure_cached_stmt(sqlite3 *db, sqlite3_stmt **stmt, const char *sql)
@@ -872,14 +875,16 @@ static ERL_NIF_TERM ekv_release(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
 
 /* ------------------------------------------------------------------ */
 /* NIF: write_entry(db, kv_stmt, keyref_stmt, oplog_stmt, kv_args,     */
-/*                  oplog_args, local_origin)                          */
+/*                  oplog_args, local_origin, reject_cas_managed)      */
 /*   -> {:ok, true, origin_seq} | {:ok, false}                         */
 /*   -> {:ok, false, origin_seq} | {:error, msg}                       */
 /*                                                                     */
 /* Single dirty IO bounce: BEGIN IMMEDIATE, bind+step kv upsert,       */
 /* check sqlite3_changes() for LWW result. If 0 (LWW lost), ROLLBACK  */
 /* and return {:ok, false}. Otherwise bind+step oplog, advance the     */
-/* contiguous local origin progress, COMMIT, return                    */
+/* contiguous local origin progress, COMMIT, return. When              */
+/* reject_cas_managed is true, abort early if kv_paxos already has     */
+/* state for the key.                                                  */
 /* {:ok, applied?, origin_seq, local_progress_seq}.                    */
 /* ------------------------------------------------------------------ */
 
@@ -941,6 +946,7 @@ static ERL_NIF_TERM ekv_write_entry(ErlNifEnv *env, int argc, const ERL_NIF_TERM
     sqlite3_int64 local_progress_seq = 0;
     int origin_seq_provided = !enif_is_identical(kv_origin_seq_term, atom_nil);
     int local_origin = enif_is_identical(argv[6], atom_true);
+    int reject_cas_managed = enif_is_identical(argv[7], atom_true);
     if (origin_seq_provided) {
         if (!enif_get_int64(env, kv_origin_seq_term, (ErlNifSInt64 *)&origin_seq)) {
             enif_mutex_unlock(conn->mutex);
@@ -955,6 +961,51 @@ static ERL_NIF_TERM ekv_write_entry(ErlNifEnv *env, int argc, const ERL_NIF_TERM
         sqlite3_reset(kv_s->stmt);
         enif_mutex_unlock(conn->mutex);
         return err;
+    }
+
+    if (reject_cas_managed) {
+        sqlite3_stmt *cas_stmt = NULL;
+        int step_rc = SQLITE_OK;
+
+        rc = ensure_cached_stmt(
+            conn->db,
+            &conn->cas_managed_key_check_stmt,
+            "SELECT 1 FROM kv_paxos WHERE key = ?1 LIMIT 1"
+        );
+        if (rc != SQLITE_OK) {
+            ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+            sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+            enif_mutex_unlock(conn->mutex);
+            return err;
+        }
+
+        cas_stmt = conn->cas_managed_key_check_stmt;
+        sqlite3_reset(cas_stmt);
+        sqlite3_clear_bindings(cas_stmt);
+        rc = sqlite3_bind_text(cas_stmt, 1, (const char *)key_bin.data, (int)key_bin.size, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) {
+            step_rc = sqlite3_step(cas_stmt);
+        } else {
+            step_rc = rc;
+        }
+
+        if (step_rc != SQLITE_ROW && step_rc != SQLITE_DONE) {
+            ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+            sqlite3_reset(cas_stmt);
+            sqlite3_clear_bindings(cas_stmt);
+            sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+            enif_mutex_unlock(conn->mutex);
+            return err;
+        }
+
+        sqlite3_reset(cas_stmt);
+        sqlite3_clear_bindings(cas_stmt);
+
+        if (step_rc == SQLITE_ROW) {
+            sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
+            enif_mutex_unlock(conn->mutex);
+            return enif_make_tuple2(env, atom_error, atom_cas_managed_key);
+        }
     }
 
     if (!origin_seq_provided) {
@@ -2571,7 +2622,7 @@ static ErlNifFunc nif_funcs[] = {
     {"ekv_bind",          2, ekv_bind,          ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_step",          2, ekv_step,          ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_release",       2, ekv_release,       ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"ekv_write_entry",   7, ekv_write_entry,   ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"ekv_write_entry",   8, ekv_write_entry,   ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_write_snapshot_entry", 3, ekv_write_snapshot_entry, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_read_entry",    3, ekv_read_entry,    ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_fetch_all",     3, ekv_fetch_all,     ERL_NIF_DIRTY_JOB_IO_BOUND},
@@ -2607,6 +2658,7 @@ static int on_load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info)
     atom_done    = make_atom(env, "done");
     atom_true    = make_atom(env, "true");
     atom_false   = make_atom(env, "false");
+    atom_cas_managed_key = make_atom(env, "cas_managed_key");
     atom_promise = make_atom(env, "promise");
     atom_nack    = make_atom(env, "nack");
     atom_stale   = make_atom(env, "stale");

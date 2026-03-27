@@ -1349,53 +1349,49 @@ defmodule EKV.Replica do
     %{db: db, stmts: stmts} = state
     {now, state} = next_lww_ts(state)
     origin_node = local_origin_id(state)
+    ttl = Keyword.get(opts, :ttl)
+    expires_at = if ttl, do: now + ttl * 1_000_000
 
-    if Store.cas_managed_key?(db, key) do
-      {:reply, {:error, :cas_managed_key}, state}
-    else
-      ttl = Keyword.get(opts, :ttl)
-      expires_at = if ttl, do: now + ttl * 1_000_000
+    case Store.write_entry(
+           db,
+           stmts.kv_upsert,
+           stmts.keyref_upsert,
+           stmts.oplog_insert,
+           key,
+           value_binary,
+           now,
+           origin_node,
+           expires_at,
+           nil,
+           nil,
+           true,
+           true
+         ) do
+      {:ok, true, origin_seq, local_progress_seq} ->
+        state =
+          state
+          |> set_local_origin_seq(origin_seq)
+          |> merge_local_progress_seq(origin_node, local_progress_seq)
 
-      state =
-        case Store.write_entry(
-               db,
-               stmts.kv_upsert,
-               stmts.keyref_upsert,
-               stmts.oplog_insert,
-               key,
-               value_binary,
-               now,
-               origin_node,
-               expires_at,
-               nil,
-               nil,
-               true
-             ) do
-          {:ok, true, origin_seq, local_progress_seq} ->
-            state =
-              state
-              |> set_local_origin_seq(origin_seq)
-              |> merge_local_progress_seq(origin_node, local_progress_seq)
+        broadcast_to_members(
+          state,
+          {:ekv_put, key, value_binary, now, origin_node, origin_seq, expires_at}
+        )
 
-            broadcast_to_members(
-              state,
-              {:ekv_put, key, value_binary, now, origin_node, origin_seq, expires_at}
-            )
+        dispatch_events(state, [
+          %EKV.Event{type: :put, key: key, value: :erlang.binary_to_term(value_binary)}
+        ])
 
-            dispatch_events(state, [
-              %EKV.Event{type: :put, key: key, value: :erlang.binary_to_term(value_binary)}
-            ])
+        {:reply, :ok, state}
 
-            state
+      {:ok, false, _origin_seq, local_progress_seq} ->
+        {:reply, :ok, merge_local_progress_seq(state, origin_node, local_progress_seq)}
 
-          {:ok, false, _origin_seq, local_progress_seq} ->
-            merge_local_progress_seq(state, origin_node, local_progress_seq)
+      {:ok, false} ->
+        {:reply, :ok, state}
 
-          {:ok, false} ->
-            state
-        end
-
-      {:reply, :ok, state}
+      {:error, :cas_managed_key} ->
+        {:reply, {:error, :cas_managed_key}, state}
     end
   end
 
@@ -1403,45 +1399,41 @@ defmodule EKV.Replica do
     %{db: db, stmts: stmts} = state
     {now, %Replica{} = state} = next_lww_ts(state)
     origin_node = local_origin_id(state)
+    prev_value = if has_subscribers?(state), do: read_previous_value(state, key)
 
-    if Store.cas_managed_key?(db, key) do
-      {:reply, {:error, :cas_managed_key}, state}
-    else
-      prev_value = if has_subscribers?(state), do: read_previous_value(state, key)
+    case Store.write_entry(
+           db,
+           stmts.kv_upsert,
+           stmts.keyref_upsert,
+           stmts.oplog_insert,
+           key,
+           nil,
+           now,
+           origin_node,
+           nil,
+           now,
+           nil,
+           true,
+           true
+         ) do
+      {:ok, true, origin_seq, local_progress_seq} ->
+        state =
+          state
+          |> set_local_origin_seq(origin_seq)
+          |> merge_local_progress_seq(origin_node, local_progress_seq)
 
-      state =
-        case Store.write_entry(
-               db,
-               stmts.kv_upsert,
-               stmts.keyref_upsert,
-               stmts.oplog_insert,
-               key,
-               nil,
-               now,
-               origin_node,
-               nil,
-               now,
-               nil,
-               true
-             ) do
-          {:ok, true, origin_seq, local_progress_seq} ->
-            state =
-              state
-              |> set_local_origin_seq(origin_seq)
-              |> merge_local_progress_seq(origin_node, local_progress_seq)
+        broadcast_to_members(state, {:ekv_delete, key, now, origin_node, origin_seq})
+        dispatch_events(state, [%EKV.Event{type: :delete, key: key, value: prev_value}])
+        {:reply, :ok, state}
 
-            broadcast_to_members(state, {:ekv_delete, key, now, origin_node, origin_seq})
-            dispatch_events(state, [%EKV.Event{type: :delete, key: key, value: prev_value}])
-            state
+      {:ok, false, _origin_seq, local_progress_seq} ->
+        {:reply, :ok, merge_local_progress_seq(state, origin_node, local_progress_seq)}
 
-          {:ok, false, _origin_seq, local_progress_seq} ->
-            merge_local_progress_seq(state, origin_node, local_progress_seq)
+      {:ok, false} ->
+        {:reply, :ok, state}
 
-          {:ok, false} ->
-            state
-        end
-
-      {:reply, :ok, state}
+      {:error, :cas_managed_key} ->
+        {:reply, {:error, :cas_managed_key}, state}
     end
   end
 
@@ -2279,48 +2271,48 @@ defmodule EKV.Replica do
       Enum.reduce(expired, {state, []}, fn {key, value_binary, _timestamp, _origin_node,
                                             _expires_at},
                                            {state, acc} ->
-        if Store.cas_managed_key?(db, key) do
-          {:ok, applied} = Store.mark_expired(db, key, now)
+        origin = local_origin_id(state)
 
-          if applied do
-            prev_value = if value_binary, do: :erlang.binary_to_term(value_binary)
-            {state, [%EKV.Event{type: :expired, key: key, value: prev_value} | acc]}
-          else
-            {state, acc}
-          end
-        else
-          origin = local_origin_id(state)
+        case Store.write_entry(
+               db,
+               state.stmts.kv_upsert,
+               state.stmts.keyref_upsert,
+               state.stmts.oplog_insert,
+               key,
+               nil,
+               now,
+               origin,
+               nil,
+               now,
+               nil,
+               true,
+               true
+             ) do
+          {:error, :cas_managed_key} ->
+            {:ok, applied} = Store.mark_expired(db, key, now)
 
-          case Store.write_entry(
-                 db,
-                 state.stmts.kv_upsert,
-                 state.stmts.keyref_upsert,
-                 state.stmts.oplog_insert,
-                 key,
-                 nil,
-                 now,
-                 origin,
-                 nil,
-                 now,
-                 nil,
-                 true
-               ) do
-            {:ok, true, origin_seq, local_progress_seq} ->
-              state =
-                state
-                |> set_local_origin_seq(origin_seq)
-                |> merge_local_progress_seq(origin, local_progress_seq)
-
-              broadcast_to_members(state, {:ekv_delete, key, now, origin, origin_seq})
+            if applied do
               prev_value = if value_binary, do: :erlang.binary_to_term(value_binary)
               {state, [%EKV.Event{type: :expired, key: key, value: prev_value} | acc]}
-
-            {:ok, false, _origin_seq, local_progress_seq} ->
-              {merge_local_progress_seq(state, origin, local_progress_seq), acc}
-
-            {:ok, false} ->
+            else
               {state, acc}
-          end
+            end
+
+          {:ok, true, origin_seq, local_progress_seq} ->
+            state =
+              state
+              |> set_local_origin_seq(origin_seq)
+              |> merge_local_progress_seq(origin, local_progress_seq)
+
+            broadcast_to_members(state, {:ekv_delete, key, now, origin, origin_seq})
+            prev_value = if value_binary, do: :erlang.binary_to_term(value_binary)
+            {state, [%EKV.Event{type: :expired, key: key, value: prev_value} | acc]}
+
+          {:ok, false, _origin_seq, local_progress_seq} ->
+            {merge_local_progress_seq(state, origin, local_progress_seq), acc}
+
+          {:ok, false} ->
+            {state, acc}
         end
       end)
 

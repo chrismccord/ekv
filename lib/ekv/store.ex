@@ -406,6 +406,8 @@ defmodule EKV.Store do
     - `{:ok, false, origin_seq, local_progress_seq}` when the kv row was not updated but
       the replay row/progress state was still processed
     - `{:ok, false}` only for local-origin LWW loss where no replay row was retained
+    - `{:error, :cas_managed_key}` when a local eventual write is rejected because the key
+      is managed by CAS state
   """
   def write_entry(
         db,
@@ -419,7 +421,8 @@ defmodule EKV.Store do
         expires_at,
         deleted_at \\ nil,
         origin_seq \\ nil,
-        local_origin_override \\ :auto
+        local_origin_override \\ :auto,
+        reject_cas_managed \\ false
       ) do
     is_delete = if deleted_at, do: 1, else: 0
     origin_str = persisted_member_id(origin_node)
@@ -440,7 +443,8 @@ defmodule EKV.Store do
       oplog_stmt,
       kv_args,
       oplog_args,
-      local_origin
+      local_origin,
+      reject_cas_managed
     )
   end
 
@@ -1368,14 +1372,6 @@ defmodule EKV.Store do
       ballot_n,
       origin_seq
     )
-  end
-
-  def cas_managed_key?(db, key) do
-    case EKV.Sqlite3.fetch_all(db, "SELECT 1 FROM kv_paxos WHERE key = ?1 LIMIT 1", [key]) do
-      {:ok, []} -> false
-      {:ok, _rows} -> true
-      _ -> false
-    end
   end
 
   @clear_paxos_accepted_sql """

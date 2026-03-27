@@ -47,7 +47,8 @@ defmodule EKV.Sqlite3NIF do
         _oplog_stmt,
         _kv_args,
         _oplog_args,
-        _local_origin
+        _local_origin,
+        _reject_cas_managed
       ),
       do: :erlang.nif_error(:not_loaded)
 

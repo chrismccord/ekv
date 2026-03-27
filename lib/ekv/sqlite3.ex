@@ -18,7 +18,8 @@ defmodule EKV.Sqlite3 do
         oplog_stmt,
         kv_args,
         oplog_args,
-        local_origin
+        local_origin,
+        reject_cas_managed
       ),
       do:
         Sqlite3NIF.ekv_write_entry(
@@ -28,7 +29,8 @@ defmodule EKV.Sqlite3 do
           oplog_stmt,
           kv_args,
           oplog_args,
-          local_origin
+          local_origin,
+          reject_cas_managed
         )
 
   def write_snapshot_entry(db, kv_stmt, kv_args),
