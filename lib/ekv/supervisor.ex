@@ -363,7 +363,7 @@ defmodule EKV.Supervisor do
         if(is_integer(wait_for_quorum),
           do: {EKV.QuorumGate, name: name, timeout: wait_for_quorum, log: log}
         ),
-        {EKV.MemberPresence, name: name, region: region, voter: true},
+        {EKV.MemberPresence, name: name, region: region, voter: true, node_id: effective_node_id},
         {EKV.GC, name: name},
         if(is_integer(shutdown_barrier),
           do:
@@ -488,7 +488,8 @@ defmodule EKV.Supervisor do
         if(is_integer(wait_for_quorum),
           do: {EKV.QuorumGate, name: name, timeout: wait_for_quorum, log: log}
         ),
-        {EKV.MemberPresence, name: name, region: region, voter: false},
+        {EKV.MemberPresence,
+         name: name, region: region, voter: false, node_id: effective_node_id},
         {EKV.GC, name: name},
         if(is_integer(shutdown_barrier),
           do:

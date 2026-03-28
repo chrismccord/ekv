@@ -8,10 +8,14 @@ defmodule EKV.MemberPresence do
   - decouples client routing discoverability from replica shard processes
   - advertises only after member startup is complete
   - stops advertising during blue-green handoff before the old node enters proxy mode
+  - publishes a stable `node_id` presence index so replicas can recognize known
+    member origins even before a given shard has learned that peer's current
+    Erlang node name via connect/ack
 
   Design:
   - one long-lived process per member EKV instance
   - joins `{:ekv_members, name, region}` in the instance-local `:pg` scope
+  - joins `{:ekv_member_ids, name, node_id}` for stable member-origin lookups
   - `ClientRouter` monitors those groups to build its regional candidate set
   - `advertised?/1` is the cold-path validation check used to reject stale
     blue-green candidates before caching them as a backend
@@ -20,7 +24,7 @@ defmodule EKV.MemberPresence do
   use GenServer
 
   def start_link(opts) do
-    opts = Keyword.validate!(opts, [:name, :region, :voter])
+    opts = Keyword.validate!(opts, [:name, :region, :voter, :node_id])
     name = Keyword.fetch!(opts, :name)
     GenServer.start_link(__MODULE__, opts, name: server_name(name))
   end
@@ -29,6 +33,7 @@ defmodule EKV.MemberPresence do
 
   def region_group(name, region), do: {:ekv_members, name, region}
   def voter_region_group(name, region), do: {:ekv_voters, name, region}
+  def member_id_group(name, node_id), do: {:ekv_member_ids, name, node_id}
 
   def advertised?(name) do
     case Process.whereis(server_name(name)) do
@@ -53,6 +58,16 @@ defmodule EKV.MemberPresence do
     |> Enum.uniq()
   end
 
+  def member_origin_known?(name, origin_id)
+      when is_binary(origin_id) and byte_size(origin_id) > 0 do
+    scope = EKV.Supervisor.pg_scope(name)
+    :pg.get_members(scope, member_id_group(name, origin_id)) != []
+  rescue
+    _ -> false
+  end
+
+  def member_origin_known?(_name, _origin_id), do: false
+
   def leave(name) do
     case Process.whereis(server_name(name)) do
       nil -> :ok
@@ -65,7 +80,18 @@ defmodule EKV.MemberPresence do
     name = Keyword.fetch!(opts, :name)
     region = Keyword.fetch!(opts, :region)
     voter? = Keyword.get(opts, :voter, false)
-    state = %{name: name, region: region, voter?: voter?, joined?: false, voter_joined?: false}
+    node_id = Keyword.get(opts, :node_id) || Atom.to_string(node())
+
+    state = %{
+      name: name,
+      region: region,
+      node_id: node_id,
+      voter?: voter?,
+      joined?: false,
+      voter_joined?: false,
+      node_id_joined?: false
+    }
+
     {:ok, join_groups(state)}
   end
 
@@ -87,6 +113,13 @@ defmodule EKV.MemberPresence do
         self()
       )
 
+    :ok =
+      :pg.join(
+        EKV.Supervisor.pg_scope(state.name),
+        member_id_group(state.name, state.node_id),
+        self()
+      )
+
     state =
       if state.voter? do
         :ok =
@@ -101,7 +134,7 @@ defmodule EKV.MemberPresence do
         state
       end
 
-    %{state | joined?: true}
+    %{state | joined?: true, node_id_joined?: true}
   end
 
   defp leave_groups(%{joined?: false} = state), do: state
@@ -113,6 +146,20 @@ defmodule EKV.MemberPresence do
         region_group(state.name, state.region),
         self()
       )
+
+    state =
+      if state.node_id_joined? do
+        :ok =
+          :pg.leave(
+            EKV.Supervisor.pg_scope(state.name),
+            member_id_group(state.name, state.node_id),
+            self()
+          )
+
+        %{state | node_id_joined?: false}
+      else
+        state
+      end
 
     state =
       if state.voter_joined? do

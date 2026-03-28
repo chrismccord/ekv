@@ -437,9 +437,11 @@ defmodule EKV.AntiEntropyTest do
       shard_name = EKV.Replica.shard_name(ekv_name, 0)
 
       assert_receive {:trace, _pid, :send,
-                      {:ekv, 1, :summary_probe, {_from_pid, 0, _progress}, %{}},
-                      {^shard_name, ^node_b}},
+                      {:ekv, 1, :summary_probe, {_from_pid, 0, _progress},
+                       %{node_id: sent_node_id}}, {^shard_name, ^node_b}},
                      1_500
+
+      assert sent_node_id == assigned_node_id(peers, node_a)
 
       TestCluster.assert_eventually(fn ->
         state = TestCluster.replica_state(node_a, ekv_name)
@@ -451,6 +453,31 @@ defmodule EKV.AntiEntropyTest do
       end)
 
       assert :ok = TestCluster.untrace_shard_sends(node_a, ekv_name)
+    end
+
+    test "summary reply restores member identity when current shard only knows progress" do
+      peers = TestCluster.start_peers(2)
+      [{_, node_a}, {_, node_b}] = peers
+      ekv_name = unique_name(:anti_entropy_summary_reply_node_id)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      start_cluster(peers, ekv_name, anti_entropy_interval: @manual_anti_entropy_interval)
+
+      assert assigned_node_id(peers, node_b) ==
+               TestCluster.member_node_identity(node_a, ekv_name, node_b)
+
+      assert :ok = TestCluster.clear_member_node_id(node_a, ekv_name, node_b)
+      assert :ok = TestCluster.clear_member_node_identity(node_a, ekv_name, node_b)
+      assert :ok = TestCluster.trigger_anti_entropy(node_a, ekv_name)
+
+      TestCluster.assert_eventually(fn ->
+        state = TestCluster.replica_state(node_a, ekv_name)
+
+        Map.get(state.member_node_ids, node_b) == assigned_node_id(peers, node_b) and
+          TestCluster.member_node_identity(node_a, ekv_name, node_b) ==
+            assigned_node_id(peers, node_b)
+      end)
     end
 
     test "live LWW gap triggers immediate delta request and repair" do
@@ -735,6 +762,40 @@ defmodule EKV.AntiEntropyTest do
       assert :ok = TestCluster.force_local_progress(node_b, ekv_name, node_a, 0)
       assert :ok = TestCluster.drop_remote_shard(node_b, ekv_name, node_a)
       assert :ok = TestCluster.clear_member_node_id(node_b, ekv_name, node_a)
+      assert :ok = TestCluster.trace_shard_sends(node_b, ekv_name, self())
+      assert :ok = TestCluster.trigger_anti_entropy(node_b, ekv_name)
+
+      requests = collect_sync_request_messages([], 1_000)
+
+      assert Enum.any?(requests, fn {shard, request, _destination} ->
+               shard == 0 and request == {:delta, assigned_node_id(peers, node_a), 0}
+             end)
+
+      refute Enum.any?(requests, fn {shard, request, _destination} ->
+               shard == 0 and request == :full
+             end)
+
+      assert :ok = TestCluster.untrace_shard_sends(node_b, ekv_name)
+    end
+
+    test "third-origin relay uses node-id presence when current peer mapping is absent" do
+      peers = TestCluster.start_peers(3)
+      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
+      ekv_name = unique_name(:anti_entropy_member_presence_node_id)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      start_cluster(peers, ekv_name, anti_entropy_interval: @manual_anti_entropy_interval)
+
+      write_many(node_a, ekv_name, "presence_identity_gap", 3)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.keys_count(node_c, ekv_name, "presence_identity_gap/") == 3
+      end)
+
+      assert :ok = TestCluster.force_local_progress(node_b, ekv_name, node_a, 0)
+      assert :ok = TestCluster.clear_member_node_id(node_b, ekv_name, node_a)
+      assert :ok = TestCluster.clear_member_node_identity(node_b, ekv_name, node_a)
       assert :ok = TestCluster.trace_shard_sends(node_b, ekv_name, self())
       assert :ok = TestCluster.trigger_anti_entropy(node_b, ekv_name)
 

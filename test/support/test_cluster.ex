@@ -378,6 +378,11 @@ defmodule EKV.TestCluster do
     rpc!(node, __MODULE__, :do_member_node_identity, [name, remote_node, shard_index])
   end
 
+  @doc "Delete the persisted member-node identity for one remote shard"
+  def clear_member_node_identity(node, name, remote_node, shard_index \\ 0) do
+    rpc!(node, __MODULE__, :do_clear_member_node_identity, [name, remote_node, shard_index])
+  end
+
   @doc "Delete retained oplog rows below keep_from_seq for one origin on a remote shard"
   def prune_origin_replay(node, name, origin_node, keep_from_seq, shard_index \\ 0) do
     rpc!(node, __MODULE__, :do_prune_origin_replay, [
@@ -786,6 +791,19 @@ defmodule EKV.TestCluster do
     shard_name = EKV.Replica.shard_name(name, shard_index)
     %{db: db} = :sys.get_state(shard_name)
     EKV.Store.member_node_identity_get(db, remote_node)
+  end
+
+  def do_clear_member_node_identity(name, remote_node, shard_index) do
+    shard_name = EKV.Replica.shard_name(name, shard_index)
+    %{db: db} = :sys.get_state(shard_name)
+
+    {:ok, stmt} =
+      EKV.Sqlite3.prepare(db, "DELETE FROM kv_meta WHERE key = ?1")
+
+    :ok = EKV.Sqlite3.bind(stmt, ["member_node_id:" <> Atom.to_string(remote_node)])
+    :done = EKV.Sqlite3.step(db, stmt)
+    :ok = EKV.Sqlite3.release(db, stmt)
+    :ok
   end
 
   def do_prune_origin_replay(name, origin_node, keep_from_seq, shard_index) do

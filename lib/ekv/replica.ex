@@ -1587,8 +1587,11 @@ defmodule EKV.Replica do
 
   def handle_info({:ekv, @wire_protocol_version, kind, payload, meta}, %Replica{} = state) do
     case decode_wire_message(kind, payload, meta) do
-      {:ok, message} -> handle_info(message, state)
-      :ignore -> {:noreply, state}
+      {:ok, message} ->
+        handle_wire_message(state, message)
+
+      :ignore ->
+        {:noreply, state}
     end
   end
 
@@ -1719,60 +1722,6 @@ defmodule EKV.Replica do
        remote_node_id,
        remote_features
      )}
-  end
-
-  def handle_info(
-        {:ekv_summary_probe, remote_pid, remote_shard, remote_progress},
-        %Replica{} = state
-      )
-      when remote_shard == state.shard_index do
-    remote_node = node(remote_pid)
-    remote_progress = normalize_progress_summary(remote_progress)
-
-    case maybe_allow_member_reconnect(state, remote_node) do
-      {:quarantine, %Replica{} = state} ->
-        {:noreply, state}
-
-      {:ok, %Replica{} = state} ->
-        state =
-          state
-          |> clear_summary_probe_inflight(remote_node)
-          |> track_remote_shard(remote_node, remote_pid)
-          |> replace_remote_member_progress(remote_node, remote_progress)
-          |> reconcile_authoritative_origin_head(remote_node, remote_progress)
-
-        send_to_member(
-          state,
-          remote_node,
-          {:ekv_summary_reply, self(), state.shard_index, local_progress_summary_for_wire(state)}
-        )
-
-        {:noreply, maybe_request_repair(state, remote_node, remote_progress)}
-    end
-  end
-
-  def handle_info(
-        {:ekv_summary_reply, remote_pid, remote_shard, remote_progress},
-        %Replica{} = state
-      )
-      when remote_shard == state.shard_index do
-    remote_node = node(remote_pid)
-    remote_progress = normalize_progress_summary(remote_progress)
-
-    case maybe_allow_member_reconnect(state, remote_node) do
-      {:quarantine, %Replica{} = state} ->
-        {:noreply, state}
-
-      {:ok, %Replica{} = state} ->
-        state =
-          state
-          |> clear_summary_probe_inflight(remote_node)
-          |> track_remote_shard(remote_node, remote_pid)
-          |> replace_remote_member_progress(remote_node, remote_progress)
-          |> reconcile_authoritative_origin_head(remote_node, remote_progress)
-
-        {:noreply, maybe_request_repair(state, remote_node, remote_progress)}
-    end
   end
 
   def handle_info({:ekv_sync_request, remote_pid, remote_shard, request}, %Replica{} = state)
@@ -2401,6 +2350,105 @@ defmodule EKV.Replica do
   # =====================================================================
   # Internal helpers
   # =====================================================================
+
+  defp handle_wire_message(
+         %Replica{} = state,
+         {:ekv_summary_probe, remote_pid, remote_shard, remote_progress, remote_node_id}
+       ) do
+    handle_wire_summary_probe(state, remote_pid, remote_shard, remote_progress, remote_node_id)
+  end
+
+  defp handle_wire_message(
+         %Replica{} = state,
+         {:ekv_summary_reply, remote_pid, remote_shard, remote_progress, remote_node_id}
+       ) do
+    handle_wire_summary_reply(state, remote_pid, remote_shard, remote_progress, remote_node_id)
+  end
+
+  defp handle_wire_message(%Replica{} = state, message), do: handle_info(message, state)
+
+  defp handle_wire_summary_probe(
+         %Replica{} = state,
+         remote_pid,
+         remote_shard,
+         remote_progress,
+         remote_node_id
+       )
+       when remote_shard == state.shard_index do
+    remote_node = node(remote_pid)
+    remote_progress = normalize_progress_summary(remote_progress)
+
+    case maybe_allow_member_reconnect(state, remote_node, remote_node_id) do
+      {:quarantine, %Replica{} = state} ->
+        {:noreply, state}
+
+      {:ok, %Replica{} = state} ->
+        state =
+          state
+          |> clear_summary_probe_inflight(remote_node)
+          |> track_remote_shard(remote_node, remote_pid)
+          |> track_member_node_id(remote_node, remote_node_id)
+          |> persist_member_node_identity(remote_node, remote_node_id)
+          |> replace_remote_member_progress(remote_node, remote_progress)
+          |> reconcile_authoritative_origin_head(remote_node, remote_progress)
+
+        send_to_member(
+          state,
+          remote_node,
+          {:ekv_summary_reply, self(), state.shard_index, local_progress_summary_for_wire(state),
+           state.node_id}
+        )
+
+        {:noreply, maybe_request_repair(state, remote_node, remote_progress)}
+    end
+  end
+
+  defp handle_wire_summary_probe(
+         %Replica{} = state,
+         _remote_pid,
+         _remote_shard,
+         _remote_progress,
+         _remote_node_id
+       ),
+       do: {:noreply, state}
+
+  defp handle_wire_summary_reply(
+         %Replica{} = state,
+         remote_pid,
+         remote_shard,
+         remote_progress,
+         remote_node_id
+       )
+       when remote_shard == state.shard_index do
+    remote_node = node(remote_pid)
+    remote_progress = normalize_progress_summary(remote_progress)
+
+    case maybe_allow_member_reconnect(state, remote_node, remote_node_id) do
+      {:quarantine, %Replica{} = state} ->
+        {:noreply, state}
+
+      {:ok, %Replica{} = state} ->
+        state =
+          state
+          |> clear_summary_probe_inflight(remote_node)
+          |> track_remote_shard(remote_node, remote_pid)
+          |> track_member_node_id(remote_node, remote_node_id)
+          |> persist_member_node_identity(remote_node, remote_node_id)
+          |> replace_remote_member_progress(remote_node, remote_progress)
+          |> reconcile_authoritative_origin_head(remote_node, remote_progress)
+
+        {:noreply, maybe_request_repair(state, remote_node, remote_progress)}
+    end
+  end
+
+  defp handle_wire_summary_reply(
+         %Replica{} = state,
+         _remote_pid,
+         _remote_shard,
+         _remote_progress,
+         _remote_node_id
+       ),
+       do: {:noreply, state}
 
   defp do_member_connect(
          %Replica{} = state,
@@ -3225,6 +3273,7 @@ defmodule EKV.Replica do
 
   defp known_member_origin?(%Replica{} = state, known_member_nodes, origin_node) do
     Enum.any?(known_member_nodes, &member_matches_origin?(state, &1, origin_node)) or
+      EKV.MemberPresence.member_origin_known?(state.name, origin_node) or
       origin_node == state.node_id or
       Enum.any?(Map.keys(state.member_node_ids), &member_matches_origin?(state, &1, origin_node)) or
       Enum.any?(Map.keys(state.remote_shards), &member_matches_origin?(state, &1, origin_node)) or
@@ -3340,7 +3389,8 @@ defmodule EKV.Replica do
         send_to_member(
           acc,
           remote_node,
-          {:ekv_summary_probe, self(), acc.shard_index, local_progress_summary_for_wire(acc)}
+          {:ekv_summary_probe, self(), acc.shard_index, local_progress_summary_for_wire(acc),
+           acc.node_id}
         )
 
         mark_summary_probe_inflight(acc, remote_node)
@@ -3705,6 +3755,24 @@ defmodule EKV.Replica do
   end
 
   defp wire_encode_message(
+         %Replica{} = state,
+         _target_node,
+         {:ekv_summary_probe, pid, shard, progress, remote_node_id}
+       ) do
+    {:ekv, @wire_protocol_version, :summary_probe, {pid, shard, progress},
+     summary_wire_meta(state, remote_node_id)}
+  end
+
+  defp wire_encode_message(
+         %Replica{} = state,
+         _target_node,
+         {:ekv_summary_reply, pid, shard, progress, remote_node_id}
+       ) do
+    {:ekv, @wire_protocol_version, :summary_reply, {pid, shard, progress},
+     summary_wire_meta(state, remote_node_id)}
+  end
+
+  defp wire_encode_message(
          %Replica{} = _state,
          _target_node,
          {:ekv_summary_probe, pid, shard, progress}
@@ -3807,12 +3875,12 @@ defmodule EKV.Replica do
     {:ok, {:ekv_sync, from_node, shard, mode, entries, progress}}
   end
 
-  defp decode_wire_message(:summary_probe, {pid, shard, progress}, _meta) do
-    {:ok, {:ekv_summary_probe, pid, shard, progress}}
+  defp decode_wire_message(:summary_probe, {pid, shard, progress}, meta) do
+    {:ok, {:ekv_summary_probe, pid, shard, progress, wire_meta_node_id(meta)}}
   end
 
-  defp decode_wire_message(:summary_reply, {pid, shard, progress}, _meta) do
-    {:ok, {:ekv_summary_reply, pid, shard, progress}}
+  defp decode_wire_message(:summary_reply, {pid, shard, progress}, meta) do
+    {:ok, {:ekv_summary_reply, pid, shard, progress, wire_meta_node_id(meta)}}
   end
 
   defp decode_wire_message(:sync_request, {pid, shard, request}, _meta) do
@@ -3922,6 +3990,18 @@ defmodule EKV.Replica do
   end
 
   defp normalize_wire_features(_meta), do: MapSet.new()
+
+  defp wire_meta_node_id(%{node_id: node_id}) when is_binary(node_id) and byte_size(node_id) > 0,
+    do: node_id
+
+  defp wire_meta_node_id(_meta), do: nil
+
+  defp summary_wire_meta(%Replica{} = _state, node_id)
+       when is_binary(node_id) and byte_size(node_id) > 0 do
+    %{node_id: node_id}
+  end
+
+  defp summary_wire_meta(%Replica{} = _state, _node_id), do: %{}
 
   defp normalize_progress_summary(progress) when is_map(progress) do
     Map.new(progress, fn
