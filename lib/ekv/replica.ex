@@ -4495,7 +4495,17 @@ defmodule EKV.Replica do
     remote_head = Map.get(remote_progress, remote_origin)
     local_head = Map.get(local_progress, remote_origin, 0)
 
-    if is_integer(remote_head) and remote_head >= 0 and local_head > remote_head do
+    corroborated_higher_head? =
+      Enum.any?(state.remote_member_progress, fn
+        {^remote_node, _member_progress} ->
+          false
+
+        {_member_node, member_progress} ->
+          Map.get(normalize_progress_summary(member_progress), remote_origin, 0) >= local_head
+      end)
+
+    if is_integer(remote_head) and remote_head >= 0 and local_head > remote_head and
+         not corroborated_higher_head? do
       local_progress = Map.put(local_progress, remote_origin, remote_head)
       :ok = Store.replace_local_progress_summary(state.db, local_progress)
       %{state | local_progress: local_progress}

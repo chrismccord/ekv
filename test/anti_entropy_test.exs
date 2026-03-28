@@ -480,6 +480,70 @@ defmodule EKV.AntiEntropyTest do
       end)
     end
 
+    test "stale member summary does not regress local progress or reopen repaired relayed delta" do
+      peers = TestCluster.start_peers(3)
+      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
+      ekv_name = unique_name(:anti_entropy_no_progress_regression)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      start_cluster(peers, ekv_name, anti_entropy_interval: @manual_anti_entropy_interval)
+
+      write_many(node_c, ekv_name, "origin_regress", 6)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.keys_count(node_a, ekv_name, "origin_regress/") == 6 and
+          TestCluster.keys_count(node_b, ekv_name, "origin_regress/") == 6
+      end)
+
+      current_seq = TestCluster.local_progress(node_b, ekv_name, node_c)
+      assert current_seq >= 6
+
+      assert :ok = TestCluster.set_peer_progress(node_b, ekv_name, node_a, node_c, current_seq)
+
+      assert :ok =
+               TestCluster.set_cached_remote_progress(
+                 node_b,
+                 ekv_name,
+                 node_a,
+                 node_c,
+                 current_seq
+               )
+
+      stale_seq = current_seq - 3
+      origin_id = traced_origin_id(node_b, ekv_name, node_c, peers)
+
+      remote_pid =
+        TestCluster.rpc!(node_c, Process, :whereis, [EKV.Replica.shard_name(ekv_name, 0)])
+
+      assert :ok = TestCluster.trace_shard_sends(node_b, ekv_name, self())
+
+      TestCluster.rpc!(node_b, :erlang, :send, [
+        EKV.Replica.shard_name(ekv_name, 0),
+        {:ekv, 1, :summary_reply, {remote_pid, 0, %{origin_id => stale_seq}},
+         %{node_id: assigned_node_id(peers, node_c)}}
+      ])
+
+      Process.sleep(100)
+
+      assert TestCluster.local_progress(node_b, ekv_name, node_c) == current_seq
+
+      assert :ok = TestCluster.trigger_anti_entropy(node_b, ekv_name)
+      shard_name = EKV.Replica.shard_name(ekv_name, 0)
+
+      refute_receive {:trace, _pid, :send,
+                      {:ekv_sync_request, _from_pid, 0, {:delta, ^origin_id, ^stale_seq}},
+                      {^shard_name, ^node_a}},
+                     750
+
+      refute_receive {:trace, _pid, :send,
+                      {:ekv, 1, :sync_request, {_from_pid, 0, {:delta, ^origin_id, ^stale_seq}},
+                       _meta}, {^shard_name, ^node_a}},
+                     250
+
+      assert :ok = TestCluster.untrace_shard_sends(node_b, ekv_name)
+    end
+
     test "live LWW gap triggers immediate delta request and repair" do
       peers = TestCluster.start_peers(2)
       [{_, node_a}, {_, node_b}] = peers
