@@ -544,6 +544,38 @@ defmodule EKV.AntiEntropyTest do
       assert :ok = TestCluster.untrace_shard_sends(node_b, ekv_name)
     end
 
+    test "summary reply does not clear active relayed delta inflight guard" do
+      peers = TestCluster.start_peers(3)
+      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
+      ekv_name = unique_name(:anti_entropy_preserve_relay_guard)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      start_cluster(peers, ekv_name, anti_entropy_interval: @manual_anti_entropy_interval)
+
+      origin_id = stable_origin_id(node_c, ekv_name)
+
+      assert :ok = TestCluster.set_sync_inflight_age(node_a, ekv_name, node_b, 0)
+      assert :ok = TestCluster.set_delta_origin_inflight_age(node_a, ekv_name, node_c, node_b, 0)
+
+      remote_pid =
+        TestCluster.rpc!(node_b, Process, :whereis, [EKV.Replica.shard_name(ekv_name, 0)])
+
+      TestCluster.rpc!(node_a, :erlang, :send, [
+        EKV.Replica.shard_name(ekv_name, 0),
+        {:ekv, 1, :summary_reply, {remote_pid, 0, %{}},
+         %{node_id: assigned_node_id(peers, node_b)}}
+      ])
+
+      Process.sleep(100)
+      state = TestCluster.replica_state(node_a, ekv_name)
+
+      assert Map.has_key?(state.sync_inflight, node_b), inspect(state.sync_inflight)
+
+      assert Map.has_key?(state.delta_origin_inflight, origin_id),
+             inspect(state.delta_origin_inflight)
+    end
+
     test "live LWW gap triggers immediate delta request and repair" do
       peers = TestCluster.start_peers(2)
       [{_, node_a}, {_, node_b}] = peers

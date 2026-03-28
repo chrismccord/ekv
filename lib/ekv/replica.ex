@@ -2399,7 +2399,8 @@ defmodule EKV.Replica do
            state.node_id}
         )
 
-        {:noreply, maybe_request_repair(state, remote_node, remote_progress)}
+        {:noreply,
+         maybe_request_repair(state, remote_node, remote_progress, preserve_inflight?: true)}
     end
   end
 
@@ -2437,7 +2438,8 @@ defmodule EKV.Replica do
           |> replace_remote_member_progress(remote_node, remote_progress)
           |> reconcile_authoritative_origin_head(remote_node, remote_progress)
 
-        {:noreply, maybe_request_repair(state, remote_node, remote_progress)}
+        {:noreply,
+         maybe_request_repair(state, remote_node, remote_progress, preserve_inflight?: true)}
     end
   end
 
@@ -2506,7 +2508,15 @@ defmodule EKV.Replica do
           )
 
           log_once(state, fn -> "#{log_prefix(state)} ekv_member_connect from #{remote_node}" end)
-          state = maybe_request_repair(state, remote_node, remote_progress)
+
+          state =
+            maybe_request_repair(
+              state,
+              remote_node,
+              remote_progress,
+              preserve_inflight?: true
+            )
+
           maybe_reply_to_quorum_waiters(state)
       end
     end
@@ -2575,7 +2585,14 @@ defmodule EKV.Replica do
             "#{log_prefix(state)} ekv_member_connect_ack from #{remote_node}"
           end)
 
-          state = maybe_request_repair(state, remote_node, remote_progress)
+          state =
+            maybe_request_repair(
+              state,
+              remote_node,
+              remote_progress,
+              preserve_inflight?: true
+            )
+
           maybe_reply_to_quorum_waiters(state)
       end
     end
@@ -3129,13 +3146,22 @@ defmodule EKV.Replica do
     end
   end
 
-  defp maybe_request_repair(%Replica{} = state, remote_node, remote_progress) do
+  defp maybe_request_repair(%Replica{} = state, remote_node, remote_progress, opts \\ []) do
     {state, request} =
       sync_request_for_remote(state, remote_node, normalize_progress_summary(remote_progress))
 
+    preserve_inflight? = Keyword.get(opts, :preserve_inflight?, false)
+
     case request do
-      nil -> clear_sync_inflight(state, remote_node)
-      request -> request_sync(state, remote_node, request)
+      nil ->
+        if preserve_inflight? and Map.has_key?(state.sync_inflight, remote_node) do
+          state
+        else
+          clear_sync_inflight(state, remote_node)
+        end
+
+      request ->
+        request_sync(state, remote_node, request)
     end
   end
 
@@ -5115,6 +5141,11 @@ defmodule EKV.Replica do
          remote_node,
          remote_node_id
        ) do
+    reconnecting? =
+      MapSet.member?(state.quarantined_members, remote_node) or
+        known_down_member?(state, remote_node) or
+        (is_binary(remote_node_id) and known_down_member?(state, remote_node_id))
+
     %Replica{} = state = clear_member_down_markers(state, remote_node, remote_node_id)
 
     state = %{
@@ -5123,9 +5154,13 @@ defmodule EKV.Replica do
     }
 
     state =
-      state
-      |> clear_summary_probe_inflight(remote_node)
-      |> clear_sync_inflight(remote_node)
+      if reconnecting? do
+        state
+        |> clear_summary_probe_inflight(remote_node)
+        |> clear_sync_inflight(remote_node)
+      else
+        clear_summary_probe_inflight(state, remote_node)
+      end
 
     {:ok, state}
   end
@@ -5144,12 +5179,7 @@ defmodule EKV.Replica do
           | quarantined_members: MapSet.delete(state.quarantined_members, remote_node)
         }
 
-        state =
-          state
-          |> clear_summary_probe_inflight(remote_node)
-          |> clear_sync_inflight(remote_node)
-
-        {:ok, state}
+        {:ok, clear_summary_probe_inflight(state, remote_node)}
 
       is_integer(down_since_ms) and age_ms > state.tombstone_ttl ->
         state = %{

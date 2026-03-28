@@ -358,6 +358,24 @@ defmodule EKV.TestCluster do
     ])
   end
 
+  @doc "Force a delta_origin_inflight marker age for one origin stream via one remote member"
+  def set_delta_origin_inflight_age(
+        node,
+        name,
+        origin_node,
+        remote_node,
+        age_ms,
+        shard_index \\ 0
+      ) do
+    rpc!(node, __MODULE__, :do_set_delta_origin_inflight_age, [
+      name,
+      origin_node,
+      remote_node,
+      age_ms,
+      shard_index
+    ])
+  end
+
   @doc "Trigger one anti-entropy tick on a remote shard"
   def trigger_anti_entropy(node, name, shard_index \\ 0) do
     rpc!(node, __MODULE__, :do_trigger_anti_entropy, [name, shard_index])
@@ -722,6 +740,24 @@ defmodule EKV.TestCluster do
       %{
         state
         | summary_probe_inflight: Map.put(state.summary_probe_inflight, remote_node, sent_at_ms)
+      }
+    end)
+
+    :ok
+  end
+
+  def do_set_delta_origin_inflight_age(name, origin_node, remote_node, age_ms, shard_index) do
+    shard_name = EKV.Replica.shard_name(name, shard_index)
+    state = :sys.get_state(shard_name)
+    origin_node = replay_origin_id(origin_node, state)
+
+    :sys.replace_state(shard_name, fn state ->
+      activity_at_ms = System.monotonic_time(:millisecond) - max(age_ms, 0)
+
+      %{
+        state
+        | delta_origin_inflight:
+            Map.put(state.delta_origin_inflight, origin_node, {remote_node, activity_at_ms})
       }
     end)
 
