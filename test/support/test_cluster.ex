@@ -391,6 +391,16 @@ defmodule EKV.TestCluster do
     rpc!(node, __MODULE__, :do_clear_member_node_id, [name, remote_node, shard_index])
   end
 
+  @doc "Set one in-memory member-node identity mapping on a remote shard state"
+  def set_member_node_id(node, name, remote_node, remote_node_id, shard_index \\ 0) do
+    rpc!(node, __MODULE__, :do_set_member_node_id, [
+      name,
+      remote_node,
+      remote_node_id,
+      shard_index
+    ])
+  end
+
   @doc "Read the persisted member-node identity for one remote shard"
   def member_node_identity(node, name, remote_node, shard_index \\ 0) do
     rpc!(node, __MODULE__, :do_member_node_identity, [name, remote_node, shard_index])
@@ -399,6 +409,26 @@ defmodule EKV.TestCluster do
   @doc "Delete the persisted member-node identity for one remote shard"
   def clear_member_node_identity(node, name, remote_node, shard_index \\ 0) do
     rpc!(node, __MODULE__, :do_clear_member_node_identity, [name, remote_node, shard_index])
+  end
+
+  @doc "Read a raw member-down marker from shard metadata"
+  def member_down_marker(node, name, marker_key, shard_index \\ 0) do
+    rpc!(node, __MODULE__, :do_member_down_marker, [name, marker_key, shard_index])
+  end
+
+  @doc "Set a raw member-down marker in shard metadata and cache"
+  def set_member_down_marker(node, name, marker_key, down_since_ms, shard_index \\ 0) do
+    rpc!(node, __MODULE__, :do_set_member_down_marker, [
+      name,
+      marker_key,
+      down_since_ms,
+      shard_index
+    ])
+  end
+
+  @doc "Clear a raw member-down marker from shard metadata and cache"
+  def clear_member_down_marker(node, name, marker_key, shard_index \\ 0) do
+    rpc!(node, __MODULE__, :do_clear_member_down_marker, [name, marker_key, shard_index])
   end
 
   @doc "Delete retained oplog rows below keep_from_seq for one origin on a remote shard"
@@ -823,6 +853,16 @@ defmodule EKV.TestCluster do
     :ok
   end
 
+  def do_set_member_node_id(name, remote_node, remote_node_id, shard_index) do
+    shard_name = EKV.Replica.shard_name(name, shard_index)
+
+    :sys.replace_state(shard_name, fn state ->
+      %{state | member_node_ids: Map.put(state.member_node_ids, remote_node, remote_node_id)}
+    end)
+
+    :ok
+  end
+
   def do_member_node_identity(name, remote_node, shard_index) do
     shard_name = EKV.Replica.shard_name(name, shard_index)
     %{db: db} = :sys.get_state(shard_name)
@@ -839,6 +879,36 @@ defmodule EKV.TestCluster do
     :ok = EKV.Sqlite3.bind(stmt, ["member_node_id:" <> Atom.to_string(remote_node)])
     :done = EKV.Sqlite3.step(db, stmt)
     :ok = EKV.Sqlite3.release(db, stmt)
+    :ok
+  end
+
+  def do_member_down_marker(name, marker_key, shard_index) do
+    shard_name = EKV.Replica.shard_name(name, shard_index)
+    %{db: db} = :sys.get_state(shard_name)
+    EKV.Store.member_down_marker_get(db, marker_key)
+  end
+
+  def do_set_member_down_marker(name, marker_key, down_since_ms, shard_index) do
+    shard_name = EKV.Replica.shard_name(name, shard_index)
+    %{db: db} = :sys.get_state(shard_name)
+    EKV.Store.member_down_marker_put(db, marker_key, down_since_ms)
+
+    :sys.replace_state(shard_name, fn state ->
+      %{state | member_down_at: Map.put(state.member_down_at, marker_key, down_since_ms)}
+    end)
+
+    :ok
+  end
+
+  def do_clear_member_down_marker(name, marker_key, shard_index) do
+    shard_name = EKV.Replica.shard_name(name, shard_index)
+    %{db: db} = :sys.get_state(shard_name)
+    EKV.Store.member_down_marker_clear(db, marker_key)
+
+    :sys.replace_state(shard_name, fn state ->
+      %{state | member_down_at: Map.delete(state.member_down_at, marker_key)}
+    end)
+
     :ok
   end
 

@@ -1646,6 +1646,114 @@ defmodule EKV.AntiEntropyTest do
   end
 
   describe "anti-entropy suppression / gating" do
+    test "same-name reconnect still quarantines when exact node downtime exceeded tombstone ttl" do
+      peers = TestCluster.start_peers(2)
+      [{_, node_a}, {_, node_b}] = peers
+      ekv_name = unique_name(:anti_entropy_quarantine_same_name)
+      tombstone_ttl = 700
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      start_cluster(
+        peers,
+        ekv_name,
+        anti_entropy_interval: @manual_anti_entropy_interval,
+        tombstone_ttl: tombstone_ttl,
+        gc_interval: 100
+      )
+
+      node_b_id = assigned_node_id(peers, node_b)
+      id_marker_key = "member_down_at:id:" <> node_b_id
+      name_marker_key = "member_down_at:name:" <> Atom.to_string(node_b)
+      stale_down_since = System.system_time(:millisecond) - tombstone_ttl - 1_000
+
+      assert :ok =
+               TestCluster.set_member_down_marker(
+                 node_a,
+                 ekv_name,
+                 id_marker_key,
+                 stale_down_since
+               )
+
+      assert :ok =
+               TestCluster.set_member_down_marker(
+                 node_a,
+                 ekv_name,
+                 name_marker_key,
+                 stale_down_since
+               )
+
+      assert :ok = TestCluster.drop_remote_shard(node_a, ekv_name, node_b)
+      assert :ok = TestCluster.trigger_anti_entropy(node_a, ekv_name)
+
+      TestCluster.assert_eventually(fn ->
+        state = TestCluster.replica_state(node_a, ekv_name)
+
+        not Map.has_key?(state.remote_shards, node_b) and
+          MapSet.member?(state.quarantined_members, node_b) and
+          TestCluster.member_down_marker(node_a, ekv_name, id_marker_key) == stale_down_since
+      end)
+    end
+
+    test "anti-entropy reconnects to presence members missing from remote_shards and clears node_id down markers within tombstone ttl" do
+      peers = TestCluster.start_peers(2)
+      [{_, node_a}, {_, node_b}] = peers
+      ekv_name = unique_name(:anti_entropy_presence_reconnect)
+      tombstone_ttl = 700
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      start_cluster(
+        peers,
+        ekv_name,
+        anti_entropy_interval: @manual_anti_entropy_interval,
+        tombstone_ttl: tombstone_ttl,
+        gc_interval: 100
+      )
+
+      node_b_id = assigned_node_id(peers, node_b)
+      marker_key = "member_down_at:id:" <> node_b_id
+      reconnect_down_since = System.system_time(:millisecond) - div(tombstone_ttl, 2)
+
+      assert :ok =
+               TestCluster.set_member_down_marker(
+                 node_a,
+                 ekv_name,
+                 marker_key,
+                 reconnect_down_since
+               )
+
+      assert :ok = TestCluster.drop_remote_shard(node_a, ekv_name, node_b)
+
+      state = TestCluster.replica_state(node_a, ekv_name)
+      refute Map.has_key?(state.remote_shards, node_b)
+      assert TestCluster.member_down_marker(node_a, ekv_name, marker_key) == reconnect_down_since
+
+      assert TestCluster.rpc!(node_a, EKV.MemberPresence, :member_nodes, [ekv_name])
+             |> Enum.sort() ==
+               Enum.sort([node_a, node_b])
+
+      assert :ok = TestCluster.trace_shard_sends(node_a, ekv_name, self())
+      assert :ok = TestCluster.trigger_anti_entropy(node_a, ekv_name)
+
+      shard_name = EKV.Replica.shard_name(ekv_name, 0)
+
+      assert_receive {:trace, _pid, :send,
+                      {:ekv, 1, :member_connect, {_from_pid, 0, _num_shards, _progress, _node_id},
+                       _meta}, {^shard_name, ^node_b}},
+                     1_000
+
+      TestCluster.assert_eventually(fn ->
+        state = TestCluster.replica_state(node_a, ekv_name)
+
+        Map.has_key?(state.remote_shards, node_b) and
+          not MapSet.member?(state.quarantined_members, node_b) and
+          TestCluster.member_down_marker(node_a, ekv_name, marker_key) == nil
+      end)
+
+      assert :ok = TestCluster.untrace_shard_sends(node_a, ekv_name)
+    end
+
     test "skips quarantined members" do
       peers = TestCluster.start_peers(2)
       [{_, node_a}, {_, node_b}] = peers

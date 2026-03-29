@@ -339,6 +339,17 @@ Nodes automatically reconnect and sync:
     quarantine. This trades safety for availability and can resurrect state
     that would otherwise have been protected by quarantine.
 
+Transient false down-markers should normally self-heal before they age into
+quarantine: anti-entropy periodically retries `member_connect` to current
+`EKV.MemberPresence` members that are missing from `remote_shards`.
+
+That retry does not override overdue quarantine. If a bad `member_down_at:id:*`
+marker has already aged past `tombstone_ttl`, the reconnect gate will still
+quarantine by default. A temporary `tombstone_ttl` increase can be used as a
+controlled recovery maneuver to let currently-live members reconnect and clear
+those markers, but it temporarily widens the stale-state safety window and
+should be reverted after the markers are gone.
+
 For automatic-sync cases, no operator action is needed. Monitor convergence:
 
 ```elixir

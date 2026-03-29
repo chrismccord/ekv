@@ -405,6 +405,15 @@ defmodule EKV do
   restarts and prevents node-name churn from bypassing quarantine when
   `node_id` is stable.
 
+  Anti-entropy also retries `member_connect` to current `EKV.MemberPresence`
+  members missing from `remote_shards`. That lets transient false down-markers
+  usually self-heal while they are still within `tombstone_ttl`.
+
+  Presence alone does not bypass overdue quarantine. If a persisted down-marker
+  has already aged past `tombstone_ttl`, EKV still quarantines that reconnect
+  by default until an operator rebuilds one side or explicitly widens the
+  safety window.
+
   Fallback name-based markers are bounded: EKV periodically prunes very old
   entries and caps retained fallback markers per shard.
 

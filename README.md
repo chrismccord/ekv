@@ -309,6 +309,13 @@ available (fallback: node name), so restart does not clear quarantine history.
 This also means node-name churn does not bypass quarantine when `node_id` is
 stable.
 
+Members also retry `member_connect` during anti-entropy for current
+`EKV.MemberPresence` members missing from `remote_shards`. That means a
+transient false down-marker should normally clear on its own while it is still
+within `tombstone_ttl`. If the persisted down-marker has already aged past
+`tombstone_ttl`, EKV still quarantines the reconnect by default. Operators must
+then rebuild one side or explicitly widen the safety window before reconnecting.
+
 Fallback name-based markers are bounded: EKV prunes very old entries and caps
 the retained set per shard to avoid unbounded growth over long periods.
 

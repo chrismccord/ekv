@@ -339,6 +339,12 @@ Important:
   - default `partition_ttl_policy: :quarantine`
   - reconnect after downtime > `tombstone_ttl` blocks replication for that member pair
 - Down-since markers live in `kv_meta`, keyed by `node_id` when available, otherwise node name.
+- Anti-entropy periodically retries `member_connect` to current `MemberPresence`
+  members missing from `remote_shards`, so transient false down-markers should
+  usually self-heal before they age into quarantine.
+- Current presence does not bypass overdue quarantine. Once a down-marker is
+  older than `tombstone_ttl`, the reconnect gate still quarantines until an
+  operator rebuilds one side or deliberately widens the safety window.
 
 ## Common Failure Patterns
 - CAS returns `{:error, :no_quorum}` or `{:error, :quorum_timeout}`
@@ -403,6 +409,7 @@ mix test test/linearizability_pure_elixir_test.exs
 
 ### If touching sync, HWM, reconnect, quarantine, stale-db rejection
 ```bash
+mix test test/anti_entropy_test.exs
 mix test test/distributed_test.exs
 mix test test/adversarial_verification_test.exs
 mix test test/ekv_test.exs

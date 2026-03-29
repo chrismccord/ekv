@@ -598,6 +598,10 @@ defmodule EKV.Replica do
   On reconnect handshake, if downtime > tombstone_ttl and policy is
   `:quarantine`, replication is blocked for that member. Down markers are
   cleared only after a successful non-quarantined reconnect.
+  Anti-entropy also retries member_connect to current MemberPresence members
+  missing from remote_shards, so transient false down-markers should normally
+  self-heal before they age into quarantine. Current presence does not bypass
+  overdue quarantine.
 
 
   ## Member Sync Protocol
@@ -2300,6 +2304,7 @@ defmodule EKV.Replica do
       else
         state
         |> expire_stale_inflight()
+        |> trigger_missing_member_connects()
         |> trigger_summary_probe()
       end
 
@@ -3422,6 +3427,26 @@ defmodule EKV.Replica do
         mark_summary_probe_inflight(acc, remote_node)
       end
     end)
+  end
+
+  defp trigger_missing_member_connects(%Replica{} = state) do
+    state.name
+    |> EKV.MemberPresence.member_nodes()
+    |> Enum.reduce(state, fn remote_node, acc ->
+      cond do
+        remote_node == node() ->
+          acc
+
+        Map.has_key?(acc.remote_shards, remote_node) ->
+          acc
+
+        true ->
+          send_to_member(acc, remote_node, member_connect_message(acc))
+          acc
+      end
+    end)
+  rescue
+    _ -> state
   end
 
   defp expire_stale_inflight(%Replica{} = state) do
@@ -5230,21 +5255,23 @@ defmodule EKV.Replica do
     {%Replica{} = state, id_down_since} = read_member_down_marker(state, id_key)
     {%Replica{} = state, name_down_since} = read_member_down_marker(state, name_key)
 
-    if is_integer(name_down_since) do
-      merged_down_since =
-        if is_integer(id_down_since),
-          do: min(id_down_since, name_down_since),
-          else: name_down_since
+    cond do
+      is_integer(name_down_since) ->
+        merged_down_since =
+          if is_integer(id_down_since),
+            do: min(id_down_since, name_down_since),
+            else: name_down_since
 
-      state =
-        if id_down_since == merged_down_since,
-          do: state,
-          else: put_member_down_marker(state, id_key, merged_down_since)
+        state =
+          if id_down_since == merged_down_since,
+            do: state,
+            else: put_member_down_marker(state, id_key, merged_down_since)
 
-      %Replica{} = state = clear_member_down_marker(state, name_key)
-      {state, merged_down_since}
-    else
-      {state, id_down_since}
+        %Replica{} = state = clear_member_down_marker(state, name_key)
+        {state, merged_down_since}
+
+      true ->
+        {state, id_down_since}
     end
   end
 
