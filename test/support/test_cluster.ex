@@ -46,6 +46,27 @@ defmodule EKV.TestCluster do
     end)
   end
 
+  @doc "Start EKV on a remote node and return the raw result"
+  def start_ekv_result(node, opts) do
+    opts = Keyword.put_new(opts, :log, false)
+
+    :erpc.call(node, fn ->
+      try do
+        case EKV.start_link(opts) do
+          {:ok, pid} ->
+            Process.unlink(pid)
+            {:ok, pid}
+
+          other ->
+            other
+        end
+      catch
+        :exit, reason ->
+          {:exit, reason}
+      end
+    end)
+  end
+
   @doc "Stop EKV on a remote node by supervisor name"
   def stop_ekv(node, name, timeout \\ 5_000) do
     :erpc.call(node, __MODULE__, :do_stop_ekv, [name, timeout])
@@ -325,6 +346,11 @@ defmodule EKV.TestCluster do
   @doc "Count oplog rows on a remote shard"
   def oplog_count(node, name, shard_index \\ 0) do
     rpc!(node, __MODULE__, :do_oplog_count, [name, shard_index])
+  end
+
+  @doc "Read oplog retention stats on a remote shard"
+  def oplog_retention_stats(node, name, shard_index \\ 0, limit \\ 5) do
+    rpc!(node, __MODULE__, :do_oplog_retention_stats, [name, shard_index, limit])
   end
 
   @doc "Read a shard's min oplog seq on a remote node"
@@ -728,6 +754,12 @@ defmodule EKV.TestCluster do
       {:ok, [[count]]} -> count
       _ -> 0
     end
+  end
+
+  def do_oplog_retention_stats(name, shard_index, limit) do
+    shard_name = EKV.Replica.shard_name(name, shard_index)
+    %{db: db} = :sys.get_state(shard_name)
+    EKV.Store.oplog_retention_stats(db, limit)
   end
 
   def do_set_cached_remote_progress(name, remote_node, origin_node, seq, shard_index) do

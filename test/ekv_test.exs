@@ -658,7 +658,8 @@ defmodule EKVTest do
       :ok = EKV.Store.update_peer_progress(db, :member_b@host, :node_a, 10)
 
       # Truncate oplog
-      :ok = EKV.Store.truncate_oplog(db)
+      assert %{deleted_rows: deleted_rows, retention_lag: []} = EKV.Store.truncate_oplog(db)
+      assert deleted_rows >= 1
 
       # min_seq should now be >= 5 (entries below 5 removed)
       assert EKV.Store.min_seq(db) >= 5
@@ -729,7 +730,7 @@ defmodule EKVTest do
       assert EKV.Store.get(db, "keyref_gc_key") == nil
 
       :ok = EKV.Store.update_peer_progress(db, :member_a@host, :node_a, 4)
-      :ok = EKV.Store.truncate_oplog(db)
+      assert %{retention_lag: []} = EKV.Store.truncate_oplog(db)
 
       assert {:ok, [[0]]} =
                EKV.Sqlite3.fetch_all(

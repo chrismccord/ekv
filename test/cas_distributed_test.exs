@@ -2785,6 +2785,47 @@ defmodule EKV.CASDistributedTest do
       assert TestCluster.rpc!(n3, EKV, :get, [ekv_name, "key1"]) == "val1"
     end
 
+    test "blue_green startup aborts when a reachable old shard misses handoff ack" do
+      peers = TestCluster.start_peers(4)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, n1}, {_, n1b}, {_, n2}, {_, n3}] = peers
+      ekv_name = unique_name(:handoff)
+      shared_dir = "/tmp/ekv_handoff_shared_#{ekv_name}"
+      marker_path = Path.join(shared_dir, "current")
+      on_exit(fn -> cleanup_handoff_data(peers, ekv_name, shared_dir) end)
+
+      start_handoff_cluster(n1, n2, n3, ekv_name, shared_dir)
+      Process.sleep(500)
+
+      :ok = TestCluster.terminate_replica_shard(n1, ekv_name, 0)
+      Process.sleep(200)
+
+      exit_reason =
+        catch_exit(
+          TestCluster.start_ekv_result(
+            n1b,
+            name: ekv_name,
+            data_dir: shared_dir,
+            shards: 2,
+            log: false,
+            blue_green: true,
+            gc_interval: :timer.hours(1),
+            tombstone_ttl: :timer.hours(24 * 7),
+            cluster_size: 3,
+            node_id: "m1"
+          )
+        )
+
+      result_text = inspect(exit_reason)
+
+      assert result_text =~ ":handoff_failed"
+      assert result_text =~ Atom.to_string(n1)
+      refute result_text =~ "database is locked"
+      assert String.trim(File.read!(marker_path)) == Atom.to_string(n1)
+      assert TestCluster.ekv_stopped?(n1b, ekv_name)
+    end
+
     test "outgoing blue-green member does not wait on shutdown barrier after handoff" do
       peers = TestCluster.start_peers(4)
       on_exit(fn -> TestCluster.stop_peers(peers) end)

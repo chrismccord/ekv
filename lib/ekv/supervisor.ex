@@ -5,6 +5,8 @@ defmodule EKV.Supervisor do
   require Logger
 
   @default_member_progress_retention_ttl :timer.hours(6)
+  @handoff_ack_timeout_ms 5_000
+  @handoff_task_timeout_ms 10_000
 
   _archdoc = ~S"""
   Top-level EKV supervisor.
@@ -132,8 +134,10 @@ defmodule EKV.Supervisor do
 
   3. **Marker node != `node()`** → potential blue-green deploy. If the marker
      node is reachable now, send handoff request to old VM's shards in
-     parallel (5s timeout per shard). If the marker node is unreachable, treat
-     the marker as stale and proceed without handoff.
+     parallel (5s timeout per shard). Startup proceeds only after every shard
+     acks handoff. If any shard fails or times out, startup aborts without
+     rewriting the marker. If the marker node is unreachable, treat the marker
+     as stale and proceed without handoff.
 
   ### Key Invariants
 
@@ -315,7 +319,12 @@ defmodule EKV.Supervisor do
         id when is_binary(id) -> id
       end
 
-    if blue_green, do: perform_handoff(name, data_dir, num_shards)
+    if blue_green do
+      case perform_handoff(name, data_dir, num_shards) do
+        :ok -> :ok
+        {:error, reason} -> exit(reason)
+      end
+    end
 
     effective_node_id = resolve_member_node_id(name, data_dir, node_id)
 
@@ -436,7 +445,12 @@ defmodule EKV.Supervisor do
         id when is_binary(id) -> id
       end
 
-    if blue_green, do: perform_handoff(name, data_dir, num_shards)
+    if blue_green do
+      case perform_handoff(name, data_dir, num_shards) do
+        :ok -> :ok
+        {:error, reason} -> exit(reason)
+      end
+    end
 
     effective_node_id = resolve_member_node_id(name, data_dir, node_id)
 
@@ -854,32 +868,67 @@ defmodule EKV.Supervisor do
       true ->
         old_node = String.to_atom(old_node_str)
 
-        if handoff_reachable?(old_node) do
-          Logger.info("[EKV #{name}] handoff: requesting from #{old_node}")
+        handoff_result =
+          if handoff_reachable?(old_node) do
+            Logger.info("[EKV #{name}] handoff: requesting from #{old_node}")
+            request_handoff(name, old_node, num_shards)
+          else
+            Logger.info("[EKV #{name}] handoff: stale marker #{old_node}, skipping handoff")
+            :ok
+          end
 
-          0..(num_shards - 1)
-          |> Task.async_stream(
-            fn shard_index ->
-              shard_name = EKV.Replica.shard_name(name, shard_index)
-              ref = make_ref()
-              send({shard_name, old_node}, {:ekv_handoff_request, ref, node(), self()})
+        case handoff_result do
+          :ok ->
+            # Update marker to current node only after successful handoff or
+            # after positively classifying the old marker as stale.
+            write_marker(data_dir, node())
 
-              receive do
-                {:ekv_handoff_ack, ^ref} -> :ok
-              after
-                5_000 -> :timeout
-              end
-            end,
-            ordered: false,
-            timeout: 10_000
-          )
-          |> Stream.run()
-        else
-          Logger.info("[EKV #{name}] handoff: stale marker #{old_node}, skipping handoff")
+          {:error, _reason} = error ->
+            error
         end
+    end
+  end
 
-        # Update marker to current node
-        write_marker(data_dir, node())
+  defp request_handoff(name, old_node, num_shards) do
+    failures =
+      0..(num_shards - 1)
+      |> Task.async_stream(
+        fn shard_index ->
+          shard_name = EKV.Replica.shard_name(name, shard_index)
+          ref = make_ref()
+          send({shard_name, old_node}, {:ekv_handoff_request, ref, node(), self()})
+
+          receive do
+            {:ekv_handoff_ack, ^ref} -> :ok
+          after
+            @handoff_ack_timeout_ms -> {:error, :timeout}
+          end
+        end,
+        ordered: true,
+        timeout: @handoff_task_timeout_ms
+      )
+      |> Enum.with_index()
+      |> Enum.reduce([], fn
+        {{:ok, :ok}, _shard_index}, acc ->
+          acc
+
+        {{:ok, {:error, reason}}, shard_index}, acc ->
+          [{shard_index, reason} | acc]
+
+        {{:exit, reason}, shard_index}, acc ->
+          [{shard_index, {:task_exit, reason}} | acc]
+      end)
+
+    case failures do
+      [] ->
+        :ok
+
+      failures ->
+        failures = Enum.reverse(failures)
+
+        Logger.error("[EKV #{name}] handoff failed from #{old_node}: #{inspect(failures)}")
+
+        {:error, {:handoff_failed, old_node, failures}}
     end
   end
 

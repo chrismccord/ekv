@@ -2285,7 +2285,8 @@ defmodule EKV.Replica do
     Store.prune_member_progress(db, retained_members)
 
     # 4. Truncate oplog
-    Store.truncate_oplog(db)
+    {truncate_us, truncate_stats} = :timer.tc(Store, :truncate_oplog, [db])
+    maybe_log_oplog_truncate(state, truncate_stats, truncate_us)
     state = %{state | local_max_seq: Store.max_seq(db)}
 
     # 5. Bump liveness timestamp
@@ -5437,6 +5438,29 @@ defmodule EKV.Replica do
 
   defp log_once(%Replica{} = state, message_fn) do
     if state.shard_index == 0, do: log(state, message_fn)
+  end
+
+  defp maybe_log_oplog_truncate(%Replica{} = state, truncate_stats, truncate_us) do
+    duration_ms = System.convert_time_unit(truncate_us, :microsecond, :millisecond)
+    deleted_rows = Map.get(truncate_stats, :deleted_rows, 0)
+    retained_floors = Map.get(truncate_stats, :retained_floors, [])
+    retention_lag = Map.get(truncate_stats, :retention_lag, [])
+
+    if retention_lag != [] do
+      log_warn(state, fn ->
+        "#{log_prefix_shard(state)} oplog truncate retention lag " <>
+          "duration_ms=#{duration_ms} deleted_rows=#{deleted_rows} " <>
+          "retained_floors=#{inspect(retained_floors)} lag=#{inspect(retention_lag)}"
+      end)
+    end
+
+    if deleted_rows >= 10_000 or duration_ms >= 1_000 do
+      log(state, fn ->
+        "#{log_prefix_shard(state)} oplog truncate " <>
+          "duration_ms=#{duration_ms} deleted_rows=#{deleted_rows} " <>
+          "retained_floors=#{inspect(retained_floors)}"
+      end)
+    end
   end
 
   defp log_prefix(%Replica{} = state) do

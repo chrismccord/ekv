@@ -1564,6 +1564,69 @@ defmodule EKV.AntiEntropyTest do
              end)
     end
 
+    test "replay-healed follower prunes retained oplog back to the retained floor after gc" do
+      peers = TestCluster.start_peers(2)
+      [{_, node_a}, {_, node_b}] = peers
+      ekv_name = unique_name(:anti_entropy_replay_heal_prunes)
+      tombstone_ttl = 10_000
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      start_cluster(
+        peers,
+        ekv_name,
+        anti_entropy_interval: @manual_anti_entropy_interval,
+        gc_interval: @manual_anti_entropy_interval,
+        tombstone_ttl: tombstone_ttl,
+        member_progress_retention_ttl: tombstone_ttl
+      )
+
+      TestCluster.disconnect_nodes(node_a, node_b)
+      Process.sleep(200)
+
+      for i <- 1..200 do
+        assert :ok ==
+                 TestCluster.rpc!(node_a, EKV, :put, [
+                   ekv_name,
+                   "replay_heal/key",
+                   "v#{i}"
+                 ])
+      end
+
+      TestCluster.reconnect_nodes(node_a, node_b)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, EKV, :get, [ekv_name, "replay_heal/key"]) == "v200"
+      end)
+
+      count_before_gc = TestCluster.oplog_count(node_b, ekv_name)
+      assert count_before_gc >= 200
+
+      a_max = TestCluster.max_seq(node_a, ekv_name)
+
+      assert :ok = TestCluster.trigger_anti_entropy(node_b, ekv_name)
+
+      TestCluster.assert_eventually(fn ->
+        state = TestCluster.replica_state(node_b, ekv_name)
+        get_in(state.remote_member_progress, [node_a, node_a]) == a_max
+      end)
+
+      trigger_gc(node_b, ekv_name, 0, tombstone_ttl)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.oplog_retention_stats(node_b, ekv_name).retention_lag == []
+      end)
+
+      assert %{retention_lag: []} = TestCluster.oplog_retention_stats(node_b, ekv_name, 0, 10)
+      assert TestCluster.oplog_count(node_b, ekv_name) <= 2
+
+      remaining = TestCluster.oplog_since(node_b, ekv_name, 0, 10)
+
+      assert Enum.all?(remaining, fn {_seq, key, _value, _ts, origin, origin_seq, _expires, _del} ->
+               key == "replay_heal/key" and origin == node_a and origin_seq == a_max
+             end)
+    end
+
     test "delta sync storm counters aggregate repeated tiny repairs" do
       peers = TestCluster.start_peers(2)
       [{_, node_a}, {_, node_b}] = peers

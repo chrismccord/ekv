@@ -965,8 +965,19 @@ defmodule EKV.Store do
           """
         )
 
+      deleted_rows = sqlite_changes(db)
       purge_orphan_keyrefs(db)
+
+      Map.put(oplog_retention_stats(db), :deleted_rows, deleted_rows)
     end)
+  end
+
+  @doc false
+  def oplog_retention_stats(db, limit \\ 5) do
+    %{
+      retained_floors: oplog_retention_floors(db, limit),
+      retention_lag: oplog_retention_lag(db, limit)
+    }
   end
 
   # =====================================================================
@@ -1338,6 +1349,74 @@ defmodule EKV.Store do
         _ = EKV.Sqlite3.execute(db, "ROLLBACK")
         :erlang.raise(kind, reason, __STACKTRACE__)
     end
+  end
+
+  defp sqlite_changes(db) do
+    {:ok, [[changes]]} = EKV.Sqlite3.fetch_all(db, "SELECT changes()", [])
+    changes
+  end
+
+  defp oplog_retention_floors(db, limit) do
+    {:ok, rows} =
+      EKV.Sqlite3.fetch_all(
+        db,
+        """
+        SELECT origin_node, MIN(last_seq) AS retained_min
+        FROM kv_member_progress
+        GROUP BY origin_node
+        ORDER BY retained_min ASC, origin_node ASC
+        LIMIT ?1
+        """,
+        [limit]
+      )
+
+    Enum.map(rows, fn [origin_node, retained_min] ->
+      %{origin_node: origin_node, retained_min: retained_min}
+    end)
+  end
+
+  defp oplog_retention_lag(db, limit) do
+    {:ok, rows} =
+      EKV.Sqlite3.fetch_all(
+        db,
+        """
+        WITH retained AS (
+          SELECT origin_node, MIN(last_seq) AS min_seq
+          FROM kv_member_progress
+          GROUP BY origin_node
+        )
+        SELECT
+          o.origin_node,
+          MIN(o.origin_seq) AS oldest_origin_seq,
+          MAX(o.origin_seq) AS newest_origin_seq,
+          r.min_seq AS retained_min,
+          COUNT(*) AS retained_rows
+        FROM kv_oplog AS o
+        JOIN retained AS r
+          ON r.origin_node = o.origin_node
+        GROUP BY o.origin_node, r.min_seq
+        HAVING MIN(o.origin_seq) < r.min_seq
+        ORDER BY (r.min_seq - MIN(o.origin_seq)) DESC, COUNT(*) DESC, o.origin_node ASC
+        LIMIT ?1
+        """,
+        [limit]
+      )
+
+    Enum.map(rows, fn [
+                        origin_node,
+                        oldest_origin_seq,
+                        newest_origin_seq,
+                        retained_min,
+                        retained_rows
+                      ] ->
+      %{
+        origin_node: origin_node,
+        oldest_origin_seq: oldest_origin_seq,
+        newest_origin_seq: newest_origin_seq,
+        retained_min: retained_min,
+        retained_rows: retained_rows
+      }
+    end)
   end
 
   # =====================================================================
