@@ -257,8 +257,6 @@ defmodule EKV do
   | `:delta_sync_log_min_entries` | `8` | Member and observer mode only. Suppresses per-delta `info` logs for successful terminal delta syncs smaller than this many entries. `:verbose` logging still prints all deltas. |
   | `:delta_sync_storm_window` | `60_000` (60 sec) | Member and observer mode only. Rolling per-shard window used to aggregate delta sync activity for storm detection. |
   | `:delta_sync_storm_threshold` | `100` | Member and observer mode only. When a shard sends at least this many delta syncs inside one storm window, EKV emits a single aggregated warning for that window. `false`/`nil` disables storm warnings. |
-  | `:write_admission_queue_limit` | `false` | Member and observer mode only. Optional pre-admission gate for write-like shard calls. When set to a non-negative integer, callers wait outside the shard mailbox while `message_queue_len` is above the limit and time out within their own deadline instead of amplifying shard backlog. |
-  | `:write_admission_poll_ms` | `5` | Member and observer mode only. Poll interval in milliseconds for the write admission gate while waiting for shard queue pressure to fall below `:write_admission_queue_limit`. |
   | `:wire_compression_threshold` | `262_144` (256 KB) | Optional byte threshold for member-to-member wire compression of large replicated value payloads. `false`/`nil` disables it. Large `:ekv_put`, CAS accept, and full-payload CAS commit messages compress values on the wire only; values remain uncompressed on disk and on reads. |
   | `:shutdown_barrier` | `false` | Optional graceful-shutdown barrier. Keeps EKV serving during coordinated shutdown for up to the configured timeout so members can finish final writes and replication. |
   | `:allow_stale_startup` | `false` | Member and observer mode only. Dangerous recovery override. If `true`, EKV trusts on-disk data even when stale-db detection would normally refuse startup. Intended only for explicit disaster recovery / full cold-cluster restore cases. |
@@ -1569,55 +1567,7 @@ defmodule EKV do
          request,
          timeout \\ @default_local_shard_call_timeout
        ) do
-    timeout = await_write_admission(name, shard_index, request, timeout)
     call_shard(name, shard_index, request, timeout)
-  end
-
-  defp await_write_admission(_name, _shard_index, _request, :infinity), do: :infinity
-
-  defp await_write_admission(name, shard_index, request, timeout) when is_integer(timeout) do
-    config = EKV.Supervisor.get_config(name)
-
-    case Map.get(config, :write_admission_queue_limit) do
-      limit when is_integer(limit) and limit >= 0 ->
-        poll_ms = Map.get(config, :write_admission_poll_ms, 5)
-        target = Replica.shard_name(name, shard_index)
-        deadline_ms = System.monotonic_time(:millisecond) + timeout
-        wait_for_write_admission(target, request, timeout, deadline_ms, limit, poll_ms)
-
-      _ ->
-        timeout
-    end
-  end
-
-  defp wait_for_write_admission(target, request, original_timeout, deadline_ms, limit, poll_ms) do
-    now_ms = System.monotonic_time(:millisecond)
-    queue_len = shard_message_queue_len(target)
-
-    cond do
-      queue_len <= limit ->
-        max(deadline_ms - now_ms, 1)
-
-      now_ms >= deadline_ms ->
-        exit({:timeout, {GenServer, :call, [target, request, original_timeout]}})
-
-      true ->
-        Process.sleep(min(poll_ms, max(deadline_ms - now_ms, 1)))
-        wait_for_write_admission(target, request, original_timeout, deadline_ms, limit, poll_ms)
-    end
-  end
-
-  defp shard_message_queue_len(target) do
-    case GenServer.whereis(target) do
-      pid when is_pid(pid) ->
-        case Process.info(pid, :message_queue_len) do
-          {:message_queue_len, len} when is_integer(len) -> len
-          _ -> 0
-        end
-
-      _ ->
-        0
-    end
   end
 
   # Runs on the client node; wraps a routed read and raises on transport failure.

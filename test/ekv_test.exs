@@ -2488,14 +2488,6 @@ defmodule EKVTest do
         [
           delta_sync_storm_threshold: 0,
           expected: ":delta_sync_storm_threshold must be false/nil or a positive integer"
-        ],
-        [
-          write_admission_queue_limit: -1,
-          expected: ":write_admission_queue_limit must be false/nil or a non-negative integer"
-        ],
-        [
-          write_admission_poll_ms: 0,
-          expected: ":write_admission_poll_ms must be a positive timeout in ms"
         ]
       ]
 
@@ -2855,55 +2847,6 @@ defmodule EKVTest do
 
       assert {:observer_read_result, {:ok, nil, nil}, {:deleted, _vsn}, nil} =
                EKV.__observer_consistent_get__(name, "obs/dead", [])
-    end
-  end
-
-  describe "write admission gating" do
-    test "eventual put times out before entering an overloaded shard mailbox" do
-      name = :"write_gate_#{System.unique_integer([:positive])}"
-      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
-
-      {:ok, pid} =
-        EKV.start_link(
-          name: name,
-          data_dir: data_dir,
-          shards: 1,
-          log: false,
-          write_admission_queue_limit: 0,
-          write_admission_poll_ms: 1
-        )
-
-      shard = EKV.Replica.shard_name(name, 0)
-
-      on_exit(fn ->
-        case GenServer.whereis(shard) do
-          shard_pid when is_pid(shard_pid) ->
-            :sys.resume(shard)
-
-          _ ->
-            :ok
-        end
-
-        Process.exit(pid, :shutdown)
-        File.rm_rf!(data_dir)
-      end)
-
-      :sys.suspend(shard)
-      send(shard, :queued)
-
-      assert {:message_queue_len, 1} = Process.info(Process.whereis(shard), :message_queue_len)
-
-      assert match?(
-               {:timeout,
-                {GenServer, :call, [^shard, {:put, "gate/1", _value_binary, []}, 5000]}},
-               catch_exit(EKV.put(name, "gate/1", "value"))
-             )
-
-      assert {:message_queue_len, 1} = Process.info(Process.whereis(shard), :message_queue_len)
-
-      :sys.resume(shard)
-
-      assert EKV.get(name, "gate/1") == nil
     end
   end
 

@@ -194,8 +194,6 @@ defmodule EKV.Supervisor do
     :delta_sync_log_min_entries,
     :delta_sync_storm_window,
     :delta_sync_storm_threshold,
-    :write_admission_queue_limit,
-    :write_admission_poll_ms,
     :member_progress_retention_ttl,
     :unavailable_origin_full_sync_delay,
     :allow_stale_startup,
@@ -274,8 +272,6 @@ defmodule EKV.Supervisor do
     delta_sync_log_min_entries = Keyword.get(opts, :delta_sync_log_min_entries, 8)
     delta_sync_storm_window = Keyword.get(opts, :delta_sync_storm_window, :timer.minutes(1))
     delta_sync_storm_threshold = Keyword.get(opts, :delta_sync_storm_threshold, 100)
-    write_admission_queue_limit = Keyword.get(opts, :write_admission_queue_limit, false)
-    write_admission_poll_ms = Keyword.get(opts, :write_admission_poll_ms, 5)
 
     member_progress_retention_ttl =
       Keyword.get(
@@ -306,8 +302,6 @@ defmodule EKV.Supervisor do
     validate_delta_sync_log_min_entries!(delta_sync_log_min_entries)
     validate_delta_sync_storm_window!(delta_sync_storm_window)
     validate_delta_sync_storm_threshold!(delta_sync_storm_threshold)
-    validate_write_admission_queue_limit!(write_admission_queue_limit)
-    validate_write_admission_poll_ms!(write_admission_poll_ms)
     validate_member_progress_retention_ttl!(member_progress_retention_ttl)
     validate_unavailable_origin_full_sync_delay!(legacy_unavailable_origin_full_sync_delay)
     validate_allow_stale_startup!(allow_stale_startup)
@@ -351,8 +345,6 @@ defmodule EKV.Supervisor do
       delta_sync_log_min_entries: delta_sync_log_min_entries,
       delta_sync_storm_window: delta_sync_storm_window,
       delta_sync_storm_threshold: delta_sync_storm_threshold,
-      write_admission_queue_limit: write_admission_queue_limit,
-      write_admission_poll_ms: write_admission_poll_ms,
       member_progress_retention_ttl: member_progress_retention_ttl,
       allow_stale_startup: allow_stale_startup,
       partition_ttl_policy: partition_ttl_policy,
@@ -400,8 +392,6 @@ defmodule EKV.Supervisor do
     delta_sync_log_min_entries = Keyword.get(opts, :delta_sync_log_min_entries, 8)
     delta_sync_storm_window = Keyword.get(opts, :delta_sync_storm_window, :timer.minutes(1))
     delta_sync_storm_threshold = Keyword.get(opts, :delta_sync_storm_threshold, 100)
-    write_admission_queue_limit = Keyword.get(opts, :write_admission_queue_limit, false)
-    write_admission_poll_ms = Keyword.get(opts, :write_admission_poll_ms, 5)
     region_routing = Keyword.get(opts, :region_routing)
 
     member_progress_retention_ttl =
@@ -432,8 +422,6 @@ defmodule EKV.Supervisor do
     validate_delta_sync_log_min_entries!(delta_sync_log_min_entries)
     validate_delta_sync_storm_window!(delta_sync_storm_window)
     validate_delta_sync_storm_threshold!(delta_sync_storm_threshold)
-    validate_write_admission_queue_limit!(write_admission_queue_limit)
-    validate_write_admission_poll_ms!(write_admission_poll_ms)
     validate_member_progress_retention_ttl!(member_progress_retention_ttl)
     validate_unavailable_origin_full_sync_delay!(legacy_unavailable_origin_full_sync_delay)
     validate_allow_stale_startup!(allow_stale_startup)
@@ -477,8 +465,6 @@ defmodule EKV.Supervisor do
       delta_sync_log_min_entries: delta_sync_log_min_entries,
       delta_sync_storm_window: delta_sync_storm_window,
       delta_sync_storm_threshold: delta_sync_storm_threshold,
-      write_admission_queue_limit: write_admission_queue_limit,
-      write_admission_poll_ms: write_admission_poll_ms,
       member_progress_retention_ttl: member_progress_retention_ttl,
       allow_stale_startup: allow_stale_startup,
       partition_ttl_policy: partition_ttl_policy,
@@ -718,8 +704,6 @@ defmodule EKV.Supervisor do
     reject_client_opt!(opts, :delta_sync_log_min_entries, [nil])
     reject_client_opt!(opts, :delta_sync_storm_window, [nil])
     reject_client_opt!(opts, :delta_sync_storm_threshold, [nil, false])
-    reject_client_opt!(opts, :write_admission_queue_limit, [nil, false])
-    reject_client_opt!(opts, :write_admission_poll_ms, [nil])
     reject_client_opt!(opts, :member_progress_retention_ttl, [nil])
     reject_client_opt!(opts, :unavailable_origin_full_sync_delay, [nil])
     reject_client_opt!(opts, :allow_stale_startup, [nil, false])
@@ -787,27 +771,6 @@ defmodule EKV.Supervisor do
   defp validate_delta_sync_storm_threshold!(threshold) do
     raise ArgumentError,
           "EKV: :delta_sync_storm_threshold must be false/nil or a positive integer, got: #{inspect(threshold)}"
-  end
-
-  defp validate_write_admission_queue_limit!(false), do: :ok
-  defp validate_write_admission_queue_limit!(nil), do: :ok
-
-  defp validate_write_admission_queue_limit!(limit)
-       when is_integer(limit) and limit >= 0,
-       do: :ok
-
-  defp validate_write_admission_queue_limit!(limit) do
-    raise ArgumentError,
-          "EKV: :write_admission_queue_limit must be false/nil or a non-negative integer, got: #{inspect(limit)}"
-  end
-
-  defp validate_write_admission_poll_ms!(poll_ms)
-       when is_integer(poll_ms) and poll_ms > 0,
-       do: :ok
-
-  defp validate_write_admission_poll_ms!(poll_ms) do
-    raise ArgumentError,
-          "EKV: :write_admission_poll_ms must be a positive timeout in ms, got: #{inspect(poll_ms)}"
   end
 
   defp validate_member_progress_retention_ttl!(ttl)
