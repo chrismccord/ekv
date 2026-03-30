@@ -407,6 +407,24 @@ defmodule EKV.TestCluster do
     rpc!(node, __MODULE__, :do_trigger_anti_entropy, [name, shard_index])
   end
 
+  @doc "Inject one internal summary reply into a remote shard"
+  def inject_summary_reply(
+        node,
+        name,
+        remote_node,
+        remote_progress,
+        remote_node_id,
+        shard_index \\ 0
+      ) do
+    rpc!(node, __MODULE__, :do_inject_summary_reply, [
+      name,
+      remote_node,
+      remote_progress,
+      remote_node_id,
+      shard_index
+    ])
+  end
+
   @doc "Drop one remote shard mapping from a replica state without simulating a full node down"
   def drop_remote_shard(node, name, remote_node, shard_index \\ 0) do
     rpc!(node, __MODULE__, :do_drop_remote_shard, [name, remote_node, shard_index])
@@ -851,6 +869,20 @@ defmodule EKV.TestCluster do
   def do_trigger_anti_entropy(name, shard_index) do
     shard_name = EKV.Replica.shard_name(name, shard_index)
     send(shard_name, :anti_entropy_tick)
+    :ok
+  end
+
+  def do_inject_summary_reply(name, remote_node, remote_progress, remote_node_id, shard_index) do
+    shard_name = EKV.Replica.shard_name(name, shard_index)
+    state = :sys.get_state(shard_name)
+    remote_pid = Map.fetch!(state.remote_shards, remote_node)
+
+    send(
+      shard_name,
+      {:ekv, 1, :summary_reply, {remote_pid, shard_index, remote_progress},
+       %{node_id: remote_node_id}}
+    )
+
     :ok
   end
 

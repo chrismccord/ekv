@@ -1072,6 +1072,8 @@ defmodule EKV.Replica do
       where `live_progress` means the peer supports progress summaries and
       sync-settlement progress exchange in the v1 contract; it is not a
       promise of per-write live progress-ack traffic
+    - `:sync_request` may include `%{explicit_full_reason: ...}` for requester-
+      driven full syncs while keeping the payload shape backward compatible
     - replication/control messages keep `meta` empty unless an optional feature requires it
 
   Internally, Replica still uses the raw tuples below after decoding the wire
@@ -2756,6 +2758,10 @@ defmodule EKV.Replica do
     send_full_sync(state, remote_node, :explicit_request)
   end
 
+  defp serve_sync_request(%Replica{} = state, remote_node, {:full, reason}) do
+    send_full_sync(state, remote_node, {:explicit_request, reason})
+  end
+
   defp serve_sync_request(%Replica{} = state, _remote_node, _request), do: state
 
   defp send_full_sync(%Replica{} = state, remote_node, reason) do
@@ -2834,6 +2840,20 @@ defmodule EKV.Replica do
   end
 
   defp format_full_sync_reason(:explicit_request), do: "explicit_request"
+
+  defp format_full_sync_reason(
+         {:explicit_request, {:unknown_member_origin, origin_node, local_seq}}
+       ) do
+    "explicit_request subreason=unknown_member_origin origin=#{origin_node} local_seq=#{local_seq}"
+  end
+
+  defp format_full_sync_reason({:explicit_request, {:quarantined_origin, origin_node, local_seq}}) do
+    "explicit_request subreason=quarantined_origin origin=#{origin_node} local_seq=#{local_seq}"
+  end
+
+  defp format_full_sync_reason({:explicit_request, reason}) do
+    "explicit_request detail=#{inspect(reason)}"
+  end
 
   defp format_full_sync_reason({:no_replay_bounds, origin_node, from_seq}) do
     "no_replay_bounds origin=#{origin_node} from_seq=#{from_seq}"
@@ -2944,7 +2964,17 @@ defmodule EKV.Replica do
     end
   end
 
-  defp mark_sync_inflight(%Replica{} = state, remote_node, :full) do
+  defp mark_sync_inflight(%Replica{} = state, remote_node, request) when request in [:full] do
+    now_ms = System.monotonic_time(:millisecond)
+
+    %{
+      state
+      | sync_inflight: Map.put(state.sync_inflight, remote_node, now_ms),
+        full_sync_inflight: remote_node
+    }
+  end
+
+  defp mark_sync_inflight(%Replica{} = state, remote_node, {:full, _reason}) do
     now_ms = System.monotonic_time(:millisecond)
 
     %{
@@ -3127,10 +3157,10 @@ defmodule EKV.Replica do
       MapSet.member?(state.quarantined_members, remote_node) ->
         clear_sync_inflight(state, remote_node)
 
-      request == :full and state.full_sync_inflight == remote_node ->
+      full_sync_request?(request) and state.full_sync_inflight == remote_node ->
         state
 
-      request == :full and not is_nil(state.full_sync_inflight) ->
+      full_sync_request?(request) and not is_nil(state.full_sync_inflight) ->
         state
 
       delta_origin_inflight?(state, remote_node, request) ->
@@ -3208,6 +3238,10 @@ defmodule EKV.Replica do
 
   defp mark_delta_origin_inflight(%Replica{} = state, _remote_node, _request), do: state
 
+  defp full_sync_request?(:full), do: true
+  defp full_sync_request?({:full, _reason}), do: true
+  defp full_sync_request?(_request), do: false
+
   defp relayed_delta_request?(%Replica{} = state, remote_node, origin_node)
        when is_atom(remote_node) and is_binary(origin_node) do
     remote_origin_id(state, remote_node) != origin_node
@@ -3276,13 +3310,13 @@ defmodule EKV.Replica do
        when is_binary(origin_node) do
     cond do
       known_down_member_quarantined?(state, origin_node) ->
-        {state, :full}
+        {state, {:full, {:quarantined_origin, origin_node, local_seq}}}
 
       known_member_origin?(state, known_member_nodes, origin_node) ->
         {state, {:delta, origin_node, local_seq}}
 
       true ->
-        {state, :full}
+        {state, {:full, {:unknown_member_origin, origin_node, local_seq}}}
     end
   end
 
@@ -3843,6 +3877,15 @@ defmodule EKV.Replica do
   defp wire_encode_message(
          %Replica{} = _state,
          _target_node,
+         {:ekv_sync_request, pid, shard, {:full, explicit_full_reason}}
+       ) do
+    {:ekv, @wire_protocol_version, :sync_request, {pid, shard, :full},
+     %{explicit_full_reason: explicit_full_reason}}
+  end
+
+  defp wire_encode_message(
+         %Replica{} = _state,
+         _target_node,
          {:ekv_sync_request, pid, shard, request}
        ) do
     {:ekv, @wire_protocol_version, :sync_request, {pid, shard, request}, %{}}
@@ -3933,6 +3976,16 @@ defmodule EKV.Replica do
 
   defp decode_wire_message(:summary_reply, {pid, shard, progress}, meta) do
     {:ok, {:ekv_summary_reply, pid, shard, progress, wire_meta_node_id(meta)}}
+  end
+
+  defp decode_wire_message(:sync_request, {pid, shard, :full}, meta) do
+    case wire_meta_explicit_full_reason(meta) do
+      nil ->
+        {:ok, {:ekv_sync_request, pid, shard, :full}}
+
+      explicit_full_reason ->
+        {:ok, {:ekv_sync_request, pid, shard, {:full, explicit_full_reason}}}
+    end
   end
 
   defp decode_wire_message(:sync_request, {pid, shard, request}, _meta) do
@@ -4047,6 +4100,11 @@ defmodule EKV.Replica do
     do: node_id
 
   defp wire_meta_node_id(_meta), do: nil
+
+  defp wire_meta_explicit_full_reason(%{explicit_full_reason: explicit_full_reason}),
+    do: explicit_full_reason
+
+  defp wire_meta_explicit_full_reason(_meta), do: nil
 
   defp summary_wire_meta(%Replica{} = _state, node_id)
        when is_binary(node_id) and byte_size(node_id) > 0 do

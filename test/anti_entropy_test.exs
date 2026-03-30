@@ -155,6 +155,29 @@ defmodule EKV.AntiEntropyTest do
     end
   end
 
+  defp collect_sync_request_meta_messages(acc, timeout) do
+    deadline_ms = System.monotonic_time(:millisecond) + timeout
+    do_collect_sync_request_meta_messages(acc, deadline_ms)
+  end
+
+  defp do_collect_sync_request_meta_messages(acc, deadline_ms) do
+    timeout = max(deadline_ms - System.monotonic_time(:millisecond), 0)
+
+    receive do
+      {:trace, _pid, :send, {:ekv, 1, :sync_request, {_from_pid, shard, request}, meta},
+       destination} ->
+        do_collect_sync_request_meta_messages(
+          [{shard, request, meta, destination} | acc],
+          deadline_ms
+        )
+
+      {:trace, _pid, :send, _msg, _destination} ->
+        do_collect_sync_request_meta_messages(acc, deadline_ms)
+    after
+      timeout -> Enum.reverse(acc)
+    end
+  end
+
   defp collect_trace_messages(acc, timeout) do
     receive do
       {:trace, _pid, :send, {:ekv_sync_request, _from_pid, shard, request}, destination} ->
@@ -833,6 +856,50 @@ defmodule EKV.AntiEntropyTest do
       refute Enum.any?(requests, fn {shard, request, _destination} ->
                shard == 0 and request == :full
              end)
+
+      assert :ok = TestCluster.untrace_shard_sends(node_b, ekv_name)
+    end
+
+    test "unknown third-origin full request carries explicit reason metadata on the wire" do
+      peers = TestCluster.start_peers(2)
+      [{_, node_a}, {_, node_b}] = peers
+      ekv_name = unique_name(:anti_entropy_unknown_origin_full_reason)
+      unknown_origin = "unknown-origin"
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      start_cluster(peers, ekv_name, anti_entropy_interval: @manual_anti_entropy_interval)
+
+      TestCluster.assert_eventually(fn ->
+        state = TestCluster.replica_state(node_b, ekv_name)
+
+        Map.has_key?(state.remote_shards, node_a) and state.sync_inflight == %{} and
+          state.summary_probe_inflight == %{}
+      end)
+
+      remote_node_id = assigned_node_id(peers, node_a)
+      stale_age_ms = 999_999
+      assert :ok = TestCluster.set_sync_inflight_age(node_b, ekv_name, node_a, stale_age_ms)
+      assert :ok = TestCluster.trace_shard_sends(node_b, ekv_name, self())
+
+      assert :ok =
+               TestCluster.inject_summary_reply(
+                 node_b,
+                 ekv_name,
+                 node_a,
+                 %{remote_node_id => 0, unknown_origin => 1},
+                 remote_node_id
+               )
+
+      shard_name = EKV.Replica.shard_name(ekv_name, 0)
+      requests = collect_sync_request_meta_messages([], 1_000)
+
+      assert Enum.any?(requests, fn {shard, request, meta, destination} ->
+               shard == 0 and request == :full and
+                 meta == %{explicit_full_reason: {:unknown_member_origin, unknown_origin, 0}} and
+                 destination == {shard_name, node_a}
+             end),
+             "requests=#{inspect(requests)}"
 
       assert :ok = TestCluster.untrace_shard_sends(node_b, ekv_name)
     end
