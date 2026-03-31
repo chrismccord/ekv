@@ -5,8 +5,8 @@ defmodule EKV.Supervisor do
   require Logger
 
   @default_member_progress_retention_ttl :timer.hours(6)
-  @handoff_ack_timeout_ms 60_000
-  @handoff_task_timeout_ms 90_000
+  @default_handoff_ack_timeout_ms 60_000
+  @handoff_task_timeout_buffer_ms 30_000
 
   _archdoc = ~S"""
   Top-level EKV supervisor.
@@ -134,8 +134,9 @@ defmodule EKV.Supervisor do
 
   3. **Marker node != `node()`** → potential blue-green deploy. If the marker
      node is reachable now, send handoff request to old VM's shards in
-     parallel (5s timeout per shard). Startup proceeds only after every shard
-     acks handoff. If any shard fails or times out, startup aborts without
+     parallel (default 60s timeout per shard, configurable via
+     `:handoff_ack_timeout_ms`). Startup proceeds only after every shard acks
+     handoff. If any shard fails or times out, startup aborts without
      rewriting the marker. If the marker node is unreachable, treat the marker
      as stale and proceed without handoff.
 
@@ -199,6 +200,7 @@ defmodule EKV.Supervisor do
     :allow_stale_startup,
     :partition_ttl_policy,
     :wire_compression_threshold,
+    :handoff_ack_timeout_ms,
     :replication_batch_flush_ms,
     :replication_batch_max_entries,
     :replication_batch_max_bytes,
@@ -272,6 +274,10 @@ defmodule EKV.Supervisor do
     node_id = Keyword.get(opts, :node_id)
     sync_chunk_size = Keyword.get(opts, :sync_chunk_size, 500)
     anti_entropy_interval = Keyword.get(opts, :anti_entropy_interval, 30_000)
+
+    handoff_ack_timeout_ms =
+      Keyword.get(opts, :handoff_ack_timeout_ms, @default_handoff_ack_timeout_ms)
+
     delta_sync_log_min_entries = Keyword.get(opts, :delta_sync_log_min_entries, 8)
     delta_sync_storm_window = Keyword.get(opts, :delta_sync_storm_window, :timer.minutes(1))
     delta_sync_storm_threshold = Keyword.get(opts, :delta_sync_storm_threshold, 100)
@@ -291,7 +297,7 @@ defmodule EKV.Supervisor do
     allow_stale_startup = Keyword.get(opts, :allow_stale_startup, false)
     partition_ttl_policy = Keyword.get(opts, :partition_ttl_policy, :quarantine)
     wire_compression_threshold = Keyword.get(opts, :wire_compression_threshold, 256 * 1024)
-    replication_batch_flush_ms = Keyword.get(opts, :replication_batch_flush_ms, 2)
+    replication_batch_flush_ms = Keyword.get(opts, :replication_batch_flush_ms, 3)
     replication_batch_max_entries = Keyword.get(opts, :replication_batch_max_entries, 64)
     replication_batch_max_bytes = Keyword.get(opts, :replication_batch_max_bytes, 256 * 1024)
     wait_for_quorum = Keyword.get(opts, :wait_for_quorum, false)
@@ -301,6 +307,7 @@ defmodule EKV.Supervisor do
     validate_cas_config!(cluster_size, node_id)
     validate_partition_ttl_policy!(partition_ttl_policy)
     validate_wire_compression_threshold!(wire_compression_threshold)
+    validate_handoff_ack_timeout_ms!(handoff_ack_timeout_ms)
     validate_replication_batch_flush_ms!(replication_batch_flush_ms)
     validate_replication_batch_max_entries!(replication_batch_max_entries)
     validate_replication_batch_max_bytes!(replication_batch_max_bytes)
@@ -323,7 +330,7 @@ defmodule EKV.Supervisor do
       end
 
     if blue_green do
-      case perform_handoff(name, data_dir, num_shards) do
+      case perform_handoff(name, data_dir, num_shards, handoff_ack_timeout_ms) do
         :ok -> :ok
         {:error, reason} -> exit(reason)
       end
@@ -401,6 +408,10 @@ defmodule EKV.Supervisor do
     node_id = Keyword.get(opts, :node_id)
     sync_chunk_size = Keyword.get(opts, :sync_chunk_size, 500)
     anti_entropy_interval = Keyword.get(opts, :anti_entropy_interval, 30_000)
+
+    handoff_ack_timeout_ms =
+      Keyword.get(opts, :handoff_ack_timeout_ms, @default_handoff_ack_timeout_ms)
+
     delta_sync_log_min_entries = Keyword.get(opts, :delta_sync_log_min_entries, 8)
     delta_sync_storm_window = Keyword.get(opts, :delta_sync_storm_window, :timer.minutes(1))
     delta_sync_storm_threshold = Keyword.get(opts, :delta_sync_storm_threshold, 100)
@@ -430,6 +441,7 @@ defmodule EKV.Supervisor do
     validate_cas_config!(cluster_size, node_id)
     validate_partition_ttl_policy!(partition_ttl_policy)
     validate_wire_compression_threshold!(wire_compression_threshold)
+    validate_handoff_ack_timeout_ms!(handoff_ack_timeout_ms)
     validate_replication_batch_flush_ms!(replication_batch_flush_ms)
     validate_replication_batch_max_entries!(replication_batch_max_entries)
     validate_replication_batch_max_bytes!(replication_batch_max_bytes)
@@ -452,7 +464,7 @@ defmodule EKV.Supervisor do
       end
 
     if blue_green do
-      case perform_handoff(name, data_dir, num_shards) do
+      case perform_handoff(name, data_dir, num_shards, handoff_ack_timeout_ms) do
         :ok -> :ok
         {:error, reason} -> exit(reason)
       end
@@ -729,6 +741,7 @@ defmodule EKV.Supervisor do
     reject_client_opt!(opts, :unavailable_origin_full_sync_delay, [nil])
     reject_client_opt!(opts, :allow_stale_startup, [nil, false])
     reject_client_opt!(opts, :partition_ttl_policy, [nil])
+    reject_client_opt!(opts, :handoff_ack_timeout_ms, [nil])
     reject_client_opt!(opts, :replication_batch_flush_ms, [nil])
     reject_client_opt!(opts, :replication_batch_max_entries, [nil])
     reject_client_opt!(opts, :replication_batch_max_bytes, [nil])
@@ -744,6 +757,15 @@ defmodule EKV.Supervisor do
   defp validate_wire_compression_threshold!(threshold) do
     raise ArgumentError,
           "EKV: :wire_compression_threshold must be false/nil or a non-negative byte threshold, got: #{inspect(threshold)}"
+  end
+
+  defp validate_handoff_ack_timeout_ms!(timeout)
+       when is_integer(timeout) and timeout > 0,
+       do: :ok
+
+  defp validate_handoff_ack_timeout_ms!(timeout) do
+    raise ArgumentError,
+          "EKV: :handoff_ack_timeout_ms must be a positive timeout in ms, got: #{inspect(timeout)}"
   end
 
   defp validate_replication_batch_flush_ms!(flush_ms)
@@ -865,7 +887,7 @@ defmodule EKV.Supervisor do
   # Blue-green handoff
   # =====================================================================
 
-  defp perform_handoff(name, data_dir, num_shards) do
+  defp perform_handoff(name, data_dir, num_shards, handoff_ack_timeout_ms) do
     File.mkdir_p!(data_dir)
     old_node_str = read_marker(data_dir)
 
@@ -885,7 +907,7 @@ defmodule EKV.Supervisor do
         handoff_result =
           if handoff_reachable?(old_node) do
             Logger.info("[EKV #{name}] handoff: requesting from #{old_node}")
-            request_handoff(name, old_node, num_shards)
+            request_handoff(name, old_node, num_shards, handoff_ack_timeout_ms)
           else
             Logger.info("[EKV #{name}] handoff: stale marker #{old_node}, skipping handoff")
             :ok
@@ -903,7 +925,9 @@ defmodule EKV.Supervisor do
     end
   end
 
-  defp request_handoff(name, old_node, num_shards) do
+  defp request_handoff(name, old_node, num_shards, handoff_ack_timeout_ms) do
+    handoff_task_timeout_ms = handoff_ack_timeout_ms + @handoff_task_timeout_buffer_ms
+
     failures =
       0..(num_shards - 1)
       |> Task.async_stream(
@@ -915,11 +939,11 @@ defmodule EKV.Supervisor do
           receive do
             {:ekv_handoff_ack, ^ref} -> :ok
           after
-            @handoff_ack_timeout_ms -> {:error, :timeout}
+            handoff_ack_timeout_ms -> {:error, :timeout}
           end
         end,
         ordered: true,
-        timeout: @handoff_task_timeout_ms
+        timeout: handoff_task_timeout_ms
       )
       |> Enum.with_index()
       |> Enum.reduce([], fn
