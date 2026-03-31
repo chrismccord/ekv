@@ -14,14 +14,17 @@ defmodule EKV.Replica do
   keys that need stronger guarantees, an opt-in Compare-And-Swap (CAS) mode
   provides linearizable read-modify-write via CASPaxos consensus.
 
-  Member-to-member replica discovery is fully self-contained: shards use
-  `:net_kernel.monitor_nodes/1` and `Node.list/0` directly for member handshakes and
-  sync. Client routing is separate — client EKV instances discover ready
-  members through `:pg` region groups published by `EKV.MemberPresence`. Each EKV
-  instance owns its own scoped `:pg` mesh, isolating routing, subscriptions, and
-  shutdown coordination from other EKV instances and unrelated default-scope
-  `:pg` traffic. Zero runtime deps. SQLite is vendored as a C NIF
-  (c_src/sqlite3.c amalgamation).
+  Member-to-member replica discovery is shard-local, but not purely raw
+  `Node.list/0` anymore: shards still use `:net_kernel.monitor_nodes/1` and
+  Erlang node connectivity for direct handshakes, while `EKV.MemberPresence`
+  provides the current logical-member view used by routing, origin
+  recognition, and reconnect retry to peers missing from `remote_shards`.
+  Client routing is separate — client EKV instances discover ready members
+  through scoped `:pg` groups published by `EKV.MemberPresence`. Each EKV
+  instance owns its own scoped `:pg` mesh, isolating routing, subscriptions,
+  and shutdown coordination from other EKV instances and unrelated
+  default-scope `:pg` traffic. Zero runtime deps. SQLite is vendored as a C
+  NIF (c_src/sqlite3.c amalgamation).
 
 
   ## Supervision Tree
@@ -36,12 +39,13 @@ defmodule EKV.Replica do
         │   ├── EKV.SubDispatcher 0   async event fan-out per shard
         │   ├── EKV.SubDispatcher 1
         │   └── ...
+        ├── EKV.MemberPresence    publishes ready member in :pg region groups
+        │                         and node_id groups
         ├── EKV.Replica.Supervisor (one_for_one)
         │   ├── EKV.Replica 0     shard GenServer (writes + replication + SQLite)
         │   ├── EKV.Replica 1
         │   └── ...               N shards (default 8)
         ├── EKV.QuorumGate?       optional startup barrier for CAS quorum
-        ├── EKV.MemberPresence    publishes ready member in :pg region group
         ├── EKV.GC                periodic timer, sends :gc to each shard
         └── EKV.ShutdownBarrier?  optional graceful shutdown barrier
 
@@ -54,10 +58,12 @@ defmodule EKV.Replica do
         ├── EKV.ClientSubscriptions  local subscribe/unsubscribe bookkeeping
         └── EKV.ShutdownBarrier?     optional graceful shutdown barrier
 
-  rest_for_one: SubTracker crash restarts everything. Registry crash
-  restarts Dispatchers + Replicas. Single Replica crash → only that shard
-  restarts. QuorumGate, MemberPresence, GC, and ShutdownBarrier are downstream
-  of Replicas.
+  rest_for_one: SubTracker crash restarts everything. Registry crash restarts
+  Dispatchers + MemberPresence + Replicas. Single Replica crash → only that
+  shard restarts. MemberPresence now starts before Replicas so startup-time
+  origin recognition and reconnect retry can see current logical members
+  before anti-entropy begins. QuorumGate, GC, and ShutdownBarrier are
+  downstream of Replicas.
 
 
   ## Graceful Shutdown Barrier
@@ -676,6 +682,17 @@ defmodule EKV.Replica do
   one full-sync source active at a time, so cold-start/bootstrap repair does
   not fan out into duplicate full snapshots from every eligible peer.
 
+  Upgraded peers may also exchange live LWW replication batches:
+
+      {:ekv, 1, :replication_batch,
+       {from_node, shard, origin_node, entries}, %{}}
+
+  This is only for hot live replication fanout. Local writes still commit one
+  at a time. Batches are bounded by time/count/bytes per destination shard,
+  same-origin by construction, and applied in one SQLite transaction on the
+  receiver. Older peers that do not advertise `:replication_batch` stay on the
+  per-entry `:put` / `:delete` path.
+
 
   ## Delta Sync vs Full Sync
 
@@ -698,6 +715,12 @@ defmodule EKV.Replica do
       │ immediate. Mere handshake lag is not enough to trigger full    │
       │ fallback.                                                      │
       └────────────────────────────────────────────────────────────────┘
+
+  Live replication batching is a separate path from sync:
+    - no requester-side `:sync_request`
+    - no terminal sync progress settlement
+    - receiver still must advance local contiguous origin progress correctly
+      after the batch and preserve ordered subscriber semantics
 
       ┌────────────────────────────────────────────────────────────────┐
       │ Full Sync                                                      │
@@ -1135,6 +1158,7 @@ defmodule EKV.Replica do
   @wire_compressed_tag :ekv_wire_compressed
   @wire_feature_live_progress :live_progress
   @wire_feature_compression :wire_compression
+  @wire_feature_replication_batch :replication_batch
   @wire_feature_observer :observer
   @summary_probe_timeout_ms :timer.minutes(2)
   @sync_inflight_timeout_ms :timer.minutes(2)
@@ -1170,6 +1194,10 @@ defmodule EKV.Replica do
     remote_features: %{},
     summary_probe_inflight: %{},
     started_at_ms: nil,
+    replication_batch_flush_ms: 3,
+    replication_batch_max_entries: 64,
+    replication_batch_max_bytes: 256 * 1024,
+    replication_batches: %{},
     sync_inflight: %{},
     delta_origin_inflight: %{},
     delta_sync_storm_started_at_ms: nil,
@@ -1272,6 +1300,9 @@ defmodule EKV.Replica do
       cluster_size: config.cluster_size,
       cas_voter?: Map.get(config, :cas_voter, true),
       wire_compression_threshold: config[:wire_compression_threshold],
+      replication_batch_flush_ms: config[:replication_batch_flush_ms] || 3,
+      replication_batch_max_entries: config[:replication_batch_max_entries] || 64,
+      replication_batch_max_bytes: config[:replication_batch_max_bytes] || 256 * 1024,
       lww_ts_counter: lww_ts_counter,
       local_max_seq: local_max_seq,
       local_origin_seq: local_origin_seq,
@@ -1314,6 +1345,8 @@ defmodule EKV.Replica do
 
   @impl true
   def terminate(_reason, %Replica{} = state) do
+    state = flush_all_replication_batches(state)
+
     for {rdb, get_stmt} <- state.readers do
       EKV.Sqlite3.release(rdb, get_stmt)
       Store.close(rdb)
@@ -1348,10 +1381,10 @@ defmodule EKV.Replica do
 
     try do
       result = GenServer.call({shard_name, handoff_node}, request, 5_000)
-      {:reply, result, state}
+      cb_reply(result, state)
     catch
       :exit, _ ->
-        {:reply, {:error, :shutting_down}, state}
+        cb_reply({:error, :shutting_down}, state)
     end
   end
 
@@ -1386,26 +1419,24 @@ defmodule EKV.Replica do
           state
           |> set_local_origin_seq(origin_seq)
           |> merge_local_progress_seq(origin_node, local_progress_seq)
-
-        broadcast_to_members(
-          state,
-          {:ekv_put, key, value_binary, now, origin_node, origin_seq, expires_at}
-        )
+          |> replicate_live_to_members(
+            {:ekv_put, key, value_binary, now, origin_node, origin_seq, expires_at}
+          )
 
         dispatch_events(state, [
           %EKV.Event{type: :put, key: key, value: :erlang.binary_to_term(value_binary)}
         ])
 
-        {:reply, :ok, state}
+        cb_reply(:ok, state)
 
       {:ok, false, _origin_seq, local_progress_seq} ->
-        {:reply, :ok, merge_local_progress_seq(state, origin_node, local_progress_seq)}
+        cb_reply(:ok, merge_local_progress_seq(state, origin_node, local_progress_seq))
 
       {:ok, false} ->
-        {:reply, :ok, state}
+        cb_reply(:ok, state)
 
       {:error, :cas_managed_key} ->
-        {:reply, {:error, :cas_managed_key}, state}
+        cb_reply({:error, :cas_managed_key}, state)
     end
   end
 
@@ -1435,19 +1466,19 @@ defmodule EKV.Replica do
           state
           |> set_local_origin_seq(origin_seq)
           |> merge_local_progress_seq(origin_node, local_progress_seq)
+          |> replicate_live_to_members({:ekv_delete, key, now, origin_node, origin_seq})
 
-        broadcast_to_members(state, {:ekv_delete, key, now, origin_node, origin_seq})
         dispatch_events(state, [%EKV.Event{type: :delete, key: key, value: prev_value}])
-        {:reply, :ok, state}
+        cb_reply(:ok, state)
 
       {:ok, false, _origin_seq, local_progress_seq} ->
-        {:reply, :ok, merge_local_progress_seq(state, origin_node, local_progress_seq)}
+        cb_reply(:ok, merge_local_progress_seq(state, origin_node, local_progress_seq))
 
       {:ok, false} ->
-        {:reply, :ok, state}
+        cb_reply(:ok, state)
 
       {:error, :cas_managed_key} ->
-        {:reply, {:error, :cas_managed_key}, state}
+        cb_reply({:error, :cas_managed_key}, state)
     end
   end
 
@@ -1457,7 +1488,7 @@ defmodule EKV.Replica do
 
   def handle_call({:cas_put, key, value_binary, expected_vsn, opts}, from, %Replica{} = state) do
     operation = {:cas_put, expected_vsn, value_binary, opts}
-    {:noreply, start_cas(state, key, operation, from, cas_deadline_from_opts(opts))}
+    cb_noreply(start_cas(state, key, operation, from, cas_deadline_from_opts(opts)))
   end
 
   def handle_call(
@@ -1467,48 +1498,52 @@ defmodule EKV.Replica do
       ) do
     operation = {:cas_put, expected_vsn, value_binary, opts}
 
-    {:noreply,
-     start_cas(state, key, operation, from, cas_deadline_from_opts(opts), :observer_write)}
+    cb_noreply(
+      start_cas(state, key, operation, from, cas_deadline_from_opts(opts), :observer_write)
+    )
   end
 
   def handle_call({:cas_delete, key, expected_vsn, opts}, from, %Replica{} = state) do
     operation = {:cas_delete, expected_vsn, opts}
-    {:noreply, start_cas(state, key, operation, from, cas_deadline_from_opts(opts))}
+    cb_noreply(start_cas(state, key, operation, from, cas_deadline_from_opts(opts)))
   end
 
   def handle_call({:observer_cas_delete, key, expected_vsn, opts}, from, %Replica{} = state) do
     operation = {:cas_delete, expected_vsn, opts}
 
-    {:noreply,
-     start_cas(state, key, operation, from, cas_deadline_from_opts(opts), :observer_write)}
+    cb_noreply(
+      start_cas(state, key, operation, from, cas_deadline_from_opts(opts), :observer_write)
+    )
   end
 
   def handle_call({:update, key, fun, opts}, from, %Replica{} = state) do
     retries = Keyword.get(opts, :retries, 5)
     operation = {:update, fun, opts, retries}
-    {:noreply, start_cas(state, key, operation, from, cas_deadline_from_opts(opts))}
+    cb_noreply(start_cas(state, key, operation, from, cas_deadline_from_opts(opts)))
   end
 
   def handle_call({:observer_update, key, fun, opts}, from, %Replica{} = state) do
     retries = Keyword.get(opts, :retries, 5)
     operation = {:update, fun, opts, retries}
 
-    {:noreply,
-     start_cas(state, key, operation, from, cas_deadline_from_opts(opts), :observer_write)}
+    cb_noreply(
+      start_cas(state, key, operation, from, cas_deadline_from_opts(opts), :observer_write)
+    )
   end
 
   def handle_call({:cas_read, key, opts}, from, %Replica{} = state) do
     retries = Keyword.get(opts, :retries, 5)
     operation = {:cas_read, opts, retries}
-    {:noreply, start_cas(state, key, operation, from, cas_deadline_from_opts(opts))}
+    cb_noreply(start_cas(state, key, operation, from, cas_deadline_from_opts(opts)))
   end
 
   def handle_call({:observer_cas_read, key, opts}, from, %Replica{} = state) do
     retries = Keyword.get(opts, :retries, 5)
     operation = {:cas_read, opts, retries}
 
-    {:noreply,
-     start_cas(state, key, operation, from, cas_deadline_from_opts(opts), :observer_read)}
+    cb_noreply(
+      start_cas(state, key, operation, from, cas_deadline_from_opts(opts), :observer_read)
+    )
   end
 
   def handle_call(
@@ -1520,28 +1555,28 @@ defmodule EKV.Replica do
     gap? = origin_gap?(state, origin_node, origin_seq)
     {state, applied?} = apply_cas_commit(state, key, ballot_c, ballot_n, entry_tuple, origin_seq)
     state = maybe_request_origin_gap_repair(state, origin_node, origin_seq, gap? and applied?)
-    {:reply, :ok, state}
+    cb_reply(:ok, state)
   end
 
   def handle_call({:await_quorum, timeout_ms}, from, %Replica{} = state) do
     case quorum_status(state) do
       :ok ->
-        {:reply, :ok, state}
+        cb_reply(:ok, state)
 
       {:error, :cluster_overflow} = error ->
-        {:reply, error, state}
+        cb_reply(error, state)
 
       {:error, :cas_not_configured} = error ->
-        {:reply, error, state}
+        cb_reply(error, state)
 
       {:error, :no_quorum} ->
         if timeout_ms == 0 do
-          {:reply, {:error, :timeout}, state}
+          cb_reply({:error, :timeout}, state)
         else
           ref = make_ref()
           timer = Process.send_after(self(), {:await_quorum_timeout, ref}, timeout_ms)
           waiter = %{from: from, timer: timer}
-          {:noreply, %{state | quorum_waiters: Map.put(state.quorum_waiters, ref, waiter)}}
+          cb_noreply(%{state | quorum_waiters: Map.put(state.quorum_waiters, ref, waiter)})
         end
     end
   end
@@ -1562,6 +1597,7 @@ defmodule EKV.Replica do
     end
 
     %Replica{} = state = fail_quorum_waiters(state, {:error, :shutting_down})
+    %Replica{} = state = flush_all_replication_batches(state)
 
     # 2. Persist ballot counter
     if state.cluster_size && state.db do
@@ -1583,8 +1619,14 @@ defmodule EKV.Replica do
     end)
 
     # 6. Enter proxy mode (readers stay alive until terminate)
-    {:noreply,
-     %{state | db: nil, stmts: nil, pending_cas: %{}, quorum_waiters: %{}, handoff_node: new_node}}
+    cb_noreply(%{
+      state
+      | db: nil,
+        stmts: nil,
+        pending_cas: %{},
+        quorum_waiters: %{},
+        handoff_node: new_node
+    })
   end
 
   # In handoff mode: drop all messages (replication, GC, nodeup/down, CAS).
@@ -1592,7 +1634,7 @@ defmodule EKV.Replica do
   # node via nodeup; new clients bind to the incoming member via MemberPresence.
   def handle_info(_msg, %Replica{handoff_node: handoff_node} = state)
       when handoff_node != nil do
-    {:noreply, state}
+    cb_noreply(state)
   end
 
   # =====================================================================
@@ -1605,7 +1647,7 @@ defmodule EKV.Replica do
         handle_wire_message(state, message)
 
       :ignore ->
-        {:noreply, state}
+        cb_noreply(state)
     end
   end
 
@@ -1615,7 +1657,7 @@ defmodule EKV.Replica do
       "#{log_prefix_shard(state)} ignoring unsupported wire version #{version} kind=#{inspect(kind)}"
     end)
 
-    {:noreply, state}
+    cb_noreply(state)
   end
 
   def handle_info(
@@ -1646,7 +1688,7 @@ defmodule EKV.Replica do
       ])
     end
 
-    {:noreply, state}
+    cb_noreply(state)
   end
 
   def handle_info({:ekv_delete, key, timestamp, origin_node, origin_seq}, %Replica{} = state) do
@@ -1663,7 +1705,21 @@ defmodule EKV.Replica do
       dispatch_events(state, [%EKV.Event{type: :delete, key: key, value: prev_value}])
     end
 
-    {:noreply, state}
+    cb_noreply(state)
+  end
+
+  def handle_info(
+        {:ekv_replication_batch, from_node, remote_shard, origin_node, entries},
+        %Replica{} = state
+      )
+      when remote_shard == state.shard_index do
+    origin_node = normalize_origin_node(origin_node)
+    entries = wire_decompress_replication_batch_entries(entries)
+    cb_noreply(apply_replication_batch(state, from_node, origin_node, entries))
+  end
+
+  def handle_info({:flush_replication_batch, remote_node}, %Replica{} = state) do
+    cb_noreply(flush_replication_batch(state, remote_node))
   end
 
   # =====================================================================
@@ -1675,16 +1731,17 @@ defmodule EKV.Replica do
          remote_node_id},
         %Replica{} = state
       ) do
-    {:noreply,
-     do_member_connect(
-       state,
-       remote_pid,
-       remote_shard,
-       remote_num_shards,
-       remote_progress,
-       remote_node_id,
-       MapSet.new()
-     )}
+    cb_noreply(
+      do_member_connect(
+        state,
+        remote_pid,
+        remote_shard,
+        remote_num_shards,
+        remote_progress,
+        remote_node_id,
+        MapSet.new()
+      )
+    )
   end
 
   def handle_info(
@@ -1692,16 +1749,17 @@ defmodule EKV.Replica do
          remote_node_id, remote_features},
         %Replica{} = state
       ) do
-    {:noreply,
-     do_member_connect(
-       state,
-       remote_pid,
-       remote_shard,
-       remote_num_shards,
-       remote_progress,
-       remote_node_id,
-       remote_features
-     )}
+    cb_noreply(
+      do_member_connect(
+        state,
+        remote_pid,
+        remote_shard,
+        remote_num_shards,
+        remote_progress,
+        remote_node_id,
+        remote_features
+      )
+    )
   end
 
   def handle_info(
@@ -1709,16 +1767,17 @@ defmodule EKV.Replica do
          remote_node_id},
         %Replica{} = state
       ) do
-    {:noreply,
-     do_member_connect_ack(
-       state,
-       remote_pid,
-       remote_shard,
-       remote_num_shards,
-       remote_progress,
-       remote_node_id,
-       MapSet.new()
-     )}
+    cb_noreply(
+      do_member_connect_ack(
+        state,
+        remote_pid,
+        remote_shard,
+        remote_num_shards,
+        remote_progress,
+        remote_node_id,
+        MapSet.new()
+      )
+    )
   end
 
   def handle_info(
@@ -1726,16 +1785,17 @@ defmodule EKV.Replica do
          remote_node_id, remote_features},
         %Replica{} = state
       ) do
-    {:noreply,
-     do_member_connect_ack(
-       state,
-       remote_pid,
-       remote_shard,
-       remote_num_shards,
-       remote_progress,
-       remote_node_id,
-       remote_features
-     )}
+    cb_noreply(
+      do_member_connect_ack(
+        state,
+        remote_pid,
+        remote_shard,
+        remote_num_shards,
+        remote_progress,
+        remote_node_id,
+        remote_features
+      )
+    )
   end
 
   def handle_info({:ekv_sync_request, remote_pid, remote_shard, request}, %Replica{} = state)
@@ -1744,16 +1804,16 @@ defmodule EKV.Replica do
 
     cond do
       state.handoff_node != nil ->
-        {:noreply, state}
+        cb_noreply(state)
 
       not Map.has_key?(state.remote_shards, remote_node) ->
-        {:noreply, state}
+        cb_noreply(state)
 
       MapSet.member?(state.quarantined_members, remote_node) ->
-        {:noreply, state}
+        cb_noreply(state)
 
       true ->
-        {:noreply, serve_sync_request(state, remote_node, request)}
+        cb_noreply(serve_sync_request(state, remote_node, request))
     end
   end
 
@@ -1846,7 +1906,7 @@ defmodule EKV.Replica do
         state
       end
 
-    {:noreply, state}
+    cb_noreply(state)
   end
 
   def handle_info(
@@ -1863,7 +1923,7 @@ defmodule EKV.Replica do
         :delta -> merge_remote_member_progress(state, remote_node, progress)
       end
 
-    {:noreply, state}
+    cb_noreply(state)
   end
 
   # =====================================================================
@@ -1873,12 +1933,12 @@ defmodule EKV.Replica do
   def handle_info({:nodeup, remote_node}, %Replica{} = state) do
     case maybe_allow_member_reconnect(state, remote_node) do
       {:quarantine, %Replica{} = state} ->
-        {:noreply, state}
+        cb_noreply(state)
 
       {:ok, %Replica{} = state} ->
         send_to_member(state, remote_node, member_connect_message(state))
 
-        {:noreply, state}
+        cb_noreply(state)
     end
   end
 
@@ -1898,6 +1958,7 @@ defmodule EKV.Replica do
     }
 
     state = clear_sync_inflight(state, dead_node)
+    state = drop_replication_batch(state, dead_node)
 
     state = mark_member_down(state, dead_node, dead_node_id)
     # Check if any pending CAS ops lost quorum
@@ -1906,7 +1967,7 @@ defmodule EKV.Replica do
       |> fail_pending_cas_if_no_quorum()
       |> maybe_reply_to_quorum_waiters()
 
-    {:noreply, new_state}
+    cb_noreply(new_state)
   end
 
   # =====================================================================
@@ -1934,6 +1995,7 @@ defmodule EKV.Replica do
       }
 
       state = clear_sync_inflight(state, remote_node)
+      state = drop_replication_batch(state, remote_node)
 
       new_state =
         state
@@ -1941,20 +2003,20 @@ defmodule EKV.Replica do
         |> fail_pending_cas_if_no_quorum()
         |> maybe_reply_to_quorum_waiters()
 
-      {:noreply, new_state}
+      cb_noreply(new_state)
     else
-      {:noreply, state}
+      cb_noreply(state)
     end
   end
 
   def handle_info({:await_quorum_timeout, ref}, %Replica{} = state) do
     case Map.pop(state.quorum_waiters, ref) do
       {nil, _waiters} ->
-        {:noreply, state}
+        cb_noreply(state)
 
       {%{from: from}, waiters} ->
         GenServer.reply(from, {:error, :timeout})
-        {:noreply, %{state | quorum_waiters: waiters}}
+        cb_noreply(%{state | quorum_waiters: waiters})
     end
   end
 
@@ -1976,7 +2038,7 @@ defmodule EKV.Replica do
         )
       )
 
-      {:noreply, state}
+      cb_noreply(state)
     else
       %{db: db} = state
 
@@ -2002,7 +2064,7 @@ defmodule EKV.Replica do
           )
       end
 
-      {:noreply, state}
+      cb_noreply(state)
     end
   end
 
@@ -2020,7 +2082,7 @@ defmodule EKV.Replica do
         )
       )
 
-      {:noreply, state}
+      cb_noreply(state)
     else
       %{db: db} = state
       entry_tuple = wire_decompress_entry_tuple(entry_tuple)
@@ -2052,7 +2114,7 @@ defmodule EKV.Replica do
           )
       end
 
-      {:noreply, state}
+      cb_noreply(state)
     end
   end
 
@@ -2069,7 +2131,7 @@ defmodule EKV.Replica do
 
     state = maybe_request_origin_gap_repair(state, origin_node, origin_seq, gap? and applied?)
 
-    {:noreply, state}
+    cb_noreply(state)
   end
 
   # =====================================================================
@@ -2082,11 +2144,11 @@ defmodule EKV.Replica do
       ) do
     case Map.get(state.pending_cas, ref) do
       nil ->
-        {:noreply, state}
+        cb_noreply(state)
 
       %{phase: :prepare} = op ->
         if MapSet.member?(op.responded, remote_node_id) do
-          {:noreply, state}
+          cb_noreply(state)
         else
           op = %{
             op
@@ -2095,25 +2157,25 @@ defmodule EKV.Replica do
           }
 
           if length(op.promises) >= op.quorum do
-            {:noreply, enter_accept_phase(state, ref, op)}
+            cb_noreply(enter_accept_phase(state, ref, op))
           else
-            {:noreply, %{state | pending_cas: Map.put(state.pending_cas, ref, op)}}
+            cb_noreply(%{state | pending_cas: Map.put(state.pending_cas, ref, op)})
           end
         end
 
       _ ->
-        {:noreply, state}
+        cb_noreply(state)
     end
   end
 
   def handle_info({:ekv_nack, ref, _pid, remote_node_id, _prom_c, _prom_n}, %Replica{} = state) do
     case Map.get(state.pending_cas, ref) do
       nil ->
-        {:noreply, state}
+        cb_noreply(state)
 
       %{phase: :prepare} = op ->
         if MapSet.member?(op.responded, remote_node_id) do
-          {:noreply, state}
+          cb_noreply(state)
         else
           op = %{op | nacks: op.nacks + 1, responded: MapSet.put(op.responded, remote_node_id)}
 
@@ -2121,25 +2183,25 @@ defmodule EKV.Replica do
 
           if max_possible_promises < op.quorum do
             # Can't reach quorum — fail or retry
-            {:noreply, handle_cas_failure(state, ref, op)}
+            cb_noreply(handle_cas_failure(state, ref, op))
           else
-            {:noreply, %{state | pending_cas: Map.put(state.pending_cas, ref, op)}}
+            cb_noreply(%{state | pending_cas: Map.put(state.pending_cas, ref, op)})
           end
         end
 
       _ ->
-        {:noreply, state}
+        cb_noreply(state)
     end
   end
 
   def handle_info({:ekv_accepted, ref, _pid, remote_node_id}, %Replica{} = state) do
     case Map.get(state.pending_cas, ref) do
       nil ->
-        {:noreply, state}
+        cb_noreply(state)
 
       %{phase: :accept} = op ->
         if MapSet.member?(op.responded, remote_node_id) do
-          {:noreply, state}
+          cb_noreply(state)
         else
           accepts = MapSet.put(op.accepts, remote_node_id)
           responded = MapSet.put(op.responded, remote_node_id)
@@ -2147,25 +2209,25 @@ defmodule EKV.Replica do
 
           if MapSet.size(accepts) >= op.quorum do
             # Accept quorum reached — commit
-            {:noreply, commit_cas(state, ref, op)}
+            cb_noreply(commit_cas(state, ref, op))
           else
-            {:noreply, %{state | pending_cas: Map.put(state.pending_cas, ref, op)}}
+            cb_noreply(%{state | pending_cas: Map.put(state.pending_cas, ref, op)})
           end
         end
 
       _ ->
-        {:noreply, state}
+        cb_noreply(state)
     end
   end
 
   def handle_info({:ekv_accept_nack, ref, _pid, remote_node_id}, %Replica{} = state) do
     case Map.get(state.pending_cas, ref) do
       nil ->
-        {:noreply, state}
+        cb_noreply(state)
 
       %{phase: :accept} = op ->
         if MapSet.member?(op.responded, remote_node_id) do
-          {:noreply, state}
+          cb_noreply(state)
         else
           op = %{
             op
@@ -2176,14 +2238,14 @@ defmodule EKV.Replica do
           max_possible = alive_node_id_count(state) - op.accept_nacks
 
           if max_possible < op.quorum do
-            {:noreply, handle_cas_failure(state, ref, op)}
+            cb_noreply(handle_cas_failure(state, ref, op))
           else
-            {:noreply, %{state | pending_cas: Map.put(state.pending_cas, ref, op)}}
+            cb_noreply(%{state | pending_cas: Map.put(state.pending_cas, ref, op)})
           end
         end
 
       _ ->
-        {:noreply, state}
+        cb_noreply(state)
     end
   end
 
@@ -2191,10 +2253,10 @@ defmodule EKV.Replica do
   def handle_info({:cas_timeout, ref}, %Replica{} = state) do
     case Map.pop(state.pending_cas, ref) do
       {nil, _} ->
-        {:noreply, state}
+        cb_noreply(state)
 
       {op, pending_cas} ->
-        {:noreply, reply_cas_timeout(%{state | pending_cas: pending_cas}, op)}
+        cb_noreply(reply_cas_timeout(%{state | pending_cas: pending_cas}, op))
     end
   end
 
@@ -2203,20 +2265,21 @@ defmodule EKV.Replica do
     # Re-check if we still have the pending op (might have been cleaned up)
     case Map.pop(state.pending_cas, ref) do
       {nil, _} ->
-        {:noreply, state}
+        cb_noreply(state)
 
       {old_op, pending_cas} ->
         state = %{state | pending_cas: pending_cas}
 
-        {:noreply,
-         start_cas(
-           state,
-           key,
-           operation,
-           old_op.from,
-           old_op.deadline_ms,
-           Map.get(old_op, :reply_mode, :normal)
-         )}
+        cb_noreply(
+          start_cas(
+            state,
+            key,
+            operation,
+            old_op.from,
+            old_op.deadline_ms,
+            Map.get(old_op, :reply_mode, :normal)
+          )
+        )
     end
   end
 
@@ -2266,8 +2329,8 @@ defmodule EKV.Replica do
               state
               |> set_local_origin_seq(origin_seq)
               |> merge_local_progress_seq(origin, local_progress_seq)
+              |> replicate_live_to_members({:ekv_delete, key, now, origin, origin_seq})
 
-            broadcast_to_members(state, {:ekv_delete, key, now, origin, origin_seq})
             prev_value = if value_binary, do: :erlang.binary_to_term(value_binary)
             {state, [%EKV.Event{type: :expired, key: key, value: prev_value} | acc]}
 
@@ -2306,7 +2369,7 @@ defmodule EKV.Replica do
     prune_stale_member_down_name_markers(state)
     prune_stale_member_seen_markers(state)
 
-    {:noreply, state}
+    cb_noreply(state)
   end
 
   def handle_info(:anti_entropy_tick, %Replica{} = state) do
@@ -2321,7 +2384,7 @@ defmodule EKV.Replica do
       end
 
     schedule_anti_entropy_tick(state)
-    {:noreply, state}
+    cb_noreply(state)
   end
 
   # =====================================================================
@@ -2334,18 +2397,19 @@ defmodule EKV.Replica do
         %Replica{} = state
       ) do
     if Map.has_key?(state.remote_shards, remote_node) do
-      {:noreply,
-       send_full_chunk(
-         state,
-         remote_node,
-         last_key,
-         tombstone_cutoff,
-         progress_summary,
-         chunk_size,
-         reason
-       )}
+      cb_noreply(
+        send_full_chunk(
+          state,
+          remote_node,
+          last_key,
+          tombstone_cutoff,
+          progress_summary,
+          chunk_size,
+          reason
+        )
+      )
     else
-      {:noreply, state}
+      cb_noreply(state)
     end
   end
 
@@ -2354,14 +2418,19 @@ defmodule EKV.Replica do
         %Replica{} = state
       ) do
     if Map.has_key?(state.remote_shards, remote_node) do
-      {:noreply, send_delta_chunk(state, remote_node, origin_node, last_seq, my_seq, chunk_size)}
+      cb_noreply(send_delta_chunk(state, remote_node, origin_node, last_seq, my_seq, chunk_size))
     else
-      {:noreply, state}
+      cb_noreply(state)
     end
   end
 
   def handle_info(_msg, %Replica{} = state) do
-    {:noreply, state}
+    cb_noreply(state)
+  end
+
+  @impl true
+  def handle_continue(:flush_due_replication_batches, %Replica{} = state) do
+    {:noreply, flush_due_replication_batches(state)}
   end
 
   # =====================================================================
@@ -2397,7 +2466,7 @@ defmodule EKV.Replica do
 
     case maybe_allow_member_reconnect(state, remote_node, remote_node_id) do
       {:quarantine, %Replica{} = state} ->
-        {:noreply, state}
+        cb_noreply(state)
 
       {:ok, %Replica{} = state} ->
         state =
@@ -2417,8 +2486,9 @@ defmodule EKV.Replica do
            state.node_id}
         )
 
-        {:noreply,
-         maybe_request_repair(state, remote_node, remote_progress, preserve_inflight?: true)}
+        cb_noreply(
+          maybe_request_repair(state, remote_node, remote_progress, preserve_inflight?: true)
+        )
     end
   end
 
@@ -2429,7 +2499,7 @@ defmodule EKV.Replica do
          _remote_progress,
          _remote_node_id
        ),
-       do: {:noreply, state}
+       do: cb_noreply(state)
 
   defp handle_wire_summary_reply(
          %Replica{} = state,
@@ -2444,7 +2514,7 @@ defmodule EKV.Replica do
 
     case maybe_allow_member_reconnect(state, remote_node, remote_node_id) do
       {:quarantine, %Replica{} = state} ->
-        {:noreply, state}
+        cb_noreply(state)
 
       {:ok, %Replica{} = state} ->
         state =
@@ -2457,8 +2527,9 @@ defmodule EKV.Replica do
           |> replace_remote_member_progress(remote_node, remote_progress)
           |> reconcile_authoritative_origin_head(remote_node, remote_progress)
 
-        {:noreply,
-         maybe_request_repair(state, remote_node, remote_progress, preserve_inflight?: true)}
+        cb_noreply(
+          maybe_request_repair(state, remote_node, remote_progress, preserve_inflight?: true)
+        )
     end
   end
 
@@ -2469,7 +2540,7 @@ defmodule EKV.Replica do
          _remote_progress,
          _remote_node_id
        ),
-       do: {:noreply, state}
+       do: cb_noreply(state)
 
   defp do_member_connect(
          %Replica{} = state,
@@ -2718,6 +2789,163 @@ defmodule EKV.Replica do
       {:ok, true} -> {true, state}
       {:ok, false} -> {false, state}
     end
+  end
+
+  defp apply_replication_batch(%Replica{} = state, from_node, origin_node, entries)
+       when is_atom(from_node) and is_binary(origin_node) and is_list(entries) do
+    case normalize_replication_batch_entries(entries) do
+      {:ok, normalized_entries, first_origin_seq, last_origin_seq} ->
+        gap? = origin_gap?(state, origin_node, first_origin_seq)
+        initial_delete_values = replication_batch_initial_delete_values(state, normalized_entries)
+
+        case Store.write_entries_batch(
+               state.db,
+               state.stmts.kv_upsert,
+               state.stmts.keyref_upsert,
+               state.stmts.oplog_insert,
+               origin_node,
+               normalized_entries
+             ) do
+          {:ok, applied_flags, _applied_origin_seq, local_progress_seq} ->
+            state =
+              state
+              |> track_applied_origin_progress(origin_node, last_origin_seq, local_progress_seq)
+              |> maybe_request_origin_gap_repair(origin_node, last_origin_seq, gap?)
+
+            dispatch_events(
+              state,
+              replication_batch_events(normalized_entries, applied_flags, initial_delete_values)
+            )
+
+            state
+
+          {:error, _reason} ->
+            apply_replication_batch_fallback(state, origin_node, normalized_entries)
+        end
+
+      :error ->
+        apply_replication_batch_fallback(state, origin_node, entries)
+    end
+  end
+
+  defp apply_replication_batch(%Replica{} = state, _from_node, _origin_node, _entries), do: state
+
+  defp normalize_replication_batch_entries(entries) when is_list(entries) do
+    Enum.reduce_while(entries, {:ok, [], nil, nil}, fn
+      {key, value_binary, timestamp, origin_seq, expires_at, deleted_at}, {:ok, acc, nil, nil}
+      when is_binary(key) and is_integer(timestamp) and is_integer(origin_seq) and origin_seq >= 0 ->
+        {:cont,
+         {:ok, [{key, value_binary, timestamp, origin_seq, expires_at, deleted_at} | acc],
+          origin_seq, origin_seq}}
+
+      {key, value_binary, timestamp, origin_seq, expires_at, deleted_at},
+      {:ok, acc, first_origin_seq, prev_origin_seq}
+      when is_binary(key) and is_integer(timestamp) and is_integer(origin_seq) and
+             origin_seq == prev_origin_seq + 1 ->
+        {:cont,
+         {:ok, [{key, value_binary, timestamp, origin_seq, expires_at, deleted_at} | acc],
+          first_origin_seq, origin_seq}}
+
+      _entry, _acc ->
+        {:halt, :error}
+    end)
+    |> case do
+      {:ok, [], nil, nil} ->
+        :error
+
+      {:ok, acc, first_origin_seq, last_origin_seq} ->
+        {:ok, Enum.reverse(acc), first_origin_seq, last_origin_seq}
+
+      :error ->
+        :error
+    end
+  end
+
+  defp normalize_replication_batch_entries(_entries), do: :error
+
+  defp replication_batch_initial_delete_values(%Replica{} = state, entries) do
+    if has_subscribers?(state) do
+      entries
+      |> Enum.reduce(MapSet.new(), fn
+        {key, _value_binary, _timestamp, _origin_seq, _expires_at, deleted_at}, acc ->
+          if is_integer(deleted_at), do: MapSet.put(acc, key), else: acc
+      end)
+      |> Map.new(fn key -> {key, read_previous_value(state, key)} end)
+    else
+      %{}
+    end
+  end
+
+  defp replication_batch_events(entries, applied_flags, initial_delete_values) do
+    {events, _shadow_values} =
+      entries
+      |> Enum.zip(applied_flags)
+      |> Enum.reduce({[], initial_delete_values}, fn
+        {{_key, _value_binary, _timestamp, _origin_seq, _expires_at, _deleted_at}, false},
+        {acc_events, shadow_values} ->
+          {acc_events, shadow_values}
+
+        {{key, _value_binary, _timestamp, _origin_seq, _expires_at, deleted_at}, true},
+        {acc_events, shadow_values}
+        when is_integer(deleted_at) ->
+          event = %EKV.Event{type: :delete, key: key, value: Map.get(shadow_values, key)}
+          {[event | acc_events], Map.put(shadow_values, key, nil)}
+
+        {{key, value_binary, _timestamp, _origin_seq, _expires_at, _deleted_at}, true},
+        {acc_events, shadow_values} ->
+          value = :erlang.binary_to_term(value_binary)
+          event = %EKV.Event{type: :put, key: key, value: value}
+          {[event | acc_events], Map.put(shadow_values, key, value)}
+      end)
+
+    Enum.reverse(events)
+  end
+
+  defp apply_replication_batch_fallback(%Replica{} = state, origin_node, entries) do
+    {state, events} =
+      Enum.reduce(entries, {state, []}, fn
+        {key, value_binary, timestamp, origin_seq, expires_at, deleted_at},
+        {acc_state, acc_events} ->
+          gap? = origin_gap?(acc_state, origin_node, origin_seq)
+
+          prev_value =
+            if is_integer(deleted_at) and has_subscribers?(acc_state),
+              do: read_previous_value(acc_state, key)
+
+          {applied, acc_state} =
+            merge_remote_entry(
+              acc_state,
+              key,
+              value_binary,
+              timestamp,
+              origin_node,
+              origin_seq,
+              expires_at,
+              deleted_at
+            )
+
+          acc_state = maybe_request_origin_gap_repair(acc_state, origin_node, origin_seq, gap?)
+
+          acc_events =
+            cond do
+              not applied ->
+                acc_events
+
+              is_integer(deleted_at) ->
+                [%EKV.Event{type: :delete, key: key, value: prev_value} | acc_events]
+
+              true ->
+                [
+                  %EKV.Event{type: :put, key: key, value: :erlang.binary_to_term(value_binary)}
+                  | acc_events
+                ]
+            end
+
+          {acc_state, acc_events}
+      end)
+
+    dispatch_events(state, Enum.reverse(events))
+    state
   end
 
   defp serve_sync_request(%Replica{} = state, remote_node, {:delta, origin_node, from_seq})
@@ -3838,11 +4066,172 @@ defmodule EKV.Replica do
     end
   end
 
-  defp broadcast_to_members(%Replica{} = state, message) do
-    shard_name = shard_name(state.name, state.shard_index)
+  defp replicate_live_to_members(%Replica{} = state, message) do
+    Enum.reduce(Map.keys(state.remote_shards), state, fn target_node, acc ->
+      if remote_supports_feature?(acc, target_node, @wire_feature_replication_batch) do
+        enqueue_replication_batch(acc, target_node, message)
+      else
+        send_to_member(acc, target_node, message)
+        acc
+      end
+    end)
+  end
 
-    for target_node <- Map.keys(state.remote_shards) do
-      send({shard_name, target_node}, wire_encode_message(state, target_node, message))
+  defp enqueue_replication_batch(%Replica{} = state, target_node, message) do
+    entry = replication_batch_entry(message)
+    entry_bytes = replication_batch_entry_bytes(entry)
+    now_ms = System.monotonic_time(:millisecond)
+
+    batch =
+      case Map.get(state.replication_batches, target_node) do
+        nil ->
+          flush_at_ms = replication_batch_deadline_ms(state, now_ms)
+
+          %{
+            entries: [entry],
+            bytes: entry_bytes,
+            flush_at_ms: flush_at_ms,
+            timer_ref: schedule_replication_batch_flush(state, target_node, flush_at_ms)
+          }
+
+        %{entries: entries, bytes: bytes, flush_at_ms: flush_at_ms, timer_ref: timer_ref} ->
+          %{
+            entries: [entry | entries],
+            bytes: bytes + entry_bytes,
+            flush_at_ms: flush_at_ms,
+            timer_ref:
+              timer_ref || schedule_replication_batch_flush(state, target_node, flush_at_ms)
+          }
+      end
+
+    state = %{state | replication_batches: Map.put(state.replication_batches, target_node, batch)}
+
+    if length(batch.entries) >= state.replication_batch_max_entries or
+         batch.bytes >= state.replication_batch_max_bytes do
+      flush_replication_batch(state, target_node)
+    else
+      state
+    end
+  end
+
+  defp replication_batch_entry({:ekv_put, key, value_binary, ts, _origin, origin_seq, exp}) do
+    {key, value_binary, ts, origin_seq, exp, nil}
+  end
+
+  defp replication_batch_entry({:ekv_delete, key, ts, _origin, origin_seq}) do
+    {key, nil, ts, origin_seq, nil, ts}
+  end
+
+  defp replication_batch_entry_bytes({key, value_binary, _ts, _origin_seq, _exp, _deleted_at}) do
+    byte_size(key) + if(is_binary(value_binary), do: byte_size(value_binary), else: 0) + 64
+  end
+
+  defp replication_batch_deadline_ms(%Replica{} = state, now_ms) do
+    now_ms + state.replication_batch_flush_ms
+  end
+
+  defp schedule_replication_batch_flush(%Replica{} = _state, target_node, flush_at_ms) do
+    delay_ms = max(flush_at_ms - System.monotonic_time(:millisecond), 0)
+
+    Process.send_after(
+      self(),
+      {:flush_replication_batch, target_node},
+      delay_ms
+    )
+  end
+
+  defp flush_replication_batch(%Replica{} = state, target_node) do
+    case Map.pop(state.replication_batches, target_node) do
+      {nil, _batches} ->
+        state
+
+      {%{entries: entries, timer_ref: timer_ref}, batches} ->
+        cancel_timer(timer_ref)
+        state = %{state | replication_batches: batches}
+
+        cond do
+          entries == [] ->
+            state
+
+          not Map.has_key?(state.remote_shards, target_node) ->
+            state
+
+          MapSet.member?(state.quarantined_members, target_node) ->
+            state
+
+          true ->
+            send_to_member(
+              state,
+              target_node,
+              {:ekv_replication_batch, node(), state.shard_index, local_origin_id(state),
+               Enum.reverse(entries)}
+            )
+
+            state
+        end
+    end
+  end
+
+  defp flush_all_replication_batches(%Replica{} = state) do
+    Enum.reduce(Map.keys(state.replication_batches), state, fn target_node, acc ->
+      flush_replication_batch(acc, target_node)
+    end)
+  end
+
+  defp flush_due_replication_batches(%Replica{} = state) do
+    now_ms = System.monotonic_time(:millisecond)
+
+    Enum.reduce(Map.keys(state.replication_batches), state, fn target_node, acc ->
+      case Map.get(acc.replication_batches, target_node) do
+        %{flush_at_ms: flush_at_ms} when is_integer(flush_at_ms) and flush_at_ms <= now_ms ->
+          flush_replication_batch(acc, target_node)
+
+        _ ->
+          acc
+      end
+    end)
+  end
+
+  defp replication_batches_due?(%Replica{replication_batches: batches})
+       when map_size(batches) == 0,
+       do: false
+
+  defp replication_batches_due?(%Replica{} = state) do
+    now_ms = System.monotonic_time(:millisecond)
+
+    Enum.any?(state.replication_batches, fn
+      {_target_node, %{flush_at_ms: flush_at_ms}} when is_integer(flush_at_ms) ->
+        flush_at_ms <= now_ms
+
+      _ ->
+        false
+    end)
+  end
+
+  defp cb_noreply(%Replica{} = state) do
+    if replication_batches_due?(state) do
+      {:noreply, state, {:continue, :flush_due_replication_batches}}
+    else
+      {:noreply, state}
+    end
+  end
+
+  defp cb_reply(reply, %Replica{} = state) do
+    if replication_batches_due?(state) do
+      {:reply, reply, state, {:continue, :flush_due_replication_batches}}
+    else
+      {:reply, reply, state}
+    end
+  end
+
+  defp drop_replication_batch(%Replica{} = state, remote_node) do
+    case Map.pop(state.replication_batches, remote_node) do
+      {nil, _} ->
+        state
+
+      {%{timer_ref: timer_ref}, batches} ->
+        cancel_timer(timer_ref)
+        %{state | replication_batches: batches}
     end
   end
 
@@ -3901,6 +4290,20 @@ defmodule EKV.Replica do
          {:ekv_delete, key, ts, origin, origin_seq}
        ) do
     {:ekv, @wire_protocol_version, :delete, {key, ts, origin, origin_seq}, %{}}
+  end
+
+  defp wire_encode_message(
+         %Replica{} = state,
+         target_node,
+         {:ekv_replication_batch, from_node, shard, origin, entries}
+       ) do
+    compress? = remote_supports_feature?(state, target_node, @wire_feature_compression)
+
+    payload =
+      {from_node, shard, origin,
+       wire_compress_replication_batch_entries(state, entries, compress?)}
+
+    {:ekv, @wire_protocol_version, :replication_batch, payload, %{}}
   end
 
   defp wire_encode_message(
@@ -4066,6 +4469,10 @@ defmodule EKV.Replica do
     {:ok, {:ekv_delete, key, ts, origin, origin_seq}}
   end
 
+  defp decode_wire_message(:replication_batch, {from_node, shard, origin, entries}, _meta) do
+    {:ok, {:ekv_replication_batch, from_node, shard, origin, entries}}
+  end
+
   defp decode_wire_message(
          :member_connect,
          {pid, shard, num_shards, remote_progress, remote_node_id},
@@ -4166,6 +4573,21 @@ defmodule EKV.Replica do
      expires_at, deleted_at}
   end
 
+  defp wire_compress_replication_batch_entries(%Replica{} = state, entries, compress?) do
+    Enum.map(entries, fn
+      {key, value_binary, timestamp, origin_seq, expires_at, deleted_at} ->
+        {key, maybe_wire_compress_value(state, value_binary, compress?), timestamp, origin_seq,
+         expires_at, deleted_at}
+    end)
+  end
+
+  defp wire_decompress_replication_batch_entries(entries) when is_list(entries) do
+    Enum.map(entries, fn
+      {key, value_binary, timestamp, origin_seq, expires_at, deleted_at} ->
+        {key, wire_decompress_value(value_binary), timestamp, origin_seq, expires_at, deleted_at}
+    end)
+  end
+
   defp maybe_wire_compress_value(%Replica{} = _state, nil, _compress?), do: nil
 
   defp maybe_wire_compress_value(%Replica{} = _state, value_binary, false),
@@ -4203,6 +4625,7 @@ defmodule EKV.Replica do
     %{
       @wire_feature_live_progress => true,
       @wire_feature_compression => true,
+      @wire_feature_replication_batch => true,
       @wire_feature_observer => not state.cas_voter?
     }
   end
@@ -5436,6 +5859,7 @@ defmodule EKV.Replica do
         state =
           state
           |> clear_sync_inflight(remote_node)
+          |> drop_replication_batch(remote_node)
 
         log_once(state, fn ->
           "#{log_prefix(state)} quarantining #{remote_node}: reconnect downtime exceeded " <>

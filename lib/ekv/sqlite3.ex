@@ -33,6 +33,24 @@ defmodule EKV.Sqlite3 do
           reject_cas_managed
         )
 
+  def write_entries_batch(
+        db,
+        kv_stmt,
+        keyref_stmt,
+        oplog_stmt,
+        origin_node,
+        entries
+      ),
+      do:
+        Sqlite3NIF.ekv_write_entries_batch(
+          db,
+          kv_stmt,
+          keyref_stmt,
+          oplog_stmt,
+          origin_node,
+          entries
+        )
+
   def write_snapshot_entry(db, kv_stmt, kv_args),
     do: Sqlite3NIF.ekv_write_snapshot_entry(db, kv_stmt, kv_args)
 

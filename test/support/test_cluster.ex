@@ -815,6 +815,26 @@ defmodule EKV.TestCluster do
     :ok
   end
 
+  def set_remote_features(node, name, remote_node, features, shard_index \\ 0) do
+    :erpc.call(node, __MODULE__, :do_set_remote_features, [
+      name,
+      remote_node,
+      features,
+      shard_index
+    ])
+  end
+
+  def do_set_remote_features(name, remote_node, features, shard_index) do
+    shard_name = EKV.Replica.shard_name(name, shard_index)
+    feature_set = MapSet.new(features)
+
+    :sys.replace_state(shard_name, fn state ->
+      %{state | remote_features: Map.put(state.remote_features, remote_node, feature_set)}
+    end)
+
+    :ok
+  end
+
   def do_set_sync_inflight_age(name, remote_node, age_ms, shard_index) do
     shard_name = EKV.Replica.shard_name(name, shard_index)
 

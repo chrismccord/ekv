@@ -449,6 +449,33 @@ defmodule EKV.Store do
   end
 
   @doc """
+  Apply a same-origin remote replication batch in a single SQLite transaction.
+
+  Returns `{:ok, applied_flags, last_origin_seq, local_progress_seq}` where
+  `applied_flags` preserves per-entry LWW outcomes in input order.
+  """
+  def write_entries_batch(
+        db,
+        kv_stmt,
+        keyref_stmt,
+        oplog_stmt,
+        origin_node,
+        entries
+      )
+      when is_list(entries) do
+    origin_str = persisted_member_id(origin_node)
+
+    EKV.Sqlite3.write_entries_batch(
+      db,
+      kv_stmt,
+      keyref_stmt,
+      oplog_stmt,
+      origin_str,
+      entries
+    )
+  end
+
+  @doc """
   Apply a full-sync snapshot row to `kv` without appending replay history.
   """
   def write_snapshot_entry(

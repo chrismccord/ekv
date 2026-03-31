@@ -103,6 +103,25 @@ Durable replicas run periodic anti-entropy by default:
 - In a healthy hot cluster you should mostly see `member_connect` / summary traffic, not steady `sending delta sync` spam.
 - Tune the interval upward if you want less background repair traffic; do not disable it in production.
 
+### Live Replication Batching
+
+Durable replicas can batch live LWW replication fanout on upgraded peers:
+
+```elixir
+{EKV,
+ name: :my_kv,
+ data_dir: "/var/data/ekv",
+ replication_batch_flush_ms: 3,
+ replication_batch_max_entries: 64,
+ replication_batch_max_bytes: 262_144}
+```
+
+- Local writes still commit and reply one at a time. Only member-to-member live replication is batched.
+- Batches are bounded by time, count, and encoded byte size per destination shard.
+- Receivers apply each batch in one SQLite transaction and still emit ordered subscriber events.
+- Peers that do not advertise batch support automatically keep the old per-entry replication path.
+- Lower `replication_batch_flush_ms` if tail latency matters more than throughput. Lower `replication_batch_max_entries` or `replication_batch_max_bytes` if shard stalls appear under bursty traffic.
+
 ## Backups
 
 ### Taking a Backup

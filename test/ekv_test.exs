@@ -1649,6 +1649,150 @@ defmodule EKVTest do
                       %{name: ^name}}
     end
 
+    test "remote replication batch dispatches ordered events with same-batch previous value",
+         %{name: name} do
+      config = EKV.Supervisor.get_config(name)
+      shard = EKV.Replica.shard_index_for("remote_batch_key", config.num_shards)
+      shard_name = EKV.Replica.shard_name(name, shard)
+
+      :ok = EKV.subscribe(name, "remote_batch_key")
+      flush_dispatchers(name)
+
+      now = System.system_time(:nanosecond)
+      value_binary = :erlang.term_to_binary("batched_value")
+
+      send(
+        shard_name,
+        {:ekv_replication_batch, node(), shard, :remote@host,
+         [
+           {"remote_batch_key", value_binary, now, 1, nil, nil},
+           {"remote_batch_key", nil, now + 1, 2, nil, now + 1}
+         ]}
+      )
+
+      :sys.get_state(shard_name)
+      flush_dispatchers(name)
+
+      assert EKV.get(name, "remote_batch_key") == nil
+
+      assert_receive {:ekv,
+                      [
+                        %EKV.Event{
+                          type: :put,
+                          key: "remote_batch_key",
+                          value: "batched_value"
+                        },
+                        %EKV.Event{
+                          type: :delete,
+                          key: "remote_batch_key",
+                          value: "batched_value"
+                        }
+                      ], %{name: ^name}}
+    end
+
+    test "remote replication batch only dispatches applied entries", %{name: name} do
+      config = EKV.Supervisor.get_config(name)
+      existing_key = "remote_batch_existing"
+      shard = EKV.Replica.shard_index_for(existing_key, config.num_shards)
+
+      fresh_key =
+        Stream.iterate(1, &(&1 + 1))
+        |> Enum.find_value(fn i ->
+          key = "remote_batch_fresh/#{i}"
+          if EKV.Replica.shard_index_for(key, config.num_shards) == shard, do: key
+        end)
+
+      :ok = EKV.put(name, existing_key, "winner")
+
+      shard_name = EKV.Replica.shard_name(name, shard)
+
+      :ok = EKV.subscribe(name, fresh_key)
+      flush_dispatchers(name)
+
+      now = System.system_time(:nanosecond)
+      losing_value = :erlang.term_to_binary("loser")
+      winning_value = :erlang.term_to_binary("fresh")
+
+      send(
+        shard_name,
+        {:ekv_replication_batch, node(), shard, :remote@host,
+         [
+           {existing_key, losing_value, now - 1_000_000_000, 1, nil, nil},
+           {fresh_key, winning_value, now + 1_000_000_000, 2, nil, nil}
+         ]}
+      )
+
+      :sys.get_state(shard_name)
+      flush_dispatchers(name)
+
+      assert EKV.get(name, existing_key) == "winner"
+      assert EKV.get(name, fresh_key) == "fresh"
+
+      assert_receive {:ekv,
+                      [
+                        %EKV.Event{
+                          type: :put,
+                          key: ^fresh_key,
+                          value: "fresh"
+                        }
+                      ], %{name: ^name}}
+    end
+
+    test "due replication batch flushes on next callback boundary without waiting for timer",
+         %{name: name} do
+      config = EKV.Supervisor.get_config(name)
+      shard = EKV.Replica.shard_index_for("replication_batch_due/injected", config.num_shards)
+      shard_name = EKV.Replica.shard_name(name, shard)
+      shard_pid = Process.whereis(shard_name)
+      fake_node = :replication_batch_due_peer@fake
+
+      trigger_key =
+        Stream.iterate(1, &(&1 + 1))
+        |> Enum.find_value(fn i ->
+          key = "replication_batch_due/trigger/#{i}"
+          if EKV.Replica.shard_index_for(key, config.num_shards) == shard, do: key
+        end)
+
+      injected_key = "replication_batch_due/injected"
+      injected_value = :erlang.term_to_binary("batched")
+      now = System.system_time(:nanosecond)
+      timer_ref = Process.send_after(shard_pid, {:flush_replication_batch, fake_node}, 60_000)
+
+      :sys.replace_state(shard_name, fn state ->
+        batch = %{
+          entries: [{injected_key, injected_value, now, 1, nil, nil}],
+          bytes: byte_size(injected_key) + byte_size(injected_value) + 64,
+          flush_at_ms: System.monotonic_time(:millisecond) - 1,
+          timer_ref: timer_ref
+        }
+
+        %{
+          state
+          | remote_shards: Map.put(state.remote_shards, fake_node, shard_pid),
+            remote_features:
+              Map.put(state.remote_features, fake_node, MapSet.new([:replication_batch])),
+            replication_batches: Map.put(state.replication_batches, fake_node, batch)
+        }
+      end)
+
+      :erlang.trace(shard_pid, true, [:send])
+      _ = collect_trace_replication_batch_messages()
+
+      assert :ok == EKV.put(name, trigger_key, "fresh")
+      :sys.get_state(shard_name)
+
+      :erlang.trace(shard_pid, false, [:send])
+      messages = collect_trace_replication_batch_messages()
+
+      assert Enum.any?(messages, fn
+               {:replication_batch, _from_node, ^shard, _origin, keys, _destination} ->
+                 Enum.sort(keys) == Enum.sort([injected_key, trigger_key])
+
+               _ ->
+                 false
+             end)
+    end
+
     test "re-subscribe to same prefix is idempotent — no double delivery", %{name: name} do
       :ok = EKV.subscribe(name, "user/")
       :ok = EKV.subscribe(name, "user/")
@@ -2494,6 +2638,44 @@ defmodule EKVTest do
       Enum.each(invalid_opts, fn opts ->
         name = :"ekv_delta_sync_cfg_#{System.unique_integer([:positive])}"
         data_dir = Path.join(System.tmp_dir!(), "ekv_delta_sync_cfg_#{name}")
+        Process.flag(:trap_exit, true)
+
+        expected = Keyword.fetch!(opts, :expected)
+        start_opts = Keyword.drop(opts, [:expected])
+
+        assert {:error, {%ArgumentError{message: msg}, _}} =
+                 EKV.start_link(
+                   Keyword.merge(
+                     [name: name, data_dir: data_dir, log: false],
+                     start_opts
+                   )
+                 )
+
+        assert msg =~ expected
+
+        File.rm_rf!(data_dir)
+      end)
+    end
+
+    test "replication batch config must be valid" do
+      invalid_opts = [
+        [
+          replication_batch_flush_ms: 0,
+          expected: ":replication_batch_flush_ms must be a positive timeout in ms"
+        ],
+        [
+          replication_batch_max_entries: 0,
+          expected: ":replication_batch_max_entries must be a positive integer"
+        ],
+        [
+          replication_batch_max_bytes: 0,
+          expected: ":replication_batch_max_bytes must be a positive byte count"
+        ]
+      ]
+
+      Enum.each(invalid_opts, fn opts ->
+        name = :"ekv_replication_batch_cfg_#{System.unique_integer([:positive])}"
+        data_dir = Path.join(System.tmp_dir!(), "ekv_replication_batch_cfg_#{name}")
         Process.flag(:trap_exit, true)
 
         expected = Keyword.fetch!(opts, :expected)
@@ -5318,6 +5500,27 @@ defmodule EKVTest do
     end
   end
 
+  defp collect_trace_replication_batch_messages do
+    collect_trace_replication_batch_messages([])
+  end
+
+  defp collect_trace_replication_batch_messages(acc) do
+    receive do
+      {:trace, _, :send,
+       {:ekv, 1, :replication_batch, {from_node, shard, origin, entries}, _meta}, destination} ->
+        collect_trace_replication_batch_messages([
+          {:replication_batch, from_node, shard, origin, Enum.map(entries, &elem(&1, 0)),
+           destination}
+          | acc
+        ])
+
+      {:trace, _, :send, _, _} ->
+        collect_trace_replication_batch_messages(acc)
+    after
+      100 -> Enum.reverse(acc)
+    end
+  end
+
   # =====================================================================
   # Auto-persist node_id
   # =====================================================================
@@ -5681,6 +5884,44 @@ defmodule EKVTest do
                )
 
       assert msg =~ ":anti_entropy_interval is not supported in :client mode"
+    end
+
+    test "rejects replication batch knobs in client mode" do
+      invalid_opts = [
+        [
+          replication_batch_flush_ms: 10,
+          expected: ":replication_batch_flush_ms is not supported in :client mode"
+        ],
+        [
+          replication_batch_max_entries: 10,
+          expected: ":replication_batch_max_entries is not supported in :client mode"
+        ],
+        [
+          replication_batch_max_bytes: 10,
+          expected: ":replication_batch_max_bytes is not supported in :client mode"
+        ]
+      ]
+
+      Enum.each(invalid_opts, fn opts ->
+        Process.flag(:trap_exit, true)
+        expected = Keyword.fetch!(opts, :expected)
+        start_opts = Keyword.drop(opts, [:expected])
+
+        assert {:error, {%ArgumentError{message: msg}, _}} =
+                 EKV.start_link(
+                   Keyword.merge(
+                     [
+                       name:
+                         :"ekv_client_replication_batch_bad_#{System.unique_integer([:positive])}",
+                       mode: :client,
+                       region_routing: ["iad"]
+                     ],
+                     start_opts
+                   )
+                 )
+
+        assert msg =~ expected
+      end)
     end
 
     test "reports client info and rejects member-only APIs" do

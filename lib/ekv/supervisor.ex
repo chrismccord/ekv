@@ -199,6 +199,9 @@ defmodule EKV.Supervisor do
     :allow_stale_startup,
     :partition_ttl_policy,
     :wire_compression_threshold,
+    :replication_batch_flush_ms,
+    :replication_batch_max_entries,
+    :replication_batch_max_bytes,
     :wait_for_quorum,
     :wait_for_route,
     :shutdown_barrier
@@ -288,6 +291,9 @@ defmodule EKV.Supervisor do
     allow_stale_startup = Keyword.get(opts, :allow_stale_startup, false)
     partition_ttl_policy = Keyword.get(opts, :partition_ttl_policy, :quarantine)
     wire_compression_threshold = Keyword.get(opts, :wire_compression_threshold, 256 * 1024)
+    replication_batch_flush_ms = Keyword.get(opts, :replication_batch_flush_ms, 2)
+    replication_batch_max_entries = Keyword.get(opts, :replication_batch_max_entries, 64)
+    replication_batch_max_bytes = Keyword.get(opts, :replication_batch_max_bytes, 256 * 1024)
     wait_for_quorum = Keyword.get(opts, :wait_for_quorum, false)
     wait_for_route = Keyword.get(opts, :wait_for_route, false)
     shutdown_barrier = Keyword.get(opts, :shutdown_barrier, false)
@@ -295,6 +301,9 @@ defmodule EKV.Supervisor do
     validate_cas_config!(cluster_size, node_id)
     validate_partition_ttl_policy!(partition_ttl_policy)
     validate_wire_compression_threshold!(wire_compression_threshold)
+    validate_replication_batch_flush_ms!(replication_batch_flush_ms)
+    validate_replication_batch_max_entries!(replication_batch_max_entries)
+    validate_replication_batch_max_bytes!(replication_batch_max_bytes)
     validate_wait_for_quorum!(wait_for_quorum, cluster_size)
     validate_wait_for_route!(wait_for_route, :member)
     validate_shutdown_barrier!(shutdown_barrier)
@@ -348,7 +357,10 @@ defmodule EKV.Supervisor do
       member_progress_retention_ttl: member_progress_retention_ttl,
       allow_stale_startup: allow_stale_startup,
       partition_ttl_policy: partition_ttl_policy,
-      wire_compression_threshold: wire_compression_threshold
+      wire_compression_threshold: wire_compression_threshold,
+      replication_batch_flush_ms: replication_batch_flush_ms,
+      replication_batch_max_entries: replication_batch_max_entries,
+      replication_batch_max_bytes: replication_batch_max_bytes
     }
 
     :persistent_term.put({EKV, name}, config)
@@ -407,6 +419,9 @@ defmodule EKV.Supervisor do
     allow_stale_startup = Keyword.get(opts, :allow_stale_startup, false)
     partition_ttl_policy = Keyword.get(opts, :partition_ttl_policy, :quarantine)
     wire_compression_threshold = Keyword.get(opts, :wire_compression_threshold, 256 * 1024)
+    replication_batch_flush_ms = Keyword.get(opts, :replication_batch_flush_ms, 2)
+    replication_batch_max_entries = Keyword.get(opts, :replication_batch_max_entries, 64)
+    replication_batch_max_bytes = Keyword.get(opts, :replication_batch_max_bytes, 256 * 1024)
     wait_for_quorum = Keyword.get(opts, :wait_for_quorum, false)
     wait_for_route = Keyword.get(opts, :wait_for_route, false)
     shutdown_barrier = Keyword.get(opts, :shutdown_barrier, false)
@@ -415,6 +430,9 @@ defmodule EKV.Supervisor do
     validate_cas_config!(cluster_size, node_id)
     validate_partition_ttl_policy!(partition_ttl_policy)
     validate_wire_compression_threshold!(wire_compression_threshold)
+    validate_replication_batch_flush_ms!(replication_batch_flush_ms)
+    validate_replication_batch_max_entries!(replication_batch_max_entries)
+    validate_replication_batch_max_bytes!(replication_batch_max_bytes)
     validate_wait_for_quorum!(wait_for_quorum, 1)
     validate_wait_for_route!(wait_for_route, :observer)
     validate_shutdown_barrier!(shutdown_barrier)
@@ -468,7 +486,10 @@ defmodule EKV.Supervisor do
       member_progress_retention_ttl: member_progress_retention_ttl,
       allow_stale_startup: allow_stale_startup,
       partition_ttl_policy: partition_ttl_policy,
-      wire_compression_threshold: wire_compression_threshold
+      wire_compression_threshold: wire_compression_threshold,
+      replication_batch_flush_ms: replication_batch_flush_ms,
+      replication_batch_max_entries: replication_batch_max_entries,
+      replication_batch_max_bytes: replication_batch_max_bytes
     }
 
     :persistent_term.put({EKV, name}, config)
@@ -708,6 +729,9 @@ defmodule EKV.Supervisor do
     reject_client_opt!(opts, :unavailable_origin_full_sync_delay, [nil])
     reject_client_opt!(opts, :allow_stale_startup, [nil, false])
     reject_client_opt!(opts, :partition_ttl_policy, [nil])
+    reject_client_opt!(opts, :replication_batch_flush_ms, [nil])
+    reject_client_opt!(opts, :replication_batch_max_entries, [nil])
+    reject_client_opt!(opts, :replication_batch_max_bytes, [nil])
   end
 
   defp validate_wire_compression_threshold!(false), do: :ok
@@ -720,6 +744,33 @@ defmodule EKV.Supervisor do
   defp validate_wire_compression_threshold!(threshold) do
     raise ArgumentError,
           "EKV: :wire_compression_threshold must be false/nil or a non-negative byte threshold, got: #{inspect(threshold)}"
+  end
+
+  defp validate_replication_batch_flush_ms!(flush_ms)
+       when is_integer(flush_ms) and flush_ms > 0,
+       do: :ok
+
+  defp validate_replication_batch_flush_ms!(flush_ms) do
+    raise ArgumentError,
+          "EKV: :replication_batch_flush_ms must be a positive timeout in ms, got: #{inspect(flush_ms)}"
+  end
+
+  defp validate_replication_batch_max_entries!(entries)
+       when is_integer(entries) and entries > 0,
+       do: :ok
+
+  defp validate_replication_batch_max_entries!(entries) do
+    raise ArgumentError,
+          "EKV: :replication_batch_max_entries must be a positive integer, got: #{inspect(entries)}"
+  end
+
+  defp validate_replication_batch_max_bytes!(bytes)
+       when is_integer(bytes) and bytes > 0,
+       do: :ok
+
+  defp validate_replication_batch_max_bytes!(bytes) do
+    raise ArgumentError,
+          "EKV: :replication_batch_max_bytes must be a positive byte count, got: #{inspect(bytes)}"
   end
 
   defp validate_allow_stale_startup!(value) when is_boolean(value), do: :ok

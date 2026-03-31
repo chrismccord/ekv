@@ -141,9 +141,13 @@ Important:
   - Current advertised features:
     - `:live_progress`
     - `:wire_compression`
+    - `:replication_batch`
   - `:live_progress` now means the peer understands progress summaries,
     `:summary_probe` / `:summary_reply`, `:sync_request`, and sync-settlement
     `:progress_ack`. It does not imply per-write live progress acks.
+  - `:replication_batch` means the peer accepts live LWW replication batches
+    over the wire and can apply them in one SQLite transaction while preserving
+    per-entry subscriber semantics.
 - Version determines parse shape.
 - Features determine which optional send-side behaviors are allowed.
 - There is still no support for unversioned/old mixed-member overlap.
@@ -292,6 +296,15 @@ Important:
   - `origin_node` is persisted as a string; with member identity configured it
     should be the stable `node_id`, not a transient blue/green node name.
   - Receivers advance local contiguous progress in the same write/promote transaction.
+- Upgraded peers may batch live LWW replication fanout per destination shard.
+  - Local writes still commit and reply one at a time; only the live
+    member-to-member fanout is buffered briefly.
+  - Batches are same-origin by construction, bounded by time/count/bytes, and
+    applied in one SQLite transaction on the receiver.
+  - Receiver progress must refresh against the final batch high-water mark; the
+    single-entry "advance by one" fast path is not sufficient for batches.
+  - Subscriber delivery must stay ordered and only emit applied entries.
+    Deletes need pre-batch values only for keys that appear in delete ops.
 - Full sync rebuilds `kv` only.
   - Receivers settle progress from the terminal advertised summary.
   - Receivers must not append full-sync rows back into `kv_oplog`.
@@ -345,6 +358,11 @@ Important:
 - Current presence does not bypass overdue quarantine. Once a down-marker is
   older than `tombstone_ttl`, the reconnect gate still quarantines until an
   operator rebuilds one side or deliberately widens the safety window.
+- Pending live replication batches should not strand durable state during
+  orderly shutdown.
+  - Flush pending batches on normal terminate and blue-green handoff.
+  - It is acceptable to drop per-destination in-memory batches on peer loss or
+    quarantine; anti-entropy must repair any missed live writes afterward.
 
 ## Common Failure Patterns
 - CAS returns `{:error, :no_quorum}` or `{:error, :quorum_timeout}`
@@ -369,15 +387,22 @@ Important:
   - per-instance scoped `:pg`
   - persisted `node_id` resolution
   - blue-green startup handoff
+  - live replication batch knob validation/defaults
 - `lib/ekv/replica.ex`
   - shard process
   - LWW path
+  - live replication batch enqueue/flush/receive path
   - CASPaxos prepare/accept/promote
   - sync/HWM logic
   - quarantine
   - handoff/proxy mode
 - `lib/ekv/store.ex`
   - schema and persistence primitives
+  - single-entry and batched replication writes
+- `lib/ekv/sqlite3.ex`
+  - Elixir wrapper around SQLite NIFs
+- `lib/ekv/sqlite3_nif.ex`
+  - NIF stubs and load boundary
 - `lib/ekv/client_router.ex`
   - client route selection, ETS cache, waiters, cooldowns
 - `lib/ekv/member_presence.ex`
@@ -413,6 +438,13 @@ mix test test/anti_entropy_test.exs
 mix test test/distributed_test.exs
 mix test test/adversarial_verification_test.exs
 mix test test/ekv_test.exs
+```
+
+### If touching live replication batching or replication wire features
+```bash
+mix test test/anti_entropy_test.exs
+mix test test/ekv_test.exs
+mix test test/distributed_test.exs
 ```
 
 ### If touching client mode, routing, subscriptions, scoped `:pg`, startup gates

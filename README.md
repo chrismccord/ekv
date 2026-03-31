@@ -128,6 +128,9 @@ Values can be any Erlang term (stored via `:erlang.term_to_binary/1`). Keys are 
 | `:delta_sync_storm_window` | `60_000` (60 sec) | Member and observer mode only. Rolling per-shard window used to aggregate delta sync activity for storm detection. |
 | `:delta_sync_storm_threshold` | `100` | Member and observer mode only. When a shard sends at least this many delta syncs inside one storm window, EKV emits a single aggregated warning for that window. `false`/`nil` disables storm warnings. |
 | `:wire_compression_threshold` | `262_144` (256 KB) | Optional byte threshold for member-to-member wire compression of large replicated value payloads. `false`/`nil` disables it. Large LWW replication and CAS accept/commit payloads compress on the wire only; values remain uncompressed on disk and on reads. |
+| `:replication_batch_flush_ms` | `2` | Member and observer mode only. Max time one live LWW replication batch may stay queued per destination shard before EKV flushes it. |
+| `:replication_batch_max_entries` | `64` | Member and observer mode only. Max live LWW replication operations EKV queues per destination shard before flushing immediately. |
+| `:replication_batch_max_bytes` | `262_144` (256 KB) | Member and observer mode only. Max encoded byte size of one live LWW replication batch per destination shard before flushing immediately. |
 | `:shutdown_barrier` | `false` | Optional graceful-shutdown barrier. Keeps EKV serving during coordinated shutdown for up to the configured timeout so members can finish final writes and replication. |
 | `:allow_stale_startup` | `false` | Member and observer mode only. Dangerous recovery override. If `true`, EKV trusts on-disk data even when stale-db detection would normally refuse startup. Intended only for explicit disaster recovery / full cold-cluster restore cases. |
 | `:blue_green` | `false` | Member and observer mode only. Enable blue-green deployment handoff for shared-volume replacement nodes. |
@@ -179,6 +182,11 @@ Every write is broadcast to the counterpart shard on all connected members. Memb
 discovery is self-contained by monitoring connected Erlang nodes going up
 and down. Client routing, client subscriptions, and shutdown coordination are
 separate and use an EKV-instance-specific `:pg` scope.
+
+On upgraded peers, live LWW replication is buffered briefly per destination
+shard and applied on the receiver in one SQLite batch. Local writes still
+commit and reply one at a time; only the replication fanout is batched. Peers
+that do not advertise batch support keep the older per-entry replication path.
 
 *Note: Node connection is left up to the user, ie either explicit `Node.connect/1`/`sys.config`, or using a library like `DNSCluster`, or `libcluster`.
 

@@ -603,6 +603,60 @@ static int advance_local_origin_progress(
     return SQLITE_OK;
 }
 
+static int refresh_local_origin_progress(
+    connection_t *conn,
+    const char *origin_node,
+    int origin_node_len,
+    sqlite3_int64 *out_progress
+)
+{
+    sqlite3_int64 current = 0;
+    sqlite3_int64 last_contiguous = 0;
+    sqlite3_int64 expected = 0;
+    int rc = read_local_origin_progress(conn, origin_node, origin_node_len, &current);
+    if (rc != SQLITE_OK) return rc;
+
+    rc = ensure_cached_stmt(
+        conn->db,
+        &conn->scan_origin_oplog_stmt,
+        "SELECT origin_seq FROM kv_oplog "
+        "WHERE origin_node = ?1 AND origin_seq > ?2 "
+        "ORDER BY origin_seq"
+    );
+    if (rc != SQLITE_OK) return rc;
+
+    sqlite3_reset(conn->scan_origin_oplog_stmt);
+    sqlite3_clear_bindings(conn->scan_origin_oplog_stmt);
+    sqlite3_bind_text(conn->scan_origin_oplog_stmt, 1, origin_node, origin_node_len, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(conn->scan_origin_oplog_stmt, 2, current);
+
+    last_contiguous = current;
+    expected = current + 1;
+
+    while ((rc = sqlite3_step(conn->scan_origin_oplog_stmt)) == SQLITE_ROW) {
+        sqlite3_int64 row_seq = sqlite3_column_int64(conn->scan_origin_oplog_stmt, 0);
+        if (row_seq != expected)
+            break;
+
+        last_contiguous = row_seq;
+        expected++;
+    }
+
+    sqlite3_reset(conn->scan_origin_oplog_stmt);
+    sqlite3_clear_bindings(conn->scan_origin_oplog_stmt);
+
+    if (rc != SQLITE_ROW && rc != SQLITE_DONE)
+        return rc;
+
+    if (last_contiguous > current) {
+        rc = write_local_origin_progress(conn, origin_node, origin_node_len, last_contiguous);
+        if (rc != SQLITE_OK) return rc;
+    }
+
+    *out_progress = last_contiguous;
+    return SQLITE_OK;
+}
+
 static int begin_immediate(sqlite3 *db)
 {
     return sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
@@ -638,6 +692,69 @@ static int get_progress_entry(
 
     if (!enif_get_int64(env, elems[1], seq)) {
         return 0;
+    }
+
+    return 1;
+}
+
+static int get_replication_batch_entry(
+    ErlNifEnv *env,
+    ERL_NIF_TERM term,
+    ErlNifBinary *key_bin,
+    int *has_value,
+    ErlNifBinary *value_bin,
+    ErlNifSInt64 *timestamp,
+    ErlNifSInt64 *origin_seq,
+    int *has_expires_at,
+    ErlNifSInt64 *expires_at,
+    int *has_deleted_at,
+    ErlNifSInt64 *deleted_at
+)
+{
+    const ERL_NIF_TERM *elems;
+    int arity;
+
+    if (!enif_get_tuple(env, term, &arity, &elems) || arity != 6) {
+        return 0;
+    }
+
+    if (!enif_inspect_iolist_as_binary(env, elems[0], key_bin)) {
+        return 0;
+    }
+
+    if (enif_is_identical(elems[1], atom_nil)) {
+        *has_value = 0;
+    } else {
+        if (!enif_inspect_iolist_as_binary(env, elems[1], value_bin)) {
+            return 0;
+        }
+        *has_value = 1;
+    }
+
+    if (!enif_get_int64(env, elems[2], timestamp)) {
+        return 0;
+    }
+
+    if (!enif_get_int64(env, elems[3], origin_seq) || *origin_seq < 0) {
+        return 0;
+    }
+
+    if (enif_is_identical(elems[4], atom_nil)) {
+        *has_expires_at = 0;
+    } else {
+        if (!enif_get_int64(env, elems[4], expires_at)) {
+            return 0;
+        }
+        *has_expires_at = 1;
+    }
+
+    if (enif_is_identical(elems[5], atom_nil)) {
+        *has_deleted_at = 0;
+    } else {
+        if (!enif_get_int64(env, elems[5], deleted_at)) {
+            return 0;
+        }
+        *has_deleted_at = 1;
     }
 
     return 1;
@@ -1135,6 +1252,248 @@ static ERL_NIF_TERM ekv_write_entry(ErlNifEnv *env, int argc, const ERL_NIF_TERM
         atom_ok,
         atom_false,
         enif_make_int64(env, (ErlNifSInt64)origin_seq),
+        enif_make_int64(env, (ErlNifSInt64)local_progress_seq)
+    );
+}
+
+static ERL_NIF_TERM ekv_write_entries_batch(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    (void)argc;
+    connection_t *conn;
+    statement_t *kv_s;
+    statement_t *keyref_s;
+    statement_t *oplog_s;
+    ErlNifBinary origin_bin;
+    unsigned int entry_count = 0;
+    int *applied_flags = NULL;
+    ERL_NIF_TERM list;
+    ERL_NIF_TERM head;
+    sqlite3_int64 last_origin_seq = 0;
+    sqlite3_int64 local_progress_seq = 0;
+    unsigned int idx = 0;
+
+    if (!enif_get_resource(env, argv[0], connection_type, (void **)&conn))
+        return enif_make_badarg(env);
+
+    if (!enif_get_resource(env, argv[1], statement_type, (void **)&kv_s))
+        return enif_make_badarg(env);
+
+    if (!enif_get_resource(env, argv[2], statement_type, (void **)&keyref_s))
+        return enif_make_badarg(env);
+
+    if (!enif_get_resource(env, argv[3], statement_type, (void **)&oplog_s))
+        return enif_make_badarg(env);
+
+    if (kv_s->conn != conn || keyref_s->conn != conn || oplog_s->conn != conn)
+        return make_error(env, "statement does not belong to this connection");
+
+    if (!enif_inspect_iolist_as_binary(env, argv[4], &origin_bin))
+        return enif_make_badarg(env);
+
+    if (!enif_get_list_length(env, argv[5], &entry_count) || entry_count == 0)
+        return enif_make_badarg(env);
+
+    list = argv[5];
+    applied_flags = enif_alloc(sizeof(int) * entry_count);
+    if (!applied_flags)
+        return make_error(env, "alloc failed");
+
+    enif_mutex_lock(conn->mutex);
+    if (!conn->db) {
+        enif_mutex_unlock(conn->mutex);
+        enif_free(applied_flags);
+        return make_error(env, "database closed");
+    }
+    if (!kv_s->stmt || !keyref_s->stmt || !oplog_s->stmt) {
+        enif_mutex_unlock(conn->mutex);
+        enif_free(applied_flags);
+        return make_error(env, "statement finalized");
+    }
+
+    int rc = begin_immediate(conn->db);
+    if (rc != SQLITE_OK) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        enif_mutex_unlock(conn->mutex);
+        enif_free(applied_flags);
+        return err;
+    }
+
+    while (enif_get_list_cell(env, list, &head, &list)) {
+        ErlNifBinary key_bin;
+        ErlNifBinary value_bin;
+        ErlNifSInt64 timestamp = 0;
+        ErlNifSInt64 origin_seq = 0;
+        ErlNifSInt64 expires_at = 0;
+        ErlNifSInt64 deleted_at = 0;
+        int has_value = 0;
+        int has_expires_at = 0;
+        int has_deleted_at = 0;
+        int changes = 0;
+        int bind_rc;
+        int step_rc = SQLITE_OK;
+
+        if (!get_replication_batch_entry(
+                env,
+                head,
+                &key_bin,
+                &has_value,
+                &value_bin,
+                &timestamp,
+                &origin_seq,
+                &has_expires_at,
+                &expires_at,
+                &has_deleted_at,
+                &deleted_at
+            )) {
+            sqlite3_reset(kv_s->stmt);
+            sqlite3_reset(keyref_s->stmt);
+            sqlite3_reset(oplog_s->stmt);
+            rollback_tx(conn->db);
+            enif_mutex_unlock(conn->mutex);
+            enif_free(applied_flags);
+            return enif_make_badarg(env);
+        }
+
+        sqlite3_reset(kv_s->stmt);
+        sqlite3_clear_bindings(kv_s->stmt);
+        bind_rc = sqlite3_bind_text(kv_s->stmt, 1, (const char *)key_bin.data, (int)key_bin.size, SQLITE_TRANSIENT);
+        if (bind_rc == SQLITE_OK) {
+            bind_rc = has_value
+                ? sqlite3_bind_text(kv_s->stmt, 2, (const char *)value_bin.data, (int)value_bin.size, SQLITE_TRANSIENT)
+                : sqlite3_bind_null(kv_s->stmt, 2);
+        }
+        if (bind_rc == SQLITE_OK) bind_rc = sqlite3_bind_int64(kv_s->stmt, 3, (sqlite3_int64)timestamp);
+        if (bind_rc == SQLITE_OK) bind_rc = sqlite3_bind_text(kv_s->stmt, 4, (const char *)origin_bin.data, (int)origin_bin.size, SQLITE_TRANSIENT);
+        if (bind_rc == SQLITE_OK) bind_rc = sqlite3_bind_int64(kv_s->stmt, 5, (sqlite3_int64)origin_seq);
+        if (bind_rc == SQLITE_OK) {
+            bind_rc = has_expires_at
+                ? sqlite3_bind_int64(kv_s->stmt, 6, (sqlite3_int64)expires_at)
+                : sqlite3_bind_null(kv_s->stmt, 6);
+        }
+        if (bind_rc == SQLITE_OK) {
+            bind_rc = has_deleted_at
+                ? sqlite3_bind_int64(kv_s->stmt, 7, (sqlite3_int64)deleted_at)
+                : sqlite3_bind_null(kv_s->stmt, 7);
+        }
+        if (bind_rc != SQLITE_OK) {
+            ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+            sqlite3_reset(kv_s->stmt);
+            rollback_tx(conn->db);
+            enif_mutex_unlock(conn->mutex);
+            enif_free(applied_flags);
+            return err;
+        }
+
+        rc = sqlite3_step(kv_s->stmt);
+        if (rc != SQLITE_DONE) {
+            ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+            sqlite3_reset(kv_s->stmt);
+            rollback_tx(conn->db);
+            enif_mutex_unlock(conn->mutex);
+            enif_free(applied_flags);
+            return err;
+        }
+        sqlite3_reset(kv_s->stmt);
+        changes = sqlite3_changes(conn->db);
+        applied_flags[idx] = changes > 0;
+
+        rc = bind_and_step_single_text(
+            keyref_s->stmt,
+            (const char *)key_bin.data,
+            (int)key_bin.size,
+            &step_rc
+        );
+        if (rc != SQLITE_OK) {
+            ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+            sqlite3_reset(keyref_s->stmt);
+            rollback_tx(conn->db);
+            enif_mutex_unlock(conn->mutex);
+            enif_free(applied_flags);
+            return err;
+        }
+        sqlite3_reset(keyref_s->stmt);
+
+        sqlite3_reset(oplog_s->stmt);
+        sqlite3_clear_bindings(oplog_s->stmt);
+        bind_rc = sqlite3_bind_text(oplog_s->stmt, 1, (const char *)key_bin.data, (int)key_bin.size, SQLITE_TRANSIENT);
+        if (bind_rc == SQLITE_OK) {
+            bind_rc = has_value
+                ? sqlite3_bind_text(oplog_s->stmt, 2, (const char *)value_bin.data, (int)value_bin.size, SQLITE_TRANSIENT)
+                : sqlite3_bind_null(oplog_s->stmt, 2);
+        }
+        if (bind_rc == SQLITE_OK) bind_rc = sqlite3_bind_int64(oplog_s->stmt, 3, (sqlite3_int64)timestamp);
+        if (bind_rc == SQLITE_OK) bind_rc = sqlite3_bind_text(oplog_s->stmt, 4, (const char *)origin_bin.data, (int)origin_bin.size, SQLITE_TRANSIENT);
+        if (bind_rc == SQLITE_OK) bind_rc = sqlite3_bind_int64(oplog_s->stmt, 5, (sqlite3_int64)origin_seq);
+        if (bind_rc == SQLITE_OK) {
+            bind_rc = has_expires_at
+                ? sqlite3_bind_int64(oplog_s->stmt, 6, (sqlite3_int64)expires_at)
+                : sqlite3_bind_null(oplog_s->stmt, 6);
+        }
+        if (bind_rc == SQLITE_OK) {
+            bind_rc = sqlite3_bind_int(oplog_s->stmt, 7, has_deleted_at ? 1 : 0);
+        }
+        if (bind_rc != SQLITE_OK) {
+            ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+            sqlite3_reset(oplog_s->stmt);
+            rollback_tx(conn->db);
+            enif_mutex_unlock(conn->mutex);
+            enif_free(applied_flags);
+            return err;
+        }
+
+        rc = sqlite3_step(oplog_s->stmt);
+        if (rc != SQLITE_DONE) {
+            ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+            sqlite3_reset(oplog_s->stmt);
+            rollback_tx(conn->db);
+            enif_mutex_unlock(conn->mutex);
+            enif_free(applied_flags);
+            return err;
+        }
+        sqlite3_reset(oplog_s->stmt);
+
+        last_origin_seq = (sqlite3_int64)origin_seq;
+        idx++;
+    }
+
+    rc = refresh_local_origin_progress(
+        conn,
+        (const char *)origin_bin.data,
+        (int)origin_bin.size,
+        &local_progress_seq
+    );
+    if (rc != SQLITE_OK) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        rollback_tx(conn->db);
+        enif_mutex_unlock(conn->mutex);
+        enif_free(applied_flags);
+        return err;
+    }
+
+    rc = commit_tx(conn->db);
+    if (rc != SQLITE_OK) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        rollback_tx(conn->db);
+        enif_mutex_unlock(conn->mutex);
+        enif_free(applied_flags);
+        return err;
+    }
+
+    enif_mutex_unlock(conn->mutex);
+
+    ERL_NIF_TERM applied_flags_list = enif_make_list(env, 0);
+    while (idx > 0) {
+        idx--;
+        applied_flags_list =
+            enif_make_list_cell(env, applied_flags[idx] ? atom_true : atom_false, applied_flags_list);
+    }
+    enif_free(applied_flags);
+
+    return enif_make_tuple4(
+        env,
+        atom_ok,
+        applied_flags_list,
+        enif_make_int64(env, (ErlNifSInt64)last_origin_seq),
         enif_make_int64(env, (ErlNifSInt64)local_progress_seq)
     );
 }
@@ -2623,6 +2982,7 @@ static ErlNifFunc nif_funcs[] = {
     {"ekv_step",          2, ekv_step,          ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_release",       2, ekv_release,       ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_write_entry",   8, ekv_write_entry,   ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"ekv_write_entries_batch", 6, ekv_write_entries_batch, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_write_snapshot_entry", 3, ekv_write_snapshot_entry, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_read_entry",    3, ekv_read_entry,    ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_fetch_all",     3, ekv_fetch_all,     ERL_NIF_DIRTY_JOB_IO_BOUND},
