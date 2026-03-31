@@ -1260,6 +1260,15 @@ defmodule EKV.Store do
 
   def member_down_marker_clear(db, key), do: delete_meta_key(db, key)
 
+  def member_seen_marker_get(db, node_id) when is_binary(node_id) do
+    get_meta_int(db, "member_seen_at:id:" <> node_id)
+  end
+
+  def member_seen_marker_put(db, node_id, seen_at_ms)
+      when is_binary(node_id) and is_integer(seen_at_ms) do
+    set_meta_int(db, "member_seen_at:id:" <> node_id, seen_at_ms)
+  end
+
   def member_node_identity_get(db, member_node) when is_atom(member_node) do
     get_meta_text(db, "member_node_id:" <> Atom.to_string(member_node))
   end
@@ -1291,6 +1300,27 @@ defmodule EKV.Store do
       |> Enum.with_index()
       |> Enum.reduce([], fn {[key, down_since], idx}, acc ->
         stale? = not is_integer(down_since) or down_since < stale_before_ms
+        over_cap? = idx >= max_entries
+        if stale? or over_cap?, do: [key | acc], else: acc
+      end)
+
+    Enum.each(keys_to_delete, &delete_meta_key(db, &1))
+    length(keys_to_delete)
+  end
+
+  def prune_member_seen_markers(db, stale_before_ms, max_entries) do
+    {:ok, rows} =
+      EKV.Sqlite3.fetch_all(
+        db,
+        "SELECT key, value_int FROM kv_meta WHERE key LIKE 'member_seen_at:id:%' ORDER BY value_int DESC",
+        []
+      )
+
+    keys_to_delete =
+      rows
+      |> Enum.with_index()
+      |> Enum.reduce([], fn {[key, seen_at], idx}, acc ->
+        stale? = not is_integer(seen_at) or seen_at < stale_before_ms
         over_cap? = idx >= max_entries
         if stale? or over_cap?, do: [key | acc], else: acc
       end)

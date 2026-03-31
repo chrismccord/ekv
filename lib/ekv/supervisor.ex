@@ -360,11 +360,11 @@ defmodule EKV.Supervisor do
         {EKV.SubTracker, name: sub_tracker_name, sub_count: sub_count},
         {Registry, keys: :duplicate, name: registry_name, listeners: [sub_tracker_name]},
         {EKV.SubDispatcher.Supervisor, name: name, num_shards: num_shards},
+        {EKV.MemberPresence, name: name, region: region, voter: true, node_id: effective_node_id},
         {EKV.Replica.Supervisor, name: name, num_shards: num_shards, data_dir: data_dir},
         if(is_integer(wait_for_quorum),
           do: {EKV.QuorumGate, name: name, timeout: wait_for_quorum, log: log}
         ),
-        {EKV.MemberPresence, name: name, region: region, voter: true, node_id: effective_node_id},
         {EKV.GC, name: name},
         if(is_integer(shutdown_barrier),
           do:
@@ -480,6 +480,8 @@ defmodule EKV.Supervisor do
         {EKV.SubTracker, name: sub_tracker_name, sub_count: sub_count},
         {Registry, keys: :duplicate, name: registry_name, listeners: [sub_tracker_name]},
         {EKV.SubDispatcher.Supervisor, name: name, num_shards: num_shards},
+        {EKV.MemberPresence,
+         name: name, region: region, voter: false, node_id: effective_node_id},
         {EKV.Replica.Supervisor, name: name, num_shards: num_shards, data_dir: data_dir},
         {EKV.ClientRouter, name: name},
         if(is_integer(wait_for_route),
@@ -488,8 +490,6 @@ defmodule EKV.Supervisor do
         if(is_integer(wait_for_quorum),
           do: {EKV.QuorumGate, name: name, timeout: wait_for_quorum, log: log}
         ),
-        {EKV.MemberPresence,
-         name: name, region: region, voter: false, node_id: effective_node_id},
         {EKV.GC, name: name},
         if(is_integer(shutdown_barrier),
           do:

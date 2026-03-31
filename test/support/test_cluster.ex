@@ -460,6 +460,11 @@ defmodule EKV.TestCluster do
     rpc!(node, __MODULE__, :do_member_down_marker, [name, marker_key, shard_index])
   end
 
+  @doc "Read a raw member-seen marker from shard metadata"
+  def member_seen_marker(node, name, node_id, shard_index \\ 0) do
+    rpc!(node, __MODULE__, :do_member_seen_marker, [name, node_id, shard_index])
+  end
+
   @doc "Set a raw member-down marker in shard metadata and cache"
   def set_member_down_marker(node, name, marker_key, down_since_ms, shard_index \\ 0) do
     rpc!(node, __MODULE__, :do_set_member_down_marker, [
@@ -470,9 +475,19 @@ defmodule EKV.TestCluster do
     ])
   end
 
+  @doc "Set a raw member-seen marker in shard metadata and cache"
+  def set_member_seen_marker(node, name, node_id, seen_at_ms, shard_index \\ 0) do
+    rpc!(node, __MODULE__, :do_set_member_seen_marker, [name, node_id, seen_at_ms, shard_index])
+  end
+
   @doc "Clear a raw member-down marker from shard metadata and cache"
   def clear_member_down_marker(node, name, marker_key, shard_index \\ 0) do
     rpc!(node, __MODULE__, :do_clear_member_down_marker, [name, marker_key, shard_index])
+  end
+
+  @doc "Set replica started_at_ms for testing startup grace behavior"
+  def set_replica_started_at(node, name, started_at_ms, shard_index \\ 0) do
+    rpc!(node, __MODULE__, :do_set_replica_started_at, [name, started_at_ms, shard_index])
   end
 
   @doc "Delete retained oplog rows below keep_from_seq for one origin on a remote shard"
@@ -952,6 +967,12 @@ defmodule EKV.TestCluster do
     EKV.Store.member_down_marker_get(db, marker_key)
   end
 
+  def do_member_seen_marker(name, node_id, shard_index) do
+    shard_name = EKV.Replica.shard_name(name, shard_index)
+    %{db: db} = :sys.get_state(shard_name)
+    EKV.Store.member_seen_marker_get(db, node_id)
+  end
+
   def do_set_member_down_marker(name, marker_key, down_since_ms, shard_index) do
     shard_name = EKV.Replica.shard_name(name, shard_index)
     %{db: db} = :sys.get_state(shard_name)
@@ -964,6 +985,18 @@ defmodule EKV.TestCluster do
     :ok
   end
 
+  def do_set_member_seen_marker(name, node_id, seen_at_ms, shard_index) do
+    shard_name = EKV.Replica.shard_name(name, shard_index)
+    %{db: db} = :sys.get_state(shard_name)
+    EKV.Store.member_seen_marker_put(db, node_id, seen_at_ms)
+
+    :sys.replace_state(shard_name, fn state ->
+      %{state | member_seen_at: Map.put(state.member_seen_at, node_id, seen_at_ms)}
+    end)
+
+    :ok
+  end
+
   def do_clear_member_down_marker(name, marker_key, shard_index) do
     shard_name = EKV.Replica.shard_name(name, shard_index)
     %{db: db} = :sys.get_state(shard_name)
@@ -971,6 +1004,16 @@ defmodule EKV.TestCluster do
 
     :sys.replace_state(shard_name, fn state ->
       %{state | member_down_at: Map.delete(state.member_down_at, marker_key)}
+    end)
+
+    :ok
+  end
+
+  def do_set_replica_started_at(name, started_at_ms, shard_index) do
+    shard_name = EKV.Replica.shard_name(name, shard_index)
+
+    :sys.replace_state(shard_name, fn state ->
+      %{state | started_at_ms: started_at_ms}
     end)
 
     :ok

@@ -904,6 +904,62 @@ defmodule EKV.AntiEntropyTest do
       assert :ok = TestCluster.untrace_shard_sends(node_b, ekv_name)
     end
 
+    test "successful member discovery persists a recent member-seen hint" do
+      peers = TestCluster.start_peers(2)
+      [{_, node_a}, {_, node_b}] = peers
+      ekv_name = unique_name(:anti_entropy_member_seen_hint_persisted)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      start_cluster(peers, ekv_name, anti_entropy_interval: @manual_anti_entropy_interval)
+
+      node_a_id = assigned_node_id(peers, node_a)
+      node_b_id = assigned_node_id(peers, node_b)
+
+      TestCluster.assert_eventually(fn ->
+        is_integer(TestCluster.member_seen_marker(node_a, ekv_name, node_b_id)) and
+          is_integer(TestCluster.member_seen_marker(node_b, ekv_name, node_a_id))
+      end)
+    end
+
+    test "recently seen unknown third-origin is deferred during startup instead of forcing full" do
+      peers = TestCluster.start_peers(2)
+      [{_, node_a}, {_, node_b}] = peers
+      ekv_name = unique_name(:anti_entropy_recent_unknown_origin_deferred)
+      recent_origin = "recent-origin"
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      start_cluster(peers, ekv_name, anti_entropy_interval: @manual_anti_entropy_interval)
+
+      remote_node_id = assigned_node_id(peers, node_a)
+      now_ms = System.system_time(:millisecond)
+
+      assert :ok = TestCluster.set_member_seen_marker(node_b, ekv_name, recent_origin, now_ms)
+      assert :ok = TestCluster.set_replica_started_at(node_b, ekv_name, now_ms)
+      assert :ok = TestCluster.set_sync_inflight_age(node_b, ekv_name, node_a, 999_999)
+      assert :ok = TestCluster.trace_shard_sends(node_b, ekv_name, self())
+
+      assert :ok =
+               TestCluster.inject_summary_reply(
+                 node_b,
+                 ekv_name,
+                 node_a,
+                 %{remote_node_id => 0, recent_origin => 1},
+                 remote_node_id
+               )
+
+      requests = collect_sync_request_meta_messages([], 1_000)
+
+      refute Enum.any?(requests, fn {shard, request, _meta, destination} ->
+               shard == 0 and request == :full and
+                 destination == {EKV.Replica.shard_name(ekv_name, 0), node_a}
+             end),
+             "requests=#{inspect(requests)}"
+
+      assert :ok = TestCluster.untrace_shard_sends(node_b, ekv_name)
+    end
+
     test "third-origin relay uses persisted member identity when live shard mapping is absent" do
       peers = TestCluster.start_peers(3)
       [{_, node_a}, {_, node_b}, {_, node_c}] = peers

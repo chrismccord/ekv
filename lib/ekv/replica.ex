@@ -1127,6 +1127,10 @@ defmodule EKV.Replica do
   @member_down_name_prefix "member_down_at:name:"
   @member_down_name_min_retention_ms :timer.hours(24 * 30)
   @member_down_name_max_entries 4096
+  @member_seen_hint_ttl_ms :timer.minutes(15)
+  @member_seen_refresh_window_ms :timer.minutes(1)
+  @member_seen_max_entries 8192
+  @unknown_member_origin_startup_grace_ms :timer.minutes(5)
   @wire_protocol_version 1
   @wire_compressed_tag :ekv_wire_compressed
   @wire_feature_live_progress :live_progress
@@ -1147,6 +1151,8 @@ defmodule EKV.Replica do
     remote_shards: %{},
     # Marker key -> down_since_ms (wall clock cache for kv_meta)
     member_down_at: %{},
+    # node_id -> last persisted seen_at_ms
+    member_seen_at: %{},
     quarantined_members: MapSet.new(),
     # CAS fields
     node_id: nil,
@@ -1163,6 +1169,7 @@ defmodule EKV.Replica do
     remote_member_hwms: %{},
     remote_features: %{},
     summary_probe_inflight: %{},
+    started_at_ms: nil,
     sync_inflight: %{},
     delta_origin_inflight: %{},
     delta_sync_storm_started_at_ms: nil,
@@ -1269,7 +1276,8 @@ defmodule EKV.Replica do
       local_max_seq: local_max_seq,
       local_origin_seq: local_origin_seq,
       local_progress: local_progress,
-      ballot_counter: ballot_counter
+      ballot_counter: ballot_counter,
+      started_at_ms: System.system_time(:millisecond)
     }
 
     :net_kernel.monitor_nodes(true)
@@ -2296,6 +2304,7 @@ defmodule EKV.Replica do
 
     # 6. Bounded cleanup for fallback name-based down markers.
     prune_stale_member_down_name_markers(state)
+    prune_stale_member_seen_markers(state)
 
     {:noreply, state}
   end
@@ -2397,6 +2406,7 @@ defmodule EKV.Replica do
           |> track_remote_shard(remote_node, remote_pid)
           |> track_member_node_id(remote_node, remote_node_id)
           |> persist_member_node_identity(remote_node, remote_node_id)
+          |> remember_member_origin_seen(remote_node_id)
           |> replace_remote_member_progress(remote_node, remote_progress)
           |> reconcile_authoritative_origin_head(remote_node, remote_progress)
 
@@ -2443,6 +2453,7 @@ defmodule EKV.Replica do
           |> track_remote_shard(remote_node, remote_pid)
           |> track_member_node_id(remote_node, remote_node_id)
           |> persist_member_node_identity(remote_node, remote_node_id)
+          |> remember_member_origin_seen(remote_node_id)
           |> replace_remote_member_progress(remote_node, remote_progress)
           |> reconcile_authoritative_origin_head(remote_node, remote_progress)
 
@@ -2493,6 +2504,7 @@ defmodule EKV.Replica do
             |> track_remote_shard(remote_node, remote_pid)
             |> track_member_node_id(remote_node, remote_node_id)
             |> persist_member_node_identity(remote_node, remote_node_id)
+            |> remember_member_origin_seen(remote_node_id)
             |> replace_remote_member_progress(remote_node, remote_progress)
             |> reconcile_authoritative_origin_head(remote_node, remote_progress)
             |> track_remote_features(remote_node, remote_features)
@@ -2573,6 +2585,7 @@ defmodule EKV.Replica do
             |> track_remote_shard(remote_node, remote_pid)
             |> track_member_node_id(remote_node, remote_node_id)
             |> persist_member_node_identity(remote_node, remote_node_id)
+            |> remember_member_origin_seen(remote_node_id)
             |> replace_remote_member_progress(remote_node, remote_progress)
             |> reconcile_authoritative_origin_head(remote_node, remote_progress)
             |> track_remote_features(remote_node, remote_features)
@@ -3398,6 +3411,9 @@ defmodule EKV.Replica do
       known_member_origin?(state, known_member_nodes, origin_node) ->
         {state, {:delta, origin_node, local_seq}}
 
+      recent_member_origin_hint?(state, origin_node) ->
+        {state, nil}
+
       true ->
         {state, {:full, {:unknown_member_origin, origin_node, local_seq}}}
     end
@@ -3427,6 +3443,27 @@ defmodule EKV.Replica do
       Enum.any?(Map.keys(state.member_node_ids), &member_matches_origin?(state, &1, origin_node)) or
       Enum.any?(Map.keys(state.remote_shards), &member_matches_origin?(state, &1, origin_node)) or
       known_down_member?(state, origin_node)
+  end
+
+  defp recent_member_origin_hint?(%Replica{} = state, origin_node)
+       when is_binary(origin_node) and byte_size(origin_node) > 0 do
+    now_ms = System.system_time(:millisecond)
+
+    now_ms - (state.started_at_ms || now_ms) <= @unknown_member_origin_startup_grace_ms and
+      member_origin_seen_recently?(state, origin_node, now_ms)
+  end
+
+  defp recent_member_origin_hint?(%Replica{} = _state, _origin_node), do: false
+
+  defp member_origin_seen_recently?(%Replica{} = state, origin_node, now_ms) do
+    case Map.fetch(state.member_seen_at, origin_node) do
+      {:ok, seen_at_ms} when is_integer(seen_at_ms) ->
+        now_ms - seen_at_ms <= @member_seen_hint_ttl_ms
+
+      _ ->
+        seen_at_ms = Store.member_seen_marker_get(state.db, origin_node)
+        is_integer(seen_at_ms) and now_ms - seen_at_ms <= @member_seen_hint_ttl_ms
+    end
   end
 
   defp member_matches_origin?(%Replica{} = state, member_node, origin_node)
@@ -5268,6 +5305,27 @@ defmodule EKV.Replica do
     %{state | member_node_ids: Map.put(state.member_node_ids, remote_node, remote_node_id)}
   end
 
+  defp remember_member_origin_seen(%Replica{} = state, nil), do: state
+
+  defp remember_member_origin_seen(%Replica{} = state, remote_node_id)
+       when is_binary(remote_node_id) and byte_size(remote_node_id) > 0 do
+    now_ms = System.system_time(:millisecond)
+
+    case Map.get(state.member_seen_at, remote_node_id) do
+      nil ->
+        Store.member_seen_marker_put(state.db, remote_node_id, now_ms)
+        %{state | member_seen_at: Map.put(state.member_seen_at, remote_node_id, now_ms)}
+
+      seen_at_ms
+      when is_integer(seen_at_ms) and now_ms - seen_at_ms >= @member_seen_refresh_window_ms ->
+        Store.member_seen_marker_put(state.db, remote_node_id, now_ms)
+        %{state | member_seen_at: Map.put(state.member_seen_at, remote_node_id, now_ms)}
+
+      _recent ->
+        state
+    end
+  end
+
   defp persist_member_node_identity(%Replica{} = state, _remote_node, nil), do: state
 
   defp persist_member_node_identity(%Replica{} = state, remote_node, remote_node_id) do
@@ -5563,6 +5621,16 @@ defmodule EKV.Replica do
       state.db,
       stale_before_ms,
       @member_down_name_max_entries
+    )
+  end
+
+  defp prune_stale_member_seen_markers(%Replica{} = state) do
+    stale_before_ms = System.system_time(:millisecond) - @member_seen_hint_ttl_ms
+
+    Store.prune_member_seen_markers(
+      state.db,
+      stale_before_ms,
+      @member_seen_max_entries
     )
   end
 
