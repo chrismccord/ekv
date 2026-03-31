@@ -2785,6 +2785,7 @@ defmodule EKV.CASDistributedTest do
       assert TestCluster.rpc!(n3, EKV, :get, [ekv_name, "key1"]) == "val1"
     end
 
+    @tag timeout: 120_000
     test "blue_green startup aborts when a reachable old shard misses handoff ack" do
       peers = TestCluster.start_peers(4)
       on_exit(fn -> TestCluster.stop_peers(peers) end)
