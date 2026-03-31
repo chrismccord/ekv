@@ -3170,6 +3170,8 @@ defmodule EKV.Replica do
         state
 
       true ->
+        maybe_log_full_sync_request(state, remote_node, request)
+
         send_to_member(
           state,
           remote_node,
@@ -3241,6 +3243,87 @@ defmodule EKV.Replica do
   defp full_sync_request?(:full), do: true
   defp full_sync_request?({:full, _reason}), do: true
   defp full_sync_request?(_request), do: false
+
+  defp maybe_log_full_sync_request(
+         %Replica{} = state,
+         remote_node,
+         {:full, {:unknown_member_origin, origin_node, local_seq}}
+       ) do
+    diagnostics = unknown_member_origin_diagnostics(state, origin_node)
+
+    log(state, fn ->
+      "#{log_prefix_shard(state)} requesting full sync from #{remote_node} " <>
+        "reason=unknown_member_origin origin=#{origin_node} local_seq=#{local_seq} " <>
+        "presence_origin_known=#{diagnostics.presence_origin_known} " <>
+        "known_member_nodes_count=#{diagnostics.known_member_nodes_count} " <>
+        "known_member_node_matches=#{inspect(diagnostics.known_member_node_matches)} " <>
+        "member_node_id_matches=#{inspect(diagnostics.member_node_id_matches)} " <>
+        "remote_shard_matches=#{inspect(diagnostics.remote_shard_matches)} " <>
+        "known_down_member=#{diagnostics.known_down_member}"
+    end)
+  end
+
+  defp maybe_log_full_sync_request(
+         %Replica{} = state,
+         remote_node,
+         {:full, {:quarantined_origin, origin_node, local_seq}}
+       ) do
+    quarantined_matches = quarantined_member_matches(state, origin_node)
+
+    log(state, fn ->
+      "#{log_prefix_shard(state)} requesting full sync from #{remote_node} " <>
+        "reason=quarantined_origin origin=#{origin_node} local_seq=#{local_seq} " <>
+        "quarantined_matches=#{inspect(quarantined_matches)} " <>
+        "known_down_member=#{known_down_member?(state, origin_node)}"
+    end)
+  end
+
+  defp maybe_log_full_sync_request(%Replica{} = _state, _remote_node, _request), do: :ok
+
+  defp unknown_member_origin_diagnostics(%Replica{} = state, origin_node) do
+    known_member_node_matches =
+      state
+      |> known_member_nodes()
+      |> Enum.filter(&member_matches_origin?(state, &1, origin_node))
+      |> Enum.map(&Atom.to_string/1)
+      |> Enum.sort()
+
+    member_node_id_matches =
+      state.member_node_ids
+      |> Enum.filter(fn {member_node, _member_node_id} ->
+        member_matches_origin?(state, member_node, origin_node)
+      end)
+      |> Enum.map(fn {member_node, member_node_id} ->
+        {Atom.to_string(member_node), member_node_id}
+      end)
+      |> Enum.sort()
+
+    remote_shard_matches =
+      state.remote_shards
+      |> Map.keys()
+      |> Enum.filter(&member_matches_origin?(state, &1, origin_node))
+      |> Enum.map(&Atom.to_string/1)
+      |> Enum.sort()
+
+    %{
+      presence_origin_known: EKV.MemberPresence.member_origin_known?(state.name, origin_node),
+      known_member_nodes_count: MapSet.size(known_member_nodes(state)),
+      known_member_node_matches: known_member_node_matches,
+      member_node_id_matches: member_node_id_matches,
+      remote_shard_matches: remote_shard_matches,
+      known_down_member: known_down_member?(state, origin_node)
+    }
+  end
+
+  defp quarantined_member_matches(%Replica{} = state, origin_node) do
+    state.quarantined_members
+    |> Enum.filter(fn remote_node ->
+      remote_origin_id(state, remote_node) == origin_node or
+        Atom.to_string(remote_node) == origin_node
+    end)
+    |> Enum.map(&Atom.to_string/1)
+    |> Enum.sort()
+  end
 
   defp relayed_delta_request?(%Replica{} = state, remote_node, origin_node)
        when is_atom(remote_node) and is_binary(origin_node) do
@@ -5250,8 +5333,10 @@ defmodule EKV.Replica do
   end
 
   defp maybe_allow_member_reconnect(%Replica{} = state, remote_node, remote_node_id) do
-    {%Replica{} = state, down_since_ms} =
-      resolve_member_down_since(state, remote_node, remote_node_id)
+    {%Replica{} = state, down_marker} =
+      resolve_member_down_marker(state, remote_node, remote_node_id)
+
+    down_since_ms = down_marker.down_since_ms
 
     age_ms =
       if is_integer(down_since_ms), do: max(0, System.system_time(:millisecond) - down_since_ms)
@@ -5264,6 +5349,22 @@ defmodule EKV.Replica do
         }
 
         {:ok, clear_summary_probe_inflight(state, remote_node)}
+
+      is_integer(down_since_ms) and
+          allow_live_member_id_marker_reconnect?(state, remote_node, remote_node_id, down_marker) ->
+        %Replica{} = state = clear_member_down_markers(state, remote_node, remote_node_id)
+
+        state = %{
+          state
+          | quarantined_members: MapSet.delete(state.quarantined_members, remote_node)
+        }
+
+        state =
+          state
+          |> clear_summary_probe_inflight(remote_node)
+          |> clear_sync_inflight(remote_node)
+
+        {:ok, state}
 
       is_integer(down_since_ms) and age_ms > state.tombstone_ttl ->
         state = %{
@@ -5303,11 +5404,15 @@ defmodule EKV.Replica do
     end
   end
 
-  defp resolve_member_down_since(%Replica{} = state, remote_node, nil) do
-    read_member_down_marker(state, member_down_name_key(remote_node))
+  defp resolve_member_down_marker(%Replica{} = state, remote_node, nil) do
+    {%Replica{} = state, name_down_since} =
+      read_member_down_marker(state, member_down_name_key(remote_node))
+
+    {state,
+     %{down_since_ms: name_down_since, id_down_since: nil, name_down_since: name_down_since}}
   end
 
-  defp resolve_member_down_since(%Replica{} = state, remote_node, remote_node_id) do
+  defp resolve_member_down_marker(%Replica{} = state, remote_node, remote_node_id) do
     id_key = member_down_id_key(remote_node_id)
     name_key = member_down_name_key(remote_node)
 
@@ -5327,12 +5432,44 @@ defmodule EKV.Replica do
             else: put_member_down_marker(state, id_key, merged_down_since)
 
         %Replica{} = state = clear_member_down_marker(state, name_key)
-        {state, merged_down_since}
+
+        {state,
+         %{
+           down_since_ms: merged_down_since,
+           id_down_since: id_down_since,
+           name_down_since: name_down_since
+         }}
 
       true ->
-        {state, id_down_since}
+        {state,
+         %{
+           down_since_ms: id_down_since,
+           id_down_since: id_down_since,
+           name_down_since: name_down_since
+         }}
     end
   end
+
+  defp allow_live_member_id_marker_reconnect?(
+         %Replica{} = state,
+         remote_node,
+         remote_node_id,
+         %{id_down_since: id_down_since, name_down_since: nil}
+       )
+       when is_atom(remote_node) and is_binary(remote_node_id) and is_integer(id_down_since) do
+    remote_node in known_member_nodes(state) and
+      EKV.MemberPresence.member_origin_known?(state.name, remote_node_id)
+  rescue
+    _ -> false
+  end
+
+  defp allow_live_member_id_marker_reconnect?(
+         %Replica{} = _state,
+         _remote_node,
+         _remote_node_id,
+         _down_marker
+       ),
+       do: false
 
   defp remember_member_down_marker(%Replica{} = state, marker_key) do
     {%Replica{} = state, existing_down_since} = read_member_down_marker(state, marker_key)
