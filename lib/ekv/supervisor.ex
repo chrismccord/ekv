@@ -5,8 +5,8 @@ defmodule EKV.Supervisor do
   require Logger
 
   @default_member_progress_retention_ttl :timer.hours(6)
-  @handoff_ack_timeout_ms 5_000
-  @handoff_task_timeout_ms 10_000
+  @handoff_ack_timeout_ms 60_000
+  @handoff_task_timeout_ms 90_000
 
   _archdoc = ~S"""
   Top-level EKV supervisor.

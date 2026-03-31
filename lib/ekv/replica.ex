@@ -1587,6 +1587,19 @@ defmodule EKV.Replica do
 
   @impl true
   def handle_info({:ekv_handoff_request, ref, new_node, caller_pid}, %Replica{} = state) do
+    handoff_started_ms = System.monotonic_time(:millisecond)
+
+    mailbox_len =
+      case Process.info(self(), :message_queue_len) do
+        {:message_queue_len, len} when is_integer(len) -> len
+        _ -> :unknown
+      end
+
+    log(state, fn ->
+      "#{log_prefix_shard(state)} handoff requested by #{new_node} " <>
+        "mailbox_len=#{mailbox_len} pending_cas=#{map_size(state.pending_cas)}"
+    end)
+
     EKV.BlueGreenMarker.mark_handoff_performed(state.name)
     EKV.MemberPresence.leave(state.name)
 
@@ -1615,7 +1628,10 @@ defmodule EKV.Replica do
     send(caller_pid, {:ekv_handoff_ack, ref})
 
     log(state, fn ->
-      "#{log_prefix_shard(state)} handoff to #{new_node} complete, proxy mode"
+      elapsed_ms = System.monotonic_time(:millisecond) - handoff_started_ms
+
+      "#{log_prefix_shard(state)} handoff to #{new_node} complete, " <>
+        "elapsed_ms=#{elapsed_ms}, proxy mode"
     end)
 
     # 6. Enter proxy mode (readers stay alive until terminate)
