@@ -305,6 +305,22 @@ Important:
     single-entry "advance by one" fast path is not sufficient for batches.
   - Subscriber delivery must stay ordered and only emit applied entries.
     Deletes need pre-batch values only for keys that appear in delete ops.
+- Local durable write ingress is split now:
+  - non-CAS local shard requests use a custom send/reply protocol with caller
+    monitor+timeout semantics that intentionally mirror `GenServer.call/3`
+    closely
+  - CAS local requests use that same ingress so selective receive can keep CAS
+    ahead of local LWW without touching `'$gen_call'` ordering
+  - direct `GenServer.call` compatibility still exists for internal proxy/test
+    paths, but it is no longer the hot path for local writes
+- Replica fairness is mailbox-level, not queued-state scheduling:
+  - inbound live replicated LWW still applies eagerly
+  - after each live replication turn, the shard selectively receives
+    higher-priority local/control messages before continuing replication
+  - local non-CAS LWW may opportunistically batch adjacent local requests into
+    one SQLite transaction using the local-origin batch NIF
+  - replicated LWW remains the lowest-priority lane; anti-entropy/control-plane
+    messages must not be skipped behind local batching
 - Full sync rebuilds `kv` only.
   - Receivers settle progress from the terminal advertised summary.
   - Receivers must not append full-sync rows back into `kv_oplog`.

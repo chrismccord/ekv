@@ -51,6 +51,28 @@ defmodule EKV.Sqlite3 do
           entries
         )
 
+  def write_local_entries_batch(
+        db,
+        kv_stmt,
+        keyref_stmt,
+        oplog_stmt,
+        origin_node,
+        starting_origin_seq,
+        entries,
+        reject_cas_managed
+      ),
+      do:
+        Sqlite3NIF.ekv_write_local_entries_batch(
+          db,
+          kv_stmt,
+          keyref_stmt,
+          oplog_stmt,
+          origin_node,
+          starting_origin_seq,
+          entries,
+          reject_cas_managed
+        )
+
   def write_snapshot_entry(db, kv_stmt, kv_args),
     do: Sqlite3NIF.ekv_write_snapshot_entry(db, kv_stmt, kv_args)
 

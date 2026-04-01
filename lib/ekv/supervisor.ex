@@ -201,6 +201,8 @@ defmodule EKV.Supervisor do
     :partition_ttl_policy,
     :wire_compression_threshold,
     :handoff_ack_timeout_ms,
+    :local_write_batch_max_entries,
+    :local_write_batch_max_bytes,
     :replication_batch_flush_ms,
     :replication_batch_max_entries,
     :replication_batch_max_bytes,
@@ -297,6 +299,8 @@ defmodule EKV.Supervisor do
     allow_stale_startup = Keyword.get(opts, :allow_stale_startup, false)
     partition_ttl_policy = Keyword.get(opts, :partition_ttl_policy, :quarantine)
     wire_compression_threshold = Keyword.get(opts, :wire_compression_threshold, 256 * 1024)
+    local_write_batch_max_entries = Keyword.get(opts, :local_write_batch_max_entries, 32)
+    local_write_batch_max_bytes = Keyword.get(opts, :local_write_batch_max_bytes, 256 * 1024)
     replication_batch_flush_ms = Keyword.get(opts, :replication_batch_flush_ms, 3)
     replication_batch_max_entries = Keyword.get(opts, :replication_batch_max_entries, 64)
     replication_batch_max_bytes = Keyword.get(opts, :replication_batch_max_bytes, 256 * 1024)
@@ -308,6 +312,8 @@ defmodule EKV.Supervisor do
     validate_partition_ttl_policy!(partition_ttl_policy)
     validate_wire_compression_threshold!(wire_compression_threshold)
     validate_handoff_ack_timeout_ms!(handoff_ack_timeout_ms)
+    validate_local_write_batch_max_entries!(local_write_batch_max_entries)
+    validate_local_write_batch_max_bytes!(local_write_batch_max_bytes)
     validate_replication_batch_flush_ms!(replication_batch_flush_ms)
     validate_replication_batch_max_entries!(replication_batch_max_entries)
     validate_replication_batch_max_bytes!(replication_batch_max_bytes)
@@ -365,6 +371,8 @@ defmodule EKV.Supervisor do
       allow_stale_startup: allow_stale_startup,
       partition_ttl_policy: partition_ttl_policy,
       wire_compression_threshold: wire_compression_threshold,
+      local_write_batch_max_entries: local_write_batch_max_entries,
+      local_write_batch_max_bytes: local_write_batch_max_bytes,
       replication_batch_flush_ms: replication_batch_flush_ms,
       replication_batch_max_entries: replication_batch_max_entries,
       replication_batch_max_bytes: replication_batch_max_bytes
@@ -430,6 +438,8 @@ defmodule EKV.Supervisor do
     allow_stale_startup = Keyword.get(opts, :allow_stale_startup, false)
     partition_ttl_policy = Keyword.get(opts, :partition_ttl_policy, :quarantine)
     wire_compression_threshold = Keyword.get(opts, :wire_compression_threshold, 256 * 1024)
+    local_write_batch_max_entries = Keyword.get(opts, :local_write_batch_max_entries, 32)
+    local_write_batch_max_bytes = Keyword.get(opts, :local_write_batch_max_bytes, 256 * 1024)
     replication_batch_flush_ms = Keyword.get(opts, :replication_batch_flush_ms, 2)
     replication_batch_max_entries = Keyword.get(opts, :replication_batch_max_entries, 64)
     replication_batch_max_bytes = Keyword.get(opts, :replication_batch_max_bytes, 256 * 1024)
@@ -442,6 +452,8 @@ defmodule EKV.Supervisor do
     validate_partition_ttl_policy!(partition_ttl_policy)
     validate_wire_compression_threshold!(wire_compression_threshold)
     validate_handoff_ack_timeout_ms!(handoff_ack_timeout_ms)
+    validate_local_write_batch_max_entries!(local_write_batch_max_entries)
+    validate_local_write_batch_max_bytes!(local_write_batch_max_bytes)
     validate_replication_batch_flush_ms!(replication_batch_flush_ms)
     validate_replication_batch_max_entries!(replication_batch_max_entries)
     validate_replication_batch_max_bytes!(replication_batch_max_bytes)
@@ -499,6 +511,8 @@ defmodule EKV.Supervisor do
       allow_stale_startup: allow_stale_startup,
       partition_ttl_policy: partition_ttl_policy,
       wire_compression_threshold: wire_compression_threshold,
+      local_write_batch_max_entries: local_write_batch_max_entries,
+      local_write_batch_max_bytes: local_write_batch_max_bytes,
       replication_batch_flush_ms: replication_batch_flush_ms,
       replication_batch_max_entries: replication_batch_max_entries,
       replication_batch_max_bytes: replication_batch_max_bytes
@@ -742,6 +756,8 @@ defmodule EKV.Supervisor do
     reject_client_opt!(opts, :allow_stale_startup, [nil, false])
     reject_client_opt!(opts, :partition_ttl_policy, [nil])
     reject_client_opt!(opts, :handoff_ack_timeout_ms, [nil])
+    reject_client_opt!(opts, :local_write_batch_max_entries, [nil])
+    reject_client_opt!(opts, :local_write_batch_max_bytes, [nil])
     reject_client_opt!(opts, :replication_batch_flush_ms, [nil])
     reject_client_opt!(opts, :replication_batch_max_entries, [nil])
     reject_client_opt!(opts, :replication_batch_max_bytes, [nil])
@@ -775,6 +791,24 @@ defmodule EKV.Supervisor do
   defp validate_replication_batch_flush_ms!(flush_ms) do
     raise ArgumentError,
           "EKV: :replication_batch_flush_ms must be a positive timeout in ms, got: #{inspect(flush_ms)}"
+  end
+
+  defp validate_local_write_batch_max_entries!(entries)
+       when is_integer(entries) and entries > 0,
+       do: :ok
+
+  defp validate_local_write_batch_max_entries!(entries) do
+    raise ArgumentError,
+          "EKV: :local_write_batch_max_entries must be a positive integer, got: #{inspect(entries)}"
+  end
+
+  defp validate_local_write_batch_max_bytes!(bytes)
+       when is_integer(bytes) and bytes > 0,
+       do: :ok
+
+  defp validate_local_write_batch_max_bytes!(bytes) do
+    raise ArgumentError,
+          "EKV: :local_write_batch_max_bytes must be a positive integer, got: #{inspect(bytes)}"
   end
 
   defp validate_replication_batch_max_entries!(entries)

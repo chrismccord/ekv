@@ -258,6 +258,8 @@ defmodule EKV do
   | `:delta_sync_storm_window` | `60_000` (60 sec) | Member and observer mode only. Rolling per-shard window used to aggregate delta sync activity for storm detection. |
   | `:delta_sync_storm_threshold` | `100` | Member and observer mode only. When a shard sends at least this many delta syncs inside one storm window, EKV emits a single aggregated warning for that window. `false`/`nil` disables storm warnings. |
   | `:wire_compression_threshold` | `262_144` (256 KB) | Optional byte threshold for member-to-member wire compression of large replicated value payloads. `false`/`nil` disables it. Large `:ekv_put`, CAS accept, and full-payload CAS commit messages compress values on the wire only; values remain uncompressed on disk and on reads. |
+  | `:local_write_batch_max_entries` | `32` | Member and observer mode only. Max adjacent non-CAS local LWW writes the shard will opportunistically drain into one SQLite batch before replying. |
+  | `:local_write_batch_max_bytes` | `262_144` (256 KB) | Member and observer mode only. Max encoded byte size of one opportunistic non-CAS local LWW batch before the shard stops draining more local writes. |
   | `:replication_batch_flush_ms` | `3` | Member and observer mode only. Max time one live LWW replication batch may stay queued per destination shard before EKV flushes it. |
   | `:replication_batch_max_entries` | `64` | Member and observer mode only. Max live LWW replication operations EKV queues per destination shard before flushing immediately. |
   | `:replication_batch_max_bytes` | `262_144` (256 KB) | Member and observer mode only. Max encoded byte size of one live LWW replication batch per destination shard before flushing immediately. |
@@ -1561,7 +1563,7 @@ defmodule EKV do
   end
 
   defp call_shard(name, shard_index, request, timeout) do
-    GenServer.call(Replica.shard_name(name, shard_index), request, timeout)
+    Replica.local_request(Replica.shard_name(name, shard_index), request, timeout)
   end
 
   defp call_shard_write(
@@ -1671,11 +1673,7 @@ defmodule EKV do
         shard_index = Replica.shard_index_for(key, config.num_shards)
         cas_opts = Keyword.take(opts, [:retries, :backoff])
 
-        case GenServer.call(
-               Replica.shard_name(name, shard_index),
-               {:cas_read, key, cas_opts},
-               timeout
-             ) do
+        case call_shard(name, shard_index, {:cas_read, key, cas_opts}, timeout) do
           {:ok, _value} ->
             {:ok, current_row_state(name, shard_index, key)}
 

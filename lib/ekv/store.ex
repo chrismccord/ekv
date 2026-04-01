@@ -476,6 +476,38 @@ defmodule EKV.Store do
   end
 
   @doc """
+  Apply a same-origin local replication batch in a single SQLite transaction.
+
+  Returns `{:ok, results, final_origin_seq}` where `results` preserves per-entry
+  outcomes in input order as `{:applied, origin_seq}`, `:ignored`, or
+  `:cas_managed_key`.
+  """
+  def write_local_entries_batch(
+        db,
+        kv_stmt,
+        keyref_stmt,
+        oplog_stmt,
+        origin_node,
+        starting_origin_seq,
+        entries,
+        reject_cas_managed \\ true
+      )
+      when is_list(entries) and is_integer(starting_origin_seq) and starting_origin_seq >= 0 do
+    origin_str = persisted_member_id(origin_node)
+
+    EKV.Sqlite3.write_local_entries_batch(
+      db,
+      kv_stmt,
+      keyref_stmt,
+      oplog_stmt,
+      origin_str,
+      starting_origin_seq,
+      entries,
+      reject_cas_managed
+    )
+  end
+
+  @doc """
   Apply a full-sync snapshot row to `kv` without appending replay history.
   """
   def write_snapshot_entry(

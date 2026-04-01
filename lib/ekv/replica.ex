@@ -226,17 +226,20 @@ defmodule EKV.Replica do
 
       Client                  Replica (shard i)              Peers
         │                          │                           │
-        │ GenServer.call           │                           │
-        │  {:put, key,             │                           │
-        │   value_binary, opts}    │                           │
+        │ send local request       │                           │
+        │  {:put | :delete, ...}   │                           │
         │─────────────────────────>│                           │
         │                          │                           │
-        │                    write_entry NIF (1 dirty bounce): │
+        │                    opportunistically drain adjacent  │
+        │                    local LWW writes                  │
+        │                    write_local_entries_batch NIF:    │
         │                      BEGIN IMMEDIATE                 │
-        │                      kv upsert (LWW WHERE clause)    │
-        │                      sqlite3_changes() == 0?         │
-        │                        → ROLLBACK (LWW lost)         │
-        │                        → oplog INSERT + COMMIT       │
+        │                      per entry: kv upsert (LWW)      │
+        │                      applied rows allocate           │
+        │                      contiguous local origin_seq     │
+        │                      keyref + oplog insert           │
+        │                      persist final local_origin_seq  │
+        │                      COMMIT                          │
         │                          │                           │
         │                          │ {:ekv_put, key,           │
         │                          │  value_binary, ts,        │
@@ -248,8 +251,15 @@ defmodule EKV.Replica do
         │<─────────────────────────│                           │
         │         :ok              │                           │
 
-  Delete is identical but sets deleted_at = now and value = nil.
+  Delete is identical but sets `deleted_at = now` and `value = nil`.
   Broadcast message: `{:ekv_delete, key, ts, origin_node, origin_seq}`.
+
+  Local non-CAS ingress is no longer a normal `GenServer.call/3` fast path.
+  Replica shards still run as GenServers, but local non-CAS and local CAS API
+  calls now arrive as plain messages with caller-managed timeout/monitor
+  semantics. This lets the shard selectively receive local work between
+  replicated live LWW messages without trying to reorder `'$gen_call'`
+  traffic inside OTP internals.
 
   On the receiving side, delta replay uses the same write_entry NIF with the
   remote's timestamp and `origin_seq`, so replay rows and local contiguous
@@ -262,6 +272,13 @@ defmodule EKV.Replica do
   writes therefore piggyback the sender's current head via
   `(origin_node, origin_seq)`, and receivers can detect gaps immediately
   without any extra live progress-ack message.
+
+  For live replicated LWW traffic, the shard still applies each inbound
+  single-entry or replication-batch turn eagerly, but after each such turn it
+  runs an immediate selective-receive pass for higher-priority local work
+  (local CAS/control-plane first, then local non-CAS LWW). This is the
+  mailbox-level fairness mechanism that keeps replicated write bursts from
+  monopolizing the shard's local lane.
 
   Large replicated value payloads may be compressed on the wire only.
   The message shape stays the same, but the value field may be tagged as
@@ -1160,6 +1177,8 @@ defmodule EKV.Replica do
   @wire_feature_compression :wire_compression
   @wire_feature_replication_batch :replication_batch
   @wire_feature_observer :observer
+  @local_request_tag :ekv_local_request
+  @local_reply_tag :ekv_local_reply
   @summary_probe_timeout_ms :timer.minutes(2)
   @sync_inflight_timeout_ms :timer.minutes(2)
   defstruct [
@@ -1194,6 +1213,8 @@ defmodule EKV.Replica do
     remote_features: %{},
     summary_probe_inflight: %{},
     started_at_ms: nil,
+    local_write_batch_max_entries: 32,
+    local_write_batch_max_bytes: 256 * 1024,
     replication_batch_flush_ms: 3,
     replication_batch_max_entries: 64,
     replication_batch_max_bytes: 256 * 1024,
@@ -1215,6 +1236,16 @@ defmodule EKV.Replica do
     name = Keyword.fetch!(opts, :name)
     shard_index = Keyword.fetch!(opts, :shard_index)
     GenServer.start_link(__MODULE__, opts, name: shard_name(name, shard_index))
+  end
+
+  def local_request(shard_name, request, timeout) when is_atom(shard_name) do
+    case GenServer.whereis(shard_name) do
+      pid when is_pid(pid) ->
+        do_local_request(pid, shard_name, request, timeout)
+
+      nil ->
+        exit({:noproc, {GenServer, :call, [shard_name, request, timeout]}})
+    end
   end
 
   def shard_name(name, shard_index), do: :"#{name}_ekv_replica_#{shard_index}"
@@ -1300,6 +1331,8 @@ defmodule EKV.Replica do
       cluster_size: config.cluster_size,
       cas_voter?: Map.get(config, :cas_voter, true),
       wire_compression_threshold: config[:wire_compression_threshold],
+      local_write_batch_max_entries: config[:local_write_batch_max_entries] || 32,
+      local_write_batch_max_bytes: config[:local_write_batch_max_bytes] || 256 * 1024,
       replication_batch_flush_ms: config[:replication_batch_flush_ms] || 3,
       replication_batch_max_entries: config[:replication_batch_max_entries] || 64,
       replication_batch_max_bytes: config[:replication_batch_max_bytes] || 256 * 1024,
@@ -1346,6 +1379,7 @@ defmodule EKV.Replica do
   @impl true
   def terminate(_reason, %Replica{} = state) do
     state = flush_all_replication_batches(state)
+    drain_pending_local_requests_with_reply({:error, :shutting_down})
 
     for {rdb, get_stmt} <- state.readers do
       EKV.Sqlite3.release(rdb, get_stmt)
@@ -1393,6 +1427,134 @@ defmodule EKV.Replica do
   # =====================================================================
 
   def handle_call({:put, key, value_binary, opts}, _from, %Replica{} = state) do
+    {reply, state} = handle_single_put_request(state, key, value_binary, opts)
+    cb_reply(reply, state)
+  end
+
+  def handle_call({:delete, key}, _from, %Replica{} = state) do
+    {reply, state} = handle_single_delete_request(state, key)
+    cb_reply(reply, state)
+  end
+
+  # =====================================================================
+  # CAS write calls
+  # =====================================================================
+
+  def handle_call({:cas_put, key, value_binary, expected_vsn, opts}, from, %Replica{} = state) do
+    operation = {:cas_put, expected_vsn, value_binary, opts}
+    cb_noreply(start_cas(state, key, operation, {:genserver, from}, cas_deadline_from_opts(opts)))
+  end
+
+  def handle_call(
+        {:observer_cas_put, key, value_binary, expected_vsn, opts},
+        from,
+        %Replica{} = state
+      ) do
+    operation = {:cas_put, expected_vsn, value_binary, opts}
+
+    cb_noreply(
+      start_cas(
+        state,
+        key,
+        operation,
+        {:genserver, from},
+        cas_deadline_from_opts(opts),
+        :observer_write
+      )
+    )
+  end
+
+  def handle_call({:cas_delete, key, expected_vsn, opts}, from, %Replica{} = state) do
+    operation = {:cas_delete, expected_vsn, opts}
+    cb_noreply(start_cas(state, key, operation, {:genserver, from}, cas_deadline_from_opts(opts)))
+  end
+
+  def handle_call({:observer_cas_delete, key, expected_vsn, opts}, from, %Replica{} = state) do
+    operation = {:cas_delete, expected_vsn, opts}
+
+    cb_noreply(
+      start_cas(
+        state,
+        key,
+        operation,
+        {:genserver, from},
+        cas_deadline_from_opts(opts),
+        :observer_write
+      )
+    )
+  end
+
+  def handle_call({:update, key, fun, opts}, from, %Replica{} = state) do
+    retries = Keyword.get(opts, :retries, 5)
+    operation = {:update, fun, opts, retries}
+    cb_noreply(start_cas(state, key, operation, {:genserver, from}, cas_deadline_from_opts(opts)))
+  end
+
+  def handle_call({:observer_update, key, fun, opts}, from, %Replica{} = state) do
+    retries = Keyword.get(opts, :retries, 5)
+    operation = {:update, fun, opts, retries}
+
+    cb_noreply(
+      start_cas(
+        state,
+        key,
+        operation,
+        {:genserver, from},
+        cas_deadline_from_opts(opts),
+        :observer_write
+      )
+    )
+  end
+
+  def handle_call({:cas_read, key, opts}, from, %Replica{} = state) do
+    retries = Keyword.get(opts, :retries, 5)
+    operation = {:cas_read, opts, retries}
+    cb_noreply(start_cas(state, key, operation, {:genserver, from}, cas_deadline_from_opts(opts)))
+  end
+
+  def handle_call({:observer_cas_read, key, opts}, from, %Replica{} = state) do
+    retries = Keyword.get(opts, :retries, 5)
+    operation = {:cas_read, opts, retries}
+
+    cb_noreply(
+      start_cas(
+        state,
+        key,
+        operation,
+        {:genserver, from},
+        cas_deadline_from_opts(opts),
+        :observer_read
+      )
+    )
+  end
+
+  def handle_call(
+        {:apply_observer_commit, key, ballot_c, ballot_n, entry_tuple, origin_node, origin_seq},
+        _from,
+        %Replica{} = state
+      ) do
+    {reply, state} =
+      handle_apply_observer_commit_request(
+        state,
+        key,
+        ballot_c,
+        ballot_n,
+        entry_tuple,
+        origin_node,
+        origin_seq
+      )
+
+    cb_reply(reply, state)
+  end
+
+  def handle_call({:await_quorum, timeout_ms}, from, %Replica{} = state) do
+    case handle_await_quorum_request(state, {:genserver, from}, timeout_ms) do
+      {:reply, reply, state} -> cb_reply(reply, state)
+      {:noreply, state} -> cb_noreply(state)
+    end
+  end
+
+  defp handle_single_put_request(%Replica{} = state, key, value_binary, opts) do
     %{db: db, stmts: stmts} = state
     {now, state} = next_lww_ts(state)
     origin_node = local_origin_id(state)
@@ -1427,20 +1589,21 @@ defmodule EKV.Replica do
           %EKV.Event{type: :put, key: key, value: :erlang.binary_to_term(value_binary)}
         ])
 
-        cb_reply(:ok, state)
+        {:ok, state}
 
       {:ok, false, _origin_seq, local_progress_seq} ->
-        cb_reply(:ok, merge_local_progress_seq(state, origin_node, local_progress_seq))
+        {:ok, merge_local_progress_seq(state, origin_node, local_progress_seq)}
 
       {:ok, false} ->
-        cb_reply(:ok, state)
+        {:ok, state}
 
       {:error, :cas_managed_key} ->
-        cb_reply({:error, :cas_managed_key}, state)
+        {{:error, :cas_managed_key}, state}
     end
+    |> normalize_local_write_result()
   end
 
-  def handle_call({:delete, key}, _from, %Replica{} = state) do
+  defp handle_single_delete_request(%Replica{} = state, key) do
     %{db: db, stmts: stmts} = state
     {now, %Replica{} = state} = next_lww_ts(state)
     origin_node = local_origin_id(state)
@@ -1469,114 +1632,60 @@ defmodule EKV.Replica do
           |> replicate_live_to_members({:ekv_delete, key, now, origin_node, origin_seq})
 
         dispatch_events(state, [%EKV.Event{type: :delete, key: key, value: prev_value}])
-        cb_reply(:ok, state)
+        {:ok, state}
 
       {:ok, false, _origin_seq, local_progress_seq} ->
-        cb_reply(:ok, merge_local_progress_seq(state, origin_node, local_progress_seq))
+        {:ok, merge_local_progress_seq(state, origin_node, local_progress_seq)}
 
       {:ok, false} ->
-        cb_reply(:ok, state)
+        {:ok, state}
 
       {:error, :cas_managed_key} ->
-        cb_reply({:error, :cas_managed_key}, state)
+        {{:error, :cas_managed_key}, state}
     end
+    |> normalize_local_write_result()
   end
 
-  # =====================================================================
-  # CAS write calls
-  # =====================================================================
+  defp normalize_local_write_result({reply, %Replica{} = state})
+       when reply in [:ok, {:error, :cas_managed_key}],
+       do: {reply, state}
 
-  def handle_call({:cas_put, key, value_binary, expected_vsn, opts}, from, %Replica{} = state) do
-    operation = {:cas_put, expected_vsn, value_binary, opts}
-    cb_noreply(start_cas(state, key, operation, from, cas_deadline_from_opts(opts)))
-  end
+  defp normalize_local_write_result({:ok, %Replica{} = state}), do: {:ok, state}
 
-  def handle_call(
-        {:observer_cas_put, key, value_binary, expected_vsn, opts},
-        from,
-        %Replica{} = state
-      ) do
-    operation = {:cas_put, expected_vsn, value_binary, opts}
-
-    cb_noreply(
-      start_cas(state, key, operation, from, cas_deadline_from_opts(opts), :observer_write)
-    )
-  end
-
-  def handle_call({:cas_delete, key, expected_vsn, opts}, from, %Replica{} = state) do
-    operation = {:cas_delete, expected_vsn, opts}
-    cb_noreply(start_cas(state, key, operation, from, cas_deadline_from_opts(opts)))
-  end
-
-  def handle_call({:observer_cas_delete, key, expected_vsn, opts}, from, %Replica{} = state) do
-    operation = {:cas_delete, expected_vsn, opts}
-
-    cb_noreply(
-      start_cas(state, key, operation, from, cas_deadline_from_opts(opts), :observer_write)
-    )
-  end
-
-  def handle_call({:update, key, fun, opts}, from, %Replica{} = state) do
-    retries = Keyword.get(opts, :retries, 5)
-    operation = {:update, fun, opts, retries}
-    cb_noreply(start_cas(state, key, operation, from, cas_deadline_from_opts(opts)))
-  end
-
-  def handle_call({:observer_update, key, fun, opts}, from, %Replica{} = state) do
-    retries = Keyword.get(opts, :retries, 5)
-    operation = {:update, fun, opts, retries}
-
-    cb_noreply(
-      start_cas(state, key, operation, from, cas_deadline_from_opts(opts), :observer_write)
-    )
-  end
-
-  def handle_call({:cas_read, key, opts}, from, %Replica{} = state) do
-    retries = Keyword.get(opts, :retries, 5)
-    operation = {:cas_read, opts, retries}
-    cb_noreply(start_cas(state, key, operation, from, cas_deadline_from_opts(opts)))
-  end
-
-  def handle_call({:observer_cas_read, key, opts}, from, %Replica{} = state) do
-    retries = Keyword.get(opts, :retries, 5)
-    operation = {:cas_read, opts, retries}
-
-    cb_noreply(
-      start_cas(state, key, operation, from, cas_deadline_from_opts(opts), :observer_read)
-    )
-  end
-
-  def handle_call(
-        {:apply_observer_commit, key, ballot_c, ballot_n, entry_tuple, origin_node, origin_seq},
-        _from,
-        %Replica{} = state
-      ) do
+  defp handle_apply_observer_commit_request(
+         %Replica{} = state,
+         key,
+         ballot_c,
+         ballot_n,
+         entry_tuple,
+         origin_node,
+         origin_seq
+       ) do
     origin_node = normalize_origin_node(origin_node)
     gap? = origin_gap?(state, origin_node, origin_seq)
     {state, applied?} = apply_cas_commit(state, key, ballot_c, ballot_n, entry_tuple, origin_seq)
-    state = maybe_request_origin_gap_repair(state, origin_node, origin_seq, gap? and applied?)
-    cb_reply(:ok, state)
+    {:ok, maybe_request_origin_gap_repair(state, origin_node, origin_seq, gap? and applied?)}
   end
 
-  def handle_call({:await_quorum, timeout_ms}, from, %Replica{} = state) do
+  defp handle_await_quorum_request(%Replica{} = state, from, timeout_ms) do
     case quorum_status(state) do
       :ok ->
-        cb_reply(:ok, state)
+        {:reply, :ok, state}
 
       {:error, :cluster_overflow} = error ->
-        cb_reply(error, state)
+        {:reply, error, state}
 
       {:error, :cas_not_configured} = error ->
-        cb_reply(error, state)
+        {:reply, error, state}
 
       {:error, :no_quorum} ->
         if timeout_ms == 0 do
-          cb_reply({:error, :timeout}, state)
+          {:reply, {:error, :timeout}, state}
         else
           ref = make_ref()
           timer = Process.send_after(self(), {:await_quorum_timeout, ref}, timeout_ms)
           waiter = %{from: from, timer: timer}
-          cb_noreply(%{state | quorum_waiters: Map.put(state.quorum_waiters, ref, waiter)})
+          {:noreply, %{state | quorum_waiters: Map.put(state.quorum_waiters, ref, waiter)}}
         end
     end
   end
@@ -1610,6 +1719,7 @@ defmodule EKV.Replica do
     end
 
     %Replica{} = state = fail_quorum_waiters(state, {:error, :shutting_down})
+    %Replica{} = state = drain_pending_local_requests(state)
     %Replica{} = state = flush_all_replication_batches(state)
 
     # 2. Persist ballot counter
@@ -1643,6 +1753,10 @@ defmodule EKV.Replica do
         quorum_waiters: %{},
         handoff_node: new_node
     })
+  end
+
+  def handle_info({@local_request_tag, caller_pid, ref, request}, %Replica{} = state) do
+    cb_noreply(handle_local_request_message(state, caller_pid, ref, request))
   end
 
   # In handoff mode: drop all messages (replication, GC, nodeup/down, CAS).
@@ -1704,7 +1818,7 @@ defmodule EKV.Replica do
       ])
     end
 
-    cb_noreply(state)
+    cb_noreply(drain_priority_mailbox(state))
   end
 
   def handle_info({:ekv_delete, key, timestamp, origin_node, origin_seq}, %Replica{} = state) do
@@ -1721,7 +1835,7 @@ defmodule EKV.Replica do
       dispatch_events(state, [%EKV.Event{type: :delete, key: key, value: prev_value}])
     end
 
-    cb_noreply(state)
+    cb_noreply(drain_priority_mailbox(state))
   end
 
   def handle_info(
@@ -1731,7 +1845,8 @@ defmodule EKV.Replica do
       when remote_shard == state.shard_index do
     origin_node = normalize_origin_node(origin_node)
     entries = wire_decompress_replication_batch_entries(entries)
-    cb_noreply(apply_replication_batch(state, from_node, origin_node, entries))
+    state = apply_replication_batch(state, from_node, origin_node, entries)
+    cb_noreply(drain_priority_mailbox(state))
   end
 
   def handle_info({:flush_replication_batch, remote_node}, %Replica{} = state) do
@@ -2031,7 +2146,7 @@ defmodule EKV.Replica do
         cb_noreply(state)
 
       {%{from: from}, waiters} ->
-        GenServer.reply(from, {:error, :timeout})
+        reply_local_request(from, {:error, :timeout})
         cb_noreply(%{state | quorum_waiters: waiters})
     end
   end
@@ -4240,6 +4355,678 @@ defmodule EKV.Replica do
     end
   end
 
+  defp reply_local_request({:genserver, from}, reply) do
+    GenServer.reply(from, reply)
+  end
+
+  defp reply_local_request({caller_pid, reply_tag} = from, reply)
+       when is_pid(caller_pid) and is_reference(reply_tag) do
+    GenServer.reply(from, reply)
+  end
+
+  defp reply_local_request({:send, caller_pid, ref}, reply)
+       when is_pid(caller_pid) and is_reference(ref) do
+    send(caller_pid, {@local_reply_tag, ref, reply})
+    :ok
+  end
+
+  defp do_local_request(pid, shard_name, request, timeout) when is_pid(pid) do
+    ref = make_ref()
+    mref = Process.monitor(pid)
+    send(pid, {@local_request_tag, self(), ref, request})
+
+    receive do
+      {@local_reply_tag, ^ref, reply} ->
+        Process.demonitor(mref, [:flush])
+        reply
+
+      {:DOWN, ^mref, :process, ^pid, reason} ->
+        exit({reason, {GenServer, :call, [shard_name, request, timeout]}})
+    after
+      timeout ->
+        Process.demonitor(mref, [:flush])
+
+        receive do
+          {@local_reply_tag, ^ref, _reply} -> :ok
+        after
+          0 -> :ok
+        end
+
+        exit({:timeout, {GenServer, :call, [shard_name, request, timeout]}})
+    end
+  end
+
+  defp handle_local_request_message(
+         %Replica{handoff_node: handoff_node} = state,
+         caller_pid,
+         ref,
+         request
+       )
+       when handoff_node != nil do
+    shard_name = shard_name(state.name, state.shard_index)
+
+    reply =
+      try do
+        GenServer.call({shard_name, handoff_node}, request, 5_000)
+      catch
+        :exit, _ -> {:error, :shutting_down}
+      end
+
+    reply_local_request({:send, caller_pid, ref}, reply)
+    state
+  end
+
+  defp handle_local_request_message(%Replica{} = state, caller_pid, ref, request) do
+    from = {:send, caller_pid, ref}
+
+    case request do
+      {:put, key, value_binary, opts} ->
+        {state, first_item} = build_local_put_batch_item(state, from, key, value_binary, opts)
+
+        {state, batch_items} =
+          collect_local_write_batch(
+            state,
+            [first_item],
+            local_request_message_bytes(request)
+          )
+
+        apply_local_write_batch(state, batch_items)
+
+      {:delete, key} ->
+        {state, first_item} = build_local_delete_batch_item(state, from, key)
+
+        {state, batch_items} =
+          collect_local_write_batch(
+            state,
+            [first_item],
+            local_request_message_bytes(request)
+          )
+
+        apply_local_write_batch(state, batch_items)
+
+      {:cas_put, key, value_binary, expected_vsn, opts} ->
+        start_cas(
+          state,
+          key,
+          {:cas_put, expected_vsn, value_binary, opts},
+          from,
+          cas_deadline_from_opts(opts)
+        )
+
+      {:observer_cas_put, key, value_binary, expected_vsn, opts} ->
+        start_cas(
+          state,
+          key,
+          {:cas_put, expected_vsn, value_binary, opts},
+          from,
+          cas_deadline_from_opts(opts),
+          :observer_write
+        )
+
+      {:cas_delete, key, expected_vsn, opts} ->
+        start_cas(
+          state,
+          key,
+          {:cas_delete, expected_vsn, opts},
+          from,
+          cas_deadline_from_opts(opts)
+        )
+
+      {:observer_cas_delete, key, expected_vsn, opts} ->
+        start_cas(
+          state,
+          key,
+          {:cas_delete, expected_vsn, opts},
+          from,
+          cas_deadline_from_opts(opts),
+          :observer_write
+        )
+
+      {:update, key, fun, opts} ->
+        retries = Keyword.get(opts, :retries, 5)
+        start_cas(state, key, {:update, fun, opts, retries}, from, cas_deadline_from_opts(opts))
+
+      {:observer_update, key, fun, opts} ->
+        retries = Keyword.get(opts, :retries, 5)
+
+        start_cas(
+          state,
+          key,
+          {:update, fun, opts, retries},
+          from,
+          cas_deadline_from_opts(opts),
+          :observer_write
+        )
+
+      {:cas_read, key, opts} ->
+        retries = Keyword.get(opts, :retries, 5)
+        start_cas(state, key, {:cas_read, opts, retries}, from, cas_deadline_from_opts(opts))
+
+      {:observer_cas_read, key, opts} ->
+        retries = Keyword.get(opts, :retries, 5)
+
+        start_cas(
+          state,
+          key,
+          {:cas_read, opts, retries},
+          from,
+          cas_deadline_from_opts(opts),
+          :observer_read
+        )
+
+      {:apply_observer_commit, key, ballot_c, ballot_n, entry_tuple, origin_node, origin_seq} ->
+        {reply, state} =
+          handle_apply_observer_commit_request(
+            state,
+            key,
+            ballot_c,
+            ballot_n,
+            entry_tuple,
+            origin_node,
+            origin_seq
+          )
+
+        reply_local_request(from, reply)
+        state
+
+      {:await_quorum, timeout_ms} ->
+        case handle_await_quorum_request(state, from, timeout_ms) do
+          {:reply, reply, state} ->
+            reply_local_request(from, reply)
+            state
+
+          {:noreply, state} ->
+            state
+        end
+    end
+  end
+
+  defp collect_local_write_batch(%Replica{} = state, batch_items, batch_bytes)
+       when is_list(batch_items) and is_integer(batch_bytes) do
+    if state.handoff_node != nil do
+      {state, batch_items}
+    else
+      receive do
+        {@local_request_tag, caller_pid, ref, request}
+        when is_pid(caller_pid) and is_reference(ref) ->
+          case maybe_extend_local_write_batch(
+                 state,
+                 batch_items,
+                 batch_bytes,
+                 {:send, caller_pid, ref},
+                 request
+               ) do
+            {:batch, %Replica{} = next_state, next_batch_items, next_batch_bytes} ->
+              collect_local_write_batch(next_state, next_batch_items, next_batch_bytes)
+
+            {:handled, %Replica{} = next_state} ->
+              collect_local_write_batch(next_state, batch_items, batch_bytes)
+          end
+
+        {:ekv_handoff_request, _ref, _new_node, _caller_pid} = msg ->
+          state = process_inline_priority_message(state, msg)
+          collect_local_write_batch(state, batch_items, batch_bytes)
+
+        {:ekv, @wire_protocol_version, kind, _payload, _meta} = msg
+        when kind not in [:put, :delete, :replication_batch] ->
+          state = process_inline_priority_message(state, msg)
+          collect_local_write_batch(state, batch_items, batch_bytes)
+
+        {:ekv, version, _kind, _payload, _meta} = msg
+        when is_integer(version) and version != @wire_protocol_version ->
+          state = process_inline_priority_message(state, msg)
+          collect_local_write_batch(state, batch_items, batch_bytes)
+
+        {:nodeup, _remote_node} = msg ->
+          state = process_inline_priority_message(state, msg)
+          collect_local_write_batch(state, batch_items, batch_bytes)
+
+        {:nodedown, _remote_node} = msg ->
+          state = process_inline_priority_message(state, msg)
+          collect_local_write_batch(state, batch_items, batch_bytes)
+
+        {:DOWN, _mref, :process, _pid, _reason} = msg ->
+          state = process_inline_priority_message(state, msg)
+          collect_local_write_batch(state, batch_items, batch_bytes)
+
+        {:await_quorum_timeout, _ref} = msg ->
+          state = process_inline_priority_message(state, msg)
+          collect_local_write_batch(state, batch_items, batch_bytes)
+
+        {:cas_timeout, _ref} = msg ->
+          state = process_inline_priority_message(state, msg)
+          collect_local_write_batch(state, batch_items, batch_bytes)
+
+        {:cas_retry, _ref, _key, _operation} = msg ->
+          state = process_inline_priority_message(state, msg)
+          collect_local_write_batch(state, batch_items, batch_bytes)
+
+        {:gc, _now, _cutoff} = msg ->
+          state = process_inline_priority_message(state, msg)
+          collect_local_write_batch(state, batch_items, batch_bytes)
+
+        :anti_entropy_tick = msg ->
+          state = process_inline_priority_message(state, msg)
+          collect_local_write_batch(state, batch_items, batch_bytes)
+
+        {:continue_full_sync, _remote_node, _last_key, _cutoff, _progress_summary, _chunk_size,
+         _reason} = msg ->
+          state = process_inline_priority_message(state, msg)
+          collect_local_write_batch(state, batch_items, batch_bytes)
+
+        {:continue_delta_sync, _remote_node, _origin_node, _last_seq, _my_seq, _chunk_size} =
+            msg ->
+          state = process_inline_priority_message(state, msg)
+          collect_local_write_batch(state, batch_items, batch_bytes)
+
+        {:flush_replication_batch, _remote_node} = msg ->
+          state = process_inline_priority_message(state, msg)
+          collect_local_write_batch(state, batch_items, batch_bytes)
+      after
+        0 ->
+          {state, Enum.reverse(batch_items)}
+      end
+    end
+  end
+
+  defp maybe_extend_local_write_batch(
+         %Replica{} = state,
+         batch_items,
+         batch_bytes,
+         from,
+         {:put, key, value_binary, opts} = request
+       ) do
+    request_bytes = local_request_message_bytes(request)
+
+    if length(batch_items) < state.local_write_batch_max_entries and
+         batch_bytes + request_bytes <= state.local_write_batch_max_bytes do
+      {state, item} = build_local_put_batch_item(state, from, key, value_binary, opts)
+      {:batch, state, [item | batch_items], batch_bytes + request_bytes}
+    else
+      {:handled, handle_local_request_message(state, elem(from, 1), elem(from, 2), request)}
+    end
+  end
+
+  defp maybe_extend_local_write_batch(
+         %Replica{} = state,
+         batch_items,
+         batch_bytes,
+         from,
+         {:delete, key} = request
+       ) do
+    request_bytes = local_request_message_bytes(request)
+
+    if length(batch_items) < state.local_write_batch_max_entries and
+         batch_bytes + request_bytes <= state.local_write_batch_max_bytes do
+      {state, item} = build_local_delete_batch_item(state, from, key)
+      {:batch, state, [item | batch_items], batch_bytes + request_bytes}
+    else
+      {:handled, handle_local_request_message(state, elem(from, 1), elem(from, 2), request)}
+    end
+  end
+
+  defp maybe_extend_local_write_batch(
+         %Replica{} = state,
+         _batch_items,
+         _batch_bytes,
+         {:send, caller_pid, ref},
+         request
+       ) do
+    {:handled, handle_local_request_message(state, caller_pid, ref, request)}
+  end
+
+  defp apply_local_write_batch(%Replica{} = state, batch_items) when is_list(batch_items) do
+    local_entries =
+      Enum.map(batch_items, fn item ->
+        {item.key, item.value_binary, item.timestamp, item.expires_at, item.deleted_at}
+      end)
+
+    initial_delete_values = local_batch_initial_delete_values(state, batch_items)
+    origin_node = local_origin_id(state)
+
+    case Store.write_local_entries_batch(
+           state.db,
+           state.stmts.kv_upsert,
+           state.stmts.keyref_upsert,
+           state.stmts.oplog_insert,
+           origin_node,
+           state.local_origin_seq,
+           local_entries
+         ) do
+      {:ok, results, final_origin_seq} ->
+        state =
+          if is_integer(final_origin_seq) and final_origin_seq > state.local_origin_seq do
+            set_local_origin_seq(state, final_origin_seq)
+          else
+            state
+          end
+
+        state =
+          Enum.zip(batch_items, results)
+          |> Enum.reduce(state, fn
+            {%{type: :put} = item, {:applied, origin_seq}}, acc ->
+              reply_local_request(item.from, :ok)
+
+              replicate_live_to_members(
+                acc,
+                {:ekv_put, item.key, item.value_binary, item.timestamp, origin_node, origin_seq,
+                 item.expires_at}
+              )
+
+            {%{type: :delete} = item, {:applied, origin_seq}}, acc ->
+              reply_local_request(item.from, :ok)
+
+              replicate_live_to_members(
+                acc,
+                {:ekv_delete, item.key, item.timestamp, origin_node, origin_seq}
+              )
+
+            {item, :ignored}, acc ->
+              reply_local_request(item.from, :ok)
+              acc
+
+            {item, :cas_managed_key}, acc ->
+              reply_local_request(item.from, {:error, :cas_managed_key})
+              acc
+          end)
+
+        dispatch_events(state, local_batch_events(batch_items, results, initial_delete_values))
+        state
+
+      {:error, _reason} ->
+        apply_local_write_batch_fallback(state, batch_items)
+    end
+  end
+
+  defp apply_local_write_batch_fallback(%Replica{} = state, batch_items) do
+    Enum.reduce(batch_items, state, fn item, acc ->
+      {reply, acc} =
+        case item.type do
+          :put ->
+            apply_single_local_batch_item(
+              acc,
+              item.key,
+              item.value_binary,
+              item.timestamp,
+              item.expires_at,
+              nil
+            )
+
+          :delete ->
+            apply_single_local_batch_item(
+              acc,
+              item.key,
+              nil,
+              item.timestamp,
+              nil,
+              item.deleted_at
+            )
+        end
+
+      reply_local_request(item.from, reply)
+      acc
+    end)
+  end
+
+  defp apply_single_local_batch_item(
+         %Replica{} = state,
+         key,
+         value_binary,
+         timestamp,
+         expires_at,
+         deleted_at
+       ) do
+    prev_value = if deleted_at && has_subscribers?(state), do: read_previous_value(state, key)
+    origin_node = local_origin_id(state)
+
+    case Store.write_entry(
+           state.db,
+           state.stmts.kv_upsert,
+           state.stmts.keyref_upsert,
+           state.stmts.oplog_insert,
+           key,
+           value_binary,
+           timestamp,
+           origin_node,
+           expires_at,
+           deleted_at,
+           nil,
+           true,
+           true
+         ) do
+      {:ok, true, origin_seq, local_progress_seq} ->
+        state =
+          state
+          |> set_local_origin_seq(origin_seq)
+          |> merge_local_progress_seq(origin_node, local_progress_seq)
+
+        state =
+          if is_integer(deleted_at) do
+            dispatch_events(state, [%EKV.Event{type: :delete, key: key, value: prev_value}])
+
+            replicate_live_to_members(
+              state,
+              {:ekv_delete, key, timestamp, origin_node, origin_seq}
+            )
+          else
+            dispatch_events(state, [
+              %EKV.Event{type: :put, key: key, value: :erlang.binary_to_term(value_binary)}
+            ])
+
+            replicate_live_to_members(
+              state,
+              {:ekv_put, key, value_binary, timestamp, origin_node, origin_seq, expires_at}
+            )
+          end
+
+        {:ok, state}
+
+      {:ok, false, _origin_seq, local_progress_seq} ->
+        {:ok, merge_local_progress_seq(state, origin_node, local_progress_seq)}
+
+      {:ok, false} ->
+        {:ok, state}
+
+      {:error, :cas_managed_key} ->
+        {{:error, :cas_managed_key}, state}
+    end
+    |> normalize_local_write_result()
+  end
+
+  defp local_batch_initial_delete_values(%Replica{} = state, batch_items) do
+    if has_subscribers?(state) do
+      batch_items
+      |> Enum.reduce(MapSet.new(), fn
+        %{type: :delete, key: key}, acc -> MapSet.put(acc, key)
+        _item, acc -> acc
+      end)
+      |> Map.new(fn key -> {key, read_previous_value(state, key)} end)
+    else
+      %{}
+    end
+  end
+
+  defp local_batch_events(batch_items, results, initial_delete_values) do
+    {events, _shadow_values} =
+      batch_items
+      |> Enum.zip(results)
+      |> Enum.reduce({[], initial_delete_values}, fn
+        {%{type: :put}, :cas_managed_key}, {acc_events, shadow_values} ->
+          {acc_events, shadow_values}
+
+        {%{type: :put}, :ignored}, {acc_events, shadow_values} ->
+          {acc_events, shadow_values}
+
+        {%{type: :delete}, :cas_managed_key}, {acc_events, shadow_values} ->
+          {acc_events, shadow_values}
+
+        {%{type: :delete}, :ignored}, {acc_events, shadow_values} ->
+          {acc_events, shadow_values}
+
+        {%{type: :delete, key: key}, {:applied, _origin_seq}}, {acc_events, shadow_values} ->
+          event = %EKV.Event{type: :delete, key: key, value: Map.get(shadow_values, key)}
+          {[event | acc_events], Map.put(shadow_values, key, nil)}
+
+        {%{type: :put, key: key, value_binary: value_binary}, {:applied, _origin_seq}},
+        {acc_events, shadow_values} ->
+          value = :erlang.binary_to_term(value_binary)
+          event = %EKV.Event{type: :put, key: key, value: value}
+          {[event | acc_events], Map.put(shadow_values, key, value)}
+      end)
+
+    Enum.reverse(events)
+  end
+
+  defp build_local_put_batch_item(%Replica{} = state, from, key, value_binary, opts) do
+    {now, state} = next_lww_ts(state)
+    ttl = Keyword.get(opts, :ttl)
+    expires_at = if ttl, do: now + ttl * 1_000_000
+
+    {state,
+     %{
+       type: :put,
+       from: from,
+       key: key,
+       value_binary: value_binary,
+       timestamp: now,
+       expires_at: expires_at,
+       deleted_at: nil
+     }}
+  end
+
+  defp build_local_delete_batch_item(%Replica{} = state, from, key) do
+    {now, state} = next_lww_ts(state)
+
+    {state,
+     %{
+       type: :delete,
+       from: from,
+       key: key,
+       value_binary: nil,
+       timestamp: now,
+       expires_at: nil,
+       deleted_at: now
+     }}
+  end
+
+  defp local_request_message_bytes({:put, key, value_binary, _opts})
+       when is_binary(key) and is_binary(value_binary),
+       do: byte_size(key) + byte_size(value_binary) + 64
+
+  defp local_request_message_bytes({:delete, key}) when is_binary(key), do: byte_size(key) + 64
+  defp local_request_message_bytes(_request), do: 64
+
+  defp process_inline_priority_message(%Replica{} = state, msg) do
+    case handle_info(msg, state) do
+      {:noreply, %Replica{} = next_state} ->
+        next_state
+
+      {:noreply, %Replica{} = next_state, {:continue, :flush_due_replication_batches}} ->
+        flush_due_replication_batches(next_state)
+    end
+  end
+
+  defp drain_priority_mailbox(%Replica{} = state) do
+    if state.handoff_node != nil do
+      state
+    else
+      receive do
+        {@local_request_tag, caller_pid, ref, request}
+        when is_pid(caller_pid) and is_reference(ref) ->
+          state = handle_local_request_message(state, caller_pid, ref, request)
+          drain_priority_mailbox(state)
+
+        {:ekv_handoff_request, _ref, _new_node, _caller_pid} = msg ->
+          state = process_inline_priority_message(state, msg)
+          drain_priority_mailbox(state)
+
+        {:ekv, @wire_protocol_version, kind, _payload, _meta} = msg
+        when kind not in [:put, :delete, :replication_batch] ->
+          state = process_inline_priority_message(state, msg)
+          drain_priority_mailbox(state)
+
+        {:ekv, version, _kind, _payload, _meta} = msg
+        when is_integer(version) and version != @wire_protocol_version ->
+          state = process_inline_priority_message(state, msg)
+          drain_priority_mailbox(state)
+
+        {:nodeup, _remote_node} = msg ->
+          state = process_inline_priority_message(state, msg)
+          drain_priority_mailbox(state)
+
+        {:nodedown, _remote_node} = msg ->
+          state = process_inline_priority_message(state, msg)
+          drain_priority_mailbox(state)
+
+        {:DOWN, _mref, :process, _pid, _reason} = msg ->
+          state = process_inline_priority_message(state, msg)
+          drain_priority_mailbox(state)
+
+        {:await_quorum_timeout, _ref} = msg ->
+          state = process_inline_priority_message(state, msg)
+          drain_priority_mailbox(state)
+
+        {:cas_timeout, _ref} = msg ->
+          state = process_inline_priority_message(state, msg)
+          drain_priority_mailbox(state)
+
+        {:cas_retry, _ref, _key, _operation} = msg ->
+          state = process_inline_priority_message(state, msg)
+          drain_priority_mailbox(state)
+
+        {:gc, _now, _cutoff} = msg ->
+          state = process_inline_priority_message(state, msg)
+          drain_priority_mailbox(state)
+
+        :anti_entropy_tick = msg ->
+          state = process_inline_priority_message(state, msg)
+          drain_priority_mailbox(state)
+
+        {:continue_full_sync, _remote_node, _last_key, _cutoff, _progress_summary, _chunk_size,
+         _reason} = msg ->
+          state = process_inline_priority_message(state, msg)
+          drain_priority_mailbox(state)
+
+        {:continue_delta_sync, _remote_node, _origin_node, _last_seq, _my_seq, _chunk_size} =
+            msg ->
+          state = process_inline_priority_message(state, msg)
+          drain_priority_mailbox(state)
+
+        {:flush_replication_batch, _remote_node} = msg ->
+          state = process_inline_priority_message(state, msg)
+          drain_priority_mailbox(state)
+      after
+        0 ->
+          state
+      end
+    end
+  end
+
+  defp drain_pending_local_requests(%Replica{} = state) do
+    receive do
+      {@local_request_tag, caller_pid, ref, request}
+      when is_pid(caller_pid) and is_reference(ref) ->
+        state
+        |> handle_local_request_message(caller_pid, ref, request)
+        |> drain_pending_local_requests()
+    after
+      0 ->
+        state
+    end
+  end
+
+  defp drain_pending_local_requests_with_reply(reply) do
+    receive do
+      {@local_request_tag, caller_pid, ref, _request}
+      when is_pid(caller_pid) and is_reference(ref) ->
+        send(caller_pid, {@local_reply_tag, ref, reply})
+        drain_pending_local_requests_with_reply(reply)
+    after
+      0 ->
+        :ok
+    end
+  end
+
   defp drop_replication_batch(%Replica{} = state, remote_node) do
     case Map.pop(state.replication_batches, remote_node) do
       {nil, _} ->
@@ -5476,7 +6263,7 @@ defmodule EKV.Replica do
         reply_cas_reply(op.from, :observer_read, {:error, :unconfirmed})
 
       _ ->
-        GenServer.reply(op.from, {:error, :unconfirmed, op.reply_value})
+        reply_local_request(op.from, {:error, :unconfirmed, op.reply_value})
     end
 
     state
@@ -5712,7 +6499,7 @@ defmodule EKV.Replica do
   defp reply_and_clear_quorum_waiters(%Replica{} = state, reply) do
     Enum.each(state.quorum_waiters, fn {_ref, %{from: from, timer: timer}} ->
       cancel_timer(timer)
-      GenServer.reply(from, reply)
+      reply_local_request(from, reply)
     end)
 
     %{state | quorum_waiters: %{}}
@@ -5776,11 +6563,11 @@ defmodule EKV.Replica do
 
   defp reply_cas_reply(from, mode, reply, commit_payload)
        when mode in [:observer_write, :observer_read] do
-    GenServer.reply(from, {:observer_result, reply, commit_payload})
+    reply_local_request(from, {:observer_result, reply, commit_payload})
   end
 
   defp reply_cas_reply(from, _mode, reply, _commit_payload) do
-    GenServer.reply(from, reply)
+    reply_local_request(from, reply)
   end
 
   defp mark_member_down(%Replica{} = state, remote_node, nil) do
