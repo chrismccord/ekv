@@ -261,6 +261,125 @@ defmodule EKV.Replica do
   replicated live LWW messages without trying to reorder `'$gen_call'`
   traffic inside OTP internals.
 
+  ### Mailbox fairness and selective receive
+
+  The fairness goal is deliberately narrow:
+
+    - local API traffic (both local LWW and local CAS) should not be buried
+      forever behind a burst of replicated live LWW
+    - CAS protocol/control traffic (`prepare`, `promise`, `accept`,
+      `accepted`, retries, timeouts, handoff, member sync, node up/down) must
+      stay responsive
+    - but neither control traffic nor local traffic should be allowed to
+      "drain forever" and starve the rest of the mailbox
+
+  EKV therefore uses two different mailbox policies:
+
+    1. Local ingest collection
+    2. Post-replication turn-taking
+
+  #### 1. Local ingest collection is FIFO across local request classes
+
+  Local API requests arrive as:
+
+      {@local_request_tag, caller_pid, ref, request}
+
+  When the shard begins a local LWW write turn, it opportunistically collects
+  adjacent local `put` / `delete` requests into one batch. The collector uses
+  one broad local-request receive clause, then branches on `request` in normal
+  Elixir code. That is intentional:
+
+    - BEAM receive scans the mailbox from oldest to newest
+    - clause order does not reorder two messages that are both matchable in
+      the same receive
+    - actual reordering happens only when an older message does not match any
+      active clause and a newer one does
+
+  So, for local ingest, EKV does not selectively match local CAS before local
+  LWW. It takes the oldest local request, and if that request is batchable LWW
+  it may extend the batch with immediately-adjacent later `put` / `delete`
+  requests that still fit the batch budget.
+
+  Important invariant:
+
+    - once a local LWW batch has started collecting, a later local request
+      that is not batchable into that batch does not execute inline
+    - instead, the current batch commits first, and the later request is
+      deferred until after the batch finishes
+
+  This prevents:
+
+    - later local `put` / `delete` overtaking earlier local LWW
+    - later local CAS observing pre-batch state by jumping ahead of an already
+      open local LWW batch
+
+  In other words, local ingest fairness is FIFO-first, not
+  latency-first-for-CAS.
+
+  #### 2. Post-replication turn-taking prioritizes control, then one local turn
+
+  Live replicated LWW (`:ekv_put`, `:ekv_delete`, `:replication_batch`) still
+  applies eagerly on receipt. After one such replicated turn completes, the
+  shard does not recursively drain all "priority" traffic. Instead it performs
+  a bounded two-stage turn:
+
+    a. process up to N control/CAS-protocol messages immediately
+    b. process at most one broad local request turn
+    c. yield back to the normal mailbox loop
+
+  `N` is intentionally bounded (today tied to the local batch budget) so that:
+
+    - handoff, member sync, CAS proposer/acceptor traffic, node monitoring,
+      retries, and timeouts get prompt service
+    - but a hot stream of control/CAS protocol messages cannot monopolize the
+      shard forever
+
+  Then EKV takes at most one local request turn via the same broad
+  `{@local_request_tag, caller_pid, ref, request}` match described above.
+  This gives local API traffic a lane between replicated LWW turns, but still
+  avoids recursively draining the entire local mailbox.
+
+  So the policy is:
+
+    - replicated live LWW yields frequently
+    - control/CAS protocol traffic gets bounded priority
+    - local API traffic gets one FIFO turn
+    - then the shard yields back to the mailbox
+
+  #### Why this split exists
+
+  Local CAS is latency-sensitive, but ingest-side CAS is not the critical
+  latency path. The critical path for CAS is receiver-side protocol handling:
+
+    - prepare / promise / nack
+    - accept / accepted / accept_nack
+    - CAS retry / timeout / quorum bookkeeping
+
+  That receiver-side protocol traffic is part of the bounded control turn
+  above, so it stays responsive during replicated LWW bursts.
+
+  Local ingest CAS, on the other hand, should not jump ahead of an older local
+  LWW request just because both happen to be waiting in the same mailbox. LWW
+  callers also expect prompt service, and allowing local CAS to selectively
+  skip older local LWW would make local request ordering surprising.
+
+  #### What this does not promise
+
+  This fairness scheme is not a hard real-time scheduler and does not create
+  isolated queues. It does not guarantee:
+
+    - local API traffic always outruns replicated traffic
+    - CAS protocol traffic outruns everything forever
+    - equal service shares across all message classes
+
+  It is a pragmatic mailbox policy:
+
+    - prevent replicated LWW from monopolizing the shard
+    - keep control/CAS protocol responsive
+    - preserve FIFO semantics for local API ingress
+    - avoid starvation caused by recursively draining one message class
+      indefinitely
+
   On the receiving side, delta replay uses the same write_entry NIF with the
   remote's timestamp and `origin_seq`, so replay rows and local contiguous
   progress advance in the same SQLite transaction. Full-sync receive uses a
@@ -274,11 +393,10 @@ defmodule EKV.Replica do
   without any extra live progress-ack message.
 
   For live replicated LWW traffic, the shard still applies each inbound
-  single-entry or replication-batch turn eagerly, but after each such turn it
-  runs an immediate selective-receive pass for higher-priority local work
-  (local CAS/control-plane first, then local non-CAS LWW). This is the
-  mailbox-level fairness mechanism that keeps replicated write bursts from
-  monopolizing the shard's local lane.
+  single-entry or replication-batch turn eagerly, then runs the bounded
+  fairness turn above. This is the mailbox-level mechanism that keeps
+  replicated write bursts from monopolizing the shard while still preserving
+  FIFO local ingest semantics.
 
   Large replicated value payloads may be compressed on the wire only.
   The message shape stays the same, but the value field may be tagged as
@@ -1818,7 +1936,7 @@ defmodule EKV.Replica do
       ])
     end
 
-    cb_noreply(drain_priority_mailbox(state))
+    cb_noreply(take_priority_turn(state))
   end
 
   def handle_info({:ekv_delete, key, timestamp, origin_node, origin_seq}, %Replica{} = state) do
@@ -1835,7 +1953,7 @@ defmodule EKV.Replica do
       dispatch_events(state, [%EKV.Event{type: :delete, key: key, value: prev_value}])
     end
 
-    cb_noreply(drain_priority_mailbox(state))
+    cb_noreply(take_priority_turn(state))
   end
 
   def handle_info(
@@ -1846,7 +1964,7 @@ defmodule EKV.Replica do
     origin_node = normalize_origin_node(origin_node)
     entries = wire_decompress_replication_batch_entries(entries)
     state = apply_replication_batch(state, from_node, origin_node, entries)
-    cb_noreply(drain_priority_mailbox(state))
+    cb_noreply(take_priority_turn(state))
   end
 
   def handle_info({:flush_replication_batch, remote_node}, %Replica{} = state) do
@@ -4423,26 +4541,30 @@ defmodule EKV.Replica do
       {:put, key, value_binary, opts} ->
         {state, first_item} = build_local_put_batch_item(state, from, key, value_binary, opts)
 
-        {state, batch_items} =
+        {state, batch_items, deferred_request} =
           collect_local_write_batch(
             state,
             [first_item],
             local_request_message_bytes(request)
           )
 
-        apply_local_write_batch(state, batch_items)
+        state
+        |> apply_local_write_batch(batch_items)
+        |> maybe_handle_deferred_local_request(deferred_request)
 
       {:delete, key} ->
         {state, first_item} = build_local_delete_batch_item(state, from, key)
 
-        {state, batch_items} =
+        {state, batch_items, deferred_request} =
           collect_local_write_batch(
             state,
             [first_item],
             local_request_message_bytes(request)
           )
 
-        apply_local_write_batch(state, batch_items)
+        state
+        |> apply_local_write_batch(batch_items)
+        |> maybe_handle_deferred_local_request(deferred_request)
 
       {:cas_put, key, value_binary, expected_vsn, opts} ->
         start_cas(
@@ -4544,7 +4666,7 @@ defmodule EKV.Replica do
   defp collect_local_write_batch(%Replica{} = state, batch_items, batch_bytes)
        when is_list(batch_items) and is_integer(batch_bytes) do
     if state.handoff_node != nil do
-      {state, batch_items}
+      {state, batch_items, nil}
     else
       receive do
         {@local_request_tag, caller_pid, ref, request}
@@ -4559,8 +4681,8 @@ defmodule EKV.Replica do
             {:batch, %Replica{} = next_state, next_batch_items, next_batch_bytes} ->
               collect_local_write_batch(next_state, next_batch_items, next_batch_bytes)
 
-            {:handled, %Replica{} = next_state} ->
-              collect_local_write_batch(next_state, batch_items, batch_bytes)
+            {:defer, %Replica{} = next_state, deferred_request} ->
+              {next_state, Enum.reverse(batch_items), deferred_request}
           end
 
         {:ekv_handoff_request, _ref, _new_node, _caller_pid} = msg ->
@@ -4624,7 +4746,7 @@ defmodule EKV.Replica do
           collect_local_write_batch(state, batch_items, batch_bytes)
       after
         0 ->
-          {state, Enum.reverse(batch_items)}
+          {state, Enum.reverse(batch_items), nil}
       end
     end
   end
@@ -4643,7 +4765,7 @@ defmodule EKV.Replica do
       {state, item} = build_local_put_batch_item(state, from, key, value_binary, opts)
       {:batch, state, [item | batch_items], batch_bytes + request_bytes}
     else
-      {:handled, handle_local_request_message(state, elem(from, 1), elem(from, 2), request)}
+      {:defer, state, {elem(from, 1), elem(from, 2), request}}
     end
   end
 
@@ -4661,7 +4783,7 @@ defmodule EKV.Replica do
       {state, item} = build_local_delete_batch_item(state, from, key)
       {:batch, state, [item | batch_items], batch_bytes + request_bytes}
     else
-      {:handled, handle_local_request_message(state, elem(from, 1), elem(from, 2), request)}
+      {:defer, state, {elem(from, 1), elem(from, 2), request}}
     end
   end
 
@@ -4672,7 +4794,17 @@ defmodule EKV.Replica do
          {:send, caller_pid, ref},
          request
        ) do
-    {:handled, handle_local_request_message(state, caller_pid, ref, request)}
+    {:defer, state, {caller_pid, ref, request}}
+  end
+
+  defp maybe_handle_deferred_local_request(%Replica{} = state, nil), do: state
+
+  defp maybe_handle_deferred_local_request(
+         %Replica{} = state,
+         {caller_pid, ref, request}
+       )
+       when is_pid(caller_pid) and is_reference(ref) do
+    handle_local_request_message(state, caller_pid, ref, request)
   end
 
   defp apply_local_write_batch(%Replica{} = state, batch_items) when is_list(batch_items) do
@@ -4926,79 +5058,93 @@ defmodule EKV.Replica do
     end
   end
 
-  defp drain_priority_mailbox(%Replica{} = state) do
+  defp take_priority_turn(%Replica{} = state) do
     if state.handoff_node != nil do
       state
     else
-      receive do
-        {@local_request_tag, caller_pid, ref, request}
-        when is_pid(caller_pid) and is_reference(ref) ->
-          state = handle_local_request_message(state, caller_pid, ref, request)
-          drain_priority_mailbox(state)
+      state
+      |> take_priority_control_turn(max(1, state.local_write_batch_max_entries))
+      |> take_one_local_request_turn()
+    end
+  end
 
-        {:ekv_handoff_request, _ref, _new_node, _caller_pid} = msg ->
-          state = process_inline_priority_message(state, msg)
-          drain_priority_mailbox(state)
+  defp take_priority_control_turn(%Replica{} = state, remaining_control_budget)
+       when remaining_control_budget > 0 do
+    receive do
+      {:ekv_handoff_request, _ref, _new_node, _caller_pid} = msg ->
+        state = process_inline_priority_message(state, msg)
+        take_priority_control_turn(state, remaining_control_budget - 1)
 
-        {:ekv, @wire_protocol_version, kind, _payload, _meta} = msg
-        when kind not in [:put, :delete, :replication_batch] ->
-          state = process_inline_priority_message(state, msg)
-          drain_priority_mailbox(state)
+      {:ekv, @wire_protocol_version, kind, _payload, _meta} = msg
+      when kind not in [:put, :delete, :replication_batch] ->
+        state = process_inline_priority_message(state, msg)
+        take_priority_control_turn(state, remaining_control_budget - 1)
 
-        {:ekv, version, _kind, _payload, _meta} = msg
-        when is_integer(version) and version != @wire_protocol_version ->
-          state = process_inline_priority_message(state, msg)
-          drain_priority_mailbox(state)
+      {:ekv, version, _kind, _payload, _meta} = msg
+      when is_integer(version) and version != @wire_protocol_version ->
+        state = process_inline_priority_message(state, msg)
+        take_priority_control_turn(state, remaining_control_budget - 1)
 
-        {:nodeup, _remote_node} = msg ->
-          state = process_inline_priority_message(state, msg)
-          drain_priority_mailbox(state)
+      {:nodeup, _remote_node} = msg ->
+        state = process_inline_priority_message(state, msg)
+        take_priority_control_turn(state, remaining_control_budget - 1)
 
-        {:nodedown, _remote_node} = msg ->
-          state = process_inline_priority_message(state, msg)
-          drain_priority_mailbox(state)
+      {:nodedown, _remote_node} = msg ->
+        state = process_inline_priority_message(state, msg)
+        take_priority_control_turn(state, remaining_control_budget - 1)
 
-        {:DOWN, _mref, :process, _pid, _reason} = msg ->
-          state = process_inline_priority_message(state, msg)
-          drain_priority_mailbox(state)
+      {:DOWN, _mref, :process, _pid, _reason} = msg ->
+        state = process_inline_priority_message(state, msg)
+        take_priority_control_turn(state, remaining_control_budget - 1)
 
-        {:await_quorum_timeout, _ref} = msg ->
-          state = process_inline_priority_message(state, msg)
-          drain_priority_mailbox(state)
+      {:await_quorum_timeout, _ref} = msg ->
+        state = process_inline_priority_message(state, msg)
+        take_priority_control_turn(state, remaining_control_budget - 1)
 
-        {:cas_timeout, _ref} = msg ->
-          state = process_inline_priority_message(state, msg)
-          drain_priority_mailbox(state)
+      {:cas_timeout, _ref} = msg ->
+        state = process_inline_priority_message(state, msg)
+        take_priority_control_turn(state, remaining_control_budget - 1)
 
-        {:cas_retry, _ref, _key, _operation} = msg ->
-          state = process_inline_priority_message(state, msg)
-          drain_priority_mailbox(state)
+      {:cas_retry, _ref, _key, _operation} = msg ->
+        state = process_inline_priority_message(state, msg)
+        take_priority_control_turn(state, remaining_control_budget - 1)
 
-        {:gc, _now, _cutoff} = msg ->
-          state = process_inline_priority_message(state, msg)
-          drain_priority_mailbox(state)
+      {:gc, _now, _cutoff} = msg ->
+        state = process_inline_priority_message(state, msg)
+        take_priority_control_turn(state, remaining_control_budget - 1)
 
-        :anti_entropy_tick = msg ->
-          state = process_inline_priority_message(state, msg)
-          drain_priority_mailbox(state)
+      :anti_entropy_tick = msg ->
+        state = process_inline_priority_message(state, msg)
+        take_priority_control_turn(state, remaining_control_budget - 1)
 
-        {:continue_full_sync, _remote_node, _last_key, _cutoff, _progress_summary, _chunk_size,
-         _reason} = msg ->
-          state = process_inline_priority_message(state, msg)
-          drain_priority_mailbox(state)
+      {:continue_full_sync, _remote_node, _last_key, _cutoff, _progress_summary, _chunk_size,
+       _reason} = msg ->
+        state = process_inline_priority_message(state, msg)
+        take_priority_control_turn(state, remaining_control_budget - 1)
 
-        {:continue_delta_sync, _remote_node, _origin_node, _last_seq, _my_seq, _chunk_size} =
-            msg ->
-          state = process_inline_priority_message(state, msg)
-          drain_priority_mailbox(state)
+      {:continue_delta_sync, _remote_node, _origin_node, _last_seq, _my_seq, _chunk_size} = msg ->
+        state = process_inline_priority_message(state, msg)
+        take_priority_control_turn(state, remaining_control_budget - 1)
 
-        {:flush_replication_batch, _remote_node} = msg ->
-          state = process_inline_priority_message(state, msg)
-          drain_priority_mailbox(state)
-      after
-        0 ->
-          state
-      end
+      {:flush_replication_batch, _remote_node} = msg ->
+        state = process_inline_priority_message(state, msg)
+        take_priority_control_turn(state, remaining_control_budget - 1)
+    after
+      0 ->
+        state
+    end
+  end
+
+  defp take_priority_control_turn(%Replica{} = state, _remaining_control_budget), do: state
+
+  defp take_one_local_request_turn(%Replica{} = state) do
+    receive do
+      {@local_request_tag, caller_pid, ref, request}
+      when is_pid(caller_pid) and is_reference(ref) ->
+        handle_local_request_message(state, caller_pid, ref, request)
+    after
+      0 ->
+        state
     end
   end
 

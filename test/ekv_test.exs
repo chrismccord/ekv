@@ -2342,6 +2342,47 @@ defmodule EKVTest do
     end
   end
 
+  describe "local request ordering" do
+    setup do
+      name = :"ekv_local_req_order_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+
+      {:ok, pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: data_dir,
+          shards: 1,
+          log: false,
+          cluster_size: 1,
+          node_id: "v1",
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      %{name: name}
+    end
+
+    test "later local CAS read does not overtake an open local LWW batch", %{name: name} do
+      shard_name = EKV.Replica.shard_name(name, 0)
+      put_ref = make_ref()
+      cas_ref = make_ref()
+      value_binary = :erlang.term_to_binary("queued")
+
+      send(shard_name, {:ekv_local_request, self(), put_ref, {:put, "fair/1", value_binary, []}})
+
+      send(shard_name, {:ekv_local_request, self(), cas_ref, {:cas_read, "fair/1", []}})
+
+      assert_receive {:ekv_local_reply, ^put_ref, :ok}, 1_000
+      assert_receive {:ekv_local_reply, ^cas_ref, {:ok, "queued", _vsn}}, 1_000
+      assert EKV.get(name, "fair/1") == "queued"
+    end
+  end
+
   describe "delta sync returns correct entries" do
     test "oplog_since returns exactly the right slice", %{name: name} do
       config = EKV.Supervisor.get_config(name)
