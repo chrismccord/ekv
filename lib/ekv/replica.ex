@@ -824,8 +824,10 @@ defmodule EKV.Replica do
 
   This is only for hot live replication fanout. Local writes still commit one
   at a time. Batches are bounded by time/count/bytes per destination shard,
-  same-origin by construction, and applied in one SQLite transaction on the
-  receiver. Older peers that do not advertise `:replication_batch` stay on the
+  same-origin by construction, and applied on the receiver in one dirty IO NIF
+  hop and one SQLite transaction. The batch NIF preserves per-entry applied
+  flags in input order, then Elixir dispatches ordered events from those
+  results. Older peers that do not advertise `:replication_batch` stay on the
   per-entry `:put` / `:delete` path.
 
 
