@@ -2222,5 +2222,72 @@ defmodule EKV.AntiEntropyTest do
 
       assert :ok = TestCluster.untrace_shard_sends(node_a, ekv_name)
     end
+
+    test "queued summary reply can cause one redundant delta request, but later anti-entropy stays quiet" do
+      peers = TestCluster.start_peers(2)
+      [{_, node_a}, {_, node_b}] = peers
+      ekv_name = unique_name(:anti_entropy_queued_live_replication)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      start_cluster(
+        peers,
+        ekv_name,
+        anti_entropy_interval: @manual_anti_entropy_interval,
+        replication_batch_flush_ms: 5_000,
+        replication_batch_max_entries: 2,
+        sync_chunk_size: 2
+      )
+
+      origin_id = traced_origin_id(node_b, ekv_name, node_a, peers)
+
+      assert :ok = TestCluster.trace_shard_sends(node_b, ekv_name, self())
+      _ = collect_sync_request_meta_messages([], 100)
+
+      assert :ok = TestCluster.suspend_shards(node_b, ekv_name)
+
+      write_many(node_a, ekv_name, "queued", 4)
+
+      sender_node_id = stable_origin_id(node_a, ekv_name)
+      sender_progress = %{sender_node_id => TestCluster.local_progress(node_a, ekv_name, node_a)}
+
+      assert :ok =
+               TestCluster.inject_summary_reply(
+                 node_b,
+                 ekv_name,
+                 node_a,
+                 sender_progress,
+                 sender_node_id
+               )
+
+      assert :ok = TestCluster.resume_shards(node_b, ekv_name)
+
+      request_messages = collect_sync_request_meta_messages([], 2_000)
+
+      redundant_delta_requests =
+        Enum.filter(request_messages, fn
+          {0, {:delta, ^origin_id, 2}, _meta, _destination} -> true
+          _ -> false
+        end)
+
+      assert length(redundant_delta_requests) == 1
+
+      refute Enum.any?(request_messages, fn
+               {0, :full, _meta, _destination} -> true
+               {0, {:full, _reason}, _meta, _destination} -> true
+               _ -> false
+             end)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.keys_count(node_b, ekv_name, "queued/") == 4 and
+          TestCluster.local_progress(node_b, ekv_name, node_a) == 4
+      end)
+
+      _ = collect_sync_request_meta_messages([], 100)
+      assert :ok = TestCluster.trigger_anti_entropy(node_b, ekv_name)
+      assert collect_sync_request_meta_messages([], 400) == []
+
+      assert :ok = TestCluster.untrace_shard_sends(node_b, ekv_name)
+    end
   end
 end
