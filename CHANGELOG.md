@@ -1,3 +1,6 @@
+## 0.3.1 (2026-04-15)
+- Optimize replicated message churn with turn-taking queue
+
 ## 0.3.0 (2026-03-19)
 - Add `:observer` mode
 - Fix barrier reads on non-existing keys
