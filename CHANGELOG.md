@@ -1,3 +1,6 @@
+## 0.3.2 (2026-04-16)
+- Fix leaked late `:ekv_local_reply` messages after local request timeout
+
 ## 0.3.1 (2026-04-15)
 - Optimize replicated message churn with turn-taking queue
 
@@ -16,4 +19,3 @@
 
 ## 0.1.4 (2026-02-23) 🚀
 - Initial release!
-
