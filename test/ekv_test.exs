@@ -2381,6 +2381,35 @@ defmodule EKVTest do
       assert_receive {:ekv_local_reply, ^cas_ref, {:ok, "queued", _vsn}}, 1_000
       assert EKV.get(name, "fair/1") == "queued"
     end
+
+    test "late local reply after timeout does not leak into caller mailbox" do
+      shard_name = :"ekv_local_req_timeout_#{System.unique_integer([:positive])}"
+      parent = self()
+
+      pid =
+        spawn(fn ->
+          receive do
+            {:ekv_local_request, reply_dest, ref, :slow_request} ->
+              Process.sleep(50)
+              send(reply_dest, {:ekv_local_reply, ref, :ok})
+
+              send(parent, :late_reply_sent)
+          end
+        end)
+
+      Process.register(pid, shard_name)
+
+      on_exit(fn ->
+        if Process.whereis(shard_name), do: Process.unregister(shard_name)
+        if Process.alive?(pid), do: Process.exit(pid, :kill)
+      end)
+
+      assert catch_exit(EKV.Replica.local_request(shard_name, :slow_request, 5)) ==
+               {:timeout, {GenServer, :call, [shard_name, :slow_request, 5]}}
+
+      assert_receive :late_reply_sent, 500
+      refute_receive {:ekv_local_reply, _, _}, 50
+    end
   end
 
   describe "delta sync returns correct entries" do

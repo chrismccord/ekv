@@ -282,7 +282,12 @@ defmodule EKV.Replica do
 
   Local API requests arrive as:
 
-      {@local_request_tag, caller_pid, ref, request}
+      {@local_request_tag, reply_dest, ref, request}
+
+  `reply_dest` is a generic reply destination, not necessarily a pid:
+
+    - in the hot local API path it is a process alias created by the caller
+    - in a few tests/manual cases it may still be a plain pid
 
   When the shard begins a local LWW write turn, it opportunistically collects
   adjacent local `put` / `delete` requests into one batch. The collector uses
@@ -335,7 +340,7 @@ defmodule EKV.Replica do
       shard forever
 
   Then EKV takes at most one local request turn via the same broad
-  `{@local_request_tag, caller_pid, ref, request}` match described above.
+  `{@local_request_tag, reply_dest, ref, request}` match described above.
   This gives local API traffic a lane between replicated LWW turns, but still
   avoids recursively draining the entire local mailbox.
 
@@ -4484,41 +4489,37 @@ defmodule EKV.Replica do
     GenServer.reply(from, reply)
   end
 
-  defp reply_local_request({:send, caller_pid, ref}, reply)
-       when is_pid(caller_pid) and is_reference(ref) do
-    send(caller_pid, {@local_reply_tag, ref, reply})
+  defp reply_local_request({:send, reply_dest, ref}, reply) when is_reference(ref) do
+    send(reply_dest, {@local_reply_tag, ref, reply})
     :ok
   end
 
   defp do_local_request(pid, shard_name, request, timeout) when is_pid(pid) do
+    reply_dest = :erlang.alias()
     ref = make_ref()
     mref = Process.monitor(pid)
-    send(pid, {@local_request_tag, self(), ref, request})
+    send(pid, {@local_request_tag, reply_dest, ref, request})
 
     receive do
       {@local_reply_tag, ^ref, reply} ->
         Process.demonitor(mref, [:flush])
+        :erlang.unalias(reply_dest)
         reply
 
       {:DOWN, ^mref, :process, ^pid, reason} ->
+        :erlang.unalias(reply_dest)
         exit({reason, {GenServer, :call, [shard_name, request, timeout]}})
     after
       timeout ->
         Process.demonitor(mref, [:flush])
-
-        receive do
-          {@local_reply_tag, ^ref, _reply} -> :ok
-        after
-          0 -> :ok
-        end
-
+        :erlang.unalias(reply_dest)
         exit({:timeout, {GenServer, :call, [shard_name, request, timeout]}})
     end
   end
 
   defp handle_local_request_message(
          %Replica{handoff_node: handoff_node} = state,
-         caller_pid,
+         reply_dest,
          ref,
          request
        )
@@ -4532,12 +4533,12 @@ defmodule EKV.Replica do
         :exit, _ -> {:error, :shutting_down}
       end
 
-    reply_local_request({:send, caller_pid, ref}, reply)
+    reply_local_request({:send, reply_dest, ref}, reply)
     state
   end
 
-  defp handle_local_request_message(%Replica{} = state, caller_pid, ref, request) do
-    from = {:send, caller_pid, ref}
+  defp handle_local_request_message(%Replica{} = state, reply_dest, ref, request) do
+    from = {:send, reply_dest, ref}
 
     case request do
       {:put, key, value_binary, opts} ->
@@ -4671,13 +4672,12 @@ defmodule EKV.Replica do
       {state, batch_items, nil}
     else
       receive do
-        {@local_request_tag, caller_pid, ref, request}
-        when is_pid(caller_pid) and is_reference(ref) ->
+        {@local_request_tag, reply_dest, ref, request} when is_reference(ref) ->
           case maybe_extend_local_write_batch(
                  state,
                  batch_items,
                  batch_bytes,
-                 {:send, caller_pid, ref},
+                 {:send, reply_dest, ref},
                  request
                ) do
             {:batch, %Replica{} = next_state, next_batch_items, next_batch_bytes} ->
@@ -4803,10 +4803,10 @@ defmodule EKV.Replica do
 
   defp maybe_handle_deferred_local_request(
          %Replica{} = state,
-         {caller_pid, ref, request}
+         {reply_dest, ref, request}
        )
-       when is_pid(caller_pid) and is_reference(ref) do
-    handle_local_request_message(state, caller_pid, ref, request)
+       when is_reference(ref) do
+    handle_local_request_message(state, reply_dest, ref, request)
   end
 
   defp apply_local_write_batch(%Replica{} = state, batch_items) when is_list(batch_items) do
@@ -5141,9 +5141,8 @@ defmodule EKV.Replica do
 
   defp take_one_local_request_turn(%Replica{} = state) do
     receive do
-      {@local_request_tag, caller_pid, ref, request}
-      when is_pid(caller_pid) and is_reference(ref) ->
-        handle_local_request_message(state, caller_pid, ref, request)
+      {@local_request_tag, reply_dest, ref, request} when is_reference(ref) ->
+        handle_local_request_message(state, reply_dest, ref, request)
     after
       0 ->
         state
@@ -5152,10 +5151,9 @@ defmodule EKV.Replica do
 
   defp drain_pending_local_requests(%Replica{} = state) do
     receive do
-      {@local_request_tag, caller_pid, ref, request}
-      when is_pid(caller_pid) and is_reference(ref) ->
+      {@local_request_tag, reply_dest, ref, request} when is_reference(ref) ->
         state
-        |> handle_local_request_message(caller_pid, ref, request)
+        |> handle_local_request_message(reply_dest, ref, request)
         |> drain_pending_local_requests()
     after
       0 ->
@@ -5165,9 +5163,8 @@ defmodule EKV.Replica do
 
   defp drain_pending_local_requests_with_reply(reply) do
     receive do
-      {@local_request_tag, caller_pid, ref, _request}
-      when is_pid(caller_pid) and is_reference(ref) ->
-        send(caller_pid, {@local_reply_tag, ref, reply})
+      {@local_request_tag, reply_dest, ref, _request} when is_reference(ref) ->
+        send(reply_dest, {@local_reply_tag, ref, reply})
         drain_pending_local_requests_with_reply(reply)
     after
       0 ->
