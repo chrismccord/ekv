@@ -403,6 +403,21 @@ defmodule EKV.Replica do
   replicated write bursts from monopolizing the shard while still preserving
   FIFO local ingest semantics.
 
+  Outbound member sends are also split into two reliability classes:
+
+    - best-effort replication / repair coordination:
+      `:put`, `:delete`, `:replication_batch`, `:member_connect`,
+      `:member_connect_ack`, `:summary_probe`, `:summary_reply`,
+      `:sync_request`, and `:progress_ack`
+    - must-send protocol / bulk transfer:
+      CAS traffic and `:sync` chunks
+
+  Best-effort classes use `send_nosuspend` so a slow peer does not suspend the
+  shard in `dsend_continue_trap`. If such a send cannot be enqueued without
+  suspending the shard, it is dropped and later anti-entropy/discovery rounds
+  are expected to catch the peer up. Must-send classes still use normal
+  blocking distribution sends.
+
   Large replicated value payloads may be compressed on the wire only.
   The message shape stays the same, but the value field may be tagged as
   `{:ekv_wire_compressed, compressed_binary}` for:
@@ -4300,8 +4315,31 @@ defmodule EKV.Replica do
 
   defp send_to_member(%Replica{} = state, target_node, message) do
     shard_name = shard_name(state.name, state.shard_index)
-    send({shard_name, target_node}, wire_encode_message(state, target_node, message))
+    encoded_message = wire_encode_message(state, target_node, message)
+    destination = {shard_name, target_node}
+
+    if best_effort_wire_message?(encoded_message) do
+      :erlang.send_nosuspend(destination, encoded_message, [:noconnect])
+    else
+      send(destination, encoded_message)
+    end
   end
+
+  defp best_effort_wire_message?({:ekv, @wire_protocol_version, kind, _payload, _meta})
+       when kind in [
+              :put,
+              :delete,
+              :replication_batch,
+              :member_connect,
+              :member_connect_ack,
+              :summary_probe,
+              :summary_reply,
+              :sync_request,
+              :progress_ack
+            ],
+       do: true
+
+  defp best_effort_wire_message?(_message), do: false
 
   # Track a remote shard pid in remote_shards. Handles three cases:
   # 1. New node: monitor and add
