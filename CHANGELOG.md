@@ -1,3 +1,6 @@
+## 0.4.0 (2026-04-17)
+- Remove legacy non matched message handlers
+
 ## 0.3.3 (2026-04-17)
 - Use `send_nosuspend` for best-effort live replication and repair coordination traffic
   which prevents blocking of shards for an individual dist erl socket at its busy limit
