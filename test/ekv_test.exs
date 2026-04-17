@@ -1744,7 +1744,7 @@ defmodule EKVTest do
       shard = EKV.Replica.shard_index_for("replication_batch_due/injected", config.num_shards)
       shard_name = EKV.Replica.shard_name(name, shard)
       shard_pid = Process.whereis(shard_name)
-      fake_node = :replication_batch_due_peer@fake
+      target_node = node()
 
       trigger_key =
         Stream.iterate(1, &(&1 + 1))
@@ -1756,7 +1756,7 @@ defmodule EKVTest do
       injected_key = "replication_batch_due/injected"
       injected_value = :erlang.term_to_binary("batched")
       now = System.system_time(:nanosecond)
-      timer_ref = Process.send_after(shard_pid, {:flush_replication_batch, fake_node}, 60_000)
+      timer_ref = Process.send_after(shard_pid, {:flush_replication_batch, target_node}, 60_000)
 
       :sys.replace_state(shard_name, fn state ->
         batch = %{
@@ -1768,10 +1768,10 @@ defmodule EKVTest do
 
         %{
           state
-          | remote_shards: Map.put(state.remote_shards, fake_node, shard_pid),
+          | remote_shards: Map.put(state.remote_shards, target_node, shard_pid),
             remote_features:
-              Map.put(state.remote_features, fake_node, MapSet.new([:replication_batch])),
-            replication_batches: Map.put(state.replication_batches, fake_node, batch)
+              Map.put(state.remote_features, target_node, MapSet.new([:replication_batch])),
+            replication_batches: Map.put(state.replication_batches, target_node, batch)
         }
       end)
 
