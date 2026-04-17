@@ -1,3 +1,7 @@
+## 0.3.3 (2026-04-17)
+- Use `send_nosuspend` for best-effort live replication and repair coordination traffic
+  which prevents blocking of shards for an individual dist erl socket at its busy limit
+
 ## 0.3.2 (2026-04-16)
 - Fix leaked late `:ekv_local_reply` messages after local request timeout
 
