@@ -225,14 +225,6 @@ defmodule EKV.AntiEntropyTest do
           timeout
         )
 
-      {:trace, _pid, :send,
-       {:ekv, 1, :put, {key, _value_binary, _ts, _origin, _origin_seq, _exp}, _meta}, destination} ->
-        collect_trace_messages([{:put, key, destination} | acc], timeout)
-
-      {:trace, _pid, :send, {:ekv, 1, :delete, {key, _ts, _origin, _origin_seq}, _meta},
-       destination} ->
-        collect_trace_messages([{:delete, key, destination} | acc], timeout)
-
       {:trace, _pid, :send, _msg, _destination} ->
         collect_trace_messages(acc, timeout)
     after
@@ -666,7 +658,8 @@ defmodule EKV.AntiEntropyTest do
 
       TestCluster.rpc!(node_b, :erlang, :send, [
         shard_name,
-        {:ekv_put, key3, value_binary, base_ts + 1_000, origin_a, 3, nil}
+        {:ekv_replication_batch, node_b, 0, origin_a,
+         [{key3, value_binary, base_ts + 1_000, 3, nil, nil}]}
       ])
 
       requests = collect_sync_request_messages([], 500)
@@ -1328,12 +1321,14 @@ defmodule EKV.AntiEntropyTest do
 
       TestCluster.rpc!(node_c, :erlang, :send, [
         shard_name,
-        {:ekv_put, a3, :erlang.term_to_binary("a-v3"), base_ts + 1_000, origin_a, 3, nil}
+        {:ekv_replication_batch, node_c, 0, origin_a,
+         [{a3, :erlang.term_to_binary("a-v3"), base_ts + 1_000, 3, nil, nil}]}
       ])
 
       TestCluster.rpc!(node_c, :erlang, :send, [
         shard_name,
-        {:ekv_put, b3, :erlang.term_to_binary("b-v3"), base_ts + 3_000, origin_b, 3, nil}
+        {:ekv_replication_batch, node_c, 0, origin_b,
+         [{b3, :erlang.term_to_binary("b-v3"), base_ts + 3_000, 3, nil, nil}]}
       ])
 
       requests = collect_sync_request_messages([], 500)
@@ -1855,7 +1850,7 @@ defmodule EKV.AntiEntropyTest do
       assert :ok = TestCluster.untrace_shard_sends(node_b, ekv_name)
     end
 
-    test "live replication batches to upgraded peers and falls back for peers without the feature" do
+    test "live replication always batches even if the remote feature map lacks replication_batch" do
       peers = TestCluster.start_peers(2)
       [{_, node_a}, {_, node_b}] = peers
       ekv_name = unique_name(:anti_entropy_live_replication_batch)
@@ -1897,21 +1892,22 @@ defmodule EKV.AntiEntropyTest do
       _ = collect_trace_messages([], 100)
 
       assert :ok = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "live_batch/3", "v3"])
+      assert :ok = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "live_batch/4", "v4"])
 
-      fallback_messages = collect_trace_messages([], 500)
+      second_batch_messages = collect_trace_messages([], 500)
 
-      refute Enum.any?(fallback_messages, fn
-               {:replication_batch, _from_node, _shard, _origin, _keys, _destination} -> true
-               _ -> false
-             end)
+      assert Enum.any?(second_batch_messages, fn
+               {:replication_batch, ^node_a, 0, _origin, ["live_batch/3", "live_batch/4"],
+                _destination} ->
+                 true
 
-      assert Enum.any?(fallback_messages, fn
-               {:put, "live_batch/3", _destination} -> true
-               _ -> false
+               _ ->
+                 false
              end)
 
       TestCluster.assert_eventually(fn ->
-        TestCluster.rpc!(node_b, EKV, :get, [ekv_name, "live_batch/3"]) == "v3"
+        TestCluster.rpc!(node_b, EKV, :get, [ekv_name, "live_batch/3"]) == "v3" and
+          TestCluster.rpc!(node_b, EKV, :get, [ekv_name, "live_batch/4"]) == "v4"
       end)
 
       assert :ok = TestCluster.untrace_shard_sends(node_a, ekv_name)

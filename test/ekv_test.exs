@@ -1302,7 +1302,8 @@ defmodule EKVTest do
 
       send(
         shard_name,
-        {:ekv_put, "lww_sub_key", value_binary, high_ts, :big_node@host, nil, 0}
+        {:ekv_replication_batch, node(), shard, :big_node@host,
+         [{"lww_sub_key", value_binary, high_ts, 0, nil, nil}]}
       )
 
       :sys.get_state(shard_name)
@@ -1316,7 +1317,8 @@ defmodule EKVTest do
 
       send(
         shard_name,
-        {:ekv_put, "lww_sub_key", loser_binary, low_ts, :small_node@host, nil, 0}
+        {:ekv_replication_batch, node(), shard, :small_node@host,
+         [{"lww_sub_key", loser_binary, low_ts, 0, nil, nil}]}
       )
 
       :sys.get_state(shard_name)
@@ -1595,7 +1597,13 @@ defmodule EKVTest do
 
       now = System.system_time(:nanosecond)
       val = :erlang.term_to_binary("remote_val")
-      send(shard_name, {:ekv_put, "remote_put_key", val, now, :remote@host, nil, 0})
+
+      send(
+        shard_name,
+        {:ekv_replication_batch, node(), shard, :remote@host,
+         [{"remote_put_key", val, now, 0, nil, nil}]}
+      )
+
       :sys.get_state(shard_name)
       flush_dispatchers(name)
 
@@ -1615,7 +1623,8 @@ defmodule EKVTest do
 
       send(
         shard_name,
-        {:ekv_put, "remote_put_compressed_key", wire_compress(val), now, :remote@host, nil, 0}
+        {:ekv_replication_batch, node(), shard, :remote@host,
+         [{"remote_put_compressed_key", wire_compress(val), now, 0, nil, nil}]}
       )
 
       :sys.get_state(shard_name)
@@ -1641,7 +1650,13 @@ defmodule EKVTest do
       :ok = EKV.subscribe(name, "remote_del_key")
 
       now = System.system_time(:nanosecond) + 1_000_000_000
-      send(shard_name, {:ekv_delete, "remote_del_key", now, :remote@host, 0})
+
+      send(
+        shard_name,
+        {:ekv_replication_batch, node(), shard, :remote@host,
+         [{"remote_del_key", nil, now, 0, nil, now}]}
+      )
+
       :sys.get_state(shard_name)
       flush_dispatchers(name)
 
@@ -1769,8 +1784,6 @@ defmodule EKVTest do
         %{
           state
           | remote_shards: Map.put(state.remote_shards, target_node, shard_pid),
-            remote_features:
-              Map.put(state.remote_features, target_node, MapSet.new([:replication_batch])),
             replication_batches: Map.put(state.replication_batches, target_node, batch)
         }
       end)

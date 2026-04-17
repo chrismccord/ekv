@@ -125,7 +125,8 @@ defmodule EKV.StressTest do
       for {_pid, node} <- peers do
         TestCluster.rpc!(node, Kernel, :send, [
           shard_name,
-          {:ekv_put, key, old_value_bin, old_ts, old_origin, 1, nil}
+          {:ekv_replication_batch, node, 0, old_origin,
+           [{key, old_value_bin, old_ts, 1, nil, nil}]}
         ])
 
         # Drain shard mailbox so the synthetic write is definitely applied.
@@ -213,7 +214,8 @@ defmodule EKV.StressTest do
 
       TestCluster.rpc!(n1, Kernel, :send, [
         shard_name,
-        {:ekv_put, conflict_key, ahead_bin, ahead_ts, ahead_origin, 1, nil}
+        {:ekv_replication_batch, n1, 0, ahead_origin,
+         [{conflict_key, ahead_bin, ahead_ts, 1, nil, nil}]}
       ])
 
       TestCluster.rpc!(n1, :sys, :get_state, [shard_name])
@@ -1460,7 +1462,13 @@ defmodule EKV.StressTest do
       # Delete the key via a replicated delete message so kv row goes away
       # without requiring CAS quorum in this fault-injection setup.
       delete_ts = System.system_time(:nanosecond) + 1
-      send(shard_name, {:ekv_delete, key, delete_ts, shard_origin_id(shard_name), 0})
+
+      send(
+        shard_name,
+        {:ekv_replication_batch, node(), 0, shard_origin_id(shard_name),
+         [{key, nil, delete_ts, 0, nil, delete_ts}]}
+      )
+
       :sys.get_state(shard_name)
 
       # Trigger GC with future cutoff to purge the tombstone

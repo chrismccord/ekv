@@ -187,8 +187,7 @@ separate and use an EKV-instance-specific `:pg` scope.
 
 On upgraded peers, live LWW replication is buffered briefly per destination
 shard and applied on the receiver in one SQLite batch. Local writes still
-commit and reply one at a time; only the replication fanout is batched. Peers
-that do not advertise batch support keep the older per-entry replication path.
+commit and reply one at a time; only the replication fanout is batched.
 
 *Note: Node connection is left up to the user, ie either explicit `Node.connect/1`/`sys.config`, or using a library like `DNSCluster`, or `libcluster`.
 

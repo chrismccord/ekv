@@ -241,18 +241,19 @@ defmodule EKV.Replica do
         │                      persist final local_origin_seq  │
         │                      COMMIT                          │
         │                          │                           │
-        │                          │ {:ekv_put, key,           │
-        │                          │  value_binary, ts,        │
-        │                          │  origin_node, origin_seq, │
-        │                          │  expires_at}              │
+        │                          │ {:ekv_replication_batch,  │
+        │                          │  from_node, shard,        │
+        │                          │  origin_node, entries}    │
         │                          │──────────────────────────>│
-        │                          │  (fire-and-forget to      │
-        │                          │   each known member)      │
+        │                          │  (one bounded live        │
+        │                          │   replication turn per    │
+        │                          │   destination shard)      │
         │<─────────────────────────│                           │
         │         :ok              │                           │
 
-  Delete is identical but sets `deleted_at = now` and `value = nil`.
-  Broadcast message: `{:ekv_delete, key, ts, origin_node, origin_seq}`.
+  Delete is identical but sets `deleted_at = now` and `value = nil`. Local
+  writes still allocate origin seqs one entry at a time; only the outbound
+  live replication fanout is buffered into `:replication_batch` messages.
 
   Local non-CAS ingress is no longer a normal `GenServer.call/3` fast path.
   Replica shards still run as GenServers, but local non-CAS and local CAS API
@@ -323,8 +324,8 @@ defmodule EKV.Replica do
 
   #### 2. Post-replication turn-taking prioritizes control, then one local turn
 
-  Live replicated LWW (`:ekv_put`, `:ekv_delete`, `:replication_batch`) still
-  applies eagerly on receipt. After one such replicated turn completes, the
+  Live replicated LWW (`:replication_batch`) still applies eagerly on receipt.
+  After one such replicated turn completes, the
   shard does not recursively drain all "priority" traffic. Instead it performs
   a bounded two-stage turn:
 
@@ -398,7 +399,7 @@ defmodule EKV.Replica do
   without any extra live progress-ack message.
 
   For live replicated LWW traffic, the shard still applies each inbound
-  single-entry or replication-batch turn eagerly, then runs the bounded
+  replication-batch turn eagerly, then runs the bounded
   fairness turn above. This is the mailbox-level mechanism that keeps
   replicated write bursts from monopolizing the shard while still preserving
   FIFO local ingest semantics.
@@ -406,7 +407,7 @@ defmodule EKV.Replica do
   Outbound member sends are also split into two reliability classes:
 
     - best-effort replication / repair coordination:
-      `:put`, `:delete`, `:replication_batch`, `:member_connect`,
+      `:replication_batch`, `:member_connect`,
       `:member_connect_ack`, `:summary_probe`, `:summary_reply`,
       `:sync_request`, and `:progress_ack`
     - must-send protocol / bulk transfer:
@@ -422,7 +423,7 @@ defmodule EKV.Replica do
   The message shape stays the same, but the value field may be tagged as
   `{:ekv_wire_compressed, compressed_binary}` for:
 
-    - `{:ekv_put, ...}`
+    - replication-batch entry values
     - `{:ekv_accept, ...}`
     - full-payload `{:ekv_cas_committed, ...}`
 
@@ -847,8 +848,7 @@ defmodule EKV.Replica do
   same-origin by construction, and applied on the receiver in one dirty IO NIF
   hop and one SQLite transaction. The batch NIF preserves per-entry applied
   flags in input order, then Elixir dispatches ordered events from those
-  results. Older peers that do not advertise `:replication_batch` stay on the
-  per-entry `:put` / `:delete` path.
+  results.
 
 
   ## Delta Sync vs Full Sync
@@ -1224,11 +1224,11 @@ defmodule EKV.Replica do
 
   Required fields live in `payload`. Optional/extensible fields live in
   `meta`. `origin_seq` is required in the v1 replication contract, so it is
-  part of payload for `:put`, `:delete`, and `:cas_committed`.
+  part of payload for `:replication_batch` entries and `:cas_committed`.
 
   Wire protocol v1 kinds:
-    :put                 {key, value_binary, timestamp, origin_node, origin_seq, expires_at}
-    :delete              {key, timestamp, origin_node, origin_seq}
+    :replication_batch   {from_node, shard_index, origin_node, entries}
+      entries: [{key, value_binary, timestamp, origin_seq, expires_at, deleted_at}]
     :member_connect      {pid, shard_index, num_shards, progress_summary, node_id}
     :member_connect_ack  {pid, shard_index, num_shards, progress_summary, node_id}
     :summary_probe       {pid, shard_index, progress_summary}
@@ -1257,9 +1257,10 @@ defmodule EKV.Replica do
     - replication/control messages keep `meta` empty unless an optional feature requires it
 
   Internally, Replica still uses the raw tuples below after decoding the wire
-  envelope:
-    {:ekv_put, ...}
-    {:ekv_delete, ...}
+  envelope. The local live-replication queue also uses raw `{:ekv_put, ...}`
+  / `{:ekv_delete, ...}` entry tuples internally before they are flushed into
+  `{:ekv_replication_batch, ...}`:
+    {:ekv_replication_batch, ...}
     {:ekv_member_connect, ...}
     {:ekv_member_connect_ack, ...}
     {:ekv_sync, ...}
@@ -1315,7 +1316,6 @@ defmodule EKV.Replica do
   @wire_compressed_tag :ekv_wire_compressed
   @wire_feature_live_progress :live_progress
   @wire_feature_compression :wire_compression
-  @wire_feature_replication_batch :replication_batch
   @wire_feature_observer :observer
   @local_request_tag :ekv_local_request
   @local_reply_tag :ekv_local_reply
@@ -1928,54 +1928,6 @@ defmodule EKV.Replica do
     end)
 
     cb_noreply(state)
-  end
-
-  def handle_info(
-        {:ekv_put, key, value_binary, timestamp, origin_node, origin_seq, expires_at},
-        %Replica{} = state
-      ) do
-    origin_node = normalize_origin_node(origin_node)
-    gap? = origin_gap?(state, origin_node, origin_seq)
-    value_binary = wire_decompress_value(value_binary)
-
-    {applied, state} =
-      merge_remote_entry(
-        state,
-        key,
-        value_binary,
-        timestamp,
-        origin_node,
-        origin_seq,
-        expires_at,
-        nil
-      )
-
-    state = maybe_request_origin_gap_repair(state, origin_node, origin_seq, gap?)
-
-    if applied do
-      dispatch_events(state, [
-        %EKV.Event{type: :put, key: key, value: :erlang.binary_to_term(value_binary)}
-      ])
-    end
-
-    cb_noreply(take_priority_turn(state))
-  end
-
-  def handle_info({:ekv_delete, key, timestamp, origin_node, origin_seq}, %Replica{} = state) do
-    origin_node = normalize_origin_node(origin_node)
-    gap? = origin_gap?(state, origin_node, origin_seq)
-    prev_value = if has_subscribers?(state), do: read_previous_value(state, key)
-
-    {applied, state} =
-      merge_remote_entry(state, key, nil, timestamp, origin_node, origin_seq, nil, timestamp)
-
-    state = maybe_request_origin_gap_repair(state, origin_node, origin_seq, gap?)
-
-    if applied do
-      dispatch_events(state, [%EKV.Event{type: :delete, key: key, value: prev_value}])
-    end
-
-    cb_noreply(take_priority_turn(state))
   end
 
   def handle_info(
@@ -4327,8 +4279,6 @@ defmodule EKV.Replica do
 
   defp best_effort_wire_message?({:ekv, @wire_protocol_version, kind, _payload, _meta})
        when kind in [
-              :put,
-              :delete,
               :replication_batch,
               :member_connect,
               :member_connect_ack,
@@ -4362,12 +4312,7 @@ defmodule EKV.Replica do
 
   defp replicate_live_to_members(%Replica{} = state, message) do
     Enum.reduce(Map.keys(state.remote_shards), state, fn target_node, acc ->
-      if remote_supports_feature?(acc, target_node, @wire_feature_replication_batch) do
-        enqueue_replication_batch(acc, target_node, message)
-      else
-        send_to_member(acc, target_node, message)
-        acc
-      end
+      enqueue_replication_batch(acc, target_node, message)
     end)
   end
 
@@ -4730,7 +4675,7 @@ defmodule EKV.Replica do
           collect_local_write_batch(state, batch_items, batch_bytes)
 
         {:ekv, @wire_protocol_version, kind, _payload, _meta} = msg
-        when kind not in [:put, :delete, :replication_batch] ->
+        when kind != :replication_batch ->
           state = process_inline_priority_message(state, msg)
           collect_local_write_batch(state, batch_items, batch_bytes)
 
@@ -5116,7 +5061,7 @@ defmodule EKV.Replica do
         take_priority_control_turn(state, remaining_control_budget - 1)
 
       {:ekv, @wire_protocol_version, kind, _payload, _meta} = msg
-      when kind not in [:put, :delete, :replication_batch] ->
+      when kind != :replication_batch ->
         state = process_inline_priority_message(state, msg)
         take_priority_control_turn(state, remaining_control_budget - 1)
 
@@ -5252,30 +5197,6 @@ defmodule EKV.Replica do
        ) do
     {:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple, state.shard_index,
      local_origin_id(state), origin_seq}
-  end
-
-  # Runs on the sender member. Only large replicated value payloads are compressed.
-  # Message tuple shapes stay stable; only the value field is tagged.
-  defp wire_encode_message(
-         %Replica{} = state,
-         target_node,
-         {:ekv_put, key, value_binary, ts, origin, origin_seq, exp}
-       ) do
-    compress? = remote_supports_feature?(state, target_node, @wire_feature_compression)
-
-    payload =
-      {key, maybe_wire_compress_value(state, value_binary, compress?), ts, origin, origin_seq,
-       exp}
-
-    {:ekv, @wire_protocol_version, :put, payload, %{}}
-  end
-
-  defp wire_encode_message(
-         %Replica{} = _state,
-         _target_node,
-         {:ekv_delete, key, ts, origin, origin_seq}
-       ) do
-    {:ekv, @wire_protocol_version, :delete, {key, ts, origin, origin_seq}, %{}}
   end
 
   defp wire_encode_message(
@@ -5447,14 +5368,6 @@ defmodule EKV.Replica do
 
   defp wire_encode_message(%Replica{} = _state, _target_node, message), do: message
 
-  defp decode_wire_message(:put, {key, value_binary, ts, origin, origin_seq, exp}, _meta) do
-    {:ok, {:ekv_put, key, value_binary, ts, origin, origin_seq, exp}}
-  end
-
-  defp decode_wire_message(:delete, {key, ts, origin, origin_seq}, _meta) do
-    {:ok, {:ekv_delete, key, ts, origin, origin_seq}}
-  end
-
   defp decode_wire_message(:replication_batch, {from_node, shard, origin, entries}, _meta) do
     {:ok, {:ekv_replication_batch, from_node, shard, origin, entries}}
   end
@@ -5611,7 +5524,6 @@ defmodule EKV.Replica do
     %{
       @wire_feature_live_progress => true,
       @wire_feature_compression => true,
-      @wire_feature_replication_batch => true,
       @wire_feature_observer => not state.cas_voter?
     }
   end
