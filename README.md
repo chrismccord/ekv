@@ -119,11 +119,14 @@ Values can be any Erlang term (stored via `:erlang.term_to_binary/1`). Keys are 
 | `:cluster_size` | `nil` | Member and observer mode only. Logical voting cluster size for CAS quorum math. Required for CAS-capable durable replica deployments. |
 | `:node_id` | auto-generated+persistent | Member and observer mode only. Stable logical durable-replica id used in ballots, persisted replay origins, quorum accounting, and blue-green overlap. If omitted, EKV generates one on first boot and persists it to the shard DBs. |
 | `:shards` | `8` | Member and observer mode only. Number of shards (each is an independent GenServer + SQLite db) |
+| `:reader_connections` | `:auto` | Member and observer mode only. Number of SQLite reader connections per shard. `:auto` uses `min(System.schedulers_online(), 16)`. Use `:schedulers` to preserve one reader per scheduler, or a positive integer to tune explicitly. |
 | `:tombstone_ttl` | `604_800_000` (7 days) | Member and observer mode only. How long tombstones are retained in milliseconds |
 | `:gc_interval` | `300_000` (5 min) | Member and observer mode only. GC tick interval in milliseconds |
 | `:member_progress_retention_ttl` | `min(:tombstone_ttl, 21_600_000)` (6 hours by default) | Member and observer mode only. How long disconnected durable replicas keep anchoring replay retention before their `kv_member_progress` rows may be pruned. This is the main guard against partitions turning into full syncs after a GC; `0` restores the old immediate-prune behavior. |
 | `:wait_for_quorum` | `false` | Optional startup gate. In member mode, waits for this EKV member to reach CAS quorum. In observer and client mode, waits for the selected backend voter to report CAS quorum reachable. |
 | `:anti_entropy_interval` | `30_000` (30 sec) | Member and observer mode only. Periodic background repair for already-connected durable replicas. Re-runs the normal HWM-driven delta/full sync path to heal missed replication without waiting for reconnect. Must be a positive timeout in ms. |
+| `:sync_chunk_size` | `500` | Member and observer mode only. Max entries per delta/full sync chunk during anti-entropy and catch-up. |
+| `:sync_chunk_max_bytes` | `:replication_batch_max_bytes` | Member and observer mode only. Approximate uncompressed byte cap for delta/full sync chunks. Count and byte limits are both enforced; one oversized entry may exceed this cap so sync can make progress. |
 | `:delta_sync_log_min_entries` | `8` | Member and observer mode only. Suppresses per-delta `info` logs for successful terminal delta syncs smaller than this many entries. `:verbose` logging still prints all deltas. |
 | `:delta_sync_storm_window` | `60_000` (60 sec) | Member and observer mode only. Rolling per-shard window used to aggregate delta sync activity for storm detection. |
 | `:delta_sync_storm_threshold` | `100` | Member and observer mode only. When a shard sends at least this many delta syncs inside one storm window, EKV emits a single aggregated warning for that window. `false`/`nil` disables storm warnings. |
@@ -155,9 +158,15 @@ adapter:
 ```
 
 The adapter is application-owned and may expect an externally started transport
-instance named `:my_transport`; EKV does not start or supervise it. Adapter
-implementations only need `init/1`, `send/4`, and `rpc/6` as defined by
-`EKV.Transport`.
+instance named `:my_transport`; EKV does not start or supervise it. In
+`{Module, opts}`, EKV validates `Module` and passes `opts` directly to
+`Module.init/1`; option keys such as `:name` are adapter-owned and not
+interpreted by EKV. Adapter implementations only need `init/1`, `send/4`, and
+`rpc/6` as defined by `EKV.Transport`. EKV initializes adapter state per
+replica shard process for member traffic, and initializes a lightweight adapter
+handle for each routed client RPC. Adapter `init/1` must be cheap: validate
+opts, fetch/build a handle to an externally supervised transport, and return.
+It must not start per-call transport workers.
 
 ### Client mode
 
@@ -194,7 +203,7 @@ low-latency eventual reads locally, but should not increase the CAS voter set.
 
 ### Storage
 
-Each shard has a single SQLite database (WAL mode) as its sole storage layer — no data is held in memory so your dataset is not bound by available system memory. Normal writes go through the shard GenServer and atomically update current state plus retained replay history in a single NIF call. Replay rows use a deduplicated `kv_keyrefs` dictionary so `kv_oplog` does not repeat full key strings on every version, and full sync rebuilds `kv` without seeding replay history on the receiver. Reads go directly to SQLite via per-scheduler read connections stored in `persistent_term`.
+Each shard has a single SQLite database (WAL mode) as its sole storage layer — no data is held in memory so your dataset is not bound by available system memory. Normal writes go through the shard GenServer and atomically update current state plus retained replay history in a single NIF call. Replay rows use a deduplicated `kv_keyrefs` dictionary so `kv_oplog` does not repeat full key strings on every version, and full sync rebuilds `kv` without seeding replay history on the receiver. Reads go directly to SQLite via per-shard reader connections stored in `persistent_term`.
 
 Data survives restarts automatically since SQLite is the source of truth.
 

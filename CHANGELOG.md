@@ -3,6 +3,8 @@
   crash on nil prepared statements instead of proxying or returning `{:error, :shutting_down}`
 - Add an optional `EKV.Transport` data-plane adapter for member shard sends and routed
   client RPC, with Erlang distribution as the default transport
+- Add `:sync_chunk_max_bytes` so delta/full sync chunks are bounded by both entry count
+  and approximate uncompressed payload bytes
 
 ## 0.4.0 (2026-04-17)
 - Remove legacy non matched message handlers

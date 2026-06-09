@@ -119,13 +119,13 @@ defmodule EKV.Replica do
 
   Connections per shard:
     - 1 writer connection (owned by the Replica GenServer)
-    - `System.schedulers_online()` reader connections
+    - `:reader_connections` reader connections, defaulting to
+      `min(System.schedulers_online(), 16)`
 
   Reader connections are stored as a tuple of `{db, get_stmt}` in
   persistent_term keyed by `{EKV, name, :readers, shard_index}`. Reads
-  pick a connection by `rem(scheduler_id - 1, num_readers)` — zero
-  contention, no pool, no GenServer hop. WAL mode ensures readers
-  don't block the writer.
+  pick a connection by `rem(scheduler_id - 1, num_readers)` — no pool,
+  no GenServer hop. WAL mode ensures readers don't block the writer.
 
   Values are stored as `:erlang.term_to_binary/1` blobs. Encoding happens
   in the public EKV module; Replica and Store only see binaries.
@@ -441,7 +441,7 @@ defmodule EKV.Replica do
 
   Reads bypass the GenServer entirely:
 
-      Client             SQLite (per-scheduler read connection)
+      Client             SQLite (reader connection)
         │                 │
         │ read_entry NIF  │
         │────────────────>│   via read_conn(name, shard)
@@ -914,7 +914,10 @@ defmodule EKV.Replica do
 
   Both full and delta sync use cursor-based pagination to avoid loading
   the entire dataset into memory. Default chunk size is 500 entries
-  (configurable via `:sync_chunk_size`).
+  (configurable via `:sync_chunk_size`). Chunks are also bounded by an
+  approximate uncompressed payload byte cap (`:sync_chunk_max_bytes`, defaulting
+  to `:replication_batch_max_bytes`). A single entry larger than the byte cap is
+  still sent alone so sync can make progress.
 
   The sender sends one chunk, then yields to other messages via
   `send(self(), {:continue_full_sync, ...})` before sending the next.
@@ -1193,7 +1196,7 @@ defmodule EKV.Replica do
           keyref_upsert:   reference,   #   ensure replay-key dictionary entry
           oplog_insert:    reference    #   oplog append
         },
-        readers:        [{db, stmt}],   # per-scheduler read connections
+        readers:        [{db, stmt}],   # read connections
         tombstone_ttl:  integer,        # ms
         partition_ttl_policy: :quarantine | :ignore,
         remote_shards:  %{node => pid}, # confirmed live member shards
@@ -1282,8 +1285,8 @@ defmodule EKV.Replica do
     {:ekv_accept_nack, ...}
 
   Sync continuations (self-messages for chunking):
-    {:continue_full_sync, node, last_key, cutoff, my_seq, chunk_size}
-    {:continue_delta_sync, node, last_seq, my_seq, chunk_size}
+    {:continue_full_sync, node, last_key, cutoff, progress, chunk_size, chunk_max_bytes, reason}
+    {:continue_delta_sync, node, origin_node, last_seq, my_seq, chunk_size, chunk_max_bytes}
 
   CAS internal (self-messages):
     {:cas_timeout, ref}
@@ -1438,9 +1441,9 @@ defmodule EKV.Replica do
   end
 
   defp init_with_open_db(db, name, shard_index, num_shards, data_dir, config, transport) do
-    # Open per-scheduler read connections
+    # Open read connections
     db_path = Path.join(data_dir, "shard_#{shard_index}.db")
-    num_readers = System.schedulers_online()
+    num_readers = Map.fetch!(config, :reader_connections)
 
     readers =
       for _ <- 1..num_readers do
@@ -2645,7 +2648,7 @@ defmodule EKV.Replica do
 
   def handle_info(
         {:continue_full_sync, remote_node, last_key, tombstone_cutoff, progress_summary,
-         chunk_size, reason},
+         chunk_size, chunk_max_bytes, reason},
         %Replica{} = state
       ) do
     if Map.has_key?(state.remote_shards, remote_node) do
@@ -2657,6 +2660,7 @@ defmodule EKV.Replica do
           tombstone_cutoff,
           progress_summary,
           chunk_size,
+          chunk_max_bytes,
           reason
         )
       )
@@ -2666,11 +2670,22 @@ defmodule EKV.Replica do
   end
 
   def handle_info(
-        {:continue_delta_sync, remote_node, origin_node, last_seq, my_seq, chunk_size},
+        {:continue_delta_sync, remote_node, origin_node, last_seq, my_seq, chunk_size,
+         chunk_max_bytes},
         %Replica{} = state
       ) do
     if Map.has_key?(state.remote_shards, remote_node) do
-      cb_noreply(send_delta_chunk(state, remote_node, origin_node, last_seq, my_seq, chunk_size))
+      cb_noreply(
+        send_delta_chunk(
+          state,
+          remote_node,
+          origin_node,
+          last_seq,
+          my_seq,
+          chunk_size,
+          chunk_max_bytes
+        )
+      )
     else
       cb_noreply(state)
     end
@@ -3204,7 +3219,9 @@ defmodule EKV.Replica do
        when is_integer(from_seq) and from_seq >= 0 do
     %{db: db} = state
     origin_node = normalize_origin_node(origin_node)
-    chunk_size = EKV.Supervisor.get_config(state.name).sync_chunk_size
+    config = EKV.Supervisor.get_config(state.name)
+    chunk_size = config.sync_chunk_size
+    chunk_max_bytes = config.sync_chunk_max_bytes
     local_progress = local_progress_summary_for_wire(state)
     my_seq = Map.get(local_progress, origin_node, 0)
     replay_bounds = Map.get(Store.replay_origin_bounds(db), origin_node)
@@ -3243,7 +3260,15 @@ defmodule EKV.Replica do
         )
 
       true ->
-        send_delta_chunk(state, remote_node, origin_node, from_seq, my_seq, chunk_size)
+        send_delta_chunk(
+          state,
+          remote_node,
+          origin_node,
+          from_seq,
+          my_seq,
+          chunk_size,
+          chunk_max_bytes
+        )
     end
   end
 
@@ -3261,6 +3286,7 @@ defmodule EKV.Replica do
     config = EKV.Supervisor.get_config(state.name)
     tombstone_cutoff = System.system_time(:nanosecond) - config.tombstone_ttl * 1_000_000
     chunk_size = config.sync_chunk_size
+    chunk_max_bytes = config.sync_chunk_max_bytes
 
     send_full_chunk(
       state,
@@ -3269,6 +3295,7 @@ defmodule EKV.Replica do
       tombstone_cutoff,
       local_progress_summary_for_wire(state),
       chunk_size,
+      chunk_max_bytes,
       reason
     )
   end
@@ -3280,6 +3307,7 @@ defmodule EKV.Replica do
          tombstone_cutoff,
          progress_summary,
          chunk_size,
+         chunk_max_bytes,
          reason
        ) do
     fetched = Store.full_state_chunk(state.db, tombstone_cutoff, last_key, chunk_size + 1)
@@ -3300,9 +3328,10 @@ defmodule EKV.Replica do
         state
 
       _ ->
-        has_more? = length(fetched) > chunk_size
-        entries = if has_more?, do: Enum.take(fetched, chunk_size), else: fetched
-        final? = not has_more?
+        {entries, stopped_early?} =
+          take_sync_entries_by_limits(fetched, chunk_size, chunk_max_bytes, &sync_entry_bytes/1)
+
+        final? = not stopped_early?
         progress = if final?, do: progress_summary, else: nil
 
         log(state, fn ->
@@ -3324,7 +3353,7 @@ defmodule EKV.Replica do
           send(
             self(),
             {:continue_full_sync, remote_node, next_key, tombstone_cutoff, progress_summary,
-             chunk_size, reason}
+             chunk_size, chunk_max_bytes, reason}
           )
 
           state
@@ -3364,7 +3393,8 @@ defmodule EKV.Replica do
          origin_node,
          last_seq,
          my_seq,
-         chunk_size
+         chunk_size,
+         chunk_max_bytes
        ) do
     fetched = Store.replay_since_origin_chunk(state.db, origin_node, last_seq, chunk_size + 1)
 
@@ -3384,8 +3414,13 @@ defmodule EKV.Replica do
         state
 
       _ ->
-        has_more? = length(fetched) > chunk_size
-        replay_entries = if has_more?, do: Enum.take(fetched, chunk_size), else: fetched
+        {replay_entries, stopped_early?} =
+          take_sync_entries_by_limits(
+            fetched,
+            chunk_size,
+            chunk_max_bytes,
+            &replay_sync_entry_bytes/1
+          )
 
         entries =
           replay_entries
@@ -3394,7 +3429,7 @@ defmodule EKV.Replica do
             {key, value, timestamp, replay_origin, origin_seq, expires_at, deleted_at}
           end)
 
-        final? = not has_more?
+        final? = not stopped_early?
         progress = if final?, do: %{origin_node => my_seq}, else: nil
 
         cond do
@@ -3415,7 +3450,8 @@ defmodule EKV.Replica do
 
             send(
               self(),
-              {:continue_delta_sync, remote_node, origin_node, max_chunk_seq, my_seq, chunk_size}
+              {:continue_delta_sync, remote_node, origin_node, max_chunk_seq, my_seq, chunk_size,
+               chunk_max_bytes}
             )
 
             state
@@ -3448,7 +3484,7 @@ defmodule EKV.Replica do
               send(
                 self(),
                 {:continue_delta_sync, remote_node, origin_node, max_chunk_seq, my_seq,
-                 chunk_size}
+                 chunk_size, chunk_max_bytes}
               )
 
               state
@@ -3456,6 +3492,50 @@ defmodule EKV.Replica do
         end
     end
   end
+
+  defp take_sync_entries_by_limits(entries, max_entries, max_bytes, byte_fun) do
+    {selected_rev, selected_count, _selected_bytes, stopped_early?} =
+      Enum.reduce_while(entries, {[], 0, 0, false}, fn entry, {acc, count, bytes, _stopped?} ->
+        entry_bytes = byte_fun.(entry)
+
+        cond do
+          count >= max_entries ->
+            {:halt, {acc, count, bytes, true}}
+
+          count > 0 and bytes + entry_bytes > max_bytes ->
+            {:halt, {acc, count, bytes, true}}
+
+          true ->
+            {:cont, {[entry | acc], count + 1, bytes + entry_bytes, false}}
+        end
+      end)
+
+    selected = Enum.reverse(selected_rev)
+    {selected, stopped_early? or selected_count < length(entries)}
+  end
+
+  defp sync_entry_bytes(
+         {key, value_binary, _timestamp, origin_node, _origin_seq, _expires_at, _deleted_at}
+       ) do
+    byte_size(key) + value_wire_bytes(value_binary) + origin_node_wire_bytes(origin_node) + 96
+  end
+
+  defp replay_sync_entry_bytes(
+         {key, value_binary, _timestamp, origin_node, _origin_seq, _expires_at, _is_delete}
+       ) do
+    byte_size(key) + value_wire_bytes(value_binary) + origin_node_wire_bytes(origin_node) + 96
+  end
+
+  defp value_wire_bytes(value) when is_binary(value), do: byte_size(value)
+  defp value_wire_bytes(_value), do: 0
+
+  defp origin_node_wire_bytes(origin_node) when is_binary(origin_node), do: byte_size(origin_node)
+
+  defp origin_node_wire_bytes(origin_node) when is_atom(origin_node) do
+    origin_node |> Atom.to_string() |> byte_size()
+  end
+
+  defp origin_node_wire_bytes(_origin_node), do: 16
 
   defp mark_sync_inflight(%Replica{} = state, remote_node, request) when request in [:full] do
     now_ms = System.monotonic_time(:millisecond)
@@ -4761,12 +4841,12 @@ defmodule EKV.Replica do
           collect_local_write_batch(state, batch_items, batch_bytes)
 
         {:continue_full_sync, _remote_node, _last_key, _cutoff, _progress_summary, _chunk_size,
-         _reason} = msg ->
+         _chunk_max_bytes, _reason} = msg ->
           state = process_inline_priority_message(state, msg)
           collect_local_write_batch(state, batch_items, batch_bytes)
 
-        {:continue_delta_sync, _remote_node, _origin_node, _last_seq, _my_seq, _chunk_size} =
-            msg ->
+        {:continue_delta_sync, _remote_node, _origin_node, _last_seq, _my_seq, _chunk_size,
+         _chunk_max_bytes} = msg ->
           state = process_inline_priority_message(state, msg)
           collect_local_write_batch(state, batch_items, batch_bytes)
 
@@ -5178,11 +5258,12 @@ defmodule EKV.Replica do
         take_priority_control_turn(state, remaining_control_budget - 1)
 
       {:continue_full_sync, _remote_node, _last_key, _cutoff, _progress_summary, _chunk_size,
-       _reason} = msg ->
+       _chunk_max_bytes, _reason} = msg ->
         state = process_inline_priority_message(state, msg)
         take_priority_control_turn(state, remaining_control_budget - 1)
 
-      {:continue_delta_sync, _remote_node, _origin_node, _last_seq, _my_seq, _chunk_size} = msg ->
+      {:continue_delta_sync, _remote_node, _origin_node, _last_seq, _my_seq, _chunk_size,
+       _chunk_max_bytes} = msg ->
         state = process_inline_priority_message(state, msg)
         take_priority_control_turn(state, remaining_control_budget - 1)
 

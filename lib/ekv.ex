@@ -250,10 +250,13 @@ defmodule EKV do
   | `:wait_for_route` | `false` | Observer and client mode only. Optional startup gate. Blocks `EKV.start_link/1` until the first reachable voter in `:region_routing` order is selected, or fails startup on timeout. |
   | `:data_dir` | *required in `:member` and `:observer`* | Directory where SQLite database files are stored. Created automatically if it doesn't exist. Each shard gets its own file (`shard_0.db`, `shard_1.db`, etc.). |
   | `:shards` | `8` | Member and observer mode only. Number of shards. See "Choosing a Shard Count" below. |
+  | `:reader_connections` | `:auto` | Member and observer mode only. Number of SQLite reader connections per shard. `:auto` uses `min(System.schedulers_online(), 16)`. Use `:schedulers` to preserve one reader per scheduler, or a positive integer to tune explicitly. |
   | `:cluster_size` | `nil` | Member and observer mode only. Logical voting cluster size for CAS quorum math. Required for CAS-capable durable replica deployments. |
   | `:node_id` | auto-generated+persistent | Member and observer mode only. Stable logical durable-replica identity used by CAS ballots, persisted replay origins, member-progress retention, and blue-green overlap. Auto-generated on first boot if omitted, then reused from disk. |
   | `:wait_for_quorum` | `false` | Optional startup gate. In member mode, blocks startup until this EKV member can reach CAS quorum. In observer and client mode, blocks startup until the selected backend voter reports CAS quorum reachable. |
   | `:anti_entropy_interval` | `30_000` (30 sec) | Member and observer mode only. Periodic background repair for already-connected durable replicas. Re-runs the normal HWM-driven delta/full sync path to heal missed replication without waiting for reconnect. Must be a positive timeout in ms. |
+  | `:sync_chunk_size` | `500` | Member and observer mode only. Max entries per delta/full sync chunk during anti-entropy and catch-up. |
+  | `:sync_chunk_max_bytes` | `:replication_batch_max_bytes` | Member and observer mode only. Approximate uncompressed byte cap for delta/full sync chunks. Count and byte limits are both enforced; one oversized entry may exceed this cap so sync can make progress. |
   | `:delta_sync_log_min_entries` | `8` | Member and observer mode only. Suppresses per-delta `info` logs for successful terminal delta syncs smaller than this many entries. `:verbose` logging still prints all deltas. |
   | `:delta_sync_storm_window` | `60_000` (60 sec) | Member and observer mode only. Rolling per-shard window used to aggregate delta sync activity for storm detection. |
   | `:delta_sync_storm_threshold` | `100` | Member and observer mode only. When a shard sends at least this many delta syncs inside one storm window, EKV emits a single aggregated warning for that window. `false`/`nil` disables storm warnings. |
@@ -283,9 +286,14 @@ defmodule EKV do
         data_dir: "/var/data/ekv",
         transport: {MyApp.EKVTransport, name: :my_transport}}
 
-  The adapter contract is `EKV.Transport`. EKV initializes adapter state per
-  replica shard process so adapters can pin ordering to the shard's lane. EKV
-  does not start or supervise the external transport.
+  The adapter contract is `EKV.Transport`. In `{Module, opts}`, EKV validates
+  `Module` and passes `opts` directly to `Module.init/1`; option keys such as
+  `:name` are adapter-owned and not interpreted by EKV. EKV initializes
+  adapter state per replica shard process for member traffic, and initializes
+  a lightweight adapter handle for each routed client RPC. Adapter `init/1`
+  must be cheap: validate opts, fetch/build a handle to an externally
+  supervised transport, and return. It must not start per-call transport
+  workers. EKV does not start or supervise the external transport.
 
   ### Observer Mode
 
@@ -759,7 +767,7 @@ defmodule EKV do
   @doc """
   Get a value by key. Returns `nil` for missing, expired, or deleted entries.
 
-  By default, reads directly from SQLite via per-scheduler read connection
+  By default, reads directly from SQLite via a per-shard reader connection pool
   (eventually consistent, no GenServer hop).
 
   ## Options
@@ -1469,7 +1477,7 @@ defmodule EKV do
   # Runs on the routed caller node; issues the cross-node transport RPC to a voter.
   defp remote_invoke(name, node, fun, args, timeout) do
     try do
-      with {:ok, transport} <- transport_handle(name) do
+      with {:ok, transport} <- init_transport(name) do
         case EKV.Transport.rpc(
                transport,
                node,
@@ -1495,25 +1503,10 @@ defmodule EKV do
     end
   end
 
-  defp transport_handle(name) do
+  defp init_transport(name) do
     config = EKV.Supervisor.get_config(name)
     transport_config = Map.get(config, :transport, EKV.Transport.default_config())
-    cache_key = {__MODULE__, :transport, name}
-
-    case Process.get(cache_key) do
-      {^transport_config, transport} ->
-        {:ok, transport}
-
-      _other ->
-        case EKV.Transport.init(transport_config) do
-          {:ok, transport} ->
-            Process.put(cache_key, {transport_config, transport})
-            {:ok, transport}
-
-          {:error, reason} ->
-            {:error, reason}
-        end
-    end
+    EKV.Transport.init(transport_config)
   end
 
   defp validate_cas_config!(%{cluster_size: nil}) do

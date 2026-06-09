@@ -162,6 +162,53 @@ defmodule EKVTest do
     end
   end
 
+  describe "reader connections" do
+    test "reader_connections config controls per-shard reader pool size" do
+      name = :"ekv_readers_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+
+      {:ok, pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: data_dir,
+          shards: 1,
+          reader_connections: 3,
+          log: false,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      readers = :persistent_term.get({EKV, name, :readers, 0})
+      assert tuple_size(readers) == 3
+    end
+
+    test "reader_connections rejects invalid values" do
+      name = :"ekv_bad_readers_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+      old = Process.flag(:trap_exit, true)
+
+      on_exit(fn ->
+        Process.flag(:trap_exit, old)
+        File.rm_rf!(data_dir)
+      end)
+
+      assert {:error, {%ArgumentError{} = error, _stack}} =
+               EKV.start_link(
+                 name: name,
+                 data_dir: data_dir,
+                 reader_connections: 0,
+                 log: false
+               )
+
+      assert Exception.message(error) =~ ":reader_connections must be"
+    end
+  end
+
   describe "put/get" do
     test "basic put and get", %{name: name} do
       :ok = EKV.put(name, "key1", "value1")
@@ -2906,7 +2953,7 @@ defmodule EKVTest do
       end)
     end
 
-    test "replication batch config must be valid" do
+    test "replication batch and sync chunk config must be valid" do
       invalid_opts = [
         [
           replication_batch_flush_ms: 0,
@@ -2919,6 +2966,14 @@ defmodule EKVTest do
         [
           replication_batch_max_bytes: 0,
           expected: ":replication_batch_max_bytes must be a positive byte count"
+        ],
+        [
+          sync_chunk_size: 0,
+          expected: ":sync_chunk_size must be a positive integer"
+        ],
+        [
+          sync_chunk_max_bytes: 0,
+          expected: ":sync_chunk_max_bytes must be a positive byte count"
         ]
       ]
 
@@ -5000,6 +5055,32 @@ defmodule EKVTest do
       %{name: name, data_dir: data_dir, shard_name: shard_name}
     end
 
+    test "sync chunk max bytes defaults from replication batch bytes and can be overridden" do
+      cases = [
+        {[replication_batch_max_bytes: 12_345], 12_345},
+        {[replication_batch_max_bytes: 12_345, sync_chunk_max_bytes: 54_321], 54_321}
+      ]
+
+      for {extra_opts, expected} <- cases do
+        name = :"ekv_sync_chunk_bytes_cfg_#{System.unique_integer([:positive])}"
+        data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+
+        {:ok, pid} =
+          EKV.start_link(
+            Keyword.merge(
+              [name: name, data_dir: data_dir, shards: 1, log: false],
+              extra_opts
+            )
+          )
+
+        assert EKV.Supervisor.get_config(name).sync_chunk_max_bytes == expected
+
+        Process.unlink(pid)
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end
+    end
+
     test "full_state_chunk paginates through all entries", %{shard_name: shard_name, name: name} do
       # Write 35 keys (more than 3 chunks of 10)
       for i <- 1..35 do
@@ -5090,7 +5171,7 @@ defmodule EKVTest do
       send(
         shard_name,
         {:continue_full_sync, fake_node, nil, tombstone_cutoff, progress, config.sync_chunk_size,
-         :explicit_request}
+         config.sync_chunk_max_bytes, :explicit_request}
       )
 
       Process.sleep(200)
@@ -5126,7 +5207,7 @@ defmodule EKVTest do
       send(
         shard_name,
         {:continue_delta_sync, fake_node, local_origin_id(state), 0, my_seq,
-         config.sync_chunk_size}
+         config.sync_chunk_size, config.sync_chunk_max_bytes}
       )
 
       Process.sleep(200)
@@ -5138,6 +5219,110 @@ defmodule EKVTest do
 
       # Should have 3 chunks (10 + 10 + 5)
       assert sync_count == 3
+    end
+
+    test "full sync chunks respect sync_chunk_max_bytes", %{
+      shard_name: shard_name,
+      name: name
+    } do
+      for i <- 1..4 do
+        key = String.pad_leading("#{i}", 3, "0")
+        :ok = EKV.put(name, "sync_bytes/#{key}", String.duplicate("x", 200))
+      end
+
+      fake_node = :full_bytes_peer@fake
+
+      :sys.replace_state(shard_name, fn state ->
+        %{state | remote_shards: Map.put(state.remote_shards, fake_node, self())}
+      end)
+
+      :erlang.trace(Process.whereis(shard_name), true, [:send])
+
+      config = EKV.Supervisor.get_config(name)
+      tombstone_cutoff = System.system_time(:nanosecond) - config.tombstone_ttl * 1_000_000
+      state = :sys.get_state(shard_name)
+
+      progress =
+        state.db
+        |> EKV.Store.local_progress_summary()
+        |> Map.put(local_origin_id(state), state.local_origin_seq)
+
+      send(
+        shard_name,
+        {:continue_full_sync, fake_node, nil, tombstone_cutoff, progress, config.sync_chunk_size,
+         150, :explicit_request}
+      )
+
+      Process.sleep(200)
+      :sys.get_state(shard_name)
+
+      :erlang.trace(Process.whereis(shard_name), false, [:send])
+
+      sync_messages = collect_trace_sync_details()
+
+      assert Enum.map(sync_messages, fn {entries_count, _progress} -> entries_count end) == [
+               1,
+               1,
+               1,
+               1
+             ]
+
+      {intermediate, [{_final_count, final_progress}]} = Enum.split(sync_messages, -1)
+
+      for {_entries_count, progress} <- intermediate do
+        assert progress == nil
+      end
+
+      assert is_map(final_progress)
+    end
+
+    test "delta sync chunks respect sync_chunk_max_bytes", %{
+      shard_name: shard_name,
+      name: name
+    } do
+      for i <- 1..4 do
+        :ok = EKV.put(name, "delta_bytes/#{i}", String.duplicate("x", 200))
+      end
+
+      fake_node = :delta_bytes_peer@fake
+
+      :sys.replace_state(shard_name, fn state ->
+        %{state | remote_shards: Map.put(state.remote_shards, fake_node, self())}
+      end)
+
+      :erlang.trace(Process.whereis(shard_name), true, [:send])
+
+      config = EKV.Supervisor.get_config(name)
+      state = :sys.get_state(shard_name)
+      my_seq = state.local_origin_seq
+
+      send(
+        shard_name,
+        {:continue_delta_sync, fake_node, local_origin_id(state), 0, my_seq,
+         config.sync_chunk_size, 150}
+      )
+
+      Process.sleep(200)
+      :sys.get_state(shard_name)
+
+      :erlang.trace(Process.whereis(shard_name), false, [:send])
+
+      sync_messages = collect_trace_sync_details()
+
+      assert Enum.map(sync_messages, fn {entries_count, _progress} -> entries_count end) == [
+               1,
+               1,
+               1,
+               1
+             ]
+
+      {intermediate, [{_final_count, final_progress}]} = Enum.split(sync_messages, -1)
+
+      for {_entries_count, progress} <- intermediate do
+        assert progress == nil
+      end
+
+      assert is_map(final_progress)
     end
 
     test "member disconnect aborts ongoing chunked sync", %{shard_name: shard_name, name: name} do
@@ -5167,7 +5352,7 @@ defmodule EKVTest do
       send(
         shard_name,
         {:continue_full_sync, fake_node, nil, tombstone_cutoff, progress, config.sync_chunk_size,
-         :explicit_request}
+         config.sync_chunk_max_bytes, :explicit_request}
       )
 
       # Resume to process just the first chunk (sends chunk + queues next continuation)
@@ -5224,7 +5409,7 @@ defmodule EKVTest do
       send(
         shard_name,
         {:continue_full_sync, fake_node, nil, tombstone_cutoff, progress, config.sync_chunk_size,
-         :explicit_request}
+         config.sync_chunk_max_bytes, :explicit_request}
       )
 
       :sys.resume(shard_name)
@@ -5271,7 +5456,7 @@ defmodule EKVTest do
       send(
         shard_name,
         {:continue_full_sync, fake_node, nil, tombstone_cutoff, progress, config.sync_chunk_size,
-         :explicit_request}
+         config.sync_chunk_max_bytes, :explicit_request}
       )
 
       Process.sleep(200)
@@ -6148,6 +6333,10 @@ defmodule EKVTest do
         [
           replication_batch_max_bytes: 10,
           expected: ":replication_batch_max_bytes is not supported in :client mode"
+        ],
+        [
+          sync_chunk_max_bytes: 10,
+          expected: ":sync_chunk_max_bytes is not supported in :client mode"
         ]
       ]
 

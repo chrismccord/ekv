@@ -5,6 +5,16 @@ defmodule EKV.Transport do
   EKV uses this boundary for member shard sends and routed client RPC. The
   default adapter keeps Erlang distribution behavior; callers may provide a
   volatile ordered lane without EKV owning that lane's supervision.
+
+  Public transport config is `nil` or `{Module, opts}`. EKV validates `Module`
+  implements this behaviour and passes `opts` directly to `Module.init/1`;
+  adapter option keys are adapter-owned and not interpreted by EKV.
+
+  `init/1` prepares a lightweight adapter handle from static configuration.
+  EKV calls it once per replica shard process for member traffic and may call
+  it on the routed-client-RPC hot path. Adapter implementations must not start
+  per-call transport workers from `init/1`; long-lived transport processes
+  should be supervised by the application that owns the transport.
   """
 
   @type config :: %{module: module(), opts: keyword()}

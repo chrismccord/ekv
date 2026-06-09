@@ -7,6 +7,7 @@ defmodule EKV.Supervisor do
   @default_member_progress_retention_ttl :timer.hours(6)
   @default_handoff_ack_timeout_ms 60_000
   @handoff_task_timeout_buffer_ms 30_000
+  @default_max_reader_connections 16
 
   _archdoc = ~S"""
   Top-level EKV supervisor.
@@ -184,6 +185,7 @@ defmodule EKV.Supervisor do
     :region_routing,
     :data_dir,
     :shards,
+    :reader_connections,
     :log,
     :tombstone_ttl,
     :gc_interval,
@@ -191,6 +193,7 @@ defmodule EKV.Supervisor do
     :cluster_size,
     :node_id,
     :sync_chunk_size,
+    :sync_chunk_max_bytes,
     :anti_entropy_interval,
     :delta_sync_log_min_entries,
     :delta_sync_storm_window,
@@ -270,6 +273,7 @@ defmodule EKV.Supervisor do
   defp init_member(name, region, log, opts) do
     data_dir = Keyword.fetch!(opts, :data_dir)
     num_shards = Keyword.get(opts, :shards, 8)
+    reader_connections = reader_connections(opts)
     blue_green = Keyword.get(opts, :blue_green, false)
     tombstone_ttl = Keyword.get(opts, :tombstone_ttl, :timer.hours(24 * 7))
     gc_interval = Keyword.get(opts, :gc_interval, :timer.minutes(5))
@@ -305,6 +309,7 @@ defmodule EKV.Supervisor do
     replication_batch_flush_ms = Keyword.get(opts, :replication_batch_flush_ms, 3)
     replication_batch_max_entries = Keyword.get(opts, :replication_batch_max_entries, 64)
     replication_batch_max_bytes = Keyword.get(opts, :replication_batch_max_bytes, 256 * 1024)
+    sync_chunk_max_bytes = Keyword.get(opts, :sync_chunk_max_bytes, replication_batch_max_bytes)
     transport = EKV.Transport.normalize_config(Keyword.get(opts, :transport))
     wait_for_quorum = Keyword.get(opts, :wait_for_quorum, false)
     wait_for_route = Keyword.get(opts, :wait_for_route, false)
@@ -319,9 +324,11 @@ defmodule EKV.Supervisor do
     validate_replication_batch_flush_ms!(replication_batch_flush_ms)
     validate_replication_batch_max_entries!(replication_batch_max_entries)
     validate_replication_batch_max_bytes!(replication_batch_max_bytes)
+    validate_sync_chunk_max_bytes!(sync_chunk_max_bytes)
     validate_wait_for_quorum!(wait_for_quorum, cluster_size)
     validate_wait_for_route!(wait_for_route, :member)
     validate_shutdown_barrier!(shutdown_barrier)
+    validate_sync_chunk_size!(sync_chunk_size)
     validate_anti_entropy_interval!(anti_entropy_interval)
     validate_delta_sync_log_min_entries!(delta_sync_log_min_entries)
     validate_delta_sync_storm_window!(delta_sync_storm_window)
@@ -356,6 +363,7 @@ defmodule EKV.Supervisor do
       region: region,
       region_routing: nil,
       num_shards: num_shards,
+      reader_connections: reader_connections,
       data_dir: data_dir,
       log: log,
       tombstone_ttl: tombstone_ttl,
@@ -378,6 +386,7 @@ defmodule EKV.Supervisor do
       replication_batch_flush_ms: replication_batch_flush_ms,
       replication_batch_max_entries: replication_batch_max_entries,
       replication_batch_max_bytes: replication_batch_max_bytes,
+      sync_chunk_max_bytes: sync_chunk_max_bytes,
       transport: transport
     }
 
@@ -412,6 +421,7 @@ defmodule EKV.Supervisor do
   defp init_observer(name, region, log, opts) do
     data_dir = Keyword.fetch!(opts, :data_dir)
     num_shards = Keyword.get(opts, :shards, 8)
+    reader_connections = reader_connections(opts)
     blue_green = Keyword.get(opts, :blue_green, false)
     tombstone_ttl = Keyword.get(opts, :tombstone_ttl, :timer.hours(24 * 7))
     gc_interval = Keyword.get(opts, :gc_interval, :timer.minutes(5))
@@ -446,6 +456,7 @@ defmodule EKV.Supervisor do
     replication_batch_flush_ms = Keyword.get(opts, :replication_batch_flush_ms, 2)
     replication_batch_max_entries = Keyword.get(opts, :replication_batch_max_entries, 64)
     replication_batch_max_bytes = Keyword.get(opts, :replication_batch_max_bytes, 256 * 1024)
+    sync_chunk_max_bytes = Keyword.get(opts, :sync_chunk_max_bytes, replication_batch_max_bytes)
     transport = EKV.Transport.normalize_config(Keyword.get(opts, :transport))
     wait_for_quorum = Keyword.get(opts, :wait_for_quorum, false)
     wait_for_route = Keyword.get(opts, :wait_for_route, false)
@@ -461,9 +472,11 @@ defmodule EKV.Supervisor do
     validate_replication_batch_flush_ms!(replication_batch_flush_ms)
     validate_replication_batch_max_entries!(replication_batch_max_entries)
     validate_replication_batch_max_bytes!(replication_batch_max_bytes)
+    validate_sync_chunk_max_bytes!(sync_chunk_max_bytes)
     validate_wait_for_quorum!(wait_for_quorum, 1)
     validate_wait_for_route!(wait_for_route, :observer)
     validate_shutdown_barrier!(shutdown_barrier)
+    validate_sync_chunk_size!(sync_chunk_size)
     validate_anti_entropy_interval!(anti_entropy_interval)
     validate_delta_sync_log_min_entries!(delta_sync_log_min_entries)
     validate_delta_sync_storm_window!(delta_sync_storm_window)
@@ -498,6 +511,7 @@ defmodule EKV.Supervisor do
       region: region,
       region_routing: region_routing,
       num_shards: num_shards,
+      reader_connections: reader_connections,
       data_dir: data_dir,
       log: log,
       tombstone_ttl: tombstone_ttl,
@@ -520,6 +534,7 @@ defmodule EKV.Supervisor do
       replication_batch_flush_ms: replication_batch_flush_ms,
       replication_batch_max_entries: replication_batch_max_entries,
       replication_batch_max_bytes: replication_batch_max_bytes,
+      sync_chunk_max_bytes: sync_chunk_max_bytes,
       transport: transport
     }
 
@@ -751,6 +766,7 @@ defmodule EKV.Supervisor do
     reject_client_opt!(opts, :cluster_size, [nil])
     reject_client_opt!(opts, :node_id, [nil])
     reject_client_opt!(opts, :shards, [nil])
+    reject_client_opt!(opts, :reader_connections, [nil])
     reject_client_opt!(opts, :gc_interval, [nil])
     reject_client_opt!(opts, :tombstone_ttl, [nil])
     reject_client_opt!(opts, :sync_chunk_size, [nil])
@@ -768,6 +784,7 @@ defmodule EKV.Supervisor do
     reject_client_opt!(opts, :replication_batch_flush_ms, [nil])
     reject_client_opt!(opts, :replication_batch_max_entries, [nil])
     reject_client_opt!(opts, :replication_batch_max_bytes, [nil])
+    reject_client_opt!(opts, :sync_chunk_max_bytes, [nil])
   end
 
   defp validate_wire_compression_threshold!(false), do: :ok
@@ -780,6 +797,23 @@ defmodule EKV.Supervisor do
   defp validate_wire_compression_threshold!(threshold) do
     raise ArgumentError,
           "EKV: :wire_compression_threshold must be false/nil or a non-negative byte threshold, got: #{inspect(threshold)}"
+  end
+
+  defp reader_connections(opts) do
+    case Keyword.get(opts, :reader_connections, :auto) do
+      :auto ->
+        min(System.schedulers_online(), @default_max_reader_connections)
+
+      :schedulers ->
+        System.schedulers_online()
+
+      count when is_integer(count) and count > 0 ->
+        count
+
+      other ->
+        raise ArgumentError,
+              "EKV: :reader_connections must be :auto, :schedulers, or a positive integer, got: #{inspect(other)}"
+    end
   end
 
   defp validate_handoff_ack_timeout_ms!(timeout)
@@ -834,6 +868,23 @@ defmodule EKV.Supervisor do
   defp validate_replication_batch_max_bytes!(bytes) do
     raise ArgumentError,
           "EKV: :replication_batch_max_bytes must be a positive byte count, got: #{inspect(bytes)}"
+  end
+
+  defp validate_sync_chunk_size!(size) when is_integer(size) and size > 0,
+    do: :ok
+
+  defp validate_sync_chunk_size!(size) do
+    raise ArgumentError,
+          "EKV: :sync_chunk_size must be a positive integer, got: #{inspect(size)}"
+  end
+
+  defp validate_sync_chunk_max_bytes!(bytes)
+       when is_integer(bytes) and bytes > 0,
+       do: :ok
+
+  defp validate_sync_chunk_max_bytes!(bytes) do
+    raise ArgumentError,
+          "EKV: :sync_chunk_max_bytes must be a positive byte count, got: #{inspect(bytes)}"
   end
 
   defp validate_allow_stale_startup!(value) when is_boolean(value), do: :ok
