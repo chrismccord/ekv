@@ -1,3 +1,9 @@
+## 0.4.1 (2026-04-20)
+- Fix a blue-green handoff race where a queued local write batch could reach proxy mode and
+  crash on nil prepared statements instead of proxying or returning `{:error, :shutting_down}`
+- Add an optional `EKV.Transport` data-plane adapter for member shard sends and routed
+  client RPC, with Erlang distribution as the default transport
+
 ## 0.4.0 (2026-04-17)
 - Remove legacy non matched message handlers
 

@@ -128,6 +128,7 @@ Values can be any Erlang term (stored via `:erlang.term_to_binary/1`). Keys are 
 | `:delta_sync_storm_window` | `60_000` (60 sec) | Member and observer mode only. Rolling per-shard window used to aggregate delta sync activity for storm detection. |
 | `:delta_sync_storm_threshold` | `100` | Member and observer mode only. When a shard sends at least this many delta syncs inside one storm window, EKV emits a single aggregated warning for that window. `false`/`nil` disables storm warnings. |
 | `:wire_compression_threshold` | `262_144` (256 KB) | Optional byte threshold for member-to-member wire compression of large replicated value payloads. `false`/`nil` disables it. Large LWW replication and CAS accept/commit payloads compress on the wire only; values remain uncompressed on disk and on reads. |
+| `:transport` | `nil` | Optional data-plane transport adapter for member shard sends and client-mode RPC. `nil` uses Erlang distribution. Custom transports are externally supervised and configured as `{Module, opts}` or `[module: Module, opts: opts]`. |
 | `:local_write_batch_max_entries` | `32` | Member and observer mode only. Max adjacent non-CAS local LWW writes the shard will opportunistically drain into one SQLite batch before replying. Also currently sets the bounded post-replication control/CAS priority turn budget; there is no separate fairness knob yet. |
 | `:local_write_batch_max_bytes` | `262_144` (256 KB) | Member and observer mode only. Max encoded byte size of one opportunistic non-CAS local LWW batch before the shard stops draining more local writes. |
 | `:replication_batch_flush_ms` | `3` | Member and observer mode only. Max time one live LWW replication batch may stay queued per destination shard before EKV flushes it. |
@@ -138,6 +139,24 @@ Values can be any Erlang term (stored via `:erlang.term_to_binary/1`). Keys are 
 | `:blue_green` | `false` | Member and observer mode only. Enable blue-green deployment handoff for shared-volume replacement nodes. |
 | `:log` | `:info` | `:info`, `false` (silent), or `:verbose` |
 | `:partition_ttl_policy` | `:quarantine` | Member and observer mode only. Policy when a durable-replica identity reconnects after being disconnected longer than `tombstone_ttl`. `:quarantine` blocks replication with that member until operator intervention. `:ignore` disables that quarantine and allows reconnect/sync anyway. |
+
+### Transport adapters
+
+By default EKV sends member shard traffic and routed client RPC over Erlang
+distribution. To move the hot data plane onto another volatile ordered lane,
+start that transport in your application supervision tree and point EKV at an
+adapter:
+
+```elixir
+{EKV,
+ name: :my_kv,
+ data_dir: "/var/data/ekv",
+ transport: {EKV.Transports.SocketDist, name: :c3}}
+```
+
+The SocketDist adapter expects an externally started SocketDist instance named
+`:c3`; EKV does not start or supervise it. Adapter implementations only need
+`init/1`, `send/4`, and `rpc/6` as defined by `EKV.Transport`.
 
 ### Client mode
 

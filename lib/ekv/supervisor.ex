@@ -206,6 +206,7 @@ defmodule EKV.Supervisor do
     :replication_batch_flush_ms,
     :replication_batch_max_entries,
     :replication_batch_max_bytes,
+    :transport,
     :wait_for_quorum,
     :wait_for_route,
     :shutdown_barrier
@@ -304,6 +305,7 @@ defmodule EKV.Supervisor do
     replication_batch_flush_ms = Keyword.get(opts, :replication_batch_flush_ms, 3)
     replication_batch_max_entries = Keyword.get(opts, :replication_batch_max_entries, 64)
     replication_batch_max_bytes = Keyword.get(opts, :replication_batch_max_bytes, 256 * 1024)
+    transport = EKV.Transport.normalize_config(Keyword.get(opts, :transport))
     wait_for_quorum = Keyword.get(opts, :wait_for_quorum, false)
     wait_for_route = Keyword.get(opts, :wait_for_route, false)
     shutdown_barrier = Keyword.get(opts, :shutdown_barrier, false)
@@ -375,7 +377,8 @@ defmodule EKV.Supervisor do
       local_write_batch_max_bytes: local_write_batch_max_bytes,
       replication_batch_flush_ms: replication_batch_flush_ms,
       replication_batch_max_entries: replication_batch_max_entries,
-      replication_batch_max_bytes: replication_batch_max_bytes
+      replication_batch_max_bytes: replication_batch_max_bytes,
+      transport: transport
     }
 
     :persistent_term.put({EKV, name}, config)
@@ -443,6 +446,7 @@ defmodule EKV.Supervisor do
     replication_batch_flush_ms = Keyword.get(opts, :replication_batch_flush_ms, 2)
     replication_batch_max_entries = Keyword.get(opts, :replication_batch_max_entries, 64)
     replication_batch_max_bytes = Keyword.get(opts, :replication_batch_max_bytes, 256 * 1024)
+    transport = EKV.Transport.normalize_config(Keyword.get(opts, :transport))
     wait_for_quorum = Keyword.get(opts, :wait_for_quorum, false)
     wait_for_route = Keyword.get(opts, :wait_for_route, false)
     shutdown_barrier = Keyword.get(opts, :shutdown_barrier, false)
@@ -515,7 +519,8 @@ defmodule EKV.Supervisor do
       local_write_batch_max_bytes: local_write_batch_max_bytes,
       replication_batch_flush_ms: replication_batch_flush_ms,
       replication_batch_max_entries: replication_batch_max_entries,
-      replication_batch_max_bytes: replication_batch_max_bytes
+      replication_batch_max_bytes: replication_batch_max_bytes,
+      transport: transport
     }
 
     :persistent_term.put({EKV, name}, config)
@@ -557,6 +562,7 @@ defmodule EKV.Supervisor do
     wait_for_quorum = Keyword.get(opts, :wait_for_quorum, false)
     shutdown_barrier = Keyword.get(opts, :shutdown_barrier, false)
     wire_compression_threshold = Keyword.get(opts, :wire_compression_threshold, 256 * 1024)
+    transport = EKV.Transport.normalize_config(Keyword.get(opts, :transport))
 
     validate_client_opts!(
       opts,
@@ -574,6 +580,7 @@ defmodule EKV.Supervisor do
       region_routing: region_routing,
       log: log,
       wire_compression_threshold: wire_compression_threshold,
+      transport: transport,
       cluster_size: nil,
       node_id: nil,
       num_shards: nil,

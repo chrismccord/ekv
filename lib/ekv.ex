@@ -258,6 +258,7 @@ defmodule EKV do
   | `:delta_sync_storm_window` | `60_000` (60 sec) | Member and observer mode only. Rolling per-shard window used to aggregate delta sync activity for storm detection. |
   | `:delta_sync_storm_threshold` | `100` | Member and observer mode only. When a shard sends at least this many delta syncs inside one storm window, EKV emits a single aggregated warning for that window. `false`/`nil` disables storm warnings. |
   | `:wire_compression_threshold` | `262_144` (256 KB) | Optional byte threshold for member-to-member wire compression of large replicated value payloads. `false`/`nil` disables it. Large live replication batch entry values, CAS accept, and full-payload CAS commit messages compress values on the wire only; values remain uncompressed on disk and on reads. |
+  | `:transport` | `nil` | Optional data-plane transport adapter for member shard sends and routed client RPC. `nil` uses Erlang distribution. Custom transports are externally supervised and configured as `{Module, opts}` or `[module: Module, opts: opts]`. |
   | `:local_write_batch_max_entries` | `32` | Member and observer mode only. Max adjacent non-CAS local LWW writes the shard will opportunistically drain into one SQLite batch before replying. Also currently sets the bounded post-replication control/CAS priority turn budget; there is no separate fairness knob yet. |
   | `:local_write_batch_max_bytes` | `262_144` (256 KB) | Member and observer mode only. Max encoded byte size of one opportunistic non-CAS local LWW batch before the shard stops draining more local writes. |
   | `:replication_batch_flush_ms` | `3` | Member and observer mode only. Max time one live LWW replication batch may stay queued per destination shard before EKV flushes it. |
@@ -270,6 +271,21 @@ defmodule EKV do
   | `:log` | `:info` | Logging level. `:info` logs cluster events (connects, syncs). `false` disables logging. `:verbose` logs per-shard detail. |
   | `:partition_ttl_policy` | `:quarantine` | Member and observer mode only. Policy for reconnects after downtime longer than `tombstone_ttl`. `:quarantine` blocks replication with that member identity until operator rebuild. `:ignore` disables that quarantine and allows reconnect/sync anyway. |
   | `:blue_green` | `false` | Member and observer mode only. Enable blue-green deployment mode. See "Blue-Green Deployment" below. |
+
+  ### Transport Adapters
+
+  By default EKV sends member shard traffic and routed client RPC over Erlang
+  distribution. `:transport` lets applications move that data plane onto an
+  externally supervised volatile ordered lane:
+
+      {EKV,
+        name: :my_kv,
+        data_dir: "/var/data/ekv",
+        transport: {EKV.Transports.SocketDist, name: :c3}}
+
+  The adapter contract is `EKV.Transport`. EKV initializes adapter state per
+  replica shard process so adapters such as SocketDist can pin ordering to the
+  shard's lane. EKV does not start or supervise the external transport.
 
   ### Observer Mode
 
@@ -1450,16 +1466,53 @@ defmodule EKV do
     end
   end
 
-  # Runs on the routed caller node; issues the cross-node erpc call to a voter.
-  defp remote_invoke(node, fun, args, timeout) do
+  # Runs on the routed caller node; issues the cross-node transport RPC to a voter.
+  defp remote_invoke(name, node, fun, args, timeout) do
     try do
-      case :erpc.call(node, __MODULE__, :__client_invoke__, [fun, args], timeout) do
-        {:ok, result} -> {:ok, result}
-        {:raise, exception} -> {:raise, exception}
-        {:exit, reason} -> {:exit, reason}
+      with {:ok, transport} <- transport_handle(name) do
+        case EKV.Transport.rpc(
+               transport,
+               node,
+               __MODULE__,
+               :__client_invoke__,
+               [fun, args],
+               timeout: timeout
+             ) do
+          {:ok, {:ok, result}} -> {:ok, result}
+          {:ok, {:raise, exception}} -> {:raise, exception}
+          {:ok, {:exit, reason}} -> {:exit, reason}
+          {:ok, _other} -> {:error, :unavailable}
+          {:raise, exception} -> {:raise, exception}
+          {:throw, value} -> {:exit, {:throw, value}}
+          {:exit, reason} -> {:exit, reason}
+          {:error, _reason} -> {:error, :unavailable}
+        end
+      else
+        {:error, _reason} -> {:error, :unavailable}
       end
     catch
       :exit, _reason -> {:error, :unavailable}
+    end
+  end
+
+  defp transport_handle(name) do
+    config = EKV.Supervisor.get_config(name)
+    transport_config = Map.get(config, :transport, EKV.Transport.default_config())
+    cache_key = {__MODULE__, :transport, name}
+
+    case Process.get(cache_key) do
+      {^transport_config, transport} ->
+        {:ok, transport}
+
+      _other ->
+        case EKV.Transport.init(transport_config) do
+          {:ok, transport} ->
+            Process.put(cache_key, {transport_config, transport})
+            {:ok, transport}
+
+          {:error, reason} ->
+            {:error, reason}
+        end
     end
   end
 
@@ -1845,7 +1898,7 @@ defmodule EKV do
   # and optionally retries safe calls.
   defp client_rpc(name, fun, args, timeout, retryable?) do
     with {:ok, backend} <- EKV.ClientRouter.backend(name) do
-      case remote_invoke(backend, fun, args, timeout) do
+      case remote_invoke(name, backend, fun, args, timeout) do
         {:ok, _result} = ok ->
           ok
 
@@ -1874,7 +1927,7 @@ defmodule EKV do
   defp retry_client_rpc(name, failed_backend, fun, args, timeout) do
     with {:ok, backend} <- EKV.ClientRouter.next_backend(name, failed_backend),
          false <- backend == failed_backend,
-         result <- remote_invoke(backend, fun, args, timeout) do
+         result <- remote_invoke(name, backend, fun, args, timeout) do
       result
     else
       _ -> {:error, :unavailable}
@@ -1921,6 +1974,7 @@ defmodule EKV do
       remaining = max(timeout_ms - elapsed, 0)
 
       case remote_invoke(
+             name,
              backend,
              :await_quorum,
              [name, remaining],

@@ -413,11 +413,17 @@ defmodule EKV.Replica do
     - must-send protocol / bulk transfer:
       CAS traffic and `:sync` chunks
 
-  Best-effort classes use `send_nosuspend` so a slow peer does not suspend the
-  shard in `dsend_continue_trap`. If such a send cannot be enqueued without
-  suspending the shard, it is dropped and later anti-entropy/discovery rounds
-  are expected to catch the peer up. Must-send classes still use normal
-  blocking distribution sends.
+  The default transport uses `send_nosuspend` for best-effort classes so a slow
+  peer does not suspend the shard in `dsend_continue_trap`. If such a send
+  cannot be enqueued without suspending the shard, it is dropped and later
+  anti-entropy/discovery rounds are expected to catch the peer up. Must-send
+  classes use normal blocking distribution sends by default.
+
+  Custom data-plane transports implement `EKV.Transport` and receive the same
+  reliability classification in send opts. They are expected to provide a
+  volatile, bounded, ordered lane for shard-to-shard messages. EKV initializes
+  the adapter per shard process so transports can pin any per-caller lane
+  selection to that shard. EKV does not start or supervise external transports.
 
   Large replicated value payloads may be compressed on the wire only.
   The message shape stays the same, but the value field may be tagged as
@@ -1328,6 +1334,7 @@ defmodule EKV.Replica do
     :db,
     :data_dir,
     :stmts,
+    :transport,
     :tombstone_ttl,
     partition_ttl_policy: :quarantine,
     readers: [],
@@ -1405,19 +1412,30 @@ defmodule EKV.Replica do
 
     config = EKV.Supervisor.get_config(name)
 
-    case Store.open(data_dir, shard_index, config.tombstone_ttl, num_shards, config.gc_interval,
-           allow_stale_startup: config[:allow_stale_startup] || false
-         ) do
-      {:ok, db} ->
-        init_with_open_db(db, name, shard_index, num_shards, data_dir, config)
+    transport_config = Map.get(config, :transport, EKV.Transport.default_config())
 
-      {:error, {:stale_db, info} = reason} ->
-        maybe_log_stale_db_failure(config, name, shard_index, info)
-        {:stop, reason}
+    case EKV.Transport.init(transport_config) do
+      {:ok, transport} ->
+        case Store.open(
+               data_dir,
+               shard_index,
+               config.tombstone_ttl,
+               num_shards,
+               config.gc_interval, allow_stale_startup: config[:allow_stale_startup] || false) do
+          {:ok, db} ->
+            init_with_open_db(db, name, shard_index, num_shards, data_dir, config, transport)
+
+          {:error, {:stale_db, info} = reason} ->
+            maybe_log_stale_db_failure(config, name, shard_index, info)
+            {:stop, reason}
+        end
+
+      {:error, reason} ->
+        {:stop, {:transport_init_failed, reason}}
     end
   end
 
-  defp init_with_open_db(db, name, shard_index, num_shards, data_dir, config) do
+  defp init_with_open_db(db, name, shard_index, num_shards, data_dir, config, transport) do
     # Open per-scheduler read connections
     db_path = Path.join(data_dir, "shard_#{shard_index}.db")
     num_readers = System.schedulers_online()
@@ -1464,6 +1482,7 @@ defmodule EKV.Replica do
       db: db,
       data_dir: data_dir,
       stmts: stmts,
+      transport: transport,
       readers: readers,
       tombstone_ttl: config.tombstone_ttl,
       partition_ttl_policy: config.partition_ttl_policy,
@@ -2191,6 +2210,14 @@ defmodule EKV.Replica do
       |> maybe_reply_to_quorum_waiters()
 
     cb_noreply(new_state)
+  end
+
+  def handle_info({:ekv_transport_down, remote_node, reason}, %Replica{} = state) do
+    log_once(state, fn ->
+      "#{log_prefix(state)} transport_down #{remote_node}: #{inspect(reason)}"
+    end)
+
+    handle_info({:nodedown, remote_node}, state)
   end
 
   # =====================================================================
@@ -4269,11 +4296,22 @@ defmodule EKV.Replica do
     shard_name = shard_name(state.name, state.shard_index)
     encoded_message = wire_encode_message(state, target_node, message)
     destination = {shard_name, target_node}
+    best_effort? = best_effort_wire_message?(encoded_message)
 
-    if best_effort_wire_message?(encoded_message) do
-      :erlang.send_nosuspend(destination, encoded_message, [:noconnect])
-    else
-      send(destination, encoded_message)
+    case EKV.Transport.send(state.transport, destination, encoded_message,
+           best_effort?: best_effort?,
+           target_node: target_node,
+           shard_index: state.shard_index
+         ) do
+      :ok ->
+        :ok
+
+      {:error, _reason} when best_effort? ->
+        :ok
+
+      {:error, reason} ->
+        send(self(), {:ekv_transport_down, target_node, reason})
+        {:error, reason}
     end
   end
 
@@ -4692,6 +4730,10 @@ defmodule EKV.Replica do
           state = process_inline_priority_message(state, msg)
           collect_local_write_batch(state, batch_items, batch_bytes)
 
+        {:ekv_transport_down, _remote_node, _reason} = msg ->
+          state = process_inline_priority_message(state, msg)
+          collect_local_write_batch(state, batch_items, batch_bytes)
+
         {:DOWN, _mref, :process, _pid, _reason} = msg ->
           state = process_inline_priority_message(state, msg)
           collect_local_write_batch(state, batch_items, batch_bytes)
@@ -4793,6 +4835,14 @@ defmodule EKV.Replica do
   end
 
   defp apply_local_write_batch(%Replica{} = state, batch_items) when is_list(batch_items) do
+    if state.handoff_node != nil do
+      proxy_local_write_batch(state, batch_items)
+    else
+      do_apply_local_write_batch(state, batch_items)
+    end
+  end
+
+  defp do_apply_local_write_batch(%Replica{} = state, batch_items) when is_list(batch_items) do
     local_entries =
       Enum.map(batch_items, fn item ->
         {item.key, item.value_binary, item.timestamp, item.expires_at, item.deleted_at}
@@ -4853,6 +4903,23 @@ defmodule EKV.Replica do
       {:error, _reason} ->
         apply_local_write_batch_fallback(state, batch_items)
     end
+  end
+
+  defp proxy_local_write_batch(%Replica{handoff_node: handoff_node} = state, batch_items)
+       when handoff_node != nil do
+    shard_name = shard_name(state.name, state.shard_index)
+
+    Enum.reduce(batch_items, state, fn item, acc ->
+      reply =
+        try do
+          GenServer.call({shard_name, handoff_node}, item.request, 5_000)
+        catch
+          :exit, _ -> {:error, :shutting_down}
+        end
+
+      reply_local_request(item.from, reply)
+      acc
+    end)
   end
 
   defp apply_local_write_batch_fallback(%Replica{} = state, batch_items) do
@@ -5003,6 +5070,7 @@ defmodule EKV.Replica do
      %{
        type: :put,
        from: from,
+       request: {:put, key, value_binary, opts},
        key: key,
        value_binary: value_binary,
        timestamp: now,
@@ -5018,6 +5086,7 @@ defmodule EKV.Replica do
      %{
        type: :delete,
        from: from,
+       request: {:delete, key},
        key: key,
        value_binary: nil,
        timestamp: now,
@@ -5075,6 +5144,10 @@ defmodule EKV.Replica do
         take_priority_control_turn(state, remaining_control_budget - 1)
 
       {:nodedown, _remote_node} = msg ->
+        state = process_inline_priority_message(state, msg)
+        take_priority_control_turn(state, remaining_control_budget - 1)
+
+      {:ekv_transport_down, _remote_node, _reason} = msg ->
         state = process_inline_priority_message(state, msg)
         take_priority_control_turn(state, remaining_control_budget - 1)
 

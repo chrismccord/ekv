@@ -45,6 +45,102 @@ defmodule EKVTest do
     )
   end
 
+  describe "transport adapter" do
+    test "dist adapter sends locally and wraps erpc results" do
+      {:ok, dist} = EKV.Transport.init(EKV.Transport.default_config())
+
+      assert :ok =
+               EKV.Transport.send(dist, self(), {:transport_dist, :message}, best_effort?: true)
+
+      assert_receive {:transport_dist, :message}
+
+      assert {:ok, 1} =
+               EKV.Transport.rpc(dist, node(), :erlang, :abs, [-1], timeout: 1_000)
+    end
+
+    test "replica member traffic uses configured transport" do
+      owner = self()
+      name = :"ekv_transport_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+
+      {:ok, pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: data_dir,
+          shards: 1,
+          log: false,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7),
+          replication_batch_max_entries: 1,
+          transport: {EKV.TestTransport, owner: owner}
+        )
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      shard_name = EKV.Replica.shard_name(name, 0)
+      shard_pid = Process.whereis(shard_name)
+      assert_receive {:ekv_test_transport_init, ^shard_pid, _opts}
+
+      remote_node = :fake_transport_peer@localhost
+
+      :sys.replace_state(shard_name, fn state ->
+        %{state | remote_shards: Map.put(state.remote_shards, remote_node, self())}
+      end)
+
+      assert :ok = EKV.put(name, "transport/key", "value")
+
+      assert_receive {:ekv_test_transport_send, ^shard_pid, {^shard_name, ^remote_node},
+                      {:ekv, 1, :replication_batch, _payload, _meta}, opts}
+
+      assert Keyword.fetch!(opts, :best_effort?) == true
+      assert Keyword.fetch!(opts, :target_node) == remote_node
+    end
+
+    test "best-effort transport failures do not crash replica shard" do
+      owner = self()
+      name = :"ekv_transport_fail_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+
+      {:ok, pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: data_dir,
+          shards: 1,
+          log: false,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7),
+          replication_batch_max_entries: 1,
+          transport: {EKV.TestTransport, owner: owner, fail_best_effort?: true}
+        )
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      shard_name = EKV.Replica.shard_name(name, 0)
+      shard_pid = Process.whereis(shard_name)
+      assert_receive {:ekv_test_transport_init, ^shard_pid, _opts}
+
+      remote_node = :fake_transport_fail_peer@localhost
+
+      :sys.replace_state(shard_name, fn state ->
+        %{state | remote_shards: Map.put(state.remote_shards, remote_node, self())}
+      end)
+
+      assert :ok = EKV.put(name, "transport/fail", "value")
+
+      assert_receive {:ekv_test_transport_send, ^shard_pid, {^shard_name, ^remote_node},
+                      {:ekv, 1, :replication_batch, _payload, _meta}, opts}
+
+      assert Keyword.fetch!(opts, :best_effort?) == true
+      assert Process.alive?(shard_pid)
+    end
+  end
+
   describe "put/get" do
     test "basic put and get", %{name: name} do
       :ok = EKV.put(name, "key1", "value1")
@@ -2306,6 +2402,55 @@ defmodule EKVTest do
       # Write call should fail with :shutting_down (proxy can't reach fake node)
       result = GenServer.call(shard_name, {:put, "proxy/2", :erlang.term_to_binary("v"), []})
       assert result == {:error, :shutting_down}
+
+      Process.flag(:trap_exit, true)
+      Process.exit(pid, :shutdown)
+      Process.sleep(50)
+    end
+
+    test "queued local batch item proxies instead of touching nil stmts after handoff", %{
+      ho_name: name,
+      ho_dir: dir
+    } do
+      {:ok, pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: dir,
+          shards: 2,
+          log: false,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      shard =
+        "proxy/batched"
+        |> EKV.Replica.shard_index_for(EKV.Supervisor.get_config(name).num_shards)
+
+      shard_name = EKV.Replica.shard_name(name, shard)
+      shard_pid = Process.whereis(shard_name)
+
+      :sys.suspend(shard_name)
+
+      put_task =
+        Task.async(fn ->
+          EKV.put(name, "proxy/batched", "val")
+        end)
+
+      EKV.TestCluster.assert_eventually(fn ->
+        match?(
+          {:message_queue_len, len} when len >= 1,
+          Process.info(shard_pid, :message_queue_len)
+        )
+      end)
+
+      ref = make_ref()
+      send(shard_name, {:ekv_handoff_request, ref, :nonexistent@node, self()})
+
+      :sys.resume(shard_name)
+
+      assert_receive {:ekv_handoff_ack, ^ref}, 2_000
+      assert Task.await(put_task, 2_000) == {:error, :shutting_down}
+      assert Process.alive?(shard_pid)
 
       Process.flag(:trap_exit, true)
       Process.exit(pid, :shutdown)
