@@ -4,11 +4,11 @@ defmodule EKV.Transport do
 
   EKV uses this boundary for member shard sends and routed client RPC. The
   default adapter keeps Erlang distribution behavior; callers may provide a
-  volatile ordered lane such as SocketDist without EKV owning that lane's
-  supervision.
+  volatile ordered lane without EKV owning that lane's supervision.
   """
 
   @type config :: %{module: module(), opts: keyword()}
+  @type external_config :: nil | {module(), keyword()}
   @type handle :: {module(), term()}
   @type target :: pid() | atom() | {atom(), node()}
 
@@ -26,43 +26,19 @@ defmodule EKV.Transport do
 
   @doc false
   def normalize_config(nil), do: default_config()
-  def normalize_config(false), do: default_config()
 
-  def normalize_config(module) when is_atom(module) do
-    validate_config!(%{module: module, opts: []})
-  end
-
-  def normalize_config({module, opts}) when is_atom(module) and is_list(opts) do
-    validate_config!(%{module: module, opts: opts})
-  end
-
-  def normalize_config(opts) when is_list(opts) do
-    case Keyword.fetch(opts, :module) do
-      {:ok, module} when is_atom(module) ->
-        adapter_opts =
-          case Keyword.fetch(opts, :opts) do
-            {:ok, nested_opts} when is_list(nested_opts) ->
-              nested_opts
-
-            {:ok, other} ->
-              raise ArgumentError,
-                    "EKV: :transport :opts must be a keyword list, got: #{inspect(other)}"
-
-            :error ->
-              Keyword.delete(opts, :module)
-          end
-
-        validate_config!(%{module: module, opts: adapter_opts})
-
-      _ ->
-        raise ArgumentError,
-              "EKV: :transport keyword config requires an adapter :module"
+  def normalize_config({module, opts}) when is_atom(module) do
+    unless Keyword.keyword?(opts) do
+      raise ArgumentError,
+            "EKV: :transport opts must be a keyword list, got: #{inspect(opts)}"
     end
+
+    validate_config!(%{module: module, opts: opts})
   end
 
   def normalize_config(other) do
     raise ArgumentError,
-          "EKV: :transport must be nil, a module, {module, opts}, or a keyword config, got: #{inspect(other)}"
+          "EKV: :transport must be nil or {Module, opts}, got: #{inspect(other)}"
   end
 
   @doc false

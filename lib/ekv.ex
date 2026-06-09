@@ -258,7 +258,7 @@ defmodule EKV do
   | `:delta_sync_storm_window` | `60_000` (60 sec) | Member and observer mode only. Rolling per-shard window used to aggregate delta sync activity for storm detection. |
   | `:delta_sync_storm_threshold` | `100` | Member and observer mode only. When a shard sends at least this many delta syncs inside one storm window, EKV emits a single aggregated warning for that window. `false`/`nil` disables storm warnings. |
   | `:wire_compression_threshold` | `262_144` (256 KB) | Optional byte threshold for member-to-member wire compression of large replicated value payloads. `false`/`nil` disables it. Large live replication batch entry values, CAS accept, and full-payload CAS commit messages compress values on the wire only; values remain uncompressed on disk and on reads. |
-  | `:transport` | `nil` | Optional data-plane transport adapter for member shard sends and routed client RPC. `nil` uses Erlang distribution. Custom transports are externally supervised and configured as `{Module, opts}` or `[module: Module, opts: opts]`. |
+  | `:transport` | `nil` | Optional data-plane transport adapter for member shard sends and routed client RPC. `nil` uses Erlang distribution. Custom transports are externally supervised and configured as `{Module, opts}`. |
   | `:local_write_batch_max_entries` | `32` | Member and observer mode only. Max adjacent non-CAS local LWW writes the shard will opportunistically drain into one SQLite batch before replying. Also currently sets the bounded post-replication control/CAS priority turn budget; there is no separate fairness knob yet. |
   | `:local_write_batch_max_bytes` | `262_144` (256 KB) | Member and observer mode only. Max encoded byte size of one opportunistic non-CAS local LWW batch before the shard stops draining more local writes. |
   | `:replication_batch_flush_ms` | `3` | Member and observer mode only. Max time one live LWW replication batch may stay queued per destination shard before EKV flushes it. |
@@ -281,11 +281,11 @@ defmodule EKV do
       {EKV,
         name: :my_kv,
         data_dir: "/var/data/ekv",
-        transport: {EKV.Transports.SocketDist, name: :c3}}
+        transport: {MyApp.EKVTransport, name: :my_transport}}
 
   The adapter contract is `EKV.Transport`. EKV initializes adapter state per
-  replica shard process so adapters such as SocketDist can pin ordering to the
-  shard's lane. EKV does not start or supervise the external transport.
+  replica shard process so adapters can pin ordering to the shard's lane. EKV
+  does not start or supervise the external transport.
 
   ### Observer Mode
 

@@ -1421,7 +1421,9 @@ defmodule EKV.Replica do
                shard_index,
                config.tombstone_ttl,
                num_shards,
-               config.gc_interval, allow_stale_startup: config[:allow_stale_startup] || false) do
+               config.gc_interval,
+               allow_stale_startup: config[:allow_stale_startup] || false
+             ) do
           {:ok, db} ->
             init_with_open_db(db, name, shard_index, num_shards, data_dir, config, transport)
 

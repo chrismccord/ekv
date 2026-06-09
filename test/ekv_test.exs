@@ -46,6 +46,27 @@ defmodule EKVTest do
   end
 
   describe "transport adapter" do
+    test "transport config accepts only nil or {module, opts}" do
+      owner = self()
+
+      assert %{module: EKV.Transports.Dist, opts: []} = EKV.Transport.normalize_config(nil)
+
+      assert %{module: EKV.TestTransport, opts: [owner: ^owner]} =
+               EKV.Transport.normalize_config({EKV.TestTransport, owner: owner})
+
+      assert_raise ArgumentError, ~r/must be nil or \{Module, opts\}/, fn ->
+        EKV.Transport.normalize_config(EKV.TestTransport)
+      end
+
+      assert_raise ArgumentError, ~r/opts must be a keyword list/, fn ->
+        EKV.Transport.normalize_config({EKV.TestTransport, [:not_keyword]})
+      end
+
+      assert_raise ArgumentError, ~r/must be nil or \{Module, opts\}/, fn ->
+        EKV.Transport.normalize_config(module: EKV.TestTransport, owner: owner)
+      end
+    end
+
     test "dist adapter sends locally and wraps erpc results" do
       {:ok, dist} = EKV.Transport.init(EKV.Transport.default_config())
 
