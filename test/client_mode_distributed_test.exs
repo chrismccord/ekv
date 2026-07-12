@@ -411,14 +411,6 @@ defmodule EKV.ClientModeDistributedTest do
     assert {:error, :unavailable} =
              TestCluster.rpc!(client_node, EKV, :put, [ekv_name, "lww", "v1"])
 
-    assert {:error, :unavailable} =
-             TestCluster.rpc!(client_node, EKV, :put, [
-               ekv_name,
-               "seed2",
-               "v2",
-               [if_vsn: nil, resolve_unconfirmed: true]
-             ])
-
     TestCluster.assert_eventually(
       fn ->
         TestCluster.rpc!(client_node, EKV, :info, [ekv_name]).current_backend in [

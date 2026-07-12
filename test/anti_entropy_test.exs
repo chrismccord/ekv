@@ -1653,6 +1653,43 @@ defmodule EKV.AntiEntropyTest do
       assert :ok = TestCluster.untrace_shard_sends(node_b, ekv_name)
     end
 
+    test "a new member full-syncs after the only existing member bounds its oplog" do
+      peers = TestCluster.start_peers(2)
+      [{_, node_a}, {_, node_b}] = peers
+      ekv_name = unique_name(:anti_entropy_join_after_single_member_gc)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      member_opts = [
+        cluster_size: 2,
+        anti_entropy_interval: 100,
+        gc_interval: @manual_anti_entropy_interval,
+        tombstone_ttl: 10_000,
+        member_progress_retention_ttl: 10_000
+      ]
+
+      start_member(node_a, ekv_name, assigned_node_id(peers, node_a), member_opts)
+      write_many(node_a, ekv_name, "single_member_gc", 25)
+
+      assert TestCluster.oplog_count(node_a, ekv_name) == 25
+      trigger_gc(node_a, ekv_name, 0, 10_000)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.oplog_count(node_a, ekv_name) == 1
+      end)
+
+      start_member(node_b, ekv_name, assigned_node_id(peers, node_b), member_opts)
+
+      TestCluster.assert_eventually(
+        fn -> TestCluster.keys_count(node_b, ekv_name, "single_member_gc/") == 25 end,
+        timeout: 5_000
+      )
+
+      # Only one replay row remains, so receiving all 25 current keys proves
+      # the joining member fell back to the full-state path.
+      assert TestCluster.oplog_count(node_a, ekv_name) == 1
+    end
+
     test "healthy connected churn prunes hot-key oplog after peers catch up" do
       peers = TestCluster.start_peers(2)
       [{_, node_a}, {_, node_b}] = peers

@@ -1159,6 +1159,9 @@ defmodule EKV.Replica do
         disconnected members still inside member_progress_retention_ttl, then
         prune orphan `kv_keyrefs`.
         (keeps replay history bounded without conflating different origins)
+        When no member is retained, keep only the newest row per origin. This
+        preserves the durable origin sequence head while forcing future or
+        too-stale members through full sync.
 
       Phase 5: Bump liveness
         touch_last_active updates kv_meta.last_active_at.
@@ -2613,7 +2616,9 @@ defmodule EKV.Replica do
     Store.prune_member_progress(db, retained_members)
 
     # 4. Truncate oplog
-    {truncate_us, truncate_stats} = :timer.tc(Store, :truncate_oplog, [db])
+    {truncate_us, truncate_stats} =
+      :timer.tc(Store, :truncate_oplog, [db, retained_members])
+
     maybe_log_oplog_truncate(state, truncate_stats, truncate_us)
     state = %{state | local_max_seq: Store.max_seq(db)}
 

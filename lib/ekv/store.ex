@@ -20,6 +20,9 @@ defmodule EKV.Store do
 
   - `kv` is the current dataset
   - `kv_oplog` is recent per-origin history for delta repair
+    When no connected or recently disconnected member retains a replay floor,
+    GC keeps only the newest row per origin so standalone members remain
+    bounded without resetting durable origin sequence heads.
   - `kv_keyrefs` stores replay keys once so the oplog does not repeat the
     full key string on every row; `oplog_refs` is maintained by SQLite
     triggers on `kv_oplog` insert/delete
@@ -1002,6 +1005,9 @@ defmodule EKV.Store do
 
   @doc """
   Truncate replay-log entries below the minimum retained peer progress per origin.
+
+  This arity operates only from persisted member-progress floors. Replica GC
+  should call `truncate_oplog/2` so the no-retained-member case is explicit.
   """
   def truncate_oplog(db) do
     in_tx(db, fn ->
@@ -1030,6 +1036,46 @@ defmodule EKV.Store do
       Map.put(oplog_retention_stats(db), :deleted_rows, deleted_rows)
     end)
   end
+
+  @doc """
+  Truncate replay history for the members currently retained by replica GC.
+
+  With retained members, their persisted per-origin progress remains the
+  deletion floor. With no retained members, no peer can consume a delta, so
+  only the newest row for each origin is kept. Keeping that origin head bounds
+  single-node history while preserving origin-sequence recovery across restart;
+  a future or stale member below that head is forced through full sync.
+  """
+  def truncate_oplog(db, []) do
+    in_tx(db, fn ->
+      :ok =
+        EKV.Sqlite3.execute(
+          db,
+          """
+          WITH origin_heads AS (
+            SELECT origin_node, MAX(origin_seq) AS max_seq
+            FROM kv_oplog
+            GROUP BY origin_node
+          )
+          DELETE FROM kv_oplog
+          WHERE EXISTS (
+            SELECT 1
+            FROM origin_heads AS head
+            WHERE head.origin_node = kv_oplog.origin_node
+              AND kv_oplog.origin_seq < head.max_seq
+          )
+          """
+        )
+
+      deleted_rows = sqlite_changes(db)
+      purge_orphan_keyrefs(db)
+
+      Map.put(oplog_retention_stats(db), :deleted_rows, deleted_rows)
+    end)
+  end
+
+  def truncate_oplog(db, retained_members) when is_list(retained_members),
+    do: truncate_oplog(db)
 
   @doc false
   def oplog_retention_stats(db, limit \\ 5) do

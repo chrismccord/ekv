@@ -790,6 +790,139 @@ defmodule EKVTest do
   end
 
   describe "oplog truncation forces full sync" do
+    test "no retained members bounds replay history to the current origin head", %{name: name} do
+      key = "single_member_hot_key"
+
+      for value <- 1..25 do
+        assert :ok = EKV.put(name, key, value)
+      end
+
+      config = EKV.Supervisor.get_config(name)
+      shard = EKV.Replica.shard_index_for(key, config.num_shards)
+      shard_name = EKV.Replica.shard_name(name, shard)
+      state = :sys.get_state(shard_name)
+      origin = local_origin_id(state)
+      origin_head = state.local_origin_seq
+
+      remote_origin = "remote-origin"
+      remote_head = 5
+      now = System.system_time(:nanosecond)
+
+      for sequence <- 1..remote_head do
+        assert {:ok, true, ^sequence, ^sequence} =
+                 EKV.Store.write_entry(
+                   state.db,
+                   state.stmts.kv_upsert,
+                   state.stmts.keyref_upsert,
+                   state.stmts.oplog_insert,
+                   "remote_key_#{sequence}",
+                   :erlang.term_to_binary(sequence),
+                   now + sequence,
+                   remote_origin,
+                   nil,
+                   nil,
+                   sequence
+                 )
+      end
+
+      assert length(EKV.Store.oplog_since(state.db, 0)) == 30
+
+      send(shard_name, {
+        :gc,
+        now,
+        now - config.tombstone_ttl * 1_000_000
+      })
+
+      state = :sys.get_state(shard_name)
+
+      retained = EKV.Store.oplog_since(state.db, 0)
+      assert length(retained) == 2
+
+      assert Enum.any?(retained, fn
+               {_seq, ^key, _value, _timestamp, ^origin, ^origin_head, _expires_at, false} ->
+                 true
+
+               _other ->
+                 false
+             end)
+
+      assert Enum.any?(retained, fn
+               {_seq, "remote_key_5", _value, _timestamp, ^remote_origin, ^remote_head,
+                _expires_at, false} ->
+                 true
+
+               _other ->
+                 false
+             end)
+
+      assert EKV.get(name, key) == 25
+      assert EKV.Store.max_origin_seq(state.db, origin) == origin_head
+    end
+
+    test "a retained member without a progress floor blocks truncation", %{name: name} do
+      key = "retained_member_without_progress"
+
+      for value <- 1..10 do
+        assert :ok = EKV.put(name, key, value)
+      end
+
+      config = EKV.Supervisor.get_config(name)
+      shard = EKV.Replica.shard_index_for(key, config.num_shards)
+      %{db: db} = :sys.get_state(EKV.Replica.shard_name(name, shard))
+
+      assert %{deleted_rows: 0} = EKV.Store.truncate_oplog(db, ["joining-member"])
+      assert length(EKV.Store.oplog_since(db, 0)) == 10
+    end
+
+    test "origin sequence remains monotonic after no-member GC and restart", %{
+      name: name,
+      data_dir: data_dir
+    } do
+      key = "single_member_restart"
+
+      for value <- 1..10 do
+        assert :ok = EKV.put(name, key, value)
+      end
+
+      config = EKV.Supervisor.get_config(name)
+      shard = EKV.Replica.shard_index_for(key, config.num_shards)
+      shard_name = EKV.Replica.shard_name(name, shard)
+      before_gc = :sys.get_state(shard_name)
+      origin = local_origin_id(before_gc)
+      origin_head = before_gc.local_origin_seq
+      now = System.system_time(:nanosecond)
+
+      send(shard_name, {:gc, now, now - config.tombstone_ttl * 1_000_000})
+      after_gc = :sys.get_state(shard_name)
+      assert EKV.Store.max_origin_seq(after_gc.db, origin) == origin_head
+
+      Process.flag(:trap_exit, true)
+      supervisor = Process.whereis(:"#{name}_ekv_sup")
+      assert :ok = Supervisor.stop(supervisor, :shutdown)
+      assert_receive {:EXIT, ^supervisor, :shutdown}
+
+      {:ok, restarted} =
+        EKV.start_link(
+          name: name,
+          data_dir: data_dir,
+          shards: 2,
+          log: false,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      restarted_state = :sys.get_state(shard_name)
+      assert restarted_state.local_origin_seq == origin_head
+      assert :ok = EKV.put(name, key, 11)
+
+      final_state = :sys.get_state(shard_name)
+      assert final_state.local_origin_seq == origin_head + 1
+      assert EKV.get(name, key) == 11
+
+      assert :ok = Supervisor.stop(restarted, :shutdown)
+      assert_receive {:EXIT, ^restarted, :shutdown}
+    end
+
     test "truncation removes entries below min HWM", %{name: name} do
       config = EKV.Supervisor.get_config(name)
       shard = EKV.Replica.shard_index_for("trunc_key_1", config.num_shards)
