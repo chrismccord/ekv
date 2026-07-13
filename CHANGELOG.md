@@ -1,3 +1,6 @@
+## 0.4.3 (2026-07-13)
+- Background WAL checkpoints for improveds sustained write performance
+
 ## 0.4.2 (2026-07-12)
 - Bound standalone oplog retention to fix single member oplog failing to gc
 

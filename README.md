@@ -9,7 +9,7 @@ Data survives node restarts, node death, and network partitions. Member nodes re
 ```elixir
 def deps do
   [
-    {:ekv, "~> 0.2.0"}
+    {:ekv, "~> 0.4.3"}
   ]
 end
 ```
