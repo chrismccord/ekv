@@ -2267,6 +2267,7 @@ defmodule EKVTest do
       assert state.stmts == nil
       assert state.handoff_node == node()
       assert state.pending_cas == %{}
+      assert %{status: :closed} = EKV.WALCheckpointer.stats(name, 0)
 
       Process.flag(:trap_exit, true)
       Process.exit(pid, :shutdown)
@@ -3088,6 +3089,40 @@ defmodule EKVTest do
       Enum.each(invalid_opts, fn opts ->
         name = :"ekv_delta_sync_cfg_#{System.unique_integer([:positive])}"
         data_dir = Path.join(System.tmp_dir!(), "ekv_delta_sync_cfg_#{name}")
+        Process.flag(:trap_exit, true)
+
+        expected = Keyword.fetch!(opts, :expected)
+        start_opts = Keyword.drop(opts, [:expected])
+
+        assert {:error, {%ArgumentError{message: msg}, _}} =
+                 EKV.start_link(
+                   Keyword.merge(
+                     [name: name, data_dir: data_dir, log: false],
+                     start_opts
+                   )
+                 )
+
+        assert msg =~ expected
+
+        File.rm_rf!(data_dir)
+      end)
+    end
+
+    test "WAL checkpoint config must be valid" do
+      invalid_opts = [
+        [
+          wal_checkpoint_interval: 0,
+          expected: ":wal_checkpoint_interval must be a positive timeout in ms"
+        ],
+        [
+          wal_size_limit: 0,
+          expected: ":wal_size_limit must be a positive byte count"
+        ]
+      ]
+
+      Enum.each(invalid_opts, fn opts ->
+        name = :"ekv_wal_cfg_#{System.unique_integer([:positive])}"
+        data_dir = Path.join(System.tmp_dir!(), "ekv_wal_cfg_#{name}")
         Process.flag(:trap_exit, true)
 
         expected = Keyword.fetch!(opts, :expected)
@@ -6474,8 +6509,16 @@ defmodule EKVTest do
       assert msg =~ ":anti_entropy_interval is not supported in :client mode"
     end
 
-    test "rejects replication batch knobs in client mode" do
+    test "rejects storage and replication knobs in client mode" do
       invalid_opts = [
+        [
+          wal_checkpoint_interval: 1_000,
+          expected: ":wal_checkpoint_interval is not supported in :client mode"
+        ],
+        [
+          wal_size_limit: 64 * 1024 * 1024,
+          expected: ":wal_size_limit is not supported in :client mode"
+        ],
         [
           replication_batch_flush_ms: 10,
           expected: ":replication_batch_flush_ms is not supported in :client mode"

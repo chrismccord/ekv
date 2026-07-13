@@ -107,9 +107,11 @@ defmodule EKV.Store do
   """
 
   @schema_version 3
+  @default_wal_size_limit 64 * 1024 * 1024
 
   def open(data_dir, shard_index, tombstone_ttl, num_shards, gc_interval, opts \\ []) do
     allow_stale_startup = Keyword.get(opts, :allow_stale_startup, false)
+    wal_size_limit = Keyword.get(opts, :wal_size_limit, @default_wal_size_limit)
     File.mkdir_p!(data_dir)
     path = Path.join(data_dir, "shard_#{shard_index}.db")
 
@@ -126,11 +128,11 @@ defmodule EKV.Store do
     stale_threshold = tombstone_ttl - gc_interval
 
     with :ok <- maybe_reject_stale_db(path, stale_threshold, allow_stale_startup) do
-      do_open(path, num_shards, data_dir, shard_index)
+      do_open(path, num_shards, data_dir, shard_index, wal_size_limit)
     end
   end
 
-  defp do_open(path, num_shards, data_dir, shard_index) do
+  defp do_open(path, num_shards, data_dir, shard_index, wal_size_limit) do
     fresh_db? = fresh_database_file?(path)
     {:ok, db} = EKV.Sqlite3.open(path)
 
@@ -143,6 +145,8 @@ defmodule EKV.Store do
     :ok = EKV.Sqlite3.execute(db, "PRAGMA synchronous=NORMAL")
     :ok = EKV.Sqlite3.execute(db, "PRAGMA busy_timeout=5000")
     :ok = EKV.Sqlite3.execute(db, "PRAGMA mmap_size=268435456")
+    :ok = EKV.Sqlite3.execute(db, "PRAGMA wal_autocheckpoint=0")
+    :ok = EKV.Sqlite3.execute(db, "PRAGMA journal_size_limit=#{wal_size_limit}")
 
     # Schema
     :ok =
@@ -350,6 +354,17 @@ defmodule EKV.Store do
     :ok = EKV.Sqlite3.execute(db, "PRAGMA synchronous=NORMAL")
     :ok = EKV.Sqlite3.execute(db, "PRAGMA busy_timeout=5000")
     :ok = EKV.Sqlite3.execute(db, "PRAGMA mmap_size=268435456")
+    {:ok, db}
+  end
+
+  def open_checkpointer(path, wal_size_limit) do
+    {:ok, db} = EKV.Sqlite3.open(path)
+    :ok = EKV.Sqlite3.execute(db, "PRAGMA journal_mode=WAL")
+    :ok = EKV.Sqlite3.execute(db, "PRAGMA synchronous=NORMAL")
+    :ok = EKV.Sqlite3.execute(db, "PRAGMA busy_timeout=5000")
+    :ok = EKV.Sqlite3.execute(db, "PRAGMA mmap_size=268435456")
+    :ok = EKV.Sqlite3.execute(db, "PRAGMA wal_autocheckpoint=0")
+    :ok = EKV.Sqlite3.execute(db, "PRAGMA journal_size_limit=#{wal_size_limit}")
     {:ok, db}
   end
 

@@ -44,7 +44,10 @@ defmodule EKV.Replica do
         ├── EKV.Replica.Supervisor (one_for_one)
         │   ├── EKV.Replica 0     shard GenServer (writes + replication + SQLite)
         │   ├── EKV.Replica 1
-        │   └── ...               N shards (default 8)
+        │   ├── ...               N shards (default 8)
+        │   └── EKV.WALCheckpointer
+        │                         dedicated connections, round-robin passive
+        │                         checkpoints across independent shard DBs
         ├── EKV.QuorumGate?       optional startup barrier for CAS quorum
         ├── EKV.GC                periodic timer, sends :gc to each shard
         └── EKV.ShutdownBarrier?  optional graceful shutdown barrier
@@ -121,11 +124,19 @@ defmodule EKV.Replica do
     - 1 writer connection (owned by the Replica GenServer)
     - `:reader_connections` reader connections, defaulting to
       `min(System.schedulers_online(), 16)`
+    - 1 checkpoint connection owned by `EKV.WALCheckpointer`
 
   Reader connections are stored as a tuple of `{db, get_stmt}` in
   persistent_term keyed by `{EKV, name, :readers, shard_index}`. Reads
   pick a connection by `rem(scheduler_id - 1, num_readers)` — no pool,
   no GenServer hop. WAL mode ensures readers don't block the writer.
+
+  Writer auto-checkpointing is disabled so the commit that crosses SQLite's
+  WAL threshold never performs checkpoint I/O in the Replica process. One
+  background process visits shard databases round-robin using independent
+  connections and `PASSIVE` checkpoints. This serializes checkpoint disk load
+  without coupling shard data or write ownership. Blue-green handoff closes a
+  shard's checkpoint connection before its final `TRUNCATE` and acknowledgement.
 
   Values are stored as `:erlang.term_to_binary/1` blobs. Encoding happens
   in the public EKV module; Replica and Store only see binaries.
@@ -1430,7 +1441,8 @@ defmodule EKV.Replica do
                config.tombstone_ttl,
                num_shards,
                config.gc_interval,
-               allow_stale_startup: config[:allow_stale_startup] || false
+               allow_stale_startup: config[:allow_stale_startup] || false,
+               wal_size_limit: config.wal_size_limit
              ) do
           {:ok, db} ->
             init_with_open_db(db, name, shard_index, num_shards, data_dir, config, transport)
@@ -1890,6 +1902,11 @@ defmodule EKV.Replica do
     %Replica{} = state = fail_quorum_waiters(state, {:error, :shutting_down})
     %Replica{} = state = drain_pending_local_requests(state)
     %Replica{} = state = flush_all_replication_batches(state)
+
+    # The background connection must be gone before the final checkpoint and
+    # handoff acknowledgement. The incoming member may open these same files as
+    # soon as it receives the acknowledgement.
+    :ok = EKV.WALCheckpointer.close(state.name, state.shard_index)
 
     # 2. Persist ballot counter
     if state.cluster_size && state.db do
