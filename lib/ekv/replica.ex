@@ -1159,9 +1159,11 @@ defmodule EKV.Replica do
         disconnected members still inside member_progress_retention_ttl, then
         prune orphan `kv_keyrefs`.
         (keeps replay history bounded without conflating different origins)
-        When no member is retained, keep only the newest row per origin. This
-        preserves the durable origin sequence head while forcing future or
-        too-stale members through full sync.
+        Only when there is no connected member and no persisted member still
+        inside member_progress_retention_ttl, keep the newest row per origin.
+        This preserves the durable origin sequence head. A genuinely new
+        member, or one returning after the configured replay window, then
+        bootstraps with full sync instead of relying on discarded history.
 
       Phase 5: Bump liveness
         touch_last_active updates kv_meta.last_active_at.
@@ -4087,11 +4089,28 @@ defmodule EKV.Replica do
           {acc, merged}
         end)
 
+      retained_since_ms =
+        if is_integer(down_since_ms) do
+          down_since_ms
+        else
+          latest_member_seen_at(state, member_node_key, member_node_id)
+        end
+
       retain? =
-        is_integer(down_since_ms) and max(0, now_ms - down_since_ms) <= retention_ttl
+        is_integer(retained_since_ms) and
+          max(0, now_ms - retained_since_ms) <= retention_ttl
 
       {state, retain?}
     end
+  end
+
+  defp latest_member_seen_at(%Replica{} = state, member_node_key, member_node_id) do
+    [member_node_key, member_node_id]
+    |> Enum.filter(&(is_binary(&1) and byte_size(&1) > 0))
+    |> Enum.uniq()
+    |> Enum.map(&Store.member_seen_marker_get(state.db, &1))
+    |> Enum.filter(&is_integer/1)
+    |> Enum.max(fn -> nil end)
   end
 
   defp known_down_member?(%Replica{} = state, remote_node_or_id)
@@ -7108,7 +7127,8 @@ defmodule EKV.Replica do
   end
 
   defp prune_stale_member_seen_markers(%Replica{} = state) do
-    stale_before_ms = System.system_time(:millisecond) - @member_seen_hint_ttl_ms
+    retention_ms = max(@member_seen_hint_ttl_ms, member_progress_retention_ttl(state))
+    stale_before_ms = System.system_time(:millisecond) - retention_ms
 
     Store.prune_member_seen_markers(
       state.db,

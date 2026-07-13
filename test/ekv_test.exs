@@ -859,7 +859,7 @@ defmodule EKVTest do
       assert EKV.Store.max_origin_seq(state.db, origin) == origin_head
     end
 
-    test "a retained member without a progress floor blocks truncation", %{name: name} do
+    test "every retained member contributes a progress floor for every origin", %{name: name} do
       key = "retained_member_without_progress"
 
       for value <- 1..10 do
@@ -869,9 +869,30 @@ defmodule EKVTest do
       config = EKV.Supervisor.get_config(name)
       shard = EKV.Replica.shard_index_for(key, config.num_shards)
       %{db: db} = :sys.get_state(EKV.Replica.shard_name(name, shard))
+      origin = local_origin_id(:sys.get_state(EKV.Replica.shard_name(name, shard)))
 
-      assert %{deleted_rows: 0} = EKV.Store.truncate_oplog(db, ["joining-member"])
+      :ok = EKV.Store.update_peer_progress(db, "caught-up-member", origin, 10)
+
+      assert %{deleted_rows: 0} =
+               EKV.Store.truncate_oplog(db, ["caught-up-member", "joining-member"])
+
       assert length(EKV.Store.oplog_since(db, 0)) == 10
+    end
+
+    test "member seen marker cap does not evict a persisted progress anchor", %{name: name} do
+      config = EKV.Supervisor.get_config(name)
+      shard = EKV.Replica.shard_index_for("marker_cap", config.num_shards)
+      state = :sys.get_state(EKV.Replica.shard_name(name, shard))
+      now = System.system_time(:millisecond)
+
+      :ok = EKV.Store.update_peer_progress(state.db, "anchored-member", local_origin_id(state), 0)
+      :ok = EKV.Store.member_seen_marker_put(state.db, "new-unanchored", now)
+      :ok = EKV.Store.member_seen_marker_put(state.db, "anchored-member", now - 1)
+      :ok = EKV.Store.member_seen_marker_put(state.db, "old-unanchored", now - 2)
+
+      assert 1 = EKV.Store.prune_member_seen_markers(state.db, 0, 1)
+      assert EKV.Store.member_seen_marker_get(state.db, "anchored-member") == now - 1
+      assert EKV.Store.member_seen_marker_get(state.db, "old-unanchored") == nil
     end
 
     test "origin sequence remains monotonic after no-member GC and restart", %{

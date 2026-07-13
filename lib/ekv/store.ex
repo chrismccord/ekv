@@ -1040,11 +1040,16 @@ defmodule EKV.Store do
   @doc """
   Truncate replay history for the members currently retained by replica GC.
 
-  With retained members, their persisted per-origin progress remains the
-  deletion floor. With no retained members, no peer can consume a delta, so
-  only the newest row for each origin is kept. Keeping that origin head bounds
-  single-node history while preserving origin-sequence recovery across restart;
-  a future or stale member below that head is forced through full sync.
+  With retained members, every member contributes a floor for every origin;
+  a missing progress row is floor zero and blocks truncation for that origin.
+  Replica GC includes connected members and persisted members still inside the
+  configured replay-retention window.
+
+  Only when that retained set is empty is there no known peer cursor to serve.
+  In that case, only the newest row for each origin is kept. Keeping that origin
+  head bounds single-node history while preserving origin-sequence recovery
+  across restart. A genuinely new member, or one returning after the configured
+  replay window, bootstraps from full state.
   """
   def truncate_oplog(db, []) do
     in_tx(db, fn ->
@@ -1074,8 +1079,51 @@ defmodule EKV.Store do
     end)
   end
 
-  def truncate_oplog(db, retained_members) when is_list(retained_members),
-    do: truncate_oplog(db)
+  def truncate_oplog(db, retained_members) when is_list(retained_members) do
+    retained_members = Enum.map(retained_members, &persisted_member_id/1)
+    placeholders = Enum.map_join(1..length(retained_members), ", ", &"(?#{&1})")
+
+    in_tx(db, fn ->
+      {:ok, stmt} =
+        EKV.Sqlite3.prepare(
+          db,
+          """
+          WITH retained_members(member_node) AS (
+            VALUES #{placeholders}
+          ),
+          origins AS (
+            SELECT DISTINCT origin_node
+            FROM kv_oplog
+          ),
+          retained AS (
+            SELECT origins.origin_node, MIN(COALESCE(progress.last_seq, 0)) AS min_seq
+            FROM origins
+            CROSS JOIN retained_members
+            LEFT JOIN kv_member_progress AS progress
+              ON progress.member_node = retained_members.member_node
+             AND progress.origin_node = origins.origin_node
+            GROUP BY origins.origin_node
+          )
+          DELETE FROM kv_oplog
+          WHERE EXISTS (
+            SELECT 1
+            FROM retained
+            WHERE retained.origin_node = kv_oplog.origin_node
+              AND kv_oplog.origin_seq < retained.min_seq
+          )
+          """
+        )
+
+      :ok = EKV.Sqlite3.bind(stmt, retained_members)
+      :done = EKV.Sqlite3.step(db, stmt)
+      :ok = EKV.Sqlite3.release(db, stmt)
+
+      deleted_rows = sqlite_changes(db)
+      purge_orphan_keyrefs(db)
+
+      Map.put(oplog_retention_stats(db), :deleted_rows, deleted_rows)
+    end)
+  end
 
   @doc false
   def oplog_retention_stats(db, limit \\ 5) do
@@ -1414,6 +1462,8 @@ defmodule EKV.Store do
   end
 
   def prune_member_seen_markers(db, stale_before_ms, max_entries) do
+    progress_members = MapSet.new(member_progress_members(db))
+
     {:ok, rows} =
       EKV.Sqlite3.fetch_all(
         db,
@@ -1425,8 +1475,9 @@ defmodule EKV.Store do
       rows
       |> Enum.with_index()
       |> Enum.reduce([], fn {[key, seen_at], idx}, acc ->
+        member_node = String.replace_prefix(key, "member_seen_at:id:", "")
         stale? = not is_integer(seen_at) or seen_at < stale_before_ms
-        over_cap? = idx >= max_entries
+        over_cap? = idx >= max_entries and not MapSet.member?(progress_members, member_node)
         if stale? or over_cap?, do: [key | acc], else: acc
       end)
 

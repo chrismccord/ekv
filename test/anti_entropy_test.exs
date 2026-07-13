@@ -1653,6 +1653,94 @@ defmodule EKV.AntiEntropyTest do
       assert :ok = TestCluster.untrace_shard_sends(node_b, ekv_name)
     end
 
+    test "restart before membership recovery retains replay and reconnect heals by delta" do
+      peers = TestCluster.start_peers(2)
+      [{_, node_a}, {_, node_b}] = peers
+      ekv_name = unique_name(:anti_entropy_restart_membership_gap)
+      retention_ttl = 10_000
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      member_opts = [
+        cluster_size: 2,
+        anti_entropy_interval: @manual_anti_entropy_interval,
+        gc_interval: 5_000,
+        tombstone_ttl: retention_ttl,
+        member_progress_retention_ttl: retention_ttl
+      ]
+
+      start_cluster(peers, ekv_name, member_opts)
+      write_many(node_a, ekv_name, "restart_gap", 5)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.keys_count(node_b, ekv_name, "restart_gap/") == 5
+      end)
+
+      origin_a = assigned_node_id(peers, node_a)
+      member_b = assigned_node_id(peers, node_b)
+      a_max = TestCluster.max_seq(node_a, ekv_name)
+
+      assert :ok = TestCluster.trigger_anti_entropy(node_b, ekv_name)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.peer_progress(node_a, ekv_name, node_b, node_a) == a_max
+      end)
+
+      assert is_integer(TestCluster.member_seen_marker(node_a, ekv_name, member_b))
+      assert :ok = TestCluster.stop_ekv(node_a, ekv_name, 10_000)
+
+      TestCluster.monitor_nodes_on(node_a, self())
+      TestCluster.monitor_nodes_on(node_b, self())
+      TestCluster.disconnect_nodes(node_a, node_b)
+      assert_receive {:nodedown_on_remote, ^node_b}, 5_000
+      assert_receive {:nodedown_on_remote, ^node_a}, 5_000
+
+      start_member(node_a, ekv_name, origin_a, member_opts)
+
+      for i <- 6..8 do
+        assert :ok ==
+                 TestCluster.rpc!(node_a, EKV, :put, [
+                   ekv_name,
+                   "restart_gap/#{i}",
+                   "v#{i}"
+                 ])
+      end
+
+      trigger_gc(node_a, ekv_name, 0, retention_ttl)
+
+      assert TestCluster.peer_progress(node_a, ekv_name, node_b, node_a) == a_max
+      assert TestCluster.oplog_count(node_a, ekv_name) >= 4
+
+      assert :ok = TestCluster.trace_shard_sends(node_a, ekv_name, self())
+      assert :ok = TestCluster.trace_shard_sends(node_b, ekv_name, self())
+      TestCluster.reconnect_nodes(node_a, node_b)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.keys_count(node_b, ekv_name, "restart_gap/") == 8
+      end)
+
+      trace_messages = collect_trace_messages([], 2_000)
+
+      assert Enum.any?(trace_messages, fn
+               {:sync, from_node, 0, :delta, keys, _progress, _destination} ->
+                 from_node == node_a and Enum.any?(keys, &String.starts_with?(&1, "restart_gap/"))
+
+               _other ->
+                 false
+             end)
+
+      refute Enum.any?(trace_messages, fn
+               {:sync, from_node, 0, :full, _keys, _progress, _destination} ->
+                 from_node == node_a
+
+               _other ->
+                 false
+             end)
+
+      assert :ok = TestCluster.untrace_shard_sends(node_a, ekv_name)
+      assert :ok = TestCluster.untrace_shard_sends(node_b, ekv_name)
+    end
+
     test "a new member full-syncs after the only existing member bounds its oplog" do
       peers = TestCluster.start_peers(2)
       [{_, node_a}, {_, node_b}] = peers

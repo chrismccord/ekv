@@ -333,7 +333,11 @@ reconnect.
 For shorter outages, oplog retention is anchored independently by
 `member_progress_retention_ttl` (default: `min(tombstone_ttl, 6 hours)`). If a disconnected member
 rejoins within that window, GC keeps its replay cursor so heal can usually stay
-on delta instead of falling back to a full sync.
+on delta instead of falling back to a full sync. Persisted recent-member markers
+also preserve this window across a local EKV restart before live membership has
+been reconstructed. A missing per-origin cursor on any retained member is treated
+as zero, so another member's newer cursor cannot truncate replay that member may
+still need.
 
 With the default `partition_ttl_policy: :quarantine`, EKV detects reconnects
 after a downtime longer than `tombstone_ttl` and quarantines that member pair
