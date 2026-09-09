@@ -3334,7 +3334,14 @@ defmodule EKV.Replica do
          chunk_max_bytes,
          reason
        ) do
-    fetched = Store.full_state_chunk(state.db, tombstone_cutoff, last_key, chunk_size + 1)
+    {fetched, byte_limited?} =
+      Store.full_state_chunk(
+        state.db,
+        tombstone_cutoff,
+        last_key,
+        chunk_size + 1,
+        chunk_max_bytes
+      )
 
     case fetched do
       [] ->
@@ -3352,10 +3359,8 @@ defmodule EKV.Replica do
         state
 
       _ ->
-        {entries, stopped_early?} =
-          take_sync_entries_by_limits(fetched, chunk_size, chunk_max_bytes, &sync_entry_bytes/1)
-
-        final? = not stopped_early?
+        entries = Enum.take(fetched, chunk_size)
+        final? = not byte_limited? and length(fetched) <= chunk_size
         progress = if final?, do: progress_summary, else: nil
 
         log(state, fn ->
@@ -3420,7 +3425,14 @@ defmodule EKV.Replica do
          chunk_size,
          chunk_max_bytes
        ) do
-    fetched = Store.replay_since_origin_chunk(state.db, origin_node, last_seq, chunk_size + 1)
+    {fetched, byte_limited?} =
+      Store.replay_since_origin_chunk(
+        state.db,
+        origin_node,
+        last_seq,
+        chunk_size + 1,
+        chunk_max_bytes
+      )
 
     case fetched do
       [] ->
@@ -3438,13 +3450,7 @@ defmodule EKV.Replica do
         state
 
       _ ->
-        {replay_entries, stopped_early?} =
-          take_sync_entries_by_limits(
-            fetched,
-            chunk_size,
-            chunk_max_bytes,
-            &replay_sync_entry_bytes/1
-          )
+        replay_entries = Enum.take(fetched, chunk_size)
 
         entries =
           replay_entries
@@ -3453,7 +3459,7 @@ defmodule EKV.Replica do
             {key, value, timestamp, replay_origin, origin_seq, expires_at, deleted_at}
           end)
 
-        final? = not stopped_early?
+        final? = not byte_limited? and length(fetched) <= chunk_size
         progress = if final?, do: %{origin_node => my_seq}, else: nil
 
         cond do
@@ -3516,50 +3522,6 @@ defmodule EKV.Replica do
         end
     end
   end
-
-  defp take_sync_entries_by_limits(entries, max_entries, max_bytes, byte_fun) do
-    {selected_rev, selected_count, _selected_bytes, stopped_early?} =
-      Enum.reduce_while(entries, {[], 0, 0, false}, fn entry, {acc, count, bytes, _stopped?} ->
-        entry_bytes = byte_fun.(entry)
-
-        cond do
-          count >= max_entries ->
-            {:halt, {acc, count, bytes, true}}
-
-          count > 0 and bytes + entry_bytes > max_bytes ->
-            {:halt, {acc, count, bytes, true}}
-
-          true ->
-            {:cont, {[entry | acc], count + 1, bytes + entry_bytes, false}}
-        end
-      end)
-
-    selected = Enum.reverse(selected_rev)
-    {selected, stopped_early? or selected_count < length(entries)}
-  end
-
-  defp sync_entry_bytes(
-         {key, value_binary, _timestamp, origin_node, _origin_seq, _expires_at, _deleted_at}
-       ) do
-    byte_size(key) + value_wire_bytes(value_binary) + origin_node_wire_bytes(origin_node) + 96
-  end
-
-  defp replay_sync_entry_bytes(
-         {key, value_binary, _timestamp, origin_node, _origin_seq, _expires_at, _is_delete}
-       ) do
-    byte_size(key) + value_wire_bytes(value_binary) + origin_node_wire_bytes(origin_node) + 96
-  end
-
-  defp value_wire_bytes(value) when is_binary(value), do: byte_size(value)
-  defp value_wire_bytes(_value), do: 0
-
-  defp origin_node_wire_bytes(origin_node) when is_binary(origin_node), do: byte_size(origin_node)
-
-  defp origin_node_wire_bytes(origin_node) when is_atom(origin_node) do
-    origin_node |> Atom.to_string() |> byte_size()
-  end
-
-  defp origin_node_wire_bytes(_origin_node), do: 16
 
   defp mark_sync_inflight(%Replica{} = state, remote_node, request) when request in [:full] do
     now_ms = System.monotonic_time(:millisecond)
