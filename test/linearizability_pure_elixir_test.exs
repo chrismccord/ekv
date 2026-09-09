@@ -52,6 +52,70 @@ defmodule EKV.LinearizabilityPureElixirTest do
     end
   end
 
+  test "CAS writes after a clock-ahead tombstone survive delayed snapshot replay" do
+    peers = TestCluster.start_peers(2)
+    on_exit(fn -> TestCluster.stop_peers(peers) end)
+    [{_, node_a}, {_, node_b}] = peers
+    name = unique_name(:cas_tombstone_clock)
+    start_cas_cluster(peers, name)
+    on_exit(fn -> cleanup_data(peers, name) end)
+    assert :ok = TestCluster.rpc!(node_b, EKV, :await_quorum, [name, 5_000])
+
+    for {operation, origin_seq} <- Enum.with_index([:put, :update, :delete], 1) do
+      key = "clock/#{operation}"
+      deleted_at = System.system_time(:nanosecond) + :timer.minutes(1) * 1_000_000
+      metadata = [origin: "1", timestamp: deleted_at, deleted_at: deleted_at]
+
+      for node <- [node_a, node_b] do
+        :ok = TestCluster.inject_paxos_accept(node, name, key, nil, 1, "1", metadata)
+
+        :ok =
+          TestCluster.inject_committed_entry(node, name, key, nil, deleted_at,
+            origin: "1",
+            origin_seq: origin_seq,
+            deleted_at: deleted_at
+          )
+      end
+
+      {timestamp, expected_value} =
+        case operation do
+          :put ->
+            assert {:ok, {ts, _origin}} =
+                     TestCluster.rpc!(node_b, EKV, :put, [name, key, 1, [if_vsn: nil]])
+
+            {ts, 1}
+
+          :update ->
+            assert {:ok, 1, {ts, _origin}} =
+                     TestCluster.rpc!(node_b, EKV, :update, [
+                       name,
+                       key,
+                       {TestCluster, :cas_increment, []}
+                     ])
+
+            {ts, 1}
+
+          :delete ->
+            assert {:ok, {ts, _origin}} =
+                     TestCluster.rpc!(node_b, EKV, :delete, [name, key, [if_vsn: nil]])
+
+            {ts, nil}
+        end
+
+      assert timestamp > deleted_at
+      entry = {key, :erlang.term_to_binary(nil), deleted_at, "1", origin_seq, nil, deleted_at}
+      shard = EKV.Replica.shard_name(name, 0)
+
+      TestCluster.rpc!(node_b, :erlang, :send, [
+        shard,
+        {:ekv, 1, :sync, {node_a, 0, :full, [entry], nil}, %{}}
+      ])
+
+      TestCluster.rpc!(node_b, :sys, :get_state, [shard])
+      assert TestCluster.rpc!(node_b, EKV, :get, [name, key]) == expected_value
+    end
+  end
+
   # BUG: under concurrent `consistent: true` reads/writes on one key, we can
   # produce histories with no valid linearization.
   #

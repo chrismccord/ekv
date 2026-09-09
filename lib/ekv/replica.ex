@@ -5967,7 +5967,14 @@ defmodule EKV.Replica do
               apply_cas_read_recovery(state, op.key, selected_kv_row, current_value, current_vsn)
 
             _ ->
-              apply_operation(state, op.operation, op.key, current_value, current_vsn)
+              apply_operation(
+                state,
+                op.operation,
+                op.key,
+                current_value,
+                current_vsn,
+                selected_kv_row
+              )
           end
 
         case apply_result do
@@ -6106,11 +6113,18 @@ defmodule EKV.Replica do
     reply_cas_reply(op.from, op.reply_mode, op.reply_value)
   end
 
-  defp apply_operation(%Replica{} = state, operation, key, current_value, current_vsn) do
+  defp apply_operation(
+         %Replica{} = state,
+         operation,
+         key,
+         current_value,
+         current_vsn,
+         current_row
+       ) do
     case operation do
       {:cas_put, expected_vsn, value_binary, opts} ->
         if current_vsn == expected_vsn do
-          now = monotonic_cas_ts(current_vsn)
+          now = monotonic_cas_ts(current_row)
           origin = local_origin_id(state)
           origin_str = origin
           ttl = Keyword.get(opts, :ttl)
@@ -6127,7 +6141,7 @@ defmodule EKV.Replica do
 
       {:cas_delete, expected_vsn, _opts} ->
         if current_vsn == expected_vsn do
-          now = monotonic_cas_ts(current_vsn)
+          now = monotonic_cas_ts(current_row)
           origin = local_origin_id(state)
           origin_str = origin
 
@@ -6142,7 +6156,7 @@ defmodule EKV.Replica do
       {:update, fun, opts, _retries} ->
         new_value = apply_update_callback(fun, current_value)
         new_value_binary = :erlang.term_to_binary(new_value)
-        now = monotonic_cas_ts(current_vsn)
+        now = monotonic_cas_ts(current_row)
         origin = local_origin_id(state)
         origin_str = origin
         ttl = Keyword.get(opts, :ttl)
@@ -6164,9 +6178,10 @@ defmodule EKV.Replica do
   # Ensure CAS commit timestamps are strictly greater than the current value's
   # timestamp. This prevents LWW merge from overwriting the CAS-committed value
   # with a prior high-timestamp value after partition heal.
+  # Tombstones and expired rows still provide a floor even though their VSN is nil.
   defp monotonic_cas_ts(nil), do: System.system_time(:nanosecond)
 
-  defp monotonic_cas_ts({current_ts, _origin}),
+  defp monotonic_cas_ts([_value, current_ts, _origin, _expires_at, _deleted_at]),
     do: max(System.system_time(:nanosecond), current_ts + 1)
 
   defp apply_update_callback(fun, current_value) when is_function(fun, 1), do: fun.(current_value)
