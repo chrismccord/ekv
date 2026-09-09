@@ -1,11 +1,10 @@
 defmodule EKV.LinearizabilityPureElixirTest do
   use ExUnit.Case
-  import Bitwise
 
   @moduletag :capture_log
   @moduletag timeout: 300_000
 
-  alias EKV.TestCluster
+  alias EKV.{RegisterHistory, TestCluster}
 
   @workers 6
   @total_ops 400
@@ -89,11 +88,10 @@ defmodule EKV.LinearizabilityPureElixirTest do
 
         events = run_workload(nodes, ekv_name, key, @workers, @total_ops, seed)
         info_writes = Enum.count(events, &(&1.type == :info and &1.f == :write))
-        ops = completed_ops(events)
-        linearizable? = linearizable_register_history?(ops)
+        result = RegisterHistory.check(events, 0)
 
         history_path =
-          if linearizable? do
+          if RegisterHistory.passes?(result) do
             nil
           else
             path =
@@ -106,27 +104,25 @@ defmodule EKV.LinearizabilityPureElixirTest do
             path
           end
 
-        %{
+        Map.merge(result, %{
           seed: seed,
           retry: retry,
           total_events: length(events),
-          completed_ops: length(ops),
           info_writes: info_writes,
-          linearizable?: linearizable?,
           history_path: history_path
-        }
+        })
       end
 
     invalid =
       Enum.filter(results, fn r ->
-        not r.linearizable? and r.info_writes == 0
+        not r.covered? or (not r.linearizable? and r.info_writes == 0)
       end)
 
     assert invalid == [],
            """
            expected all pure-Elixir linearizability checks to pass, but found #{length(invalid)} invalid run(s).
 
-           #{Enum.map_join(results, "\n", fn r -> "seed=#{r.seed} retry=#{r.retry} completed_ops=#{r.completed_ops} info_writes=#{r.info_writes} events=#{r.total_events} linearizable?=#{r.linearizable?} history=#{r.history_path || "-"}" end)}
+           #{Enum.map_join(results, "\n", fn r -> "seed=#{r.seed} retry=#{r.retry} completed_ops=#{r.completed_ops} reads=#{r.successful_reads} writes=#{r.successful_writes} info_writes=#{r.info_writes} events=#{r.total_events} linearizable?=#{r.linearizable?} history=#{r.history_path || "-"}" end)}
            """
   end
 
@@ -256,126 +252,5 @@ defmodule EKV.LinearizabilityPureElixirTest do
       |> Enum.join("\n")
 
     File.write!(path, body <> "\n")
-  end
-
-  defp completed_ops(events) do
-    events
-    |> Enum.with_index()
-    |> Enum.reduce(%{}, fn {event, idx}, acc ->
-      key = event.process
-
-      case event.type do
-        :invoke ->
-          Map.put(acc, key, %{id: key, f: event.f, invoke_idx: idx, invoke_value: event.value})
-
-        :ok ->
-          case Map.get(acc, key) do
-            %{f: f} = existing ->
-              op =
-                existing
-                |> Map.put(:ok_idx, idx)
-                |> Map.put(:ok_value, event.value)
-                |> Map.put(:kind, f)
-                |> Map.put(:value, if(f == :write, do: existing.invoke_value, else: event.value))
-
-              Map.put(acc, key, op)
-
-            _ ->
-              acc
-          end
-
-        _ ->
-          acc
-      end
-    end)
-    |> Map.values()
-    |> Enum.filter(fn op ->
-      Map.has_key?(op, :invoke_idx) and Map.has_key?(op, :ok_idx) and op.kind in [:read, :write]
-    end)
-  end
-
-  defp linearizable_register_history?(ops) when ops == [], do: true
-
-  defp linearizable_register_history?(ops) do
-    ops = Enum.sort_by(ops, & &1.ok_idx)
-    n = length(ops)
-    indexed = Enum.with_index(ops)
-
-    pred_masks =
-      for {op_i, i} <- indexed do
-        Enum.reduce(indexed, 0, fn
-          {op_j, j}, acc when j != i ->
-            if op_j.ok_idx < op_i.invoke_idx do
-              acc ||| 1 <<< j
-            else
-              acc
-            end
-
-          _, acc ->
-            acc
-        end)
-      end
-
-    full_mask = (1 <<< n) - 1
-    initial_values = [nil, 0] ++ Enum.uniq(Enum.map(ops, & &1.value))
-    ops_t = List.to_tuple(ops)
-    pred_t = List.to_tuple(pred_masks)
-
-    Enum.any?(initial_values, fn init ->
-      memo = :ets.new(:lin_memo, [:set, :private])
-
-      try do
-        do_linearizable?(ops_t, pred_t, n, full_mask, 0, init, memo)
-      after
-        :ets.delete(memo)
-      end
-    end)
-  end
-
-  defp do_linearizable?(_ops_t, _pred_t, _n, full_mask, full_mask, _state, _memo), do: true
-
-  defp do_linearizable?(ops_t, pred_t, n, full_mask, done_mask, state, memo) do
-    key = {done_mask, state}
-
-    case :ets.lookup(memo, key) do
-      [{^key, result}] ->
-        result
-
-      [] ->
-        result = try_candidates(ops_t, pred_t, n, full_mask, done_mask, state, memo, 0)
-
-        :ets.insert(memo, {key, result})
-        result
-    end
-  end
-
-  defp try_candidates(_ops_t, _pred_t, n, _full_mask, _done_mask, _state, _memo, i) when i >= n,
-    do: false
-
-  defp try_candidates(ops_t, pred_t, n, full_mask, done_mask, state, memo, i) do
-    bit = 1 <<< i
-    pred_mask = :erlang.element(i + 1, pred_t)
-
-    result =
-      if (done_mask &&& bit) == 0 and (pred_mask &&& done_mask) == pred_mask do
-        op = :erlang.element(i + 1, ops_t)
-
-        case op.kind do
-          :write ->
-            do_linearizable?(ops_t, pred_t, n, full_mask, done_mask ||| bit, op.value, memo)
-
-          :read ->
-            op.value == state and
-              do_linearizable?(ops_t, pred_t, n, full_mask, done_mask ||| bit, state, memo)
-        end
-      else
-        false
-      end
-
-    if result do
-      true
-    else
-      try_candidates(ops_t, pred_t, n, full_mask, done_mask, state, memo, i + 1)
-    end
   end
 end
