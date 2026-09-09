@@ -32,7 +32,11 @@ defmodule EKV.Transports.Dist do
     try do
       {:ok, :erpc.call(node, module, function, args, timeout)}
     catch
-      :exit, reason -> {:error, reason}
+      :error, {:erpc, reason} when reason in [:noconnection, :timeout] ->
+        {:error, reason}
+
+      :exit, reason ->
+        {:error, reason}
     end
   end
 end
