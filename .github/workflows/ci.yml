@@ -27,3 +27,29 @@ jobs:
       - run: mix deps.get
       - run: mix compile --warnings-as-errors
       - run: elixir --name ci@127.0.0.1 --cookie ekv_test -S mix test
+
+  c-check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+          elixir-version: "1.19"
+      - run: sudo apt-get update && sudo apt-get install -y clang
+      - run: make c-check
+
+  c-sanitizers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      MIX_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+          elixir-version: "1.19"
+      - run: sudo apt-get update && sudo apt-get install -y clang libclang-rt-dev llvm
+      - run: mix deps.get
+      - run: sh scripts/test-c-sanitizers.sh
