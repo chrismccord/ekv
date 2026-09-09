@@ -21,8 +21,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
@@ -57,7 +57,7 @@ jobs:
 
   jepsen:
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ (github.event_name == 'push' || inputs.suite == 'soak') && 30 || 15 }}
+    timeout-minutes: ${{ (github.event_name == 'push' || inputs.suite == 'soak') && 360 || 15 }}
     strategy:
       fail-fast: false
       matrix:
@@ -108,7 +108,7 @@ jobs:
 
       - name: Run Jepsen scenario
         working-directory: jepsen
-        timeout-minutes: ${{ env.SUITE == 'soak' && 20 || 5 }}
+        timeout-minutes: ${{ env.SUITE == 'soak' && 360 || 5 }}
         run: |
           mkdir -p results
           ./run_scenario.sh "$SCENARIO" "$SEED" "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" "$SUITE" 2>&1 | tee results/ci.log

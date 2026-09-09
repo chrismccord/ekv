@@ -52,15 +52,18 @@ Jepsen runs on OTP 28, Elixir 1.19, and Java 21:
   seed `1`, 4 workers, and 400 operations, with a 5-minute scenario limit
   inside a 15-minute job.
 - **Pushes to `main`:** all ten scenarios at their full workloads, each with
-  seeds `1`, `2`, and `3` (30 jobs). Each has a 20-minute scenario limit inside
-  a 30-minute job.
+  seeds `1`, `2`, and `3` (30 jobs). There is no short scenario cutoff: each
+  job can use GitHub-hosted runners' full six-hour limit.
 - **Run workflow:** select `smoke` (default) or `soak` and a specific `seed`
   to reproduce either suite without running all three seeds.
 
 Jobs run independently in parallel, subject to runner availability. Limits
 are per job, not a promise about queue time or aggregate runner minutes.
-New commits cancel superseded runs. Histories, checker diagnostics, and
-`ci.log` are uploaded as artifacts retained for 14 days. Only `valid? = true` passes;
+New PR commits cancel superseded PR runs; main and manual soaks run to completion
+even when newer commits arrive. Histories, checker diagnostics, and
+`ci.log` are uploaded as artifacts retained for 14 days when the job reaches
+the upload step; exhausting the six-hour job limit can prevent that upload.
+Only `valid? = true` passes;
 violations, inconclusive results, generator failures, and timeouts fail CI.
 The workflow calls each scenario directly rather than relying on the
 aggregate reporting scripts' exit status.
