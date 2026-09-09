@@ -38,13 +38,29 @@ checks must also pass; a linearizable but unexercised workload is not a pass.
 
 The `ci` GitHub Actions workflow runs the full ExUnit suite (including
 distributed, stress, and pure-Elixir linearizability tests) on OTP 26, 27, and
-28 with Elixir 1.19. It also runs all ten named Jepsen scenarios in separate
-jobs on OTP 28, Elixir 1.19, and Java 21, for pull requests and pushes to `main`.
+28 with Elixir 1.19, plus a floating latest-stable Elixir/OTP pair. Both
+`mix compile --warnings-as-errors` and `mix test --warnings-as-errors` fail
+on warnings, including new compiler type diagnostics and warnings in test
+files. `mix format --check-formatted` runs on the Elixir 1.19/OTP 28 job so
+formatting uses one canonical version rather than changing across the matrix.
+Each ExUnit job has a 15-minute wall-clock limit.
 
-Jepsen uses seed `1` by default. Use **Run workflow** with a different `seed`
-to repeat the matrix. Each scenario has a 20-minute step timeout within a
-30-minute job, leaving time to upload histories, checker diagnostics, and
-`ci.log` as artifacts retained for 14 days. Only `valid? = true` passes;
+Jepsen runs on OTP 28, Elixir 1.19, and Java 21:
+
+- **Pull requests:** three smoke jobs covering register partition/heal,
+  3-node lock partition/restart, and 5-node lock partition/restart. Each uses
+  seed `1`, 4 workers, and 400 operations, with a 5-minute scenario limit
+  inside a 15-minute job.
+- **Pushes to `main`:** all ten scenarios at their full workloads, each with
+  seeds `1`, `2`, and `3` (30 jobs). Each has a 20-minute scenario limit inside
+  a 30-minute job.
+- **Run workflow:** select `smoke` (default) or `soak` and a specific `seed`
+  to reproduce either suite without running all three seeds.
+
+Jobs run independently in parallel, subject to runner availability. Limits
+are per job, not a promise about queue time or aggregate runner minutes.
+New commits cancel superseded runs. Histories, checker diagnostics, and
+`ci.log` are uploaded as artifacts retained for 14 days. Only `valid? = true` passes;
 violations, inconclusive results, generator failures, and timeouts fail CI.
 The workflow calls each scenario directly rather than relying on the
 aggregate reporting scripts' exit status.
@@ -113,6 +129,8 @@ export PATH="/opt/homebrew/opt/openjdk/bin:$PATH"
 ./run_scenario.sh lock-3n-partition-restart 1
 # optional explicit run tag (for deterministic artifact names)
 ./run_scenario.sh lock-5n-partition-restart 23 lock-repro-seed23
+# the same bounded workload used on PRs (CI supplies the wall-clock timeout)
+./run_scenario.sh lock-5n-partition-restart 1 local-smoke smoke
 ```
 
 Lock-usecase matrix runner (multi-scenario + multi-seed summary):

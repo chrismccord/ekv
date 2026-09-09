@@ -1831,8 +1831,6 @@ defmodule EKV.Replica do
        when reply in [:ok, {:error, :cas_managed_key}],
        do: {reply, state}
 
-  defp normalize_local_write_result({:ok, %Replica{} = state}), do: {:ok, state}
-
   defp handle_apply_observer_commit_request(
          %Replica{} = state,
          key,
@@ -2653,14 +2651,10 @@ defmodule EKV.Replica do
 
   def handle_info(:anti_entropy_tick, %Replica{} = state) do
     state =
-      if state.handoff_node do
-        state
-      else
-        state
-        |> expire_stale_inflight()
-        |> trigger_missing_member_connects()
-        |> trigger_summary_probe()
-      end
+      state
+      |> expire_stale_inflight()
+      |> trigger_missing_member_connects()
+      |> trigger_summary_probe()
 
     schedule_anti_entropy_tick(state)
     cb_noreply(state)
@@ -3151,8 +3145,6 @@ defmodule EKV.Replica do
         :error
     end
   end
-
-  defp normalize_replication_batch_entries(_entries), do: :error
 
   defp replication_batch_initial_delete_values(%Replica{} = state, entries) do
     if has_subscribers?(state) do
@@ -4151,8 +4143,6 @@ defmodule EKV.Replica do
         Atom.to_string(remote_node) == origin_node_id
     end)
   end
-
-  defp known_down_member_quarantined?(%Replica{} = _state, _origin_node_id), do: false
 
   defp progress_ack_summary(%Replica{} = state, :full, _progress) do
     local_progress_summary_for_wire(state)

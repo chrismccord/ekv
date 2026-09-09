@@ -283,10 +283,10 @@ defmodule EKVTest do
       assert is_binary(origin)
     end
 
-    test "scan is a Stream (lazy)", %{name: name} do
-      :ok = EKV.put(name, "user/1", "a")
+    test "scan reads lazily when enumerated", %{name: name} do
       stream = EKV.scan(name, "user/")
-      assert is_function(stream) or match?(%Stream{}, stream)
+      :ok = EKV.put(name, "user/1", "a")
+      assert [{"user/1", "a", _vsn}] = Enum.to_list(stream)
     end
 
     test "keys returns matching {key, vsn} tuples as stream", %{name: name} do
@@ -301,10 +301,10 @@ defmodule EKVTest do
       assert Enum.all?(result, fn {_key, {ts, origin}} -> is_integer(ts) and is_binary(origin) end)
     end
 
-    test "keys is a Stream (lazy)", %{name: name} do
-      :ok = EKV.put(name, "user/1", "a")
+    test "keys reads lazily when enumerated", %{name: name} do
       stream = EKV.keys(name, "user/")
-      assert is_function(stream) or match?(%Stream{}, stream)
+      :ok = EKV.put(name, "user/1", "a")
+      assert [{"user/1", _vsn}] = Enum.to_list(stream)
     end
 
     test "scan excludes deleted entries", %{name: name} do
