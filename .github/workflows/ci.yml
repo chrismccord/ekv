@@ -27,3 +27,15 @@ jobs:
       - run: mix deps.get
       - run: mix compile --warnings-as-errors
       - run: elixir --name ci@127.0.0.1 --cookie ekv_test -S mix test
+
+  jepsen-harness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - run: sudo apt-get update && sudo apt-get install -y leiningen
+      - run: lein test
+        working-directory: jepsen

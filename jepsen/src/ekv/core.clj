@@ -67,9 +67,16 @@
                :else :unknown)
      :linearizable linearizable :coverage coverage :versions versions}))
 
-(defn -main [& args]
+(defn result-name [valid?]
+  (cond
+    (true? valid?) "true"
+    (false? valid?) "false"
+    (= :unknown valid?) "unknown"
+    :else "error"))
+
+(defn run-cli [args]
   (if (some #{"-h" "--help"} args)
-    (usage)
+    (do (usage) 0)
     (let [history-path (-> (or (nth args 0 nil) default-history-path) io/file .getAbsolutePath)
           workers      (parse-int (nth args 1 nil) default-workers)
           ops          (parse-int (nth args 2 nil) default-ops)
@@ -91,7 +98,13 @@
         (println (str "  operations:   " (count history)))
         (println (str "  coverage:     " (pr-str (:coverage result))))
         (println (str "  valid?:       " valid?))
-        (when-not valid?
+        (when-not (true? valid?)
           (println "  details:")
           (prn result))
-        (System/exit (if valid? 0 1))))))
+        ;; A stable machine-readable verdict, separate from diagnostic output.
+        ;; Only a conclusive positive result can authorize a gate to pass.
+        (println (str "EKV_JEPSEN_RESULT=" (result-name valid?)))
+        (if (true? valid?) 0 1)))))
+
+(defn -main [& args]
+  (System/exit (run-cli args)))
