@@ -247,7 +247,7 @@ defmodule EKV do
   | `:mode` | `:member` | Runtime role. `:member` stores/replicates data and votes in CAS quorum. `:observer` stores/replicates data and routes CAS to voters. `:client` is stateless and routes operations to voters. |
   | `:region` | `"default"` | Region label for this EKV instance. Durable replicas expose it for routing. Clients may set it for observability. |
   | `:region_routing` | `nil` | Observer and client mode only. Ordered list of preferred voter regions, e.g. `["iad", "dfw", "lhr"]`. |
-  | `:wait_for_route` | `false` | Observer and client mode only. Optional startup gate. Blocks `EKV.start_link/1` until the first reachable voter in `:region_routing` order is selected, or fails startup on timeout. |
+  | `:wait_for_route` | `false` | Observer and client mode only. Optional startup gate. Blocks `EKV.start_link/1` until the first reachable voter in `:region_routing` order is selected, or fails startup on timeout. Voters advertise routes only after all their shards have initialized; this does not guarantee quorum. |
   | `:data_dir` | *required in `:member` and `:observer`* | Directory where SQLite database files are stored. Created automatically if it doesn't exist. Each shard gets its own file (`shard_0.db`, `shard_1.db`, etc.). |
   | `:shards` | `8` | Member and observer mode only. Number of shards. See "Choosing a Shard Count" below. |
   | `:reader_connections` | `:auto` | Member and observer mode only. Number of SQLite reader connections per shard. `:auto` uses `min(System.schedulers_online(), 16)`. Use `:schedulers` to preserve one reader per scheduler, or a positive integer to tune explicitly. |

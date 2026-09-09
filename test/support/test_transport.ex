@@ -8,6 +8,14 @@ defmodule EKV.TestTransport do
     owner = Keyword.fetch!(opts, :owner)
     send(owner, {:ekv_test_transport_init, self(), opts})
 
+    if Keyword.get(opts, :pause_init?, false) do
+      receive do
+        :continue_init -> :ok
+      after
+        5_000 -> raise "test did not release transport initialization"
+      end
+    end
+
     {:ok,
      %{
        owner: owner,

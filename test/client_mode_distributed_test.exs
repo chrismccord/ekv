@@ -105,6 +105,68 @@ defmodule EKV.ClientModeDistributedTest do
     end)
   end
 
+  test "member identity is visible during startup but routing waits for every shard" do
+    peers = TestCluster.start_peers(2)
+    on_exit(fn -> TestCluster.stop_peers(peers) end)
+    [{_, member_node}, {_, client_node}] = peers
+    ekv_name = unique_name(:member_readiness)
+    on_exit(fn -> cleanup_data(peers, ekv_name) end)
+    owner = self()
+
+    member_task =
+      Task.async(fn ->
+        TestCluster.start_ekv(
+          member_node,
+          name: ekv_name,
+          data_dir: member_data_dir(member_node, ekv_name),
+          shards: 2,
+          region: "iad",
+          cluster_size: 1,
+          node_id: "member",
+          transport: {EKV.TestTransport, owner: owner, pause_init?: true}
+        )
+      end)
+
+    for _shard <- 0..1 do
+      assert_receive {:ekv_test_transport_init, shard_pid, _opts}, 2_000
+
+      assert TestCluster.rpc!(member_node, EKV.MemberPresence, :member_origin_known?, [
+               ekv_name,
+               "member"
+             ])
+
+      refute TestCluster.rpc!(member_node, EKV.MemberPresence, :advertised?, [ekv_name])
+      assert TestCluster.rpc!(member_node, EKV.MemberPresence, :member_nodes, [ekv_name]) == []
+      send(shard_pid, :continue_init)
+    end
+
+    assert {:ok, _} = Task.await(member_task)
+    assert TestCluster.rpc!(member_node, EKV.MemberPresence, :advertised?, [ekv_name])
+
+    assert {:ok, _} =
+             TestCluster.start_ekv(
+               client_node,
+               name: ekv_name,
+               mode: :client,
+               region_routing: ["iad"],
+               wait_for_route: 2_000,
+               wait_for_quorum: 2_000
+             )
+
+    assert {:ok, _} =
+             TestCluster.rpc!(client_node, EKV, :put, [ekv_name, "ready", true, [if_vsn: nil]])
+
+    assert :ok = TestCluster.rpc!(member_node, EKV.MemberPresence, :leave, [ekv_name])
+    refute TestCluster.rpc!(member_node, EKV.MemberPresence, :advertised?, [ekv_name])
+
+    refute TestCluster.rpc!(member_node, EKV.MemberPresence, :member_origin_known?, [
+             ekv_name,
+             "member"
+           ])
+
+    assert :ok = TestCluster.rpc!(member_node, EKV.MemberPresence, :leave, [ekv_name])
+  end
+
   test "client wait_for_quorum blocks startup until the selected backend reaches quorum" do
     peers = TestCluster.start_peers(3)
     on_exit(fn -> TestCluster.stop_peers(peers) end)

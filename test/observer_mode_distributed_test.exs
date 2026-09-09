@@ -161,6 +161,8 @@ defmodule EKV.ObserverModeDistributedTest do
         tombstone_ttl: :timer.hours(24 * 7)
       )
 
+    assert :ok = TestCluster.rpc!(voter_a, EKV, :await_quorum, [ekv_name, 5_000])
+
     assert {:ok, _vsn} =
              TestCluster.rpc!(voter_a, EKV, :put, [ekv_name, "q/key", "v", [if_vsn: nil]])
 

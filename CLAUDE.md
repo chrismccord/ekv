@@ -122,6 +122,9 @@ Important:
 - Ready members advertise themselves in scoped `:pg` region groups:
   - `{:ekv_members, name, region}`
 - This is pinned by `EKV.MemberPresence`.
+- `EKV.MemberIdentity` pins the logical `node_id` group before replicas start.
+  `MemberPresence` publishes routing groups only after all shards initialize,
+  before optional quorum gates. Do not combine early identity with route readiness.
 - New clients should discover members through this path, not by raw `Node.list/0`.
 
 ### Wire compression
