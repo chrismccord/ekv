@@ -32,9 +32,10 @@ defmodule EKV.Supervisor do
       SubTracker
       Registry
       SubDispatcher.Supervisor
+      MemberIdentity
       Replica.Supervisor         replicas + round-robin WAL checkpointer
-      QuorumGate?
       MemberPresence
+      QuorumGate?
       GC
       ShutdownBarrier?
 
@@ -45,11 +46,12 @@ defmodule EKV.Supervisor do
       SubTracker
       Registry
       SubDispatcher.Supervisor
+      MemberIdentity
       Replica.Supervisor         replicas + round-robin WAL checkpointer
+      MemberPresence
       ClientRouter
       RouteGate?
       QuorumGate?
-      MemberPresence
       GC
       ShutdownBarrier?
 
@@ -64,8 +66,8 @@ defmodule EKV.Supervisor do
 
   This ordering matters:
 
-  - `RouteGate` / `QuorumGate` block startup before the instance is considered
-    ready
+  - `MemberIdentity` exposes logical origin identity before replica initialization
+  - `RouteGate` / `QuorumGate` block application startup, not member advertisement
   - `MemberPresence` is started only after durable-replica readiness, so new
     clients and observers do not route CAS to an unready voter
   - `ShutdownBarrier` is last so supervisor shutdown reaches it first while the
@@ -412,8 +414,9 @@ defmodule EKV.Supervisor do
         {EKV.SubTracker, name: sub_tracker_name, sub_count: sub_count},
         {Registry, keys: :duplicate, name: registry_name, listeners: [sub_tracker_name]},
         {EKV.SubDispatcher.Supervisor, name: name, num_shards: num_shards},
-        {EKV.MemberPresence, name: name, region: region, voter: true, node_id: effective_node_id},
+        {EKV.MemberIdentity, name: name, node_id: effective_node_id},
         {EKV.Replica.Supervisor, name: name, num_shards: num_shards, data_dir: data_dir},
+        {EKV.MemberPresence, name: name, region: region, voter: true},
         if(is_integer(wait_for_quorum),
           do: {EKV.QuorumGate, name: name, timeout: wait_for_quorum, log: log}
         ),
@@ -569,9 +572,9 @@ defmodule EKV.Supervisor do
         {EKV.SubTracker, name: sub_tracker_name, sub_count: sub_count},
         {Registry, keys: :duplicate, name: registry_name, listeners: [sub_tracker_name]},
         {EKV.SubDispatcher.Supervisor, name: name, num_shards: num_shards},
-        {EKV.MemberPresence,
-         name: name, region: region, voter: false, node_id: effective_node_id},
+        {EKV.MemberIdentity, name: name, node_id: effective_node_id},
         {EKV.Replica.Supervisor, name: name, num_shards: num_shards, data_dir: data_dir},
+        {EKV.MemberPresence, name: name, region: region, voter: false},
         {EKV.ClientRouter, name: name},
         if(is_integer(wait_for_route),
           do: {EKV.RouteGate, name: name, timeout: wait_for_route, log: log}

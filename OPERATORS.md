@@ -78,6 +78,8 @@ Use `wait_for_route: timeout_ms` on observers or clients when startup should
 wait for a usable CAS backend route before the app continues.
 
 - The router picks the first reachable voter in `region_routing` order.
+- Voters publish routes after all local shards initialize, before optional quorum
+  gates. Early logical-member identity is visible only for origin discovery.
 - The chosen backend stays sticky until failure.
 - `wait_for_route` is about routing readiness, not quorum.
 

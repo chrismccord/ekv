@@ -39,8 +39,7 @@ defmodule EKV.Replica do
         │   ├── EKV.SubDispatcher 0   async event fan-out per shard
         │   ├── EKV.SubDispatcher 1
         │   └── ...
-        ├── EKV.MemberPresence    publishes ready member in :pg region groups
-        │                         and node_id groups
+        ├── EKV.MemberIdentity    publishes early logical node_id identity
         ├── EKV.Replica.Supervisor (one_for_one)
         │   ├── EKV.Replica 0     shard GenServer (writes + replication + SQLite)
         │   ├── EKV.Replica 1
@@ -48,6 +47,7 @@ defmodule EKV.Replica do
         │   └── EKV.WALCheckpointer
         │                         dedicated connections, round-robin passive
         │                         checkpoints across independent shard DBs
+        ├── EKV.MemberPresence    publishes ready member in :pg region groups
         ├── EKV.QuorumGate?       optional startup barrier for CAS quorum
         ├── EKV.GC                periodic timer, sends :gc to each shard
         └── EKV.ShutdownBarrier?  optional graceful shutdown barrier
@@ -62,11 +62,11 @@ defmodule EKV.Replica do
         └── EKV.ShutdownBarrier?     optional graceful shutdown barrier
 
   rest_for_one: SubTracker crash restarts everything. Registry crash restarts
-  Dispatchers + MemberPresence + Replicas. Single Replica crash → only that
-  shard restarts. MemberPresence now starts before Replicas so startup-time
-  origin recognition and reconnect retry can see current logical members
-  before anti-entropy begins. QuorumGate, GC, and ShutdownBarrier are
-  downstream of Replicas.
+  Dispatchers + MemberIdentity + Replicas + MemberPresence. Single Replica
+  crash → only that shard restarts. MemberIdentity starts before Replicas for
+  startup-time origin recognition; MemberPresence starts after all replicas
+  are initialized so routing cannot select a half-started member. QuorumGate,
+  GC, and ShutdownBarrier are downstream of both.
 
 
   ## Graceful Shutdown Barrier

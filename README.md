@@ -177,6 +177,8 @@ blue-green machinery on that node.
 
 - Eventual reads become remote reads against the selected voter.
 - `wait_for_route` can hold startup until a backend route is selected.
+- Voters advertise routes only after all their shards have initialized; replication
+  can discover their logical identity earlier, without exposing a client route.
 - `wait_for_quorum` can additionally hold startup until that backend reports CAS quorum reachable.
 - `scan/2` and `keys/2` still return Elixir streams, but are backed by paged RPC.
 - `subscribe/2` works in client mode; client subscribers are delivered cluster-wide.
