@@ -1,5 +1,6 @@
 .DS_Store
 .nrepl-port
+.lein-failures
 target/
 store/
 results/

@@ -14,6 +14,7 @@ Scenarios:
   register-3n-none
   register-3n-partition-flap
   register-3n-restart-one-small
+  register-3n-crash-one
   register-5n-none
   lock-3n-none
   lock-3n-partition-flap
@@ -21,6 +22,9 @@ Scenarios:
   lock-3n-partition-restart
   lock-5n-none
   lock-5n-partition-restart
+  lock-3n-crash-one
+  lock-3n-partition-crash
+  lock-5n-partition-crash
 
 Notes:
 - Histories are written to unique per-run files by default.
@@ -63,6 +67,12 @@ case "$SCENARIO" in
     mode="restart_one"
     profile="register"
     ;;
+  register-3n-crash-one)
+    ops=1200
+    cluster_nodes=3
+    mode="crash_one"
+    profile="register"
+    ;;
   register-5n-none)
     ops=2000
     cluster_nodes=5
@@ -103,6 +113,18 @@ case "$SCENARIO" in
     ops=1200
     cluster_nodes=5
     mode="partition_restart"
+    profile="lock"
+    ;;
+  lock-3n-crash-one)
+    ops=1200
+    cluster_nodes=3
+    mode="crash_one"
+    profile="lock"
+    ;;
+  lock-3n-partition-crash|lock-5n-partition-crash)
+    ops=1200
+    if [[ "$SCENARIO" == lock-3n-* ]]; then cluster_nodes=3; else cluster_nodes=5; fi
+    mode="partition_crash"
     profile="lock"
     ;;
   *)

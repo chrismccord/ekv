@@ -13,6 +13,9 @@ SCENARIOS=(
   lock-3n-restart-one-small
   lock-3n-partition-restart
   lock-5n-none
+  lock-3n-crash-one
+  lock-3n-partition-crash
+  lock-5n-partition-crash
 )
 
 mkdir -p results
