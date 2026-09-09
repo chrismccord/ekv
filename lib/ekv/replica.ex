@@ -1273,10 +1273,15 @@ defmodule EKV.Replica do
 
   Current `meta` usage:
     - handshake messages advertise
-      `%{features: %{live_progress: true, wire_compression: true}}`
+      `%{features: %{live_progress: true, replay_origin: true, wire_compression: true}}`
       where `live_progress` means the peer supports progress summaries and
       sync-settlement progress exchange in the v1 contract; it is not a
       promise of per-write live progress-ack traffic
+    - delta `:sync` includes `%{replay_origin: node_id}`: entries keep the
+      original value's origin (and VSN), while their sequence belongs to this
+      replay stream. Internally the mode becomes `{:delta, replay_origin}`.
+      Peers without this capability use full snapshots; their replay cursors
+      are not trusted. CAS commits already identify the stream by proposer.
     - `:sync_request` may include `%{explicit_full_reason: ...}` for requester-
       driven full syncs while keeping the payload shape backward compatible
     - replication/control messages keep `meta` empty unless an optional feature requires it
@@ -1340,6 +1345,7 @@ defmodule EKV.Replica do
   @wire_protocol_version 1
   @wire_compressed_tag :ekv_wire_compressed
   @wire_feature_live_progress :live_progress
+  @wire_feature_replay_origin :replay_origin
   @wire_feature_compression :wire_compression
   @wire_feature_observer :observer
   @local_request_tag :ekv_local_request
@@ -1480,10 +1486,14 @@ defmodule EKV.Replica do
     lww_ts_counter = max(System.system_time(:nanosecond), Store.max_timestamp(db) || 0)
     local_max_seq = Store.max_seq(db)
     local_origin_id = config.node_id || Atom.to_string(node())
-    local_origin_seq = Store.max_origin_seq(db, local_origin_id)
+
+    local_origin_seq =
+      max(Store.max_origin_seq(db, local_origin_id), Store.get_meta(db, "local_origin_seq") || 0)
 
     local_progress =
       Store.local_progress_summary(db) |> Map.put(local_origin_id, local_origin_seq)
+
+    :ok = Store.merge_local_progress(db, local_origin_id, local_origin_seq)
 
     # CAS ballot counter — restore from persisted value
     ballot_counter =
@@ -2089,6 +2099,18 @@ defmodule EKV.Replica do
   def handle_info({:ekv_sync, from_node, _shard, mode, entries, progress}, %Replica{} = state) do
     %{shard_index: shard, db: db, num_shards: num_shards} = state
     state = touch_sync_inflight(state, from_node)
+    legacy? = legacy_replay_peer?(state, from_node)
+    terminal? = is_map(progress)
+
+    {mode, replay_origin} =
+      case mode do
+        {:delta, origin} -> {:delta, normalize_origin_node(origin)}
+        mode -> {mode, nil}
+      end
+
+    # Legacy replay cursors may already be corrupt. Accept committed values,
+    # but do not relay their sequence claims or settle local progress from them.
+    mode = if legacy?, do: :full, else: mode
 
     log_verbose(state, fn ->
       "#{log_prefix_shard(state)} ekv_sync from #{from_node} (#{length(entries)} entries)"
@@ -2115,7 +2137,8 @@ defmodule EKV.Replica do
               origin_node,
               origin_seq,
               expires_at,
-              deleted_at
+              deleted_at,
+              replay_origin
             )
 
           if applied do
@@ -2139,10 +2162,10 @@ defmodule EKV.Replica do
 
     dispatch_events(state, Enum.reverse(sync_events))
 
-    progress = normalize_progress_summary(progress)
+    progress = if legacy?, do: %{}, else: normalize_progress_summary(progress)
 
     {state, replied?} =
-      if progress != %{} do
+      if terminal? do
         :ok = Store.merge_local_progress_summary(db, progress)
         state = replace_local_progress_summary(state, progress)
         ack_progress = progress_ack_summary(state, mode, progress)
@@ -2162,14 +2185,19 @@ defmodule EKV.Replica do
       if replied? do
         state = clear_sync_inflight(state, from_node)
 
-        if mode == :full do
-          maybe_request_repairs(state)
-        else
-          maybe_request_repair(
-            state,
-            from_node,
-            Map.get(state.remote_member_progress, from_node, %{})
-          )
+        cond do
+          legacy? ->
+            state
+
+          mode == :full ->
+            maybe_request_repairs(state)
+
+          true ->
+            maybe_request_repair(
+              state,
+              from_node,
+              Map.get(state.remote_member_progress, from_node, %{})
+            )
         end
       else
         state
@@ -2864,12 +2892,12 @@ defmodule EKV.Replica do
           state =
             state
             |> track_remote_shard(remote_node, remote_pid)
+            |> track_remote_features(remote_node, remote_features)
             |> track_member_node_id(remote_node, remote_node_id)
             |> persist_member_node_identity(remote_node, remote_node_id)
             |> remember_member_origin_seen(remote_node_id)
             |> replace_remote_member_progress(remote_node, remote_progress)
             |> reconcile_authoritative_origin_head(remote_node, remote_progress)
-            |> track_remote_features(remote_node, remote_features)
 
           if state.cluster_size do
             alive = alive_node_id_count(state)
@@ -2945,12 +2973,12 @@ defmodule EKV.Replica do
           state =
             state
             |> track_remote_shard(remote_node, remote_pid)
+            |> track_remote_features(remote_node, remote_features)
             |> track_member_node_id(remote_node, remote_node_id)
             |> persist_member_node_identity(remote_node, remote_node_id)
             |> remember_member_origin_seen(remote_node_id)
             |> replace_remote_member_progress(remote_node, remote_progress)
             |> reconcile_authoritative_origin_head(remote_node, remote_progress)
-            |> track_remote_features(remote_node, remote_features)
 
           if state.cluster_size do
             alive = alive_node_id_count(state)
@@ -3001,9 +3029,11 @@ defmodule EKV.Replica do
          origin_node,
          origin_seq,
          expires_at,
-         deleted_at
+         deleted_at,
+         replay_origin \\ nil
        ) do
     %{db: db, stmts: stmts} = state
+    replay_origin = replay_origin || origin_node
 
     case Store.write_entry(
            db,
@@ -3017,15 +3047,27 @@ defmodule EKV.Replica do
            expires_at,
            deleted_at,
            origin_seq,
-           false
+           false,
+           false,
+           replay_origin
          ) do
       {:ok, true, applied_origin_seq, local_progress_seq} ->
         {true,
-         track_applied_origin_progress(state, origin_node, applied_origin_seq, local_progress_seq)}
+         track_applied_origin_progress(
+           state,
+           replay_origin,
+           applied_origin_seq,
+           local_progress_seq
+         )}
 
       {:ok, false, applied_origin_seq, local_progress_seq} ->
         {false,
-         track_applied_origin_progress(state, origin_node, applied_origin_seq, local_progress_seq)}
+         track_applied_origin_progress(
+           state,
+           replay_origin,
+           applied_origin_seq,
+           local_progress_seq
+         )}
 
       {:ok, false} ->
         {false, state}
@@ -3041,7 +3083,8 @@ defmodule EKV.Replica do
          origin_node,
          origin_seq,
          expires_at,
-         deleted_at
+         deleted_at,
+         replay_origin
        ) do
     merge_remote_entry(
       state,
@@ -3051,7 +3094,8 @@ defmodule EKV.Replica do
       origin_node,
       origin_seq,
       expires_at,
-      deleted_at
+      deleted_at,
+      replay_origin
     )
   end
 
@@ -3064,7 +3108,8 @@ defmodule EKV.Replica do
          origin_node,
          origin_seq,
          expires_at,
-         deleted_at
+         deleted_at,
+         _replay_origin
        ) do
     case Store.write_snapshot_entry(
            state.db,
@@ -3251,6 +3296,9 @@ defmodule EKV.Replica do
     replay_bounds = Map.get(Store.replay_origin_bounds(db), origin_node)
 
     cond do
+      legacy_replay_peer?(state, remote_node) ->
+        send_full_sync(state, remote_node, :legacy_replay_origin)
+
       my_seq <= from_seq ->
         state = record_delta_sync_send(state, remote_node, 0)
         maybe_log_empty_terminal_delta_sync(state, remote_node, origin_node, from_seq, my_seq)
@@ -3420,6 +3468,30 @@ defmodule EKV.Replica do
          chunk_size,
          chunk_max_bytes
        ) do
+    if legacy_replay_peer?(state, remote_node) do
+      send_full_sync(state, remote_node, :legacy_replay_origin)
+    else
+      send_replay_chunk(
+        state,
+        remote_node,
+        origin_node,
+        last_seq,
+        my_seq,
+        chunk_size,
+        chunk_max_bytes
+      )
+    end
+  end
+
+  defp send_replay_chunk(
+         %Replica{} = state,
+         remote_node,
+         origin_node,
+         last_seq,
+         my_seq,
+         chunk_size,
+         chunk_max_bytes
+       ) do
     fetched = Store.replay_since_origin_chunk(state.db, origin_node, last_seq, chunk_size + 1)
 
     case fetched do
@@ -3448,9 +3520,10 @@ defmodule EKV.Replica do
 
         entries =
           replay_entries
-          |> Enum.map(fn {key, value, timestamp, replay_origin, origin_seq, expires_at, is_delete} ->
+          |> Enum.map(fn {key, value, timestamp, _replay_origin, origin_seq, expires_at,
+                          is_delete, value_origin} ->
             deleted_at = if is_delete, do: timestamp, else: nil
-            {key, value, timestamp, replay_origin, origin_seq, expires_at, deleted_at}
+            {key, value, timestamp, value_origin, origin_seq, expires_at, deleted_at}
           end)
 
         final? = not stopped_early?
@@ -3497,7 +3570,7 @@ defmodule EKV.Replica do
             send_to_member(
               state,
               remote_node,
-              {:ekv_sync, node(), state.shard_index, :delta, entries, progress}
+              {:ekv_sync, node(), state.shard_index, {:delta, origin_node}, entries, progress}
             )
 
             if final? do
@@ -3545,9 +3618,11 @@ defmodule EKV.Replica do
   end
 
   defp replay_sync_entry_bytes(
-         {key, value_binary, _timestamp, origin_node, _origin_seq, _expires_at, _is_delete}
+         {key, value_binary, _timestamp, origin_node, _origin_seq, _expires_at, _is_delete,
+          value_origin}
        ) do
-    byte_size(key) + value_wire_bytes(value_binary) + origin_node_wire_bytes(origin_node) + 96
+    byte_size(key) + value_wire_bytes(value_binary) + origin_node_wire_bytes(origin_node) +
+      origin_node_wire_bytes(value_origin) + 96
   end
 
   defp value_wire_bytes(value) when is_binary(value), do: byte_size(value)
@@ -3741,6 +3816,11 @@ defmodule EKV.Replica do
   defp touch_sync_inflight(%Replica{} = state, _remote_node), do: state
 
   defp request_sync(%Replica{} = state, remote_node, request) do
+    request =
+      if legacy_replay_peer?(state, remote_node),
+        do: {:full, :legacy_replay_origin},
+        else: request
+
     state = expire_stale_sync_inflight(state, remote_node)
     state = expire_stale_delta_origin_inflight(state, remote_node, request)
 
@@ -3783,7 +3863,11 @@ defmodule EKV.Replica do
 
   defp maybe_request_repair(%Replica{} = state, remote_node, remote_progress, opts \\ []) do
     {state, request} =
-      sync_request_for_remote(state, remote_node, normalize_progress_summary(remote_progress))
+      if legacy_replay_peer?(state, remote_node) do
+        {state, {:full, :legacy_replay_origin}}
+      else
+        sync_request_for_remote(state, remote_node, normalize_progress_summary(remote_progress))
+      end
 
     preserve_inflight? = Keyword.get(opts, :preserve_inflight?, false)
 
@@ -4326,7 +4410,7 @@ defmodule EKV.Replica do
 
   defp replace_remote_member_progress(%Replica{} = state, remote_node, remote_progress)
        when is_map(remote_progress) do
-    remote_progress = normalize_progress_summary(remote_progress)
+    remote_progress = trusted_remote_progress(state, remote_node, remote_progress)
 
     :ok =
       Store.replace_peer_progress(state.db, remote_member_id(state, remote_node), remote_progress)
@@ -4343,7 +4427,7 @@ defmodule EKV.Replica do
 
   defp merge_remote_member_progress(%Replica{} = state, remote_node, remote_progress)
        when is_map(remote_progress) do
-    remote_progress = normalize_progress_summary(remote_progress)
+    remote_progress = trusted_remote_progress(state, remote_node, remote_progress)
 
     merged =
       state.remote_member_progress
@@ -5378,11 +5462,16 @@ defmodule EKV.Replica do
     for {target_node, _pid} <- state.remote_shards do
       entry_tuple = commit_payload_for_member(state, target_node, op)
 
+      peer_seq =
+        if legacy_replay_peer?(state, target_node),
+          do: compatible_commit_seq(state, op.entry_tuple, origin_seq),
+          else: origin_seq
+
       send_to_member(
         state,
         target_node,
         {:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple, state.shard_index,
-         local_origin_id(state), origin_seq}
+         local_origin_id(state), peer_seq}
       )
     end
   end
@@ -5393,7 +5482,13 @@ defmodule EKV.Replica do
          origin_seq
        ) do
     {:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple, state.shard_index,
-     local_origin_id(state), origin_seq}
+     local_origin_id(state), compatible_commit_seq(state, entry_tuple, origin_seq)}
+  end
+
+  # Observer RPC replies have no negotiated capabilities. Zero is the existing
+  # "no replay position" sentinel; mesh sync will settle the actual stream head.
+  defp compatible_commit_seq(state, {_key, _value, _ts, origin, _exp, _deleted}, seq) do
+    if normalize_origin_node(origin) == local_origin_id(state), do: seq, else: 0
   end
 
   defp wire_encode_message(
@@ -5457,6 +5552,15 @@ defmodule EKV.Replica do
     {:ekv, @wire_protocol_version, :member_connect_ack,
      {pid, shard, num_shards, remote_progress, remote_node_id},
      %{features: wire_features_meta(state)}}
+  end
+
+  defp wire_encode_message(
+         %Replica{} = _state,
+         _target_node,
+         {:ekv_sync, from_node, shard, {:delta, replay_origin}, entries, progress}
+       ) do
+    {:ekv, @wire_protocol_version, :sync, {from_node, shard, :delta, entries, progress},
+     %{replay_origin: replay_origin}}
   end
 
   defp wire_encode_message(
@@ -5589,6 +5693,13 @@ defmodule EKV.Replica do
       normalize_wire_features(meta)}}
   end
 
+  defp decode_wire_message(:sync, {from_node, shard, :delta, entries, progress}, %{
+         replay_origin: replay_origin
+       })
+       when is_binary(replay_origin) do
+    {:ok, {:ekv_sync, from_node, shard, {:delta, replay_origin}, entries, progress}}
+  end
+
   defp decode_wire_message(:sync, {from_node, shard, mode, entries, progress}, _meta) do
     {:ok, {:ekv_sync, from_node, shard, mode, entries, progress}}
   end
@@ -5717,9 +5828,21 @@ defmodule EKV.Replica do
     end
   end
 
+  defp legacy_replay_peer?(%Replica{} = state, remote_node) do
+    remote_node != node() and
+      not remote_supports_feature?(state, remote_node, @wire_feature_replay_origin)
+  end
+
+  defp trusted_remote_progress(state, remote_node, progress) do
+    if legacy_replay_peer?(state, remote_node),
+      do: %{},
+      else: normalize_progress_summary(progress)
+  end
+
   defp wire_features_meta(%Replica{} = state) do
     %{
       @wire_feature_live_progress => true,
+      @wire_feature_replay_origin => true,
       @wire_feature_compression => true,
       @wire_feature_observer => not state.cas_voter?
     }
@@ -6073,9 +6196,9 @@ defmodule EKV.Replica do
            ballot_c,
            ballot_n
          ) do
-      {:ok, _value_binary, _ts, origin, _expires, _deleted_at, _prev_value_binary, origin_seq,
+      {:ok, _value_binary, _ts, _origin, _expires, _deleted_at, _prev_value_binary, origin_seq,
        local_progress_seq} ->
-        origin = normalize_origin_node(origin)
+        origin = local_origin_id(state)
 
         state =
           state
@@ -6238,6 +6361,7 @@ defmodule EKV.Replica do
 
   defp reconcile_authoritative_origin_head(%Replica{} = state, remote_node, remote_progress)
        when is_atom(remote_node) and is_map(remote_progress) do
+    remote_progress = trusted_remote_progress(state, remote_node, remote_progress)
     local_progress = normalize_progress_summary(state.local_progress)
     remote_origin = remote_origin_id(state, remote_node, remote_progress)
     remote_head = Map.get(remote_progress, remote_origin)
@@ -6605,6 +6729,7 @@ defmodule EKV.Replica do
 
   defp apply_cas_commit(%Replica{} = state, key, ballot_c, ballot_n, entry_tuple, origin_seq) do
     %{db: db, stmts: stmts} = state
+    replay_origin = normalize_origin_node(ballot_n)
 
     case Store.paxos_promote(
            db,
@@ -6616,10 +6741,11 @@ defmodule EKV.Replica do
            ballot_n,
            origin_seq
          ) do
-      {:ok, value_binary, _ts, origin, _expires, deleted_at, prev_value_binary, promoted_seq,
+      {:ok, value_binary, _ts, _origin, _expires, deleted_at, prev_value_binary, promoted_seq,
        local_progress_seq} ->
-        origin = normalize_origin_node(origin)
-        state = track_applied_origin_progress(state, origin, promoted_seq, local_progress_seq)
+        state =
+          track_applied_origin_progress(state, replay_origin, promoted_seq, local_progress_seq)
+
         dispatch_promote_event(state, key, value_binary, deleted_at, prev_value_binary)
         {state, true}
 
@@ -6642,14 +6768,12 @@ defmodule EKV.Replica do
                      ballot_n,
                      origin_seq
                    ) do
-                {:ok, promoted_value, _ts, origin, _expires, promoted_deleted, prev_value_binary,
+                {:ok, promoted_value, _ts, _origin, _expires, promoted_deleted, prev_value_binary,
                  promoted_seq, local_progress_seq} ->
-                  origin = normalize_origin_node(origin)
-
                   state =
                     track_applied_origin_progress(
                       state,
-                      origin,
+                      replay_origin,
                       promoted_seq,
                       local_progress_seq
                     )
