@@ -34,6 +34,21 @@ checks must also pass; a linearizable but unexercised workload is not a pass.
 - Host power loss or physical network faults. Crash modes abruptly halt a BEAM
   VM without shutdown callbacks; the OS and its page cache remain alive.
 
+## CI
+
+The `ci` GitHub Actions workflow runs the full ExUnit suite (including
+distributed, stress, and pure-Elixir linearizability tests) on OTP 26, 27, and
+28 with Elixir 1.19. It also runs all ten named Jepsen scenarios in separate
+jobs on OTP 28, Elixir 1.19, and Java 21, for pull requests and pushes to `main`.
+
+Jepsen uses seed `1` by default. Use **Run workflow** with a different `seed`
+to repeat the matrix. Each scenario has a 20-minute step timeout within a
+30-minute job, leaving time to upload histories, checker diagnostics, and
+`ci.log` as artifacts retained for 14 days. Only `valid? = true` passes;
+violations, inconclusive results, generator failures, and timeouts fail CI.
+The workflow calls each scenario directly rather than relying on the
+aggregate reporting scripts' exit status.
+
 ## Run
 
 From this directory:
