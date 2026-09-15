@@ -16,6 +16,9 @@ end
 
 EKV uses sqlite as the storage layer. Precompiled NIF binaries are available for common platforms. If a precompiled binary isn't available for your system, it will compile from source (requires a C compiler).
 
+For development, see [Checking the C NIF](C_TESTING.md) for strict compiler
+warnings, static analysis, and Linux ASan/UBSan tests.
+
 ## Usage
 
 Add EKV to your supervision tree:
