@@ -77,6 +77,7 @@ defmodule EKV.MixProject do
     [
       {:elixir_make, "~> 0.9", runtime: false},
       {:cc_precompiler, "~> 0.1", runtime: false},
+      {:stream_data, "~> 1.2", only: :test},
       {:ex_doc, "~> 0.38", only: :docs}
     ]
   end
