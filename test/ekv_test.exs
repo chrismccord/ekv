@@ -5300,11 +5300,60 @@ defmodule EKVTest do
       state = :sys.get_state(shard_name)
       tombstone_cutoff = System.system_time(:nanosecond) - :timer.hours(24 * 7) * 1_000_000
 
-      entries = EKV.Store.full_state_chunk(state.db, tombstone_cutoff, nil, 10)
+      {entries, false} =
+        EKV.Store.full_state_chunk(state.db, tombstone_cutoff, nil, 10, 256 * 1024)
+
       keys = Enum.map(entries, fn {k, _, _, _, _, _, _} -> k end)
 
       assert "chunk/live" in keys
       refute "chunk/expired" in keys
+    end
+
+    test "sync queries enforce the byte budget before returning rows", %{
+      shard_name: shard_name,
+      name: name
+    } do
+      value = String.duplicate("x", 64 * 1024)
+
+      for key <- ["a", "b", "c"] do
+        :ok = EKV.put(name, key, value)
+      end
+
+      state = :sys.get_state(shard_name)
+      origin = local_origin_id(state)
+      entry_bytes = 1 + byte_size(:erlang.term_to_binary(value)) + byte_size(origin) + 96
+
+      queries = [
+        {fn cursor, budget ->
+           EKV.Store.full_state_chunk(state.db, 0, cursor, 100, budget)
+         end, nil, &elem(&1, 0)},
+        {fn cursor, budget ->
+           EKV.Store.replay_since_origin_chunk(state.db, origin, cursor, 100, budget)
+         end, 0, &elem(&1, 4)}
+      ]
+
+      for {fetch, start_cursor, cursor_for} <- queries do
+        # Two entries fit exactly; the query must not return the discarded suffix.
+        assert {[first, second], true} = fetch.(start_cursor, entry_bytes * 2)
+        assert elem(first, 0) == "a"
+        assert elem(second, 0) == "b"
+        assert {[third], false} = fetch.(cursor_for.(second), entry_bytes * 2)
+        assert elem(third, 0) == "c"
+        assert {[], false} = fetch.(cursor_for.(third), entry_bytes * 2)
+
+        # An oversized entry still makes progress, including at the end of the stream.
+        assert {[^first], true} = fetch.(start_cursor, 1)
+        assert {[^third], false} = fetch.(cursor_for.(second), 1)
+      end
+
+      # The NIF must stop stepping after lookahead, not fetch everything and trim.
+      # Evaluating the third row would raise SQLite's integer overflow error.
+      sql = """
+      SELECT CASE column1 WHEN 3 THEN abs(-9223372036854775808) ELSE 'payload' END
+      FROM (VALUES (1), (2), (3))
+      """
+
+      assert {:ok, [["payload"]], true} = EKV.Sqlite3.fetch_chunk(state.db, sql, [], 1)
     end
 
     test "oplog_since_chunk paginates through oplog entries", %{
@@ -6048,7 +6097,8 @@ defmodule EKVTest do
   # =====================================================================
 
   defp collect_full_chunks(db, tombstone_cutoff, last_key, limit, acc, chunk_count) do
-    entries = EKV.Store.full_state_chunk(db, tombstone_cutoff, last_key, limit)
+    {entries, false} =
+      EKV.Store.full_state_chunk(db, tombstone_cutoff, last_key, limit, 256 * 1024)
 
     case entries do
       [] ->

@@ -857,20 +857,23 @@ defmodule EKV.Store do
   ORDER BY o.origin_seq LIMIT ?4
   """
 
-  def replay_since_origin_chunk(db, origin_node, origin_seq, limit) do
+  def replay_since_origin_chunk(db, origin_node, origin_seq, limit, max_bytes) do
     now = System.system_time(:nanosecond)
 
-    {:ok, rows} =
-      EKV.Sqlite3.fetch_all(db, @replay_since_origin_chunk_sql, [
-        persisted_member_id(origin_node),
-        origin_seq,
-        now,
-        limit
-      ])
+    {:ok, rows, byte_limited?} =
+      EKV.Sqlite3.fetch_chunk(
+        db,
+        @replay_since_origin_chunk_sql,
+        [persisted_member_id(origin_node), origin_seq, now, limit],
+        max_bytes
+      )
 
-    Enum.map(rows, fn [key, value, timestamp, origin_node, replay_seq, expires_at, is_delete] ->
-      {key, value, timestamp, origin_node, replay_seq, expires_at, is_delete == 1}
-    end)
+    entries =
+      Enum.map(rows, fn [key, value, timestamp, origin_node, replay_seq, expires_at, is_delete] ->
+        {key, value, timestamp, origin_node, replay_seq, expires_at, is_delete == 1}
+      end)
+
+    {entries, byte_limited?}
   end
 
   defp encode_progress_entries(progress_map) do
@@ -1195,23 +1198,35 @@ defmodule EKV.Store do
   @doc """
   Get a chunk of live entries for full sync, ordered by key with cursor pagination.
   Pass `nil` as `last_key` for the first chunk.
+  Returns `{entries, byte_limited?}`; the flag indicates rows were omitted by the
+  byte budget rather than the SQL row limit. One oversized entry is always allowed.
   """
-  def full_state_chunk(db, tombstone_cutoff, nil, limit) do
+  def full_state_chunk(db, tombstone_cutoff, nil, limit, max_bytes) do
     now = System.system_time(:nanosecond)
 
-    {:ok, rows} =
-      EKV.Sqlite3.fetch_all(db, @full_state_first_chunk_sql, [tombstone_cutoff, now, limit])
+    {:ok, rows, byte_limited?} =
+      EKV.Sqlite3.fetch_chunk(
+        db,
+        @full_state_first_chunk_sql,
+        [tombstone_cutoff, now, limit],
+        max_bytes
+      )
 
-    map_full_state_rows(rows)
+    {map_full_state_rows(rows), byte_limited?}
   end
 
-  def full_state_chunk(db, tombstone_cutoff, last_key, limit) do
+  def full_state_chunk(db, tombstone_cutoff, last_key, limit, max_bytes) do
     now = System.system_time(:nanosecond)
 
-    {:ok, rows} =
-      EKV.Sqlite3.fetch_all(db, @full_state_chunk_sql, [tombstone_cutoff, last_key, now, limit])
+    {:ok, rows, byte_limited?} =
+      EKV.Sqlite3.fetch_chunk(
+        db,
+        @full_state_chunk_sql,
+        [tombstone_cutoff, last_key, now, limit],
+        max_bytes
+      )
 
-    map_full_state_rows(rows)
+    {map_full_state_rows(rows), byte_limited?}
   end
 
   defp map_full_state_rows(rows) do

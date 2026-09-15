@@ -79,6 +79,7 @@ defmodule EKV.Sqlite3NIF do
 
   def ekv_read_entry(_db, _stmt, _args), do: :erlang.nif_error(:not_loaded)
   def ekv_fetch_all(_db, _sql, _args), do: :erlang.nif_error(:not_loaded)
+  def ekv_fetch_chunk(_db, _sql, _args, _max_bytes), do: :erlang.nif_error(:not_loaded)
   def ekv_backup(_source_path, _dest_path), do: :erlang.nif_error(:not_loaded)
   def ekv_merge_local_progress_summary(_db, _entries), do: :erlang.nif_error(:not_loaded)
   def ekv_replace_local_progress_summary(_db, _entries), do: :erlang.nif_error(:not_loaded)
