@@ -79,6 +79,19 @@ defmodule EKVTest do
                EKV.Transport.rpc(dist, node(), :erlang, :abs, [-1], timeout: 1_000)
     end
 
+    test "dist adapter returns transport errors but preserves application errors" do
+      {:ok, dist} = EKV.Transport.init(EKV.Transport.default_config())
+
+      assert {:error, :timeout} =
+               EKV.Transport.rpc(dist, node(), :timer, :sleep, [100], timeout: 1)
+
+      assert {:error, :noconnection} =
+               EKV.Transport.rpc(dist, :ekv_missing@localhost, :erlang, :node, [], timeout: 1_000)
+
+      assert {:exception, :boom, _stack} =
+               catch_error(EKV.Transport.rpc(dist, node(), :erlang, :error, [:boom], []))
+    end
+
     test "replica member traffic uses configured transport" do
       owner = self()
       name = :"ekv_transport_#{System.unique_integer([:positive])}"
