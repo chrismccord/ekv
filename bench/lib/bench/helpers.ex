@@ -79,8 +79,81 @@ defmodule Bench.Helpers do
     ops = if wall_us > 0, do: trunc(count / (wall_us / 1_000_000)), else: 0
 
     IO.puts("  #{label}")
-    IO.puts("    total   : #{format_number(count)} ops in #{format_number(trunc(wall_us / 1000))} ms")
+
+    IO.puts(
+      "    total   : #{format_number(count)} ops in #{format_number(trunc(wall_us / 1000))} ms"
+    )
+
     IO.puts("    ops/sec : #{format_number(ops)}")
+  end
+
+  # Match the summary returned by Bench.Replica.run_parallel_cas_batch/4.
+  # Only acknowledged successes contribute to successful throughput.
+  def summarize_results(results) do
+    Enum.reduce(results, %{attempted: 0, ok: 0, errors: %{}}, fn result, acc ->
+      acc = %{acc | attempted: acc.attempted + 1}
+
+      case result do
+        {:ok, _value_or_vsn} ->
+          %{acc | ok: acc.ok + 1}
+
+        {:ok, _value, _vsn} ->
+          %{acc | ok: acc.ok + 1}
+
+        {:error, reason} ->
+          %{acc | errors: Map.update(acc.errors, reason, 1, &(&1 + 1))}
+
+        other ->
+          raise "unexpected benchmark result: #{inspect(other)}"
+      end
+    end)
+  end
+
+  def report_operation_throughput(label, summary, wall_us) do
+    report_throughput("#{label} (successful)", summary.ok, wall_us)
+    report_throughput("#{label} (attempted)", summary.attempted, wall_us)
+    print_error_counts(summary.errors)
+  end
+
+  def print_error_counts(error_counts, label_prefix \\ "    errors") do
+    error_counts
+    |> Enum.sort_by(fn {reason, _count} -> inspect(reason) end)
+    |> Enum.each(fn {reason, count} ->
+      IO.puts("#{label_prefix}[#{inspect(reason)}] : #{count}")
+    end)
+  end
+
+  # This is a post-workload sanity bound, not a linearizability checker.
+  # Every acknowledged increment must exist; each ambiguous attempt may add one.
+  def validate_counter!(value, %{ok: successes, errors: errors}) do
+    ambiguous =
+      Enum.reduce(errors, 0, fn
+        {reason, count}, acc when reason in [:unconfirmed, :unavailable] ->
+          acc + count
+
+        {reason, _count}, acc
+        when reason in [
+               :conflict,
+               :no_quorum,
+               :quorum_timeout,
+               :cluster_overflow,
+               :shutting_down,
+               :cas_not_configured
+             ] ->
+          acc
+
+        {reason, _count}, _acc ->
+          raise "cannot validate counter after #{inspect(reason)}"
+      end)
+
+    count = if is_nil(value), do: 0, else: value
+
+    unless is_integer(count) and count >= successes and count <= successes + ambiguous do
+      raise "counter #{inspect(value)} is outside acknowledged/ambiguous bounds " <>
+              "#{successes}..#{successes + ambiguous}"
+    end
+
+    :ok
   end
 
   def report_sync(label, wall_us) do
@@ -94,7 +167,9 @@ defmodule Bench.Helpers do
 
   def with_ekv(opts, fun) do
     name = Keyword.get(opts, :name, @name)
-    data_dir = Keyword.get(opts, :data_dir, "/tmp/ekv_bench_#{name}_#{System.unique_integer([:positive])}")
+
+    data_dir =
+      Keyword.get(opts, :data_dir, "/tmp/ekv_bench_#{name}_#{System.unique_integer([:positive])}")
 
     all_opts =
       Keyword.merge(

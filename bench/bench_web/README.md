@@ -20,6 +20,14 @@ Defaults are tuned for faster feedback on scenarios `4..9`.
 `EKV.get(..., consistent: true)` in these scenarios is the barrier/linearizable
 path (accept+commit), so quorum read latency reflects full consensus cost.
 
+Throughput scenarios `4`, `5`, and `7` report separate successful and attempted
+rates over the same workload interval. Only acknowledged successes count toward
+successful throughput; conflicts, unconfirmed writes, and other errors remain
+separate error counts. Reporting and the hot-key scenario's final consistent read
+are outside that interval. The final counter must be between the acknowledged
+increment count and that count plus ambiguous attempts. This is a sanity check,
+not a replacement for history-based correctness checking.
+
 ## Fly deployment (`ekv-bench`)
 
 This app is built from the monorepo root because it depends on local path deps:

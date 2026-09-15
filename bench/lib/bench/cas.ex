@@ -273,15 +273,9 @@ defmodule Bench.CAS do
           |> Enum.map(& &1.errors)
           |> Enum.reduce(%{}, &merge_error_counts/2)
 
-        if map_size(error_counts) > 0 do
-          IO.puts("    successes : #{format_number(succeeded)}")
-          IO.puts("    failures  : #{format_number(attempted - succeeded)}")
-          print_error_counts(error_counts)
-        end
-
-        report_throughput(
+        report_operation_throughput(
           "CAS updates from #{workers_per_node} workers/node across #{requester_count} request nodes",
-          succeeded,
+          %{attempted: attempted, ok: succeeded, errors: error_counts},
           wall_us
         )
       end
@@ -310,42 +304,30 @@ defmodule Bench.CAS do
 
         key = "counter/#{ctx.run_id}/#{n}"
 
-        {wall_us, _} =
+        {wall_us, results} =
           time_us(fn ->
-            all =
-              ctx.request_nodes
-              |> Enum.with_index(1)
-              |> Enum.map(fn {node, ix} ->
-                ops_for_node = per_node + if(ix <= remainder, do: 1, else: 0)
+            ctx.request_nodes
+            |> Enum.with_index(1)
+            |> Enum.map(fn {node, ix} ->
+              ops_for_node = per_node + if(ix <= remainder, do: 1, else: 0)
 
-                Task.async(fn ->
-                  for _ <- 1..ops_for_node do
-                    rpc(node, Bench.Replica, :cas_update, [
-                      @name,
-                      key,
-                      &Bench.Replica.cas_increment/1
-                    ])
-                  end
-                end)
+              Task.async(fn ->
+                for _ <- 1..ops_for_node do
+                  rpc(node, Bench.Replica, :cas_update, [
+                    @name,
+                    key,
+                    &Bench.Replica.cas_increment/1
+                  ])
+                end
               end)
-              |> Enum.flat_map(&Task.await(&1, 120_000))
-
-            successes = Enum.count(all, &match?({:ok, _, _}, &1))
-            error_counts = count_errors(all)
-            conflicts = Map.get(error_counts, :conflict, 0)
-            unconfirmed = Map.get(error_counts, :unconfirmed, 0)
-
-            IO.puts("    successes : #{successes}")
-            IO.puts("    conflicts : #{conflicts} (retries exhausted)")
-
-            if unconfirmed > 0,
-              do: IO.puts("    unconfirmed : #{unconfirmed} (accept outcome ambiguous)")
-
-            print_error_counts(Map.drop(error_counts, [:conflict, :unconfirmed]))
+            end)
+            |> Enum.flat_map(&Task.await(&1, 120_000))
           end)
 
+        summary = summarize_results(results)
         final_val = rpc(r1(ctx), Bench.Replica, :consistent_get, [@name, key])
-        report_throughput("contested counter increments", n, wall_us)
+        validate_counter!(final_val, summary)
+        report_operation_throughput("contested counter increments", summary, wall_us)
         IO.puts("    final value (consistent read) : #{inspect(final_val)}")
       end
     end)
@@ -454,7 +436,7 @@ defmodule Bench.CAS do
       for {read_pct, label} <- [{90, "90% reads / 10% writes"}, {50, "50% reads / 50% writes"}] do
         subheader(label)
 
-        {wall_us, _} =
+        {wall_us, results} =
           time_us(fn ->
             tasks =
               for node <- ctx.request_nodes, worker_ix <- 1..workers_per_node do
@@ -475,23 +457,14 @@ defmodule Bench.CAS do
                 end)
               end
 
-            results = Enum.flat_map(tasks, &Task.await(&1, 120_000))
-            error_counts = count_errors(results)
-            conflicts = Map.get(error_counts, :conflict, 0)
-            unconfirmed = Map.get(error_counts, :unconfirmed, 0)
-
-            if conflicts > 0 do
-              IO.puts("    conflicts : #{conflicts}")
-            end
-
-            if unconfirmed > 0 do
-              IO.puts("    unconfirmed : #{unconfirmed}")
-            end
-
-            print_error_counts(Map.drop(error_counts, [:conflict, :unconfirmed]))
+            Enum.flat_map(tasks, &Task.await(&1, 120_000))
           end)
 
-        report_throughput("#{format_number(ops)} ops across #{workers} workers", ops, wall_us)
+        report_operation_throughput(
+          "#{format_number(ops)} ops across #{workers} workers",
+          summarize_results(results),
+          wall_us
+        )
       end
     end)
   end
@@ -678,27 +651,11 @@ defmodule Bench.CAS do
     {Enum.sort(samples), error_counts}
   end
 
-  defp count_errors(results) do
-    Enum.reduce(results, %{}, fn result, acc ->
-      accumulate_error(acc, result)
-    end)
-  end
-
   defp accumulate_error(error_counts, {:error, reason}) do
     Map.update(error_counts, reason, 1, &(&1 + 1))
   end
 
   defp accumulate_error(error_counts, _result), do: error_counts
-
-  defp print_error_counts(error_counts, label_prefix \\ "    errors") do
-    if map_size(error_counts) > 0 do
-      error_counts
-      |> Enum.sort_by(fn {reason, _count} -> inspect(reason) end)
-      |> Enum.each(fn {reason, count} ->
-        IO.puts("#{label_prefix}[#{inspect(reason)}] : #{count}")
-      end)
-    end
-  end
 
   defp run_parallel_cas(node, workers, total_ops, prefix) do
     rpc(node, Bench.Replica, :run_parallel_cas_batch, [@name, workers, total_ops, prefix])
