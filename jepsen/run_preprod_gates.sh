@@ -24,6 +24,9 @@ SCENARIOS=(
   register-3n-partition-flap
   lock-3n-partition-restart
   lock-5n-partition-restart
+  register-3n-crash-one
+  lock-3n-partition-crash
+  lock-5n-partition-crash
 )
 
 mkdir -p results results/preprod_logs

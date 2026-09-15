@@ -3,8 +3,9 @@
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.java.shell :as sh]
+            [ekv.checks :as checks]
             [jepsen.checker :as checker]
-            [knossos.model :as model]))
+            [clj-time.core :as time]))
 
 (def default-history-path "results/history.edn")
 (def default-workers 4)
@@ -21,7 +22,7 @@
   (println (str "  workers:      " default-workers))
   (println (str "  ops:          " default-ops))
   (println (str "  cluster_nodes:" default-cluster-nodes))
-  (println (str "  mode:         " default-mode " (none|partition_flap|restart_one|partition_restart)"))
+  (println (str "  mode:         " default-mode " (none|partition_flap|restart_one|partition_restart|crash_one|partition_crash)"))
   (println (str "  profile:      " default-profile " (register|lock)"))
   (println (str "  seed:         " default-seed)))
 
@@ -54,10 +55,17 @@
     (edn/read r)))
 
 (defn check-linearizable [history cluster-nodes mode profile]
-  (let [lin  (checker/linearizable {:model (model/cas-register)})
+  (let [lin  (checker/linearizable {:model (checks/->StrictRegister nil)})
         test {:name (str "ekv-local-" cluster-nodes "n-" mode "-" profile)
-              :start-time 0}]
-    (checker/check lin test history {})))
+              :start-time (time/now)}
+        linearizable (checker/check lin test (checks/client-history history) {})
+        coverage (checks/coverage history cluster-nodes mode profile)
+        versions (if (= profile "lock") (checks/versions history) {:valid? true})]
+    {:valid? (cond
+               (some #(false? (:valid? %)) [linearizable coverage versions]) false
+               (every? #(true? (:valid? %)) [linearizable coverage versions]) true
+               :else :unknown)
+     :linearizable linearizable :coverage coverage :versions versions}))
 
 (defn -main [& args]
   (if (some #{"-h" "--help"} args)
@@ -81,6 +89,7 @@
         (println (str "  profile:      " profile))
         (println (str "  seed:         " seed))
         (println (str "  operations:   " (count history)))
+        (println (str "  coverage:     " (pr-str (:coverage result))))
         (println (str "  valid?:       " valid?))
         (when-not valid?
           (println "  details:")
