@@ -77,6 +77,11 @@ defmodule EKV.LinearizabilityPureElixirTest do
     on_exit(fn -> cleanup_data(peers, ekv_name) end)
     Process.sleep(300)
 
+    # Recovery must preserve the value's VSN even when member replay counters differ.
+    for {node, index} <- Enum.with_index(nodes, 1), n <- 1..index do
+      :ok = TestCluster.rpc!(node, EKV, :put, [ekv_name, "lin/unrelated/#{index}/#{n}", n])
+    end
+
     seeds = configured_seeds()
 
     results =

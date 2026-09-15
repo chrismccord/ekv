@@ -1118,11 +1118,13 @@ static ERL_NIF_TERM ekv_write_entry(ErlNifEnv *env, int argc, const ERL_NIF_TERM
     }
 
     ERL_NIF_TERM kv_origin_term;
+    ERL_NIF_TERM replay_origin_term;
     ERL_NIF_TERM kv_origin_seq_term;
     ERL_NIF_TERM key_term;
     if (!list_nth_term(env, argv[4], 0, &key_term) ||
         !list_nth_term(env, argv[4], 3, &kv_origin_term) ||
-        !list_nth_term(env, argv[4], 4, &kv_origin_seq_term)) {
+        !list_nth_term(env, argv[5], 3, &replay_origin_term) ||
+        !list_nth_term(env, argv[5], 4, &kv_origin_seq_term)) {
         enif_mutex_unlock(conn->mutex);
         return enif_make_badarg(env);
     }
@@ -1134,7 +1136,7 @@ static ERL_NIF_TERM ekv_write_entry(ErlNifEnv *env, int argc, const ERL_NIF_TERM
     }
 
     ErlNifBinary origin_bin;
-    if (!enif_inspect_iolist_as_binary(env, kv_origin_term, &origin_bin)) {
+    if (!enif_inspect_iolist_as_binary(env, replay_origin_term, &origin_bin)) {
         enif_mutex_unlock(conn->mutex);
         return enif_make_badarg(env);
     }
@@ -1223,7 +1225,10 @@ static ERL_NIF_TERM ekv_write_entry(ErlNifEnv *env, int argc, const ERL_NIF_TERM
         return (br == -1) ? enif_make_badarg(env)
                           : make_sqlite_error(env, conn->db);
     }
-    sqlite3_bind_int64(kv_s->stmt, 5, origin_seq);
+    /* Full snapshots must not attribute a foreign stream's sequence to the
+     * value origin stored in kv. Zero means no known position for that origin. */
+    sqlite3_bind_int64(kv_s->stmt, 5,
+        enif_is_identical(kv_origin_term, replay_origin_term) ? origin_seq : 0);
 
     rc = sqlite3_step(kv_s->stmt);
     if (rc != SQLITE_DONE) {
@@ -3187,6 +3192,8 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
     int has_origin = sqlite3_column_type(sel, 4) != SQLITE_NULL;
     int origin_len = has_origin ? sqlite3_column_bytes(sel, 4) : 0;
     const char *origin_data = has_origin ? (const char *)sqlite3_column_text(sel, 4) : NULL;
+    int same_origin = has_origin && (size_t)origin_len == ballot_n_bin.size &&
+        memcmp(origin_data, ballot_n_bin.data, ballot_n_bin.size) == 0;
 
     int has_expires = sqlite3_column_type(sel, 5) != SQLITE_NULL;
     ErlNifSInt64 expires_at = 0;
@@ -3254,7 +3261,7 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
         sqlite3_bind_text(kv_s->stmt, 4, origin_copy, origin_len, SQLITE_TRANSIENT);
     else
         sqlite3_bind_null(kv_s->stmt, 4);
-    sqlite3_bind_int64(kv_s->stmt, 5, origin_seq);
+    sqlite3_bind_int64(kv_s->stmt, 5, same_origin ? origin_seq : 0);
     if (has_expires)
         sqlite3_bind_int64(kv_s->stmt, 6, expires_at);
     else
@@ -3297,7 +3304,7 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
     }
     sqlite3_reset(keyref_s->stmt);
 
-    /* 7. Bind + step oplog_insert: [key, value, ts, origin, origin_seq, expires, is_delete] */
+    /* 7. Bind + step oplog_insert, keeping replay and value origins separate. */
     sqlite3_reset(oplog_s->stmt);
     sqlite3_clear_bindings(oplog_s->stmt);
     sqlite3_bind_text(oplog_s->stmt, 1, (const char *)key_bin.data, (int)key_bin.size, SQLITE_TRANSIENT);
@@ -3306,16 +3313,17 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
     else
         sqlite3_bind_null(oplog_s->stmt, 2);
     sqlite3_bind_int64(oplog_s->stmt, 3, timestamp);
-    if (has_origin)
-        sqlite3_bind_text(oplog_s->stmt, 4, origin_copy, origin_len, SQLITE_TRANSIENT);
-    else
-        sqlite3_bind_null(oplog_s->stmt, 4);
+    /* The proposer owns the replay stream, even when recovering another
+     * member's value. Keep the original value-version origin separately. */
+    sqlite3_bind_text(oplog_s->stmt, 4, ballot_n_str, (int)ballot_n_bin.size, SQLITE_TRANSIENT);
     sqlite3_bind_int64(oplog_s->stmt, 5, origin_seq);
     if (has_expires)
         sqlite3_bind_int64(oplog_s->stmt, 6, expires_at);
     else
         sqlite3_bind_null(oplog_s->stmt, 6);
     sqlite3_bind_int64(oplog_s->stmt, 7, has_deleted ? 1 : 0);  /* is_delete */
+    if (!same_origin && has_origin)
+        sqlite3_bind_text(oplog_s->stmt, 8, origin_copy, origin_len, SQLITE_TRANSIENT);
 
     rc = sqlite3_step(oplog_s->stmt);
     if (rc != SQLITE_DONE) {
@@ -3333,16 +3341,16 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
     if (!origin_seq_provided) {
         rc = write_local_origin_progress(
             conn,
-            origin_copy,
-            origin_len,
+            ballot_n_str,
+            (int)ballot_n_bin.size,
             origin_seq
         );
         local_progress_seq = origin_seq;
     } else {
         rc = advance_local_origin_progress(
             conn,
-            origin_copy,
-            origin_len,
+            ballot_n_str,
+            (int)ballot_n_bin.size,
             origin_seq,
             &local_progress_seq
         );

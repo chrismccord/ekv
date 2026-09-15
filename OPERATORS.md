@@ -575,9 +575,29 @@ but more file descriptors and slightly more memory.
 ### Shard Count is Immutable
 
 Each shard database also persists a named `schema_version` in `kv_meta`.
-Fresh shard DBs stamp the current version on first open. If EKV sees an
-initialized shard DB with a missing or mismatched `schema_version`, startup
-fails closed instead of guessing compatibility.
+Fresh shard DBs stamp the current version on first open. Schema v3 databases
+upgrade automatically to v4 in one transaction per shard, before that shard
+serves traffic. A failed migration rolls back and fails startup; it can be
+retried without manual SQL or wiping the data directory. Missing, unknown,
+or newer versions still fail startup closed.
+
+The v3 upgrade preserves committed values (including TTLs and tombstones),
+accepted CAS state, logical identity, and sequence/ballot counters. It clears
+old replay history and progress cursors because CAS recovery could associate
+one member's sequence with another member's origin. This adds startup I/O
+proportional to retained replay history and requires full sync to rebuild
+progress, not to recover the node's already-stored values.
+
+Rolling upgrades from v3 retain live replication and CAS. A negotiated
+`:replay_origin` feature keeps replay-stream identity separate from the
+value's version origin. Repair involving older members uses full snapshots
+and ignores their potentially incorrect cursors; expect periodic full-sync
+I/O until every member is upgraded. Old members still have the original
+recovery bug, so complete the rollout rather than leaving a mixed cluster.
+
+There is no automatic downgrade: old binaries reject v4 databases. Take a
+consistent backup before upgrading if a rollback to an old build is required.
+The stale-database and long-partition safety gates still apply.
 
 Fresh shard DBs also enable SQLite `auto_vacuum=INCREMENTAL`. Existing shard
 DBs are not rebuilt on ordinary startup just to change SQLite vacuum mode.

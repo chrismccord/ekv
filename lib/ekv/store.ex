@@ -46,6 +46,10 @@ defmodule EKV.Store do
   - `kv_oplog` — authoritative replay log keyed by `(origin_node, origin_seq)`.
     Stores `key_id` into `kv_keyrefs` instead of repeating the full key text on
     every replay row. Already-expired rows are filtered out when delta sync is built.
+    `origin_node` owns the replay sequence. Nullable `value_origin` preserves
+    a recovered value's VSN origin when it differs from that stream owner.
+    `kv.origin_node` remains the value origin; foreign-stream positions are
+    stored as zero in `kv.origin_seq`, not attributed to the value origin.
   - `kv_origin_progress` — highest contiguous locally-applied replay progress
     per origin. Local-origin writes/promotes can advance this directly because
     the shard allocates self `origin_seq` in-order inside the same transaction.
@@ -62,6 +66,10 @@ defmodule EKV.Store do
   extra replay bookkeeping now happens inside that same SQLite transaction:
   allocate the next local `origin_seq` when needed, append the replay row,
   and update local contiguous progress before commit.
+
+  Startup migrates known schema v3 to v4 transactionally. It preserves KV,
+  Paxos and durable counters, but drops potentially misattributed replay rows
+  and cursors. Unknown/missing versions fail closed; no guessed migrations.
   """
 
   @get_sql """
@@ -101,12 +109,12 @@ defmodule EKV.Store do
   """
 
   @oplog_insert_sql """
-  INSERT INTO kv_oplog (key_id, value, timestamp, origin_node, origin_seq, expires_at, is_delete)
-  VALUES ((SELECT id FROM kv_keyrefs WHERE key = ?1), ?2, ?3, ?4, ?5, ?6, ?7)
+  INSERT INTO kv_oplog (key_id, value, timestamp, origin_node, origin_seq, expires_at, is_delete, value_origin)
+  VALUES ((SELECT id FROM kv_keyrefs WHERE key = ?1), ?2, ?3, ?4, ?5, ?6, ?7, ?8)
   ON CONFLICT(origin_node, origin_seq) DO NOTHING
   """
 
-  @schema_version 3
+  @schema_version 4
   @default_wal_size_limit 64 * 1024 * 1024
 
   def open(data_dir, shard_index, tombstone_ttl, num_shards, gc_interval, opts \\ []) do
@@ -148,6 +156,23 @@ defmodule EKV.Store do
     :ok = EKV.Sqlite3.execute(db, "PRAGMA wal_autocheckpoint=0")
     :ok = EKV.Sqlite3.execute(db, "PRAGMA journal_size_limit=#{wal_size_limit}")
 
+    try do
+      :ok = EKV.Sqlite3.execute(db, "BEGIN IMMEDIATE")
+      ensure_schema(db, data_dir, shard_index)
+      validate_num_shards(db, num_shards, data_dir, shard_index)
+      touch_last_active(db)
+      :ok = EKV.Sqlite3.execute(db, "COMMIT")
+      {:ok, db}
+    catch
+      kind, reason ->
+        # Cleanup must preserve the original startup failure, including failed DDL.
+        EKV.Sqlite3.execute(db, "ROLLBACK")
+        EKV.Sqlite3.close(db)
+        :erlang.raise(kind, reason, __STACKTRACE__)
+    end
+  end
+
+  defp create_schema(db) do
     # Schema
     :ok =
       EKV.Sqlite3.execute(db, """
@@ -183,6 +208,7 @@ defmodule EKV.Store do
         origin_seq INTEGER NOT NULL DEFAULT 0,
         expires_at INTEGER,
         is_delete INTEGER NOT NULL DEFAULT 0,
+        value_origin TEXT,
         FOREIGN KEY (key_id) REFERENCES kv_keyrefs(id)
       )
       """)
@@ -250,17 +276,6 @@ defmodule EKV.Store do
       )
       """)
 
-    # Migration for existing databases with old kv_meta schema (single `value` column)
-    case EKV.Sqlite3.execute(db, "ALTER TABLE kv_meta ADD COLUMN value_int INTEGER") do
-      :ok -> :ok
-      {:error, _} -> :ok
-    end
-
-    case EKV.Sqlite3.execute(db, "ALTER TABLE kv_meta ADD COLUMN value_text TEXT") do
-      :ok -> :ok
-      {:error, _} -> :ok
-    end
-
     :ok =
       EKV.Sqlite3.execute(db, """
       CREATE TABLE IF NOT EXISTS kv_paxos (
@@ -277,20 +292,6 @@ defmodule EKV.Store do
       )
       """)
 
-    # Migration for existing dev databases — add value columns if missing
-    for {col, type} <- [
-          {"accepted_value", "BLOB"},
-          {"accepted_timestamp", "INTEGER"},
-          {"accepted_origin", "TEXT"},
-          {"accepted_expires_at", "INTEGER"},
-          {"accepted_deleted_at", "INTEGER"}
-        ] do
-      case EKV.Sqlite3.execute(db, "ALTER TABLE kv_paxos ADD COLUMN #{col} #{type}") do
-        :ok -> :ok
-        {:error, _} -> :ok
-      end
-    end
-
     :ok =
       EKV.Sqlite3.execute(
         db,
@@ -303,41 +304,11 @@ defmodule EKV.Store do
         "CREATE INDEX IF NOT EXISTS idx_kv_expires ON kv(expires_at) WHERE expires_at IS NOT NULL"
       )
 
-    case EKV.Sqlite3.execute(db, "ALTER TABLE kv ADD COLUMN expired_at INTEGER") do
-      :ok -> :ok
-      {:error, _} -> :ok
-    end
-
-    case EKV.Sqlite3.execute(
-           db,
-           "ALTER TABLE kv ADD COLUMN origin_seq INTEGER NOT NULL DEFAULT 0"
-         ) do
-      :ok -> :ok
-      {:error, _} -> :ok
-    end
-
-    case EKV.Sqlite3.execute(
-           db,
-           "ALTER TABLE kv_oplog ADD COLUMN origin_seq INTEGER NOT NULL DEFAULT 0"
-         ) do
-      :ok -> :ok
-      {:error, _} -> :ok
-    end
-
     :ok =
       EKV.Sqlite3.execute(
         db,
         "CREATE INDEX IF NOT EXISTS idx_kv_expired_marker ON kv(expired_at) WHERE expired_at IS NOT NULL"
       )
-
-    # Validate/startup guards — must never silently open incompatible data.
-    validate_schema_version(db, data_dir, shard_index)
-    validate_num_shards(db, num_shards, data_dir, shard_index)
-
-    # Mark as active
-    touch_last_active(db)
-
-    {:ok, db}
   end
 
   defp fresh_database_file?(path) do
@@ -440,10 +411,13 @@ defmodule EKV.Store do
         deleted_at \\ nil,
         origin_seq \\ nil,
         local_origin_override \\ :auto,
-        reject_cas_managed \\ false
+        reject_cas_managed \\ false,
+        replay_origin_node \\ nil
       ) do
     is_delete = if deleted_at, do: 1, else: 0
     origin_str = persisted_member_id(origin_node)
+    replay_origin = persisted_member_id(replay_origin_node || origin_node)
+    value_origin = if replay_origin != origin_str, do: origin_str
 
     local_origin =
       case local_origin_override do
@@ -452,7 +426,17 @@ defmodule EKV.Store do
       end
 
     kv_args = [key, value_binary, timestamp, origin_str, origin_seq, expires_at, deleted_at]
-    oplog_args = [key, value_binary, timestamp, origin_str, origin_seq, expires_at, is_delete]
+
+    oplog_args = [
+      key,
+      value_binary,
+      timestamp,
+      replay_origin,
+      origin_seq,
+      expires_at,
+      is_delete,
+      value_origin
+    ]
 
     EKV.Sqlite3.write_entry(
       db,
@@ -848,7 +832,8 @@ defmodule EKV.Store do
   end
 
   @replay_since_origin_chunk_sql """
-  SELECT k.key, o.value, o.timestamp, o.origin_node, o.origin_seq, o.expires_at, o.is_delete
+  SELECT k.key, o.value, o.timestamp, o.origin_node, o.origin_seq, o.expires_at, o.is_delete,
+         COALESCE(o.value_origin, o.origin_node)
   FROM kv_oplog AS o
   JOIN kv_keyrefs AS k ON k.id = o.key_id
   WHERE o.origin_node = ?1
@@ -868,8 +853,17 @@ defmodule EKV.Store do
         limit
       ])
 
-    Enum.map(rows, fn [key, value, timestamp, origin_node, replay_seq, expires_at, is_delete] ->
-      {key, value, timestamp, origin_node, replay_seq, expires_at, is_delete == 1}
+    Enum.map(rows, fn [
+                        key,
+                        value,
+                        timestamp,
+                        origin_node,
+                        replay_seq,
+                        expires_at,
+                        is_delete,
+                        value_origin
+                      ] ->
+      {key, value, timestamp, origin_node, replay_seq, expires_at, is_delete == 1, value_origin}
     end)
   end
 
@@ -1710,16 +1704,28 @@ defmodule EKV.Store do
   # Shard count validation
   # =====================================================================
 
-  defp validate_schema_version(db, data_dir, shard_index) do
-    case get_meta_int(db, "schema_version") do
-      nil ->
-        if initialized_db_without_schema_version?(db) do
-          raise ArgumentError,
-                "EKV schema_version mismatch for #{data_dir}/shard_#{shard_index}.db: " <>
-                  "database has initialized state but no schema_version marker. " <>
-                  "Start with a fresh data dir or migrate it before booting this build."
-        end
+  defp ensure_schema(db, data_dir, shard_index) do
+    {:ok, tables} =
+      EKV.Sqlite3.fetch_all(
+        db,
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND (name = 'kv' OR name GLOB 'kv_*')",
+        []
+      )
 
+    version =
+      cond do
+        tables == [] -> :fresh
+        ["kv_meta"] in tables -> get_meta_int(db, "schema_version")
+        true -> nil
+      end
+
+    case version do
+      :fresh ->
+        create_schema(db)
+        set_meta_int(db, "schema_version", @schema_version)
+
+      3 ->
+        migrate_v3(db)
         set_meta_int(db, "schema_version", @schema_version)
 
       @schema_version ->
@@ -1728,33 +1734,21 @@ defmodule EKV.Store do
       other ->
         raise ArgumentError,
               "EKV schema_version mismatch for #{data_dir}/shard_#{shard_index}.db: " <>
-                "database schema_version=#{other}, but this build expects schema_version=#{@schema_version}. " <>
-                "Start with a fresh data dir or migrate it before booting this build."
+                "database schema_version=#{inspect(other)}, but this build supports migration from 3 " <>
+                "and expects schema_version=#{@schema_version}."
     end
   end
 
-  defp initialized_db_without_schema_version?(db) do
-    Enum.any?(
-      [
-        "kv_meta",
-        "kv",
-        "kv_keyrefs",
-        "kv_oplog",
-        "kv_origin_progress",
-        "kv_member_progress",
-        "kv_member_hwm",
-        "kv_paxos"
-      ],
-      &table_has_rows?(db, &1)
-    )
-  end
+  defp migrate_v3(db) do
+    :ok = EKV.Sqlite3.execute(db, "ALTER TABLE kv_oplog ADD COLUMN value_origin TEXT")
 
-  defp table_has_rows?(db, table) do
-    case EKV.Sqlite3.fetch_all(db, "SELECT 1 FROM #{table} LIMIT 1", []) do
-      {:ok, []} -> false
-      {:ok, [_ | _]} -> true
-      _ -> false
-    end
+    # v3 can attribute a recovering member's sequence to the value's origin.
+    # Those cursors and replay rows cannot be reconstructed reliably. Preserve
+    # kv, kv_paxos and the local sequence allocator; rebuild progress by full sync.
+    :ok = EKV.Sqlite3.execute(db, "DELETE FROM kv_oplog")
+    :ok = EKV.Sqlite3.execute(db, "DELETE FROM kv_origin_progress")
+    :ok = EKV.Sqlite3.execute(db, "DELETE FROM kv_member_progress")
+    :ok = EKV.Sqlite3.execute(db, "DELETE FROM kv_member_hwm")
   end
 
   defp validate_num_shards(db, num_shards, data_dir, shard_index) do

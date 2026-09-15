@@ -284,6 +284,141 @@ defmodule EKV.AntiEntropyTest do
   end
 
   describe "anti-entropy healing" do
+    test "foreign CAS recovery preserves versions and does not skip another origin's missing writes" do
+      peers = TestCluster.start_peers(3)
+      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
+      name = unique_name(:cas_replay_origin)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+      on_exit(fn -> cleanup_data(peers, name) end)
+      start_cluster(peers, name, sync_chunk_size: 1)
+      key = "recovery/register"
+      shard = EKV.Replica.shard_name(name, 0)
+
+      assert {:ok, vsn} =
+               TestCluster.rpc!(node_a, EKV, :put, [name, key, "chosen", [if_vsn: nil]])
+
+      await_all([node_b, node_c], fn node ->
+        TestCluster.rpc!(node, EKV, :lookup, [name, key]) == {"chosen", vsn}
+      end)
+
+      write_many(node_b, name, "unrelated", 10)
+
+      await_all([node_a, node_c], fn node ->
+        TestCluster.local_progress(node, name, node_b) == 10
+      end)
+
+      # Miss A:2 on B and B's subsequent recovery commit on C, without a partition.
+      :ok = TestCluster.drop_remote_shard(node_a, name, node_b)
+      assert :ok = TestCluster.rpc!(node_a, EKV, :put, [name, "missed", "A:2"])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_c, EKV, :get, [name, "missed"]) == "A:2"
+      end)
+
+      assert TestCluster.rpc!(node_b, EKV, :get, [name, "missed"]) == nil
+      :ok = TestCluster.drop_remote_shard(node_b, name, node_c)
+
+      assert "chosen" = TestCluster.rpc!(node_b, EKV, :get, [name, key, [consistent: true]])
+      assert TestCluster.local_progress(node_b, name, node_a) == 1
+      assert TestCluster.local_progress(node_b, name, node_b) == 11
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.local_progress(node_a, name, node_b) == 11
+      end)
+
+      assert TestCluster.local_progress(node_c, name, node_b) == 10
+
+      # A relays B's recovered value to C. The replay origin is B, but its VSN is A's.
+      c_pid = TestCluster.rpc!(node_c, Process, :whereis, [shard])
+      :ok = TestCluster.trace_shard_sends(node_a, name, self())
+
+      TestCluster.rpc!(node_a, :erlang, :send, [
+        shard,
+        {:ekv, 1, :sync_request, {c_pid, 0, {:delta, "2", 10}}, %{}}
+      ])
+
+      assert_receive {:trace, _, :send,
+                      {:ekv, 1, :sync,
+                       {^node_a, 0, :delta, [{^key, _, _, ^node_a, 11, nil, nil}],
+                        %{^node_b => 11}}, %{replay_origin: "2"}}, _},
+                     2_000
+
+      :ok = TestCluster.untrace_shard_sends(node_a, name)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.local_progress(node_c, name, node_b) == 11
+      end)
+
+      assert TestCluster.rpc!(node_c, EKV, :lookup, [name, key]) == {"chosen", vsn}
+
+      # Normal anti-entropy must still discover A:2; no consistent read of "missed".
+      for {_, node} <- peers, do: TestCluster.trigger_anti_entropy(node, name)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, EKV, :get, [name, "missed"]) == "A:2"
+      end)
+
+      assert TestCluster.local_progress(node_b, name, node_a) == 2
+    end
+
+    test "legacy peers receive compatible commits and cannot import poisoned replay cursors" do
+      peers = TestCluster.start_peers(3)
+      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
+      name = unique_name(:legacy_replay)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+      on_exit(fn -> cleanup_data(peers, name) end)
+      start_cluster(peers, name, [])
+      shard = EKV.Replica.shard_name(name, 0)
+      key = "legacy/register"
+
+      assert {:ok, vsn} =
+               TestCluster.rpc!(node_c, EKV, :put, [name, key, "chosen", [if_vsn: nil]])
+
+      await_all([node_a, node_b], fn node ->
+        TestCluster.rpc!(node, EKV, :lookup, [name, key]) == {"chosen", vsn}
+      end)
+
+      :ok = TestCluster.set_remote_features(node_a, name, node_c, [:live_progress])
+      :ok = TestCluster.trace_shard_sends(node_a, name, self())
+      assert "chosen" = TestCluster.rpc!(node_a, EKV, :get, [name, key, [consistent: true]])
+
+      assert_receive {:trace, _, :send,
+                      {:ekv, 1, :cas_committed, {^key, _, "1", _, 0, "1", 0}, _},
+                      {^shard, ^node_c}},
+                     2_000
+
+      progress = TestCluster.replica_state(node_a, name).local_progress
+      oplog_count = TestCluster.oplog_count(node_a, name)
+      ts = System.system_time(:nanosecond)
+      entry = {"legacy/snapshot", :erlang.term_to_binary("kept"), ts, "2", 999, nil, nil}
+
+      TestCluster.rpc!(node_a, :erlang, :send, [
+        shard,
+        {:ekv, 1, :sync, {node_c, 0, :delta, [entry], %{"2" => 999}}, %{}}
+      ])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_a, EKV, :get, [name, "legacy/snapshot"]) == "kept"
+      end)
+
+      assert TestCluster.replica_state(node_a, name).local_progress == progress
+      assert TestCluster.oplog_count(node_a, name) == oplog_count
+
+      # A legacy delta request is served as a full snapshot, never new-format replay.
+      c_pid = TestCluster.rpc!(node_c, Process, :whereis, [shard])
+
+      TestCluster.rpc!(node_a, :erlang, :send, [
+        shard,
+        {:ekv, 1, :sync_request, {c_pid, 0, {:delta, "1", 0}}, %{}}
+      ])
+
+      assert_receive {:trace, _, :send, {:ekv, 1, :sync, {^node_a, 0, :full, _, _}, _},
+                      {^shard, ^node_c}},
+                     2_000
+
+      :ok = TestCluster.untrace_shard_sends(node_a, name)
+    end
+
     test "connected stale member converges without reconnect or consistent read" do
       peers = TestCluster.start_peers(3)
       [{_, node_a}, {_, node_b}, {_, node_c}] = peers

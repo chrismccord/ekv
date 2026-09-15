@@ -30,6 +30,11 @@ defmodule EkvJepsen.HistoryGen do
       # Fresh, uniquely allocated databases, not a swallowed unsupported delete.
       for node <- nodes, do: {:ok, nil} = Workload.read(setup, node)
 
+      # Recovery must preserve the value's VSN even when member replay counters differ.
+      for {node, index} <- Enum.with_index(nodes, 1), n <- 1..index do
+        :ok = :erpc.call(node, EKV, :put, [:jepsen_kv, "jepsen/unrelated/#{index}/#{n}", n])
+      end
+
       done = :atomics.new(1, [])
       if mode == :none, do: :atomics.put(done, 1, 1)
       workload = Workload.context(nodes, history, :workload)

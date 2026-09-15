@@ -210,6 +210,12 @@ defmodule EKV do
 
   All options are passed when starting EKV.
 
+  Durable members and observers automatically migrate schema v3 databases to
+  v4 at startup, preserving committed and accepted CAS state. Migration clears
+  legacy replay history and progress cursors; full sync rebuilds progress.
+  Missing or unsupported schema versions fail startup. Older builds cannot
+  reopen migrated databases. See `OPERATORS.md` for rolling-upgrade guidance.
+
   Member mode (default):
 
       {EKV,

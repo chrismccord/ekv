@@ -309,7 +309,11 @@ defmodule EKV.AdversarialVerificationTest do
     fake_node = :delta_peer@fake
 
     :sys.replace_state(shard_name, fn state ->
-      %{state | remote_shards: Map.put(state.remote_shards, fake_node, self())}
+      %{
+        state
+        | remote_shards: Map.put(state.remote_shards, fake_node, self()),
+          remote_features: Map.put(state.remote_features, fake_node, MapSet.new([:replay_origin]))
+      }
     end)
 
     :erlang.trace(Process.whereis(shard_name), true, [:send])

@@ -143,6 +143,7 @@ Important:
 - Features are negotiated in `:member_connect` / `:member_connect_ack` meta.
   - Current advertised features:
     - `:live_progress`
+    - `:replay_origin`
     - `:wire_compression`
     - `:replication_batch`
   - `:live_progress` now means the peer understands progress summaries,
@@ -153,9 +154,12 @@ Important:
     per-entry subscriber semantics.
 - Version determines parse shape.
 - Features determine which optional send-side behaviors are allowed.
-- There is still no support for unversioned/old mixed-member overlap.
-  - This is a fresh protocol reset, not a bridge.
-  - Intended rollout model is cold deploy or a cluster rename/reset.
+- `:replay_origin` separates delta stream ownership (`meta.replay_origin`)
+  from the entry's value-version origin. Peers without it use full snapshots;
+  their replay rows and progress claims are not imported.
+- v1 schema-v3 peers may overlap during rollout. Cross-origin recovery commits
+  sent to those peers use sequence zero (no replay position), not a foreign
+  sequence attributed to the value origin. Unversioned peers remain unsupported.
 
 ### Client routing
 - `EKV.ClientRouter` is the client control plane.
@@ -274,6 +278,10 @@ Important:
   - Erlang `node()` names are transport/routing identities only.
 - `kv_origin_progress` is local applied progress per origin stream.
 - `kv_member_progress` is peer progress per origin stream.
+- CAS recovery appends to the proposer's replay stream, not the recovered
+  value's origin. `kv_oplog.value_origin` preserves a differing VSN origin;
+  null means it matches the replay origin. `kv.origin_node` is always the
+  value origin, and its `origin_seq` is zero for foreign-stream positions.
 - `kv_oplog` stores retained replay history, but uses `kv_keyrefs` so replay
   rows reference deduplicated keys instead of repeating full key strings.
   - `kv_keyrefs.oplog_refs` is maintained by SQLite triggers on `kv_oplog`
@@ -365,7 +373,10 @@ Important:
 - Startup schema guard:
   - each shard DB persists `kv_meta.schema_version`
   - fresh DBs stamp the current version on first open
-  - initialized DBs with missing or mismatched `schema_version` fail startup closed
+  - known v3 DBs automatically migrate to v4 in one transaction per shard
+  - migration preserves KV/Paxos/counters but clears old replay and progress;
+    replica startup restores its self head from the persisted sequence allocator
+  - missing, unknown, or newer versions fail startup closed; no automatic downgrade
   - fresh shard DBs also set SQLite `auto_vacuum=INCREMENTAL`; existing DBs are not rebuilt on normal startup to change that mode
 - Live long partition protection:
   - default `partition_ttl_policy: :quarantine`

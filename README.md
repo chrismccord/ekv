@@ -320,9 +320,17 @@ A periodic GC timer runs three phases per tick:
 If a node goes away longer than `tombstone_ttl` and comes back with an old database on disk, other members will have already GC'd the tombstones for entries deleted during the absence. EKV detects this by checking a `last_active_at` timestamp stored in the database. If the database is too stale, EKV fails startup by default instead of trusting that on-disk state. Operators can then wipe that node's data dir so it rebuilds from members, or explicitly set `allow_stale_startup: true` when they intend to trust the old on-disk cluster state.
 
 Each shard DB also persists a named `schema_version` in `kv_meta`. Fresh
-databases stamp the current version on first open. Initialized shard DBs with
-missing or mismatched `schema_version` fail startup closed so EKV does not
-silently boot incompatible on-disk state.
+databases stamp the current version on first open. Schema v3 databases upgrade
+automatically to v4 in a transaction per shard. Committed values, tombstones,
+accepted CAS state, and local counters are preserved. The upgrade clears old
+replay history and progress cursors, which may contain incorrect CAS recovery
+positions; members rebuild progress through full sync. Missing, unknown, or
+newer schema versions still fail startup closed.
+
+During a rolling upgrade from v3, repair with older members uses full snapshots
+instead of trusting their replay cursors. Plan for extra sync I/O until all
+members are upgraded. Older binaries cannot reopen v4 databases; automatic
+downgrade is not supported.
 
 Fresh shard DBs also enable SQLite `auto_vacuum=INCREMENTAL`. This only
 applies at creation time; EKV does not rewrite existing shard DBs on normal

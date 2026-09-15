@@ -1358,12 +1358,12 @@ defmodule EKVTest do
   describe "schema_version startup guard" do
     test "Store.open stamps schema_version on first open", %{data_dir: data_dir} do
       {:ok, db} = EKV.Store.open(data_dir, 96, :timer.hours(24 * 7), 2, :timer.minutes(5))
-      assert EKV.Store.get_meta(db, "schema_version") == 3
+      assert EKV.Store.get_meta(db, "schema_version") == 4
       assert auto_vacuum_mode(db) == 2
       EKV.Store.close(db)
 
       {:ok, db} = EKV.Store.open(data_dir, 96, :timer.hours(24 * 7), 2, :timer.minutes(5))
-      assert EKV.Store.get_meta(db, "schema_version") == 3
+      assert EKV.Store.get_meta(db, "schema_version") == 4
       assert auto_vacuum_mode(db) == 2
       EKV.Store.close(db)
     end
@@ -1385,7 +1385,7 @@ defmodule EKVTest do
           allow_stale_startup: true
         )
 
-      assert EKV.Store.get_meta(db, "schema_version") == 3
+      assert EKV.Store.get_meta(db, "schema_version") == 4
       assert auto_vacuum_mode(db) == 0
       EKV.Store.close(db)
     end
@@ -5383,7 +5383,12 @@ defmodule EKVTest do
       fake_node = :delta_peer@fake
 
       :sys.replace_state(shard_name, fn state ->
-        %{state | remote_shards: Map.put(state.remote_shards, fake_node, self())}
+        %{
+          state
+          | remote_shards: Map.put(state.remote_shards, fake_node, self()),
+            remote_features:
+              Map.put(state.remote_features, fake_node, MapSet.new([:replay_origin]))
+        }
       end)
 
       :erlang.trace(Process.whereis(shard_name), true, [:send])
@@ -5476,7 +5481,12 @@ defmodule EKVTest do
       fake_node = :delta_bytes_peer@fake
 
       :sys.replace_state(shard_name, fn state ->
-        %{state | remote_shards: Map.put(state.remote_shards, fake_node, self())}
+        %{
+          state
+          | remote_shards: Map.put(state.remote_shards, fake_node, self()),
+            remote_features:
+              Map.put(state.remote_features, fake_node, MapSet.new([:replay_origin]))
+        }
       end)
 
       :erlang.trace(Process.whereis(shard_name), true, [:send])
