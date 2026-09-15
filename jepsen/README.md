@@ -127,6 +127,12 @@ reconciliation, and recovery add history events as well.
 
 ## Harness hardening notes
 
+- Every runner requires exit status zero and one explicit
+  `EKV_JEPSEN_RESULT=true` verdict. Inconclusive (`unknown`), missing, malformed,
+  or duplicate verdicts fail closed. Matrix runners finish collecting their
+  summaries before returning a failure status.
+- Run harness regression checks with `lein test` here and
+  `mix test test/jepsen_runner_test.exs` from the repository root.
 - `run_scenario.sh` now writes to unique history files by default (no overwrite).
   Use an explicit run tag (3rd arg, or `JEPSEN_RUN_TAG`) when deterministic
   naming is needed.
