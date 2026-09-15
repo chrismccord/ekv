@@ -5,10 +5,11 @@ SCENARIO="${1:-}"
 SEED="${2:-1}"
 RUN_TAG_RAW="${3:-${JEPSEN_RUN_TAG:-$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM}}"
 RUN_TAG="$(printf '%s' "$RUN_TAG_RAW" | tr -cs 'A-Za-z0-9._-' '_')"
+SUITE="${4:-soak}"
 
 if [[ -z "$SCENARIO" ]]; then
   cat <<USAGE
-Usage: ./run_scenario.sh <scenario> [seed] [run_tag]
+Usage: ./run_scenario.sh <scenario> [seed] [run_tag] [smoke|soak]
 
 Scenarios:
   register-3n-none
@@ -29,6 +30,7 @@ Scenarios:
 Notes:
 - Histories are written to unique per-run files by default.
 - Set JEPSEN_RUN_TAG (or pass run_tag) for deterministic artifact names.
+- Smoke uses 4 workers and 400 operations; soak preserves each scenario's full workload.
 USAGE
   exit 1
 fi
@@ -133,7 +135,20 @@ case "$SCENARIO" in
     ;;
 esac
 
+case "$SUITE" in
+  smoke)
+    workers=4
+    ops=400
+    ;;
+  soak)
+    ;;
+  *)
+    echo "Unknown suite: $SUITE (expected smoke|soak)" >&2
+    exit 2
+    ;;
+esac
+
 history_base="${SCENARIO//-/_}"
-history_path="results/history_${history_base}_seed${SEED}_${RUN_TAG}.edn"
+history_path="results/history_${history_base}_seed${SEED}_${RUN_TAG}_${SUITE}.edn"
 
 exec lein run "$history_path" "$workers" "$ops" "$cluster_nodes" "$mode" "$profile" "$SEED"

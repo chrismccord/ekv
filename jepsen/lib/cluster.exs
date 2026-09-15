@@ -11,6 +11,9 @@ defmodule EkvJepsen.Cluster do
     nonce = "#{System.system_time(:microsecond)}_#{System.unique_integer([:positive])}"
 
     unless Node.alive?() do
+      # Unlike --sname at VM boot, Node.start/2 does not start EPMD.
+      {_, 0} = System.cmd("epmd", ["-daemon"])
+
       {:ok, _} =
         Node.start(:"jepsen_coordinator_#{nonce}", :shortnames)
     end

@@ -5,19 +5,42 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Jepsen workload
+        type: choice
+        options: [smoke, soak]
+        default: smoke
+      seed:
+        description: Jepsen random seed
+        type: string
+        default: "1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         otp: ["26", "27", "28"]
         elixir: ["1.19"]
+        include:
+          # setup-beam's "latest" may select an RC; ranges select stable releases.
+          - otp: "> 0"
+            elixir: "> 0"
     env:
       MIX_ENV: test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: erlef/setup-beam@v1
         with:
@@ -25,5 +48,78 @@ jobs:
           elixir-version: ${{ matrix.elixir }}
 
       - run: mix deps.get
+      - name: Check formatting
+        # Use one formatter version across the compatibility matrix.
+        if: matrix.otp == '28' && matrix.elixir == '1.19'
+        run: mix format --check-formatted
       - run: mix compile --warnings-as-errors
-      - run: elixir --name ci@127.0.0.1 --cookie ekv_test -S mix test
+      - run: elixir --sname ci --cookie ekv_test -S mix test --warnings-as-errors
+
+  jepsen:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ (github.event_name == 'push' || inputs.suite == 'soak') && 360 || 15 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: >-
+          ${{ fromJSON((github.event_name == 'push' || inputs.suite == 'soak') &&
+          '["register-3n-none", "register-3n-partition-flap", "register-3n-restart-one-small",
+            "register-5n-none", "lock-3n-none", "lock-3n-partition-flap",
+            "lock-3n-restart-one-small", "lock-3n-partition-restart",
+            "lock-5n-none", "lock-5n-partition-restart"]' ||
+          '["register-3n-partition-flap", "lock-3n-partition-restart", "lock-5n-partition-restart"]') }}
+        seed: ${{ fromJSON(github.event_name == 'push' && '[1, 2, 3]' || '[1]') }}
+    env:
+      MIX_ENV: test
+      JAVA_TOOL_OPTIONS: -Xmx2g
+      SCENARIO: ${{ matrix.scenario }}
+      SEED: ${{ inputs.seed || matrix.seed }}
+      SUITE: ${{ (github.event_name == 'push' || inputs.suite == 'soak') && 'soak' || 'smoke' }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+          elixir-version: "1.19"
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install Leiningen
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes leiningen
+
+      - uses: actions/cache@v6
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-jepsen-java21-${{ hashFiles('jepsen/project.clj') }}
+
+      - run: mix deps.get
+      - run: mix compile --warnings-as-errors
+      - run: lein test
+        working-directory: jepsen
+
+      - name: Run Jepsen scenario
+        working-directory: jepsen
+        timeout-minutes: ${{ env.SUITE == 'soak' && 360 || 5 }}
+        run: |
+          mkdir -p results
+          ./run_scenario.sh "$SCENARIO" "$SEED" "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" "$SUITE" 2>&1 | tee results/ci.log
+
+      - name: Upload Jepsen history and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: jepsen-${{ matrix.scenario }}-seed-${{ env.SEED }}
+          path: |
+            jepsen/results/
+            jepsen/store/
+          retention-days: 14
+          if-no-files-found: ignore

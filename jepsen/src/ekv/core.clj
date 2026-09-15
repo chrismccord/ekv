@@ -67,6 +67,10 @@
                :else :unknown)
      :linearizable linearizable :coverage coverage :versions versions}))
 
+(defn result-exit-code [result]
+  ;; :unknown is truthy in Clojure, but an inconclusive check must not pass CI.
+  (if (true? (:valid? result)) 0 1))
+
 (defn -main [& args]
   (if (some #{"-h" "--help"} args)
     (usage)
@@ -80,7 +84,7 @@
       (run-generator! history-path workers ops cluster-nodes mode profile seed)
       (let [history (load-history history-path)
             result  (check-linearizable history cluster-nodes mode profile)
-            valid?  (:valid? result)]
+            exit-code (result-exit-code result)]
         (println)
         (println "Jepsen linearizability check result:")
         (println (str "  history path: " history-path))
@@ -90,8 +94,8 @@
         (println (str "  seed:         " seed))
         (println (str "  operations:   " (count history)))
         (println (str "  coverage:     " (pr-str (:coverage result))))
-        (println (str "  valid?:       " valid?))
-        (when-not valid?
+        (println (str "  valid?:       " (:valid? result)))
+        (when-not (zero? exit-code)
           (println "  details:")
           (prn result))
-        (System/exit (if valid? 0 1))))))
+        (System/exit exit-code)))))
