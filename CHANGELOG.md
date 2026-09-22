@@ -1,4 +1,4 @@
-## Unreleased
+## 0.4.4 (2026-09-22)
 - Update bundled SQLite from 3.47.2 to 3.53.4, including the upstream WAL-reset
   database corruption fix.
 
