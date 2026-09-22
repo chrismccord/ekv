@@ -291,7 +291,7 @@ defmodule EKV.AntiEntropyTest do
       on_exit(fn -> TestCluster.stop_peers(peers) end)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      start_cluster(peers, ekv_name, anti_entropy_interval: 200)
+      start_cluster(peers, ekv_name, anti_entropy_interval: @manual_anti_entropy_interval)
 
       assert {:ok, vsn1} =
                TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "heal/1", "v1", [if_vsn: nil]])
@@ -315,6 +315,7 @@ defmodule EKV.AntiEntropyTest do
       end
 
       assert TestCluster.rpc!(node_c, EKV, :get, [ekv_name, "heal/1"]) == "v1"
+      assert :ok = TestCluster.trigger_anti_entropy(node_c, ekv_name)
 
       TestCluster.assert_eventually(
         fn -> TestCluster.rpc!(node_c, EKV, :get, [ekv_name, "heal/1"]) == "v2" end,
@@ -752,7 +753,10 @@ defmodule EKV.AntiEntropyTest do
       on_exit(fn -> TestCluster.stop_peers(peers) end)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      start_cluster(peers, ekv_name, anti_entropy_interval: 200, shards: 4)
+      start_cluster(peers, ekv_name,
+        anti_entropy_interval: @manual_anti_entropy_interval,
+        shards: 4
+      )
 
       key0 = key_for_shard("multi", 0, 4)
       key1 = key_for_shard("multi", 1, 4)
@@ -786,6 +790,8 @@ defmodule EKV.AntiEntropyTest do
 
       assert TestCluster.rpc!(node_c, EKV, :get, [ekv_name, key0]) == "v1-s0"
       assert TestCluster.rpc!(node_c, EKV, :get, [ekv_name, key1]) == "v1-s1"
+      assert :ok = TestCluster.trigger_anti_entropy(node_c, ekv_name, 0)
+      assert :ok = TestCluster.trigger_anti_entropy(node_c, ekv_name, 1)
 
       TestCluster.assert_eventually(
         fn ->
