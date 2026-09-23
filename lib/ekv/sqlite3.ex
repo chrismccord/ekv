@@ -78,6 +78,11 @@ defmodule EKV.Sqlite3 do
 
   def read_entry(db, stmt, args), do: Sqlite3NIF.ekv_read_entry(db, stmt, args)
   def fetch_all(db, sql, args), do: Sqlite3NIF.ekv_fetch_all(db, sql, args)
+
+  # Sync byte estimate: binary/text columns plus 96 bytes of row overhead.
+  def fetch_chunk(db, sql, args, max_bytes),
+    do: Sqlite3NIF.ekv_fetch_chunk(db, sql, args, max_bytes)
+
   def backup(source_path, dest_path), do: Sqlite3NIF.ekv_backup(source_path, dest_path)
 
   def merge_local_progress_summary(db, entries),

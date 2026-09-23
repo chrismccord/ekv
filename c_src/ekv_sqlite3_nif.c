@@ -2074,13 +2074,18 @@ static ERL_NIF_TERM ekv_read_entry(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
 /*                                                                     */
 /* Single dirty IO bounce: prepare, bind, step all rows, finalize.     */
 /* Returns {:ok, [[col1, col2, ...], ...]}.                            */
+/* fetch_chunk adds a byte budget and returns {:ok, rows, byte_limited}. */
 /* ------------------------------------------------------------------ */
 
 static ERL_NIF_TERM ekv_fetch_all(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
-    (void)argc;
     connection_t *conn;
     if (!enif_get_resource(env, argv[0], connection_type, (void **)&conn))
+        return enif_make_badarg(env);
+
+    ErlNifUInt64 max_bytes = 0;
+    if (argc == 4 &&
+        (!enif_get_uint64(env, argv[3], &max_bytes) || max_bytes == 0))
         return enif_make_badarg(env);
 
     ErlNifBinary sql_bin;
@@ -2115,6 +2120,8 @@ static ERL_NIF_TERM ekv_fetch_all(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
     /* 3. Step all rows, collecting into a dynamic array */
     size_t cap = 64;
     size_t len = 0;
+    ErlNifUInt64 bytes = 0;
+    int byte_limited = 0;
     ERL_NIF_TERM *rows = enif_alloc(sizeof(ERL_NIF_TERM) * cap);
     if (!rows) {
         sqlite3_finalize(stmt);
@@ -2124,6 +2131,24 @@ static ERL_NIF_TERM ekv_fetch_all(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
 
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         int ncols = sqlite3_column_count(stmt);
+        if (argc == 4) {
+            /* Sync rows: key/value/origin bytes plus conservative tuple/scalar
+             * overhead. Stop before copying the lookahead row into BEAM memory.
+             * Always include the first row, even if it exceeds the budget. */
+            ErlNifUInt64 row_bytes = 96;
+            for (int i = 0; i < ncols; i++) {
+                int type = sqlite3_column_type(stmt, i);
+                if (type == SQLITE_TEXT || type == SQLITE_BLOB)
+                    row_bytes += (ErlNifUInt64)sqlite3_column_bytes(stmt, i);
+            }
+            if (len > 0 && (bytes >= max_bytes || row_bytes > max_bytes - bytes)) {
+                byte_limited = 1;
+                rc = SQLITE_DONE;
+                break;
+            }
+            bytes += row_bytes;
+        }
+
         ERL_NIF_TERM row;
         if (ncols == 0) {
             row = enif_make_list(env, 0);
@@ -2179,6 +2204,9 @@ static ERL_NIF_TERM ekv_fetch_all(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
     ERL_NIF_TERM result = enif_make_list_from_array(env, rows, (unsigned)len);
     enif_free(rows);
 
+    if (argc == 4)
+        return enif_make_tuple3(env, atom_ok, result,
+            byte_limited ? atom_true : atom_false);
     return enif_make_tuple2(env, atom_ok, result);
 }
 
@@ -3406,6 +3434,7 @@ static ErlNifFunc nif_funcs[] = {
     {"ekv_write_snapshot_entry", 3, ekv_write_snapshot_entry, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_read_entry",    3, ekv_read_entry,    ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_fetch_all",     3, ekv_fetch_all,     ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"ekv_fetch_chunk",   4, ekv_fetch_all,     ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_backup",        2, ekv_backup,        ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_merge_local_progress_summary", 2, ekv_merge_local_progress_summary,
         ERL_NIF_DIRTY_JOB_IO_BOUND},
