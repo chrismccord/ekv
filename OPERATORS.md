@@ -97,9 +97,8 @@ Durable replicas run periodic anti-entropy by default:
 - In the steady state it should be cheap because healthy members only exchange summary metadata; data chunks are sent only in response to an explicit `:sync_request`.
 - Tiny successful terminal delta repairs are suppressed from normal `info` logs below `delta_sync_log_min_entries` (default `8`). Set `log: :verbose` to see every delta.
 - If a shard sends too many deltas in one rolling window, EKV emits a single `delta_sync_storm` warning for that shard. Tune with `delta_sync_storm_window` and `delta_sync_storm_threshold`.
-- Each shard keeps only one summary probe in flight per peer and only one full-sync source in flight at a time, so startup/bootstrap repair should not fan out into duplicate full snapshots from multiple peers.
-- Known member origins that are merely down/disconnected try relayed delta immediately from a live peer.
-- Quarantine still forces immediate full rebuild behavior.
+- Each requester shard keeps only one summary probe in flight per peer and only one full-sync source in flight at a time. A serving shard also coalesces duplicate full-sync requests into one active snapshot stream per destination, so queued requests cannot create parallel rescans and duplicate chunk sends.
+- Disconnected, retired, locally unknown, and quarantined third-party origins try relayed delta immediately from a live peer. Quarantine still blocks the quarantined member itself.
 - Full sync happens only if that live peer no longer retains the requested replay range.
 - Mere shard-handshake lag during startup is still not enough to trigger full sync.
 - In a healthy hot cluster you should mostly see `member_connect` / summary traffic, not steady `sending delta sync` spam.

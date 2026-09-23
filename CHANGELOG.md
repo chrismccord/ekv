@@ -1,3 +1,13 @@
+## 0.4.6 (2026-09-23)
+- Prevent anti-entropy storms after member churn by trying a retained relayed
+  delta for disconnected, retired, unknown, and quarantined third-party origins
+  before falling back to a full snapshot.
+- Coalesce duplicate full-sync requests into one active outbound snapshot
+  stream per destination shard, preventing parallel rescans and duplicate chunk
+  sends.
+- Remove stale transient quarantine entries when a remote node disconnects while
+  retaining the durable reconnect fence.
+
 ## 0.4.5 (2026-09-23)
 - Fix precompiled NIF checksum packaging and reject stale or incomplete release
   manifests before building or publishing Hex packages.

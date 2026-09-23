@@ -825,13 +825,12 @@ defmodule EKV.Replica do
         │           remote origin heads vs local contiguous progress  │
         │         if local side is behind:                            │
         │           request delta from that live origin               │
-        │         if local side is behind on quarantined dead-origin  │
-        │         state:                                              │
-        │           request full sync from a live peer immediately    │
-        │         if local side is behind on a known member origin    │
-        │         that is merely down/disconnected:                   │
-        │           request relayed delta from any live peer that     │
-        │           advertises retained history for that origin       │
+        │         if local side is behind on any third-party origin:  │
+        │           request relayed delta from the live peer that     │
+        │           advertised the higher origin progress             │
+        │         the peer validates that it still has the complete   │
+        │         requested replay suffix and falls back to full      │
+        │         only when that proof fails                           │
         │                                                             │
         │ {:ekv, 1, :summary_probe,                                   │
         │  {pid_a, i, progress_a}, %{}}                               │
@@ -851,9 +850,11 @@ defmodule EKV.Replica do
   state anti-entropy tick is therefore lightweight control-plane traffic:
   it exchanges current per-origin heads and lets actually-behind receivers
   request repair explicitly.
-  Each shard keeps at most one summary probe in flight per peer and at most
-  one full-sync source active at a time, so cold-start/bootstrap repair does
-  not fan out into duplicate full snapshots from every eligible peer.
+  Each requester shard keeps at most one summary probe in flight per peer and
+  at most one full-sync source active at a time. A serving shard also
+  coalesces duplicate full-sync requests into one active snapshot stream per
+  destination, so queued requests cannot create parallel rescans and duplicate
+  chunk sends.
 
   Upgraded peers may also exchange live LWW replication batches:
 
@@ -883,11 +884,11 @@ defmodule EKV.Replica do
       │                                                                │
       │ Delta replay is origin-ordered, but any live peer can relay    │
       │ retained oplog rows for that origin. Direct origin delta       │
-      │ remains preferred when the origin is connected. If a known     │
-      │ member origin is down/disconnected, peers immediately try      │
-      │ relayed delta instead of resending the shard. Quarantine is    │
-      │ immediate. Mere handshake lag is not enough to trigger full    │
-      │ fallback.                                                      │
+      │ remains preferred when the origin is connected. Retired,       │
+      │ unknown, and quarantined third-party origins also try relayed  │
+      │ delta instead of resending the shard. The quarantined member   │
+      │ itself remains blocked. Mere membership or handshake lag is    │
+      │ not enough to trigger full fallback.                            │
       └────────────────────────────────────────────────────────────────┘
 
   Live replication batching is a separate path from sync:
@@ -898,10 +899,8 @@ defmodule EKV.Replica do
 
       ┌────────────────────────────────────────────────────────────────┐
       │ Full Sync                                                      │
-      │ Condition: requester is behind retained replay history,        │
-      │            relayed delta cannot serve the requested range,     │
-      │            or quarantined/synthetic dead-origin state must     │
-      │            be repaired                                         │
+      │ Condition: requester is behind retained replay history or      │
+      │            relayed delta cannot serve the requested range      │
       │                                                                │
       │ Query: SELECT * FROM kv WHERE (deleted_at IS NULL              │
       │          OR deleted_at > cutoff) AND key > cursor              │
@@ -1059,9 +1058,9 @@ defmodule EKV.Replica do
         - If sync proceeds:
             * summary exchange tells each side whether it is behind
             * behind side requests delta from the live origin when possible
-            * quarantined/unrecoverable origins can trigger immediate full
-            * ordinary disconnected third origins try relayed delta
-              immediately and fall back to full only if replay is unavailable
+            * disconnected, retired, unknown, and quarantined third origins
+              try relayed delta immediately
+            * the serving peer falls back to full only if replay is unavailable
             * summary-probe and sync in-flight suppression is bounded:
                 - each shard suppresses duplicate probes/repairs per peer
                 - stale in-flight markers expire after a short timeout
@@ -1236,6 +1235,7 @@ defmodule EKV.Replica do
         delta_sync_storm_peers: MapSet.t(node),
         delta_sync_storm_logged?: boolean,
         full_sync_inflight: node() | nil, # single full-bootstrap source for this shard
+        outbound_full_syncs: %{node() => reference()}, # one snapshot stream per destination
         pending_cas:    %{ref => op},   # in-flight CAS operations
         quorum_waiters: %{ref => waiter} # pending await_quorum callers
       }
@@ -1301,7 +1301,8 @@ defmodule EKV.Replica do
     {:ekv_accept_nack, ...}
 
   Sync continuations (self-messages for chunking):
-    {:continue_full_sync, node, last_key, cutoff, progress, chunk_size, chunk_max_bytes, reason}
+    {:continue_full_sync, node, stream_ref, last_key, cutoff, progress, chunk_size,
+     chunk_max_bytes, reason}
     {:continue_delta_sync, node, origin_node, last_seq, my_seq, chunk_size, chunk_max_bytes}
 
   CAS internal (self-messages):
@@ -1336,7 +1337,6 @@ defmodule EKV.Replica do
   @member_seen_hint_ttl_ms :timer.minutes(15)
   @member_seen_refresh_window_ms :timer.minutes(1)
   @member_seen_max_entries 8192
-  @unknown_member_origin_startup_grace_ms :timer.minutes(5)
   @wire_protocol_version 1
   @wire_compressed_tag :ekv_wire_compressed
   @wire_feature_live_progress :live_progress
@@ -1393,6 +1393,7 @@ defmodule EKV.Replica do
     delta_sync_storm_peers: MapSet.new(),
     delta_sync_storm_logged?: false,
     full_sync_inflight: nil,
+    outbound_full_syncs: %{},
     pending_cas: %{},
     quorum_waiters: %{},
     handoff_node: nil
@@ -2223,7 +2224,9 @@ defmodule EKV.Replica do
         remote_member_progress: Map.delete(state.remote_member_progress, dead_node),
         remote_member_hwms: Map.delete(state.remote_member_hwms, dead_node),
         remote_features: Map.delete(state.remote_features, dead_node),
-        summary_probe_inflight: Map.delete(state.summary_probe_inflight, dead_node)
+        summary_probe_inflight: Map.delete(state.summary_probe_inflight, dead_node),
+        quarantined_members: MapSet.delete(state.quarantined_members, dead_node),
+        outbound_full_syncs: Map.delete(state.outbound_full_syncs, dead_node)
     }
 
     state = clear_sync_inflight(state, dead_node)
@@ -2268,7 +2271,9 @@ defmodule EKV.Replica do
           remote_member_progress: Map.delete(state.remote_member_progress, remote_node),
           remote_member_hwms: Map.delete(state.remote_member_hwms, remote_node),
           remote_features: Map.delete(state.remote_features, remote_node),
-          summary_probe_inflight: Map.delete(state.summary_probe_inflight, remote_node)
+          summary_probe_inflight: Map.delete(state.summary_probe_inflight, remote_node),
+          quarantined_members: MapSet.delete(state.quarantined_members, remote_node),
+          outbound_full_syncs: Map.delete(state.outbound_full_syncs, remote_node)
       }
 
       state = clear_sync_inflight(state, remote_node)
@@ -2671,15 +2676,17 @@ defmodule EKV.Replica do
   # =====================================================================
 
   def handle_info(
-        {:continue_full_sync, remote_node, last_key, tombstone_cutoff, progress_summary,
-         chunk_size, chunk_max_bytes, reason},
+        {:continue_full_sync, remote_node, stream_ref, last_key, tombstone_cutoff,
+         progress_summary, chunk_size, chunk_max_bytes, reason},
         %Replica{} = state
       ) do
-    if Map.has_key?(state.remote_shards, remote_node) do
+    if Map.get(state.outbound_full_syncs, remote_node) == stream_ref and
+         Map.has_key?(state.remote_shards, remote_node) do
       cb_noreply(
         send_full_chunk(
           state,
           remote_node,
+          stream_ref,
           last_key,
           tombstone_cutoff,
           progress_summary,
@@ -2688,6 +2695,39 @@ defmodule EKV.Replica do
           reason
         )
       )
+    else
+      cb_noreply(clear_outbound_full_sync(state, remote_node, stream_ref))
+    end
+  end
+
+  # Compatibility for a continuation queued by the previous release during a
+  # hot upgrade, and for direct internal probes. It starts a tracked stream
+  # only when no stream to that destination is already active.
+  def handle_info(
+        {:continue_full_sync, remote_node, last_key, tombstone_cutoff, progress_summary,
+         chunk_size, chunk_max_bytes, reason},
+        %Replica{} = state
+      ) do
+    if Map.has_key?(state.remote_shards, remote_node) do
+      case begin_outbound_full_sync(state, remote_node) do
+        {:ok, state, stream_ref} ->
+          cb_noreply(
+            send_full_chunk(
+              state,
+              remote_node,
+              stream_ref,
+              last_key,
+              tombstone_cutoff,
+              progress_summary,
+              chunk_size,
+              chunk_max_bytes,
+              reason
+            )
+          )
+
+        {:busy, state} ->
+          cb_noreply(state)
+      end
     else
       cb_noreply(state)
     end
@@ -3307,26 +3347,34 @@ defmodule EKV.Replica do
   defp serve_sync_request(%Replica{} = state, _remote_node, _request), do: state
 
   defp send_full_sync(%Replica{} = state, remote_node, reason) do
-    config = EKV.Supervisor.get_config(state.name)
-    tombstone_cutoff = System.system_time(:nanosecond) - config.tombstone_ttl * 1_000_000
-    chunk_size = config.sync_chunk_size
-    chunk_max_bytes = config.sync_chunk_max_bytes
+    case begin_outbound_full_sync(state, remote_node) do
+      {:ok, state, stream_ref} ->
+        config = EKV.Supervisor.get_config(state.name)
+        tombstone_cutoff = System.system_time(:nanosecond) - config.tombstone_ttl * 1_000_000
+        chunk_size = config.sync_chunk_size
+        chunk_max_bytes = config.sync_chunk_max_bytes
 
-    send_full_chunk(
-      state,
-      remote_node,
-      nil,
-      tombstone_cutoff,
-      local_progress_summary_for_wire(state),
-      chunk_size,
-      chunk_max_bytes,
-      reason
-    )
+        send_full_chunk(
+          state,
+          remote_node,
+          stream_ref,
+          nil,
+          tombstone_cutoff,
+          local_progress_summary_for_wire(state),
+          chunk_size,
+          chunk_max_bytes,
+          reason
+        )
+
+      {:busy, state} ->
+        state
+    end
   end
 
   defp send_full_chunk(
          %Replica{} = state,
          remote_node,
+         stream_ref,
          last_key,
          tombstone_cutoff,
          progress_summary,
@@ -3349,7 +3397,7 @@ defmodule EKV.Replica do
           {:ekv_sync, node(), state.shard_index, :full, [], progress_summary}
         )
 
-        state
+        clear_outbound_full_sync(state, remote_node, stream_ref)
 
       _ ->
         {entries, stopped_early?} =
@@ -3370,18 +3418,44 @@ defmodule EKV.Replica do
         )
 
         if final? do
-          state
+          clear_outbound_full_sync(state, remote_node, stream_ref)
         else
           next_key = elem(List.last(entries), 0)
 
           send(
             self(),
-            {:continue_full_sync, remote_node, next_key, tombstone_cutoff, progress_summary,
-             chunk_size, chunk_max_bytes, reason}
+            {:continue_full_sync, remote_node, stream_ref, next_key, tombstone_cutoff,
+             progress_summary, chunk_size, chunk_max_bytes, reason}
           )
 
           state
         end
+    end
+  end
+
+  defp begin_outbound_full_sync(%Replica{} = state, remote_node) when is_atom(remote_node) do
+    case Map.fetch(state.outbound_full_syncs, remote_node) do
+      {:ok, _stream_ref} ->
+        {:busy, state}
+
+      :error ->
+        stream_ref = make_ref()
+
+        {:ok,
+         %{
+           state
+           | outbound_full_syncs: Map.put(state.outbound_full_syncs, remote_node, stream_ref)
+         }, stream_ref}
+    end
+  end
+
+  defp clear_outbound_full_sync(%Replica{} = state, remote_node, stream_ref) do
+    case Map.get(state.outbound_full_syncs, remote_node) do
+      ^stream_ref ->
+        %{state | outbound_full_syncs: Map.delete(state.outbound_full_syncs, remote_node)}
+
+      _other ->
+        state
     end
   end
 
@@ -3943,7 +4017,6 @@ defmodule EKV.Replica do
 
   defp sync_request_for_remote(%Replica{} = state, remote_node, remote_progress) do
     local_progress = local_progress_summary_for_wire(state)
-    known_member_nodes = known_member_nodes(state)
     remote_origin_id = remote_origin_id(state, remote_node, remote_progress)
     remote_origin_seq = Map.get(remote_progress, remote_origin_id, 0)
     local_origin_seq = Map.get(local_progress, remote_origin_id, 0)
@@ -3962,8 +4035,6 @@ defmodule EKV.Replica do
             {acc, request} =
               third_origin_sync_request(
                 acc,
-                known_member_nodes,
-                remote_node,
                 origin_node,
                 local_seq
               )
@@ -3982,31 +4053,20 @@ defmodule EKV.Replica do
 
   defp third_origin_sync_request(
          %Replica{} = state,
-         known_member_nodes,
-         _remote_node,
          origin_node,
          local_seq
        )
        when is_binary(origin_node) do
-    cond do
-      known_down_member_quarantined?(state, origin_node) ->
-        {state, {:full, {:quarantined_origin, origin_node, local_seq}}}
-
-      known_member_origin?(state, known_member_nodes, origin_node) ->
-        {state, {:delta, origin_node, local_seq}}
-
-      recent_member_origin_hint?(state, origin_node) ->
-        {state, nil}
-
-      true ->
-        {state, {:full, {:unknown_member_origin, origin_node, local_seq}}}
-    end
+    # The live peer advertising this progress may have retained a contiguous
+    # replay suffix even when the origin itself is retired, unknown locally,
+    # or quarantined. Ask the healthy peer for that suffix first. Its delta
+    # handler validates replay bounds and falls back to a full snapshot when
+    # it cannot prove that the requested range is available.
+    {state, {:delta, origin_node, local_seq}}
   end
 
   defp third_origin_sync_request(
          %Replica{} = state,
-         _known_member_nodes,
-         _remote_node,
          _origin_node,
          _local_seq
        ),
@@ -4018,36 +4078,6 @@ defmodule EKV.Replica do
     |> MapSet.new()
   rescue
     _ -> MapSet.new()
-  end
-
-  defp known_member_origin?(%Replica{} = state, known_member_nodes, origin_node) do
-    Enum.any?(known_member_nodes, &member_matches_origin?(state, &1, origin_node)) or
-      EKV.MemberPresence.member_origin_known?(state.name, origin_node) or
-      origin_node == state.node_id or
-      Enum.any?(Map.keys(state.member_node_ids), &member_matches_origin?(state, &1, origin_node)) or
-      Enum.any?(Map.keys(state.remote_shards), &member_matches_origin?(state, &1, origin_node)) or
-      known_down_member?(state, origin_node)
-  end
-
-  defp recent_member_origin_hint?(%Replica{} = state, origin_node)
-       when is_binary(origin_node) and byte_size(origin_node) > 0 do
-    now_ms = System.system_time(:millisecond)
-
-    now_ms - (state.started_at_ms || now_ms) <= @unknown_member_origin_startup_grace_ms and
-      member_origin_seen_recently?(state, origin_node, now_ms)
-  end
-
-  defp recent_member_origin_hint?(%Replica{} = _state, _origin_node), do: false
-
-  defp member_origin_seen_recently?(%Replica{} = state, origin_node, now_ms) do
-    case Map.fetch(state.member_seen_at, origin_node) do
-      {:ok, seen_at_ms} when is_integer(seen_at_ms) ->
-        now_ms - seen_at_ms <= @member_seen_hint_ttl_ms
-
-      _ ->
-        seen_at_ms = Store.member_seen_marker_get(state.db, origin_node)
-        is_integer(seen_at_ms) and now_ms - seen_at_ms <= @member_seen_hint_ttl_ms
-    end
   end
 
   defp member_matches_origin?(%Replica{} = state, member_node, origin_node)
@@ -4143,16 +4173,6 @@ defmodule EKV.Replica do
   end
 
   defp known_down_member?(%Replica{} = _state, _remote_node_or_id), do: false
-
-  defp known_down_member_quarantined?(%Replica{} = state, origin_node_id)
-       when is_binary(origin_node_id) do
-    Enum.any?(state.quarantined_members, fn remote_node ->
-      remote_origin_id(state, remote_node) == origin_node_id or
-        Atom.to_string(remote_node) == origin_node_id
-    end)
-  end
-
-  defp known_down_member_quarantined?(%Replica{} = _state, _origin_node_id), do: false
 
   defp progress_ack_summary(%Replica{} = state, :full, _progress) do
     local_progress_summary_for_wire(state)
@@ -4881,6 +4901,11 @@ defmodule EKV.Replica do
           state = process_inline_priority_message(state, msg)
           collect_local_write_batch(state, batch_items, batch_bytes)
 
+        {:continue_full_sync, _remote_node, _stream_ref, _last_key, _cutoff, _progress_summary,
+         _chunk_size, _chunk_max_bytes, _reason} = msg ->
+          state = process_inline_priority_message(state, msg)
+          collect_local_write_batch(state, batch_items, batch_bytes)
+
         {:continue_full_sync, _remote_node, _last_key, _cutoff, _progress_summary, _chunk_size,
          _chunk_max_bytes, _reason} = msg ->
           state = process_inline_priority_message(state, msg)
@@ -5295,6 +5320,11 @@ defmodule EKV.Replica do
         take_priority_control_turn(state, remaining_control_budget - 1)
 
       :anti_entropy_tick = msg ->
+        state = process_inline_priority_message(state, msg)
+        take_priority_control_turn(state, remaining_control_budget - 1)
+
+      {:continue_full_sync, _remote_node, _stream_ref, _last_key, _cutoff, _progress_summary,
+       _chunk_size, _chunk_max_bytes, _reason} = msg ->
         state = process_inline_priority_message(state, msg)
         take_priority_control_turn(state, remaining_control_budget - 1)
 

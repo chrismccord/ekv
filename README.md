@@ -9,7 +9,7 @@ Data survives node restarts, node death, and network partitions. Member nodes re
 ```elixir
 def deps do
   [
-    {:ekv, "~> 0.4.5"}
+    {:ekv, "~> 0.4.6"}
   ]
 end
 ```
@@ -245,8 +245,10 @@ commit and reply one at a time; only the replication fanout is batched.
 When a node connects (or reconnects), each shard pair exchanges a handshake. Based on high-water marks (HWMs), they decide:
 
 - **Delta sync** if the oplog still has entries since the member's last known position (efficient for brief disconnects).
-- **Relayed delta** if a member is behind on some third-party origin that is currently down but a live peer still retains that origin stream.
+- **Relayed delta** if a member is behind on a third-party origin and a live peer still retains that origin stream. This is tried for disconnected, retired, locally unknown, and quarantined origins; the quarantined member itself remains blocked.
 - **Full sync** if the oplog has been truncated past that point or the member is new (sends all live entries + recent tombstones; expired rows are omitted). Full sync rebuilds `kv` on the receiver but does not seed `kv_oplog`.
+
+Each serving shard keeps at most one active full-snapshot stream per destination. Duplicate requests received while that stream is chunking are coalesced rather than starting parallel rescans of the same shard.
 
 Connected members also re-run that same handshake periodically by default
 (`anti_entropy_interval`) so a member that missed a prior update eventually

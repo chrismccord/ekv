@@ -884,10 +884,10 @@ defmodule EKV.AntiEntropyTest do
       assert :ok = TestCluster.untrace_shard_sends(node_b, ekv_name)
     end
 
-    test "unknown third-origin full request carries explicit reason metadata on the wire" do
+    test "unknown third-origin tries relayed delta before the sender falls back to full" do
       peers = TestCluster.start_peers(2)
       [{_, node_a}, {_, node_b}] = peers
-      ekv_name = unique_name(:anti_entropy_unknown_origin_full_reason)
+      ekv_name = unique_name(:anti_entropy_unknown_origin_delta_first)
       unknown_origin = "unknown-origin"
       on_exit(fn -> TestCluster.stop_peers(peers) end)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
@@ -903,8 +903,10 @@ defmodule EKV.AntiEntropyTest do
 
       remote_node_id = assigned_node_id(peers, node_a)
       stale_age_ms = 999_999
+      assert :ok = TestCluster.force_local_progress(node_a, ekv_name, unknown_origin, 1)
       assert :ok = TestCluster.set_sync_inflight_age(node_b, ekv_name, node_a, stale_age_ms)
       assert :ok = TestCluster.trace_shard_sends(node_b, ekv_name, self())
+      assert :ok = TestCluster.trace_shard_sends(node_a, ekv_name, self())
 
       assert :ok =
                TestCluster.inject_summary_reply(
@@ -916,14 +918,83 @@ defmodule EKV.AntiEntropyTest do
                )
 
       shard_name = EKV.Replica.shard_name(ekv_name, 0)
-      requests = collect_sync_request_meta_messages([], 1_000)
+      trace_messages = collect_trace_messages([], 2_000)
 
-      assert Enum.any?(requests, fn {shard, request, meta, destination} ->
-               shard == 0 and request == :full and
-                 meta == %{explicit_full_reason: {:unknown_member_origin, unknown_origin, 0}} and
-                 destination == {shard_name, node_a}
+      assert Enum.any?(trace_messages, fn
+               {:request, 0, {:delta, ^unknown_origin, 0}, {^shard_name, ^node_a}} -> true
+               _ -> false
+             end),
+             "trace_messages=#{inspect(trace_messages)}"
+
+      refute Enum.any?(trace_messages, fn
+               {:request, 0, :full, {^shard_name, ^node_a}} -> true
+               _ -> false
+             end),
+             "trace_messages=#{inspect(trace_messages)}"
+
+      assert Enum.any?(trace_messages, fn
+               {:sync, ^node_a, 0, :full, _keys, _progress, {^shard_name, ^node_b}} -> true
+               _ -> false
+             end),
+             "trace_messages=#{inspect(trace_messages)}"
+
+      assert :ok = TestCluster.untrace_shard_sends(node_b, ekv_name)
+      assert :ok = TestCluster.untrace_shard_sends(node_a, ekv_name)
+    end
+
+    test "quarantined third-origin progress is repaired with a relayed delta" do
+      peers = TestCluster.start_peers(3)
+      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
+      ekv_name = unique_name(:anti_entropy_quarantined_origin_delta)
+      key = "quarantined_origin/missed"
+      tombstone_ttl = 700
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+      on_exit(fn -> cleanup_data(peers, ekv_name) end)
+
+      start_cluster(
+        peers,
+        ekv_name,
+        anti_entropy_interval: @manual_anti_entropy_interval,
+        tombstone_ttl: tombstone_ttl,
+        gc_interval: 100
+      )
+
+      TestCluster.disconnect_nodes(node_a, node_b)
+      Process.sleep(1_200)
+
+      assert :ok == TestCluster.rpc!(node_a, EKV, :put, [ekv_name, key, "value"])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_c, EKV, :get, [ekv_name, key]) == "value"
+      end)
+
+      assert TestCluster.rpc!(node_b, EKV, :get, [ekv_name, key]) == nil
+      TestCluster.reconnect_nodes(node_a, node_b)
+
+      TestCluster.assert_eventually(fn ->
+        state = TestCluster.replica_state(node_b, ekv_name)
+        MapSet.member?(state.quarantined_members, node_a)
+      end)
+
+      assert :ok = TestCluster.trace_shard_sends(node_b, ekv_name, self())
+      assert :ok = TestCluster.trigger_anti_entropy(node_c, ekv_name)
+
+      origin_id = assigned_node_id(peers, node_a)
+      shard_name = EKV.Replica.shard_name(ekv_name, 0)
+      requests = collect_sync_request_messages([], 2_000)
+
+      assert Enum.any?(requests, fn {shard, request, destination} ->
+               shard == 0 and request == {:delta, origin_id, 0} and
+                 destination == {shard_name, node_c}
              end),
              "requests=#{inspect(requests)}"
+
+      refute Enum.any?(requests, fn {_shard, request, _destination} -> request == :full end),
+             "requests=#{inspect(requests)}"
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, EKV, :get, [ekv_name, key]) == "value"
+      end)
 
       assert :ok = TestCluster.untrace_shard_sends(node_b, ekv_name)
     end
@@ -946,7 +1017,7 @@ defmodule EKV.AntiEntropyTest do
       end)
     end
 
-    test "recently seen unknown third-origin is deferred during startup instead of forcing full" do
+    test "recently seen unknown third-origin requests relayed delta during startup" do
       peers = TestCluster.start_peers(2)
       [{_, node_a}, {_, node_b}] = peers
       ekv_name = unique_name(:anti_entropy_recent_unknown_origin_deferred)
@@ -974,6 +1045,12 @@ defmodule EKV.AntiEntropyTest do
                )
 
       requests = collect_sync_request_meta_messages([], 1_000)
+
+      assert Enum.any?(requests, fn {shard, request, _meta, destination} ->
+               shard == 0 and request == {:delta, recent_origin, 0} and
+                 destination == {EKV.Replica.shard_name(ekv_name, 0), node_a}
+             end),
+             "requests=#{inspect(requests)}"
 
       refute Enum.any?(requests, fn {shard, request, _meta, destination} ->
                shard == 0 and request == :full and
@@ -2297,6 +2374,13 @@ defmodule EKV.AntiEntropyTest do
       assert :ok = TestCluster.trigger_anti_entropy(node_a, ekv_name)
       assert_no_sync_messages(400)
       assert :ok = TestCluster.untrace_shard_sends(node_a, ekv_name)
+
+      TestCluster.disconnect_nodes(node_a, node_b)
+
+      TestCluster.assert_eventually(fn ->
+        state = TestCluster.replica_state(node_a, ekv_name)
+        not MapSet.member?(state.quarantined_members, node_b)
+      end)
     end
 
     test "skips proxy-mode shards" do

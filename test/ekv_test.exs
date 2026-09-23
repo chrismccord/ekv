@@ -32,6 +32,19 @@ defmodule EKVTest do
     mode
   end
 
+  defp collect_full_sync_keys(acc, timeout) do
+    receive do
+      {:trace, _pid, :send,
+       {:ekv, 1, :sync, {_from_node, _shard, :full, entries, _progress}, _meta}, _destination} ->
+        collect_full_sync_keys(Enum.map(entries, &elem(&1, 0)) ++ acc, timeout)
+
+      {:trace, _pid, :send, _message, _destination} ->
+        collect_full_sync_keys(acc, timeout)
+    after
+      timeout -> Enum.reverse(acc)
+    end
+  end
+
   defp start_single_node_cas_ekv(name, data_dir, cluster_size) do
     EKV.start_link(
       name: name,
@@ -1904,6 +1917,54 @@ defmodule EKVTest do
                  "SELECT COUNT(*) FROM kv_keyrefs WHERE key LIKE 'full_sync_only/%'",
                  []
                )
+    end
+
+    test "duplicate full-sync requests share one outbound snapshot stream" do
+      name = :"ekv_full_sync_coalesce_#{System.unique_integer([:positive])}"
+      data_dir = Path.join(System.tmp_dir!(), "ekv_test_#{name}")
+
+      {:ok, pid} =
+        EKV.start_link(
+          name: name,
+          data_dir: data_dir,
+          shards: 1,
+          sync_chunk_size: 1,
+          log: false,
+          gc_interval: :timer.hours(1),
+          tombstone_ttl: :timer.hours(24 * 7)
+        )
+
+      on_exit(fn ->
+        Process.exit(pid, :shutdown)
+        File.rm_rf!(data_dir)
+      end)
+
+      keys = Enum.map(1..3, &"full_sync_coalesce/#{&1}")
+      Enum.each(keys, &assert(:ok = EKV.put(name, &1, &1)))
+
+      shard_name = EKV.Replica.shard_name(name, 0)
+      shard_pid = Process.whereis(shard_name)
+
+      :sys.replace_state(shard_name, fn state ->
+        %{state | remote_shards: Map.put(state.remote_shards, node(), self())}
+      end)
+
+      :erlang.trace(shard_pid, true, [:send, {:tracer, self()}])
+      :sys.suspend(shard_name)
+
+      Enum.each(1..3, fn _ ->
+        send(shard_name, {:ekv_sync_request, self(), 0, :full})
+      end)
+
+      :sys.resume(shard_name)
+
+      EKV.TestCluster.assert_eventually(fn ->
+        :sys.get_state(shard_name).outbound_full_syncs == %{}
+      end)
+
+      :erlang.trace(shard_pid, false, [:send])
+
+      assert collect_full_sync_keys([], 100) |> Enum.sort() == Enum.sort(keys)
     end
 
     test "remote put generates event", %{name: name} do
