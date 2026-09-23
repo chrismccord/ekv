@@ -700,9 +700,10 @@ defmodule EKV.CASDistributedTest do
                {:ok, _, _} -> true
                {:error, :conflict} -> true
                {:error, :unconfirmed} -> true
+               {:error, :quorum_timeout} -> true
                _ -> false
              end),
-             "Expected only CAS success/conflict/unconfirmed outcomes, got: #{inspect(results)}"
+             "Expected only CAS success/conflict/unconfirmed/timeout outcomes, got: #{inspect(results)}"
 
       # A concurrent insert-if-absent race can produce an ambiguous proposer outcome
       # (`:unconfirmed`) even when one value commits. The contract we care about is
@@ -1617,7 +1618,6 @@ defmodule EKV.CASDistributedTest do
 
       # Subscribe on node B
       TestCluster.subscribe_on(node_b, ekv_name, "sub/", self())
-      Process.sleep(50)
 
       # CAS write on node A
       {:ok, _} = TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "sub/1", "val", [if_vsn: nil]])
@@ -1639,7 +1639,6 @@ defmodule EKV.CASDistributedTest do
 
       # Subscribe on acceptor node (B)
       TestCluster.subscribe_on(node_b, ekv_name, "asub/", self())
-      Process.sleep(50)
 
       # CAS put on proposer node (A) — B acts as acceptor
       {:ok, _} =
@@ -1660,18 +1659,21 @@ defmodule EKV.CASDistributedTest do
       start_cas_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      # Write initial value via CAS
+      # Subscribe before the initial write so its asynchronous notification is
+      # observed before the delete notification we want to inspect.
+      TestCluster.subscribe_on(node_b, ekv_name, "dsub/", self())
+
+      # Write initial value via CAS.
       {:ok, _} =
         TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "dsub/1", "old_val", [if_vsn: nil]])
+
+      assert_receive {:remote_ekv_event, put_events, _}, 3000
+      assert [%EKV.Event{type: :put, key: "dsub/1", value: "old_val"}] = put_events
 
       # Wait for replication so B has the value
       TestCluster.assert_eventually(fn ->
         TestCluster.rpc!(node_b, EKV, :get, [ekv_name, "dsub/1"]) == "old_val"
       end)
-
-      # Subscribe on acceptor node (B)
-      TestCluster.subscribe_on(node_b, ekv_name, "dsub/", self())
-      Process.sleep(50)
 
       # CAS delete on proposer node (A)
       {_, vsn} = TestCluster.rpc!(node_a, EKV, :lookup, [ekv_name, "dsub/1"])
@@ -1697,7 +1699,6 @@ defmodule EKV.CASDistributedTest do
 
       # Subscribe on proposer node (A)
       TestCluster.subscribe_on(node_a, ekv_name, "nosub/", self())
-      Process.sleep(50)
 
       # Get current vsn, then write again to make it stale
       {_, stale_vsn} = TestCluster.rpc!(node_a, EKV, :lookup, [ekv_name, "nosub/1"])

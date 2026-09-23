@@ -226,10 +226,21 @@ defmodule EKV.TestCluster do
 
   @doc false
   def start_subscriber(ekv_name, prefix, target_pid) do
-    spawn(fn ->
-      :ok = EKV.subscribe(ekv_name, prefix)
-      subscriber_loop(target_pid)
-    end)
+    caller = self()
+    ref = make_ref()
+
+    pid =
+      spawn(fn ->
+        :ok = EKV.subscribe(ekv_name, prefix)
+        send(caller, {ref, :subscribed})
+        subscriber_loop(target_pid)
+      end)
+
+    receive do
+      {^ref, :subscribed} -> pid
+    after
+      1_000 -> exit({:subscribe_timeout, ekv_name, prefix})
+    end
   end
 
   def start_collecting_subscriber_on(node, ekv_name, prefix, target_pid, collect_timeout) do
