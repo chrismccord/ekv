@@ -21,74 +21,37 @@ jobs:
 
   linux:
     needs: create-release
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        otp: ["26", "27"]
-        elixir: ["1.19"]
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+        libc: [gnu, musl]
+        include:
+          - libc: gnu
+            image: hexpm/elixir:1.19.5-erlang-27.3.4.7-ubuntu-jammy-20260509
+          - libc: musl
+            image: hexpm/elixir:1.19.5-erlang-27.3.4.7-alpine-3.20.9
     env:
       MIX_ENV: prod
     steps:
       - uses: actions/checkout@v4
 
-      - uses: erlef/setup-beam@v1
-        with:
-          otp-version: ${{ matrix.otp }}
-          elixir-version: ${{ matrix.elixir }}
-
-      - run: mix deps.get
-
-      - name: Precompile
+      # Build against the documented libc baseline, not the runner's newer libc.
+      - name: Precompile and smoke test
         run: |
-          export ELIXIR_MAKE_CACHE_DIR=$(pwd)/cache
-          mkdir -p "$ELIXIR_MAKE_CACHE_DIR"
-          mix elixir_make.precompile
+          docker run --rm -v "$PWD:/work" -w /work \
+            -e MIX_ENV=prod -e ELIXIR_MAKE_CACHE_DIR=/work/cache \
+            "${{ matrix.image }}" sh scripts/precompile_linux.sh
 
       - name: Upload artifacts
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload ${{ github.ref_name }} cache/*.tar.gz --clobber
 
-  linux-arm:
-    needs: create-release
-    runs-on: ubuntu-24.04-arm
-    strategy:
-      fail-fast: false
-      matrix:
-        otp: ["26", "27"]
-        elixir: ["1.19"]
-    env:
-      MIX_ENV: prod
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: erlef/setup-beam@v1
-        with:
-          otp-version: ${{ matrix.otp }}
-          elixir-version: ${{ matrix.elixir }}
-
-      - run: mix deps.get
-
-      - name: Precompile
-        run: |
-          export ELIXIR_MAKE_CACHE_DIR=$(pwd)/cache
-          mkdir -p "$ELIXIR_MAKE_CACHE_DIR"
-          mix elixir_make.precompile
-
-      - name: Upload artifacts
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release upload ${{ github.ref_name }} cache/*.tar.gz --clobber
-
-  macos-arm:
+  macos:
     needs: create-release
     runs-on: macos-14
-    strategy:
-      fail-fast: false
-      matrix:
-        otp: ["26", "27"]
-        elixir: ["1.19"]
     env:
       MIX_ENV: prod
     steps:
@@ -96,18 +59,47 @@ jobs:
 
       - uses: erlef/setup-beam@v1
         with:
-          otp-version: ${{ matrix.otp }}
-          elixir-version: ${{ matrix.elixir }}
+          otp-version: "27"
+          elixir-version: "1.19"
 
       - run: mix deps.get
 
       - name: Precompile
         run: |
-          export ELIXIR_MAKE_CACHE_DIR=$(pwd)/cache
+          export ELIXIR_MAKE_CACHE_DIR="$PWD/cache"
           mkdir -p "$ELIXIR_MAKE_CACHE_DIR"
           mix elixir_make.precompile
+          # Precompile cleans priv; compilation must now use the cached NIF.
+          MAKE=false mix compile --warnings-as-errors
+          mix run --no-compile scripts/precompile_smoke.exs
 
       - name: Upload artifacts
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload ${{ github.ref_name }} cache/*.tar.gz --clobber
+
+  checksums:
+    needs: [linux, macos]
+    runs-on: ubuntu-latest
+    env:
+      MIX_ENV: prod
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "27"
+          elixir-version: "1.19"
+
+      - run: mix deps.get
+
+      - name: Generate and verify the complete release manifest
+        run: |
+          mix elixir_make.checksum --all
+          mix ekv.verify_checksums
+          mix hex.build
+
+      - name: Upload checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload ${{ github.ref_name }} checksum.exs --clobber

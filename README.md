@@ -14,7 +14,25 @@ def deps do
 end
 ```
 
-EKV uses sqlite as the storage layer. Precompiled NIF binaries are available for common platforms. If a precompiled binary isn't available for your system, it will compile from source (requires a C compiler).
+EKV uses SQLite as the storage layer. The release build matrix is:
+
+| OS / libc | Hardware | Build baseline |
+| --- | --- | --- |
+| Linux / glibc | x86-64, ARM64 | Ubuntu 22.04 (Jammy), glibc 2.35 |
+| Linux / musl | x86-64, ARM64 | Alpine 3.20, musl 1.2.5 |
+| macOS | Intel x86-64, Apple Silicon ARM64 | macOS 14 |
+
+Linux targets cover Debian/Ubuntu and Alpine images used on Fly Machines. Match
+the binary to the **image's architecture and libc**, not just the host OS; the
+runtime image must have a compatible libc at least as new as the build baseline.
+The NIF uses ABI 2.17 (OTP 26+), including on newer OTP releases.
+
+The expanded Linux matrix applies to releases built with this workflow; older
+releases do not gain new artifacts automatically. In particular, Hex release
+0.4.4 shipped stale 0.3.0 checksums and falls back to source compilation.
+If a precompiled binary cannot be downloaded or verified, EKV compiles from
+source (requires a C compiler and `make`). Set `EKV_BUILD=1` to force a source
+build, including when using a runtime image older than the libc baseline.
 
 ## Usage
 

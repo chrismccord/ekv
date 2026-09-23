@@ -139,12 +139,10 @@ done
 
 # Generate checksums from the GitHub release artifacts
 echo "==> Generating checksums"
-MIX_ENV=prod mix elixir_make.checksum --all --ignore-unavailable
-
-if [ ! -f checksum.exs ]; then
-  echo "error: checksum.exs was not created" >&2
-  exit 1
-fi
+MIX_ENV=prod mix elixir_make.checksum --all
+# elixir_make can exit successfully even when downloads fail. File existence
+# alone also accepts checksums left over from an earlier version.
+MIX_ENV=prod mix ekv.verify_checksums
 
 # Publish to Hex
 echo "==> Publishing to Hex"
