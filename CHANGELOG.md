@@ -1,3 +1,11 @@
+## 0.4.5 (2026-09-23)
+- Fix precompiled NIF checksum packaging and reject stale or incomplete release
+  manifests before building or publishing Hex packages.
+- Add Linux x86-64 and ARM64 musl binaries for Alpine images, and build glibc
+  binaries against Ubuntu 22.04 (glibc 2.35) for compatible Fly Machine images.
+- Generate and verify the complete release checksum manifest after all
+  precompiled binaries are built.
+
 ## 0.4.4 (2026-09-22)
 - Update bundled SQLite from 3.47.2 to 3.53.4, including the upstream WAL-reset
   database corruption fix.
