@@ -44,9 +44,11 @@ defmodule EKV.Replica do
         │   ├── EKV.Replica 0     shard GenServer (writes + replication + SQLite)
         │   ├── EKV.Replica 1
         │   ├── ...               N shards (default 8)
-        │   └── EKV.WALCheckpointer
+        │   ├── EKV.WALCheckpointer
         │                         dedicated connections, round-robin passive
         │                         checkpoints across independent shard DBs
+        │   └── EKV.ReplicationGate
+        │                         starts discovery only after local storage
         ├── EKV.MemberPresence    publishes ready member in :pg region groups
         ├── EKV.QuorumGate?       optional startup barrier for CAS quorum
         ├── EKV.GC                periodic timer, sends :gc to each shard
@@ -1385,6 +1387,7 @@ defmodule EKV.Replica do
     replication_batch_max_entries: 64,
     replication_batch_max_bytes: 256 * 1024,
     replication_batches: %{},
+    replication_started?: false,
     sync_inflight: %{},
     delta_origin_inflight: %{},
     delta_sync_storm_started_at_ms: nil,
@@ -1530,12 +1533,13 @@ defmodule EKV.Replica do
 
     log_once(state, fn -> "#{log_prefix(state)} started (shards=#{num_shards})" end)
 
-    # Discover members on all known nodes
-    for remote_node <- Node.list() do
-      send_to_member(state, remote_node, member_connect_message(state))
+    # Replica.Supervisor starts the replication gate after every local shard
+    # and the WAL checkpointer have opened their SQLite connections. If the
+    # gate already exists, this is an individual shard restart and it must
+    # announce itself to that existing gate.
+    if Process.whereis(EKV.ReplicationGate.process_name(name)) do
+      send(self(), :announce_replication_ready)
     end
-
-    schedule_anti_entropy_tick(state)
 
     {:ok, state}
   end
@@ -1591,6 +1595,10 @@ defmodule EKV.Replica do
   # =====================================================================
 
   @impl true
+  def handle_call(:start_replication, _from, %Replica{} = state) do
+    {:reply, :ok, start_replication(state)}
+  end
+
   def handle_call(request, _from, %Replica{handoff_node: handoff_node} = state)
       when handoff_node != nil do
     shard_name = shard_name(state.name, state.shard_index)
@@ -1831,8 +1839,6 @@ defmodule EKV.Replica do
   defp normalize_local_write_result({reply, %Replica{} = state})
        when reply in [:ok, {:error, :cas_managed_key}],
        do: {reply, state}
-
-  defp normalize_local_write_result({:ok, %Replica{} = state}), do: {:ok, state}
 
   defp handle_apply_observer_commit_request(
          %Replica{} = state,
@@ -2097,48 +2103,24 @@ defmodule EKV.Replica do
 
     has_subs = has_subscribers?(state)
 
-    {state, sync_events} =
-      Enum.reduce(entries, {state, []}, fn {key, value_binary, timestamp, origin_node, origin_seq,
-                                            expires_at, deleted_at},
-                                           {state, acc} ->
-        origin_node = normalize_origin_node(origin_node)
-
-        if shard_index_for(key, num_shards) == shard do
-          prev_value = if deleted_at && has_subs, do: read_previous_value(state, key)
-
-          {applied, state} =
-            apply_sync_entry(
-              state,
-              mode,
-              key,
-              value_binary,
-              timestamp,
-              origin_node,
-              origin_seq,
-              expires_at,
-              deleted_at
-            )
-
-          if applied do
-            event =
-              if deleted_at,
-                do: %EKV.Event{type: :delete, key: key, value: prev_value},
-                else: %EKV.Event{
-                  type: :put,
-                  key: key,
-                  value: :erlang.binary_to_term(value_binary)
-                }
-
-            {state, [event | acc]}
+    entries =
+      Enum.reduce(entries, [], fn
+        {key, value_binary, timestamp, origin_node, origin_seq, expires_at, deleted_at}, acc ->
+          if shard_index_for(key, num_shards) == shard do
+            [
+              {key, value_binary, timestamp, normalize_origin_node(origin_node), origin_seq,
+               expires_at, deleted_at}
+              | acc
+            ]
           else
-            {state, acc}
+            acc
           end
-        else
-          {state, acc}
-        end
       end)
+      |> Enum.reverse()
 
-    dispatch_events(state, Enum.reverse(sync_events))
+    {state, sync_events} = apply_sync_entries(state, mode, entries, has_subs)
+
+    dispatch_events(state, sync_events)
 
     progress = normalize_progress_summary(progress)
 
@@ -2199,6 +2181,27 @@ defmodule EKV.Replica do
   # =====================================================================
   # Node up/down
   # =====================================================================
+
+  def handle_info(:announce_replication_ready, %Replica{} = state) do
+    case Process.whereis(EKV.ReplicationGate.process_name(state.name)) do
+      pid when is_pid(pid) ->
+        send(pid, {:replica_ready, state.shard_index, self()})
+
+      nil ->
+        Process.send_after(self(), :announce_replication_ready, 25)
+    end
+
+    cb_noreply(state)
+  end
+
+  def handle_info(:start_replication, %Replica{replication_started?: false} = state) do
+    cb_noreply(start_replication(state))
+  end
+
+  def handle_info(:start_replication, %Replica{} = state), do: cb_noreply(state)
+
+  def handle_info({:nodeup, _remote_node}, %Replica{replication_started?: false} = state),
+    do: cb_noreply(state)
 
   def handle_info({:nodeup, remote_node}, %Replica{} = state) do
     case maybe_allow_member_reconnect(state, remote_node) do
@@ -2656,16 +2659,15 @@ defmodule EKV.Replica do
     cb_noreply(state)
   end
 
+  def handle_info(:anti_entropy_tick, %Replica{replication_started?: false} = state),
+    do: cb_noreply(state)
+
   def handle_info(:anti_entropy_tick, %Replica{} = state) do
     state =
-      if state.handoff_node do
-        state
-      else
-        state
-        |> expire_stale_inflight()
-        |> trigger_missing_member_connects()
-        |> trigger_summary_probe()
-      end
+      state
+      |> expire_stale_inflight()
+      |> trigger_missing_member_connects()
+      |> trigger_summary_probe()
 
     schedule_anti_entropy_tick(state)
     cb_noreply(state)
@@ -2874,6 +2876,18 @@ defmodule EKV.Replica do
        do: cb_noreply(state)
 
   defp do_member_connect(
+         %Replica{replication_started?: false} = state,
+         _remote_pid,
+         _remote_shard,
+         _remote_num_shards,
+         _remote_progress,
+         _remote_node_id,
+         _remote_features
+       ) do
+    state
+  end
+
+  defp do_member_connect(
          %Replica{} = state,
          remote_pid,
          remote_shard,
@@ -2946,6 +2960,18 @@ defmodule EKV.Replica do
 
   defp do_member_connect(
          %Replica{} = state,
+         _remote_pid,
+         _remote_shard,
+         _remote_num_shards,
+         _remote_progress,
+         _remote_node_id,
+         _remote_features
+       ) do
+    state
+  end
+
+  defp do_member_connect_ack(
+         %Replica{replication_started?: false} = state,
          _remote_pid,
          _remote_shard,
          _remote_num_shards,
@@ -3095,31 +3121,107 @@ defmodule EKV.Replica do
     )
   end
 
-  defp apply_sync_entry(
-         %Replica{} = state,
-         :full,
-         key,
-         value_binary,
-         timestamp,
-         origin_node,
-         origin_seq,
-         expires_at,
-         deleted_at
-       ) do
-    case Store.write_snapshot_entry(
-           state.db,
-           state.stmts.kv_upsert,
-           key,
-           value_binary,
-           timestamp,
-           origin_node,
-           origin_seq,
-           expires_at,
-           deleted_at
-         ) do
-      {:ok, true} -> {true, state}
-      {:ok, false} -> {false, state}
+  defp apply_sync_entries(%Replica{} = state, :full, [], _has_subs), do: {state, []}
+
+  defp apply_sync_entries(%Replica{} = state, :full, entries, has_subs) do
+    initial_delete_values = full_sync_initial_delete_values(state, entries, has_subs)
+
+    case Store.write_snapshot_entries_batch(state.db, state.stmts.kv_upsert, entries) do
+      {:ok, applied_flags} when length(applied_flags) == length(entries) ->
+        {state, full_sync_batch_events(entries, applied_flags, initial_delete_values)}
+
+      {:ok, applied_flags} ->
+        exit({:invalid_full_sync_batch_result, length(entries), length(applied_flags)})
+
+      {:error, reason} ->
+        exit({:full_sync_batch_failed, reason})
     end
+  end
+
+  defp apply_sync_entries(%Replica{} = state, :delta, entries, has_subs),
+    do: apply_sync_entries_individually(state, :delta, entries, has_subs)
+
+  defp apply_sync_entries_individually(%Replica{} = state, mode, entries, has_subs) do
+    {state, events} =
+      Enum.reduce(entries, {state, []}, fn
+        {key, value_binary, timestamp, origin_node, origin_seq, expires_at, deleted_at},
+        {acc_state, acc_events} ->
+          prev_value =
+            if is_integer(deleted_at) and has_subs,
+              do: read_previous_value(acc_state, key)
+
+          {applied, acc_state} =
+            apply_sync_entry(
+              acc_state,
+              mode,
+              key,
+              value_binary,
+              timestamp,
+              origin_node,
+              origin_seq,
+              expires_at,
+              deleted_at
+            )
+
+          event =
+            cond do
+              not applied ->
+                nil
+
+              is_integer(deleted_at) ->
+                %EKV.Event{type: :delete, key: key, value: prev_value}
+
+              true ->
+                %EKV.Event{
+                  type: :put,
+                  key: key,
+                  value: :erlang.binary_to_term(value_binary)
+                }
+            end
+
+          if event, do: {acc_state, [event | acc_events]}, else: {acc_state, acc_events}
+      end)
+
+    {state, Enum.reverse(events)}
+  end
+
+  defp full_sync_initial_delete_values(%Replica{} = state, entries, true) do
+    entries
+    |> Enum.reduce(MapSet.new(), fn
+      {key, _value_binary, _timestamp, _origin_node, _origin_seq, _expires_at, deleted_at}, acc ->
+        if is_integer(deleted_at), do: MapSet.put(acc, key), else: acc
+    end)
+    |> Map.new(fn key -> {key, read_previous_value(state, key)} end)
+  end
+
+  defp full_sync_initial_delete_values(%Replica{}, _entries, false), do: %{}
+
+  defp full_sync_batch_events(entries, applied_flags, initial_delete_values) do
+    {events, _shadow_values} =
+      entries
+      |> Enum.zip(applied_flags)
+      |> Enum.reduce({[], initial_delete_values}, fn
+        {{_key, _value_binary, _timestamp, _origin_node, _origin_seq, _expires_at, _deleted_at},
+         false},
+        {acc_events, shadow_values} ->
+          {acc_events, shadow_values}
+
+        {{key, _value_binary, _timestamp, _origin_node, _origin_seq, _expires_at, deleted_at},
+         true},
+        {acc_events, shadow_values}
+        when is_integer(deleted_at) ->
+          event = %EKV.Event{type: :delete, key: key, value: Map.get(shadow_values, key)}
+          {[event | acc_events], Map.put(shadow_values, key, nil)}
+
+        {{key, value_binary, _timestamp, _origin_node, _origin_seq, _expires_at, _deleted_at},
+         true},
+        {acc_events, shadow_values} ->
+          value = :erlang.binary_to_term(value_binary)
+          event = %EKV.Event{type: :put, key: key, value: value}
+          {[event | acc_events], Map.put(shadow_values, key, value)}
+      end)
+
+    Enum.reverse(events)
   end
 
   defp apply_replication_batch(%Replica{} = state, from_node, origin_node, entries)
@@ -3191,8 +3293,6 @@ defmodule EKV.Replica do
         :error
     end
   end
-
-  defp normalize_replication_batch_entries(_entries), do: :error
 
   defp replication_batch_initial_delete_values(%Replica{} = state, entries) do
     if has_subscribers?(state) do
@@ -4322,6 +4422,23 @@ defmodule EKV.Replica do
 
   defp format_inflight_age(age_ms) when is_integer(age_ms), do: " age_ms=#{age_ms}"
   defp format_inflight_age(_age_ms), do: ""
+
+  defp start_replication(%Replica{handoff_node: handoff_node} = state)
+       when handoff_node != nil,
+       do: state
+
+  defp start_replication(%Replica{replication_started?: true} = state), do: state
+
+  defp start_replication(%Replica{} = state) do
+    state = %{state | replication_started?: true}
+
+    for remote_node <- Node.list() do
+      send_to_member(state, remote_node, member_connect_message(state))
+    end
+
+    schedule_anti_entropy_tick(state)
+    state
+  end
 
   defp schedule_anti_entropy_tick(%Replica{} = state) do
     case EKV.Supervisor.get_config(state.name)[:anti_entropy_interval] do

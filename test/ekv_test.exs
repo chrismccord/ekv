@@ -299,7 +299,7 @@ defmodule EKVTest do
     test "scan is a Stream (lazy)", %{name: name} do
       :ok = EKV.put(name, "user/1", "a")
       stream = EKV.scan(name, "user/")
-      assert is_function(stream) or match?(%Stream{}, stream)
+      assert is_function(stream)
     end
 
     test "keys returns matching {key, vsn} tuples as stream", %{name: name} do
@@ -317,7 +317,7 @@ defmodule EKVTest do
     test "keys is a Stream (lazy)", %{name: name} do
       :ok = EKV.put(name, "user/1", "a")
       stream = EKV.keys(name, "user/")
-      assert is_function(stream) or match?(%Stream{}, stream)
+      assert is_function(stream)
     end
 
     test "scan excludes deleted entries", %{name: name} do
@@ -340,6 +340,40 @@ defmodule EKVTest do
   end
 
   describe "restart rehydration" do
+    test "replication starts after local storage and restarts with a crashed shard", %{name: name} do
+      shard_name = EKV.Replica.shard_name(name, 0)
+      original_pid = Process.whereis(shard_name)
+
+      assert :sys.get_state(shard_name).replication_started?
+
+      monitor = Process.monitor(original_pid)
+      Process.exit(original_pid, :kill)
+      assert_receive {:DOWN, ^monitor, :process, ^original_pid, :killed}
+
+      restarted_pid =
+        Enum.reduce_while(1..100, nil, fn _, _acc ->
+          case Process.whereis(shard_name) do
+            pid when is_pid(pid) and pid != original_pid ->
+              {:halt, pid}
+
+            _ ->
+              Process.sleep(10)
+              {:cont, nil}
+          end
+        end)
+
+      assert is_pid(restarted_pid)
+
+      assert Enum.reduce_while(1..100, false, fn _, _acc ->
+               if :sys.get_state(restarted_pid).replication_started? do
+                 {:halt, true}
+               else
+                 Process.sleep(10)
+                 {:cont, false}
+               end
+             end)
+    end
+
     test "data survives replica restart", %{name: name, data_dir: data_dir} do
       :ok = EKV.put(name, "key1", "value1")
       :ok = EKV.put(name, "key2", "value2")
@@ -1810,6 +1844,49 @@ defmodule EKVTest do
       refute_receive {:ekv, _, _}, 100
     end
 
+    test "full-sync batch preserves LWW and ordered subscription semantics", %{name: name} do
+      config = EKV.Supervisor.get_config(name)
+
+      keys =
+        1..500
+        |> Enum.map(&"sync_mixed/#{&1}")
+        |> Enum.filter(&(EKV.Replica.shard_index_for(&1, config.num_shards) == 0))
+        |> Enum.take(3)
+
+      assert [stale_key, delete_key, put_key] = keys
+
+      shard_name = EKV.Replica.shard_name(name, 0)
+      now = System.system_time(:nanosecond)
+
+      :ok = EKV.put(name, stale_key, "current")
+      :ok = EKV.put(name, delete_key, "previous")
+      flush_dispatchers(name)
+
+      :ok = EKV.subscribe(name, "sync_mixed/")
+
+      entries = [
+        {stale_key, :erlang.term_to_binary("stale"), 0, :remote@host, 1, nil, nil},
+        {delete_key, nil, now + 1_000_000_000, :remote@host, 2, nil, now + 1_000_000_000},
+        {put_key, :erlang.term_to_binary("new"), now + 1_000_000_000, :remote@host, 3, nil, nil}
+      ]
+
+      send(shard_name, {:ekv_sync, :remote@host, 0, :full, entries, nil})
+      :sys.get_state(shard_name)
+      flush_dispatchers(name)
+
+      assert EKV.get(name, stale_key) == "current"
+      assert EKV.get(name, delete_key) == nil
+      assert EKV.get(name, put_key) == "new"
+
+      assert_receive {:ekv,
+                      [
+                        %EKV.Event{type: :delete, key: ^delete_key, value: "previous"},
+                        %EKV.Event{type: :put, key: ^put_key, value: "new"}
+                      ], %{name: ^name}}
+
+      refute_receive {:ekv, _, _}, 100
+    end
+
     test "delta sync emits once and suppresses duplicate or stale repairs", %{name: name} do
       config = EKV.Supervisor.get_config(name)
 
@@ -1917,6 +1994,36 @@ defmodule EKVTest do
                  "SELECT COUNT(*) FROM kv_keyrefs WHERE key LIKE 'full_sync_only/%'",
                  []
                )
+    end
+
+    test "snapshot batches roll back the whole chunk on an invalid row", %{name: name} do
+      shard_name = EKV.Replica.shard_name(name, 0)
+      %{db: db, stmts: stmts} = :sys.get_state(shard_name)
+      now = System.system_time(:nanosecond)
+      key = "snapshot_batch_atomic/#{System.unique_integer([:positive])}"
+
+      valid_args = [key, :erlang.term_to_binary("value"), now, "remote", 1, nil, nil]
+
+      invalid_args = [
+        "invalid",
+        :erlang.term_to_binary("value"),
+        now,
+        {:not, :bindable},
+        2,
+        nil,
+        nil
+      ]
+
+      assert_raise ArgumentError, fn ->
+        EKV.Sqlite3.write_snapshot_entries_batch(
+          db,
+          stmts.kv_upsert,
+          [valid_args, invalid_args]
+        )
+      end
+
+      assert {:ok, [[0]]} =
+               EKV.Sqlite3.fetch_all(db, "SELECT COUNT(*) FROM kv WHERE key = ?1", [key])
     end
 
     test "duplicate full-sync requests share one outbound snapshot stream" do

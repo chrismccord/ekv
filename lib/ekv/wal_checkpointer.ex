@@ -8,6 +8,7 @@ defmodule EKV.WALCheckpointer do
   defstruct [
     :name,
     :tick_interval,
+    :initial_delay,
     :log,
     :next_shard,
     connections: %{}
@@ -76,6 +77,7 @@ defmodule EKV.WALCheckpointer do
     state = %__MODULE__{
       name: name,
       tick_interval: max(div(interval, num_shards), 1),
+      initial_delay: interval,
       log: log,
       next_shard: 0,
       connections: connections
@@ -214,7 +216,7 @@ defmodule EKV.WALCheckpointer do
   end
 
   defp initial_delay(state) do
-    1 + :erlang.phash2(state.name, state.tick_interval)
+    state.initial_delay
   end
 
   defp put_connection(state, shard_index, connection) do

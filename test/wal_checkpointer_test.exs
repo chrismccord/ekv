@@ -23,6 +23,19 @@ defmodule EKV.WALCheckpointerTest do
              EKV.Sqlite3.fetch_all(writer, "PRAGMA journal_size_limit", [])
   end
 
+  test "first background checkpoint waits a full configured interval", %{
+    name: name,
+    data_dir: data_dir
+  } do
+    interval = 500
+    start_ekv(name, data_dir, wal_checkpoint_interval: interval)
+    checkpointer = GenServer.whereis(EKV.WALCheckpointer.process_name(name))
+
+    assert :sys.get_state(checkpointer).initial_delay == interval
+    Process.sleep(50)
+    assert %{checkpoint_count: 0} = EKV.WALCheckpointer.stats(name, 0)
+  end
+
   test "independent checkpointer advances the WAL without changing data", %{
     name: name,
     data_dir: data_dir

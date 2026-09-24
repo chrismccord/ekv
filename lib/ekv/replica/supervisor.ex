@@ -34,9 +34,11 @@ defmodule EKV.Replica.Supervisor do
        wal_size_limit: config.wal_size_limit,
        log: config.log}
 
-    # Checkpointers start only after every shard database is initialized. They
-    # are listed last so normal shutdown closes their independent SQLite
-    # connections before Replica writer connections.
-    Supervisor.init(replicas ++ [checkpointer], strategy: :one_for_one)
+    replication_gate =
+      {EKV.ReplicationGate, name: name, num_shards: num_shards}
+
+    # Replication starts only after every shard database and the checkpointer
+    # have opened. The gate is last on startup and first on normal shutdown.
+    Supervisor.init(replicas ++ [checkpointer, replication_gate], strategy: :one_for_one)
   end
 end

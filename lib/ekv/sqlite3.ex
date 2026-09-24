@@ -76,6 +76,9 @@ defmodule EKV.Sqlite3 do
   def write_snapshot_entry(db, kv_stmt, kv_args),
     do: Sqlite3NIF.ekv_write_snapshot_entry(db, kv_stmt, kv_args)
 
+  def write_snapshot_entries_batch(db, kv_stmt, kv_args_list),
+    do: Sqlite3NIF.ekv_write_snapshot_entries_batch(db, kv_stmt, kv_args_list)
+
   def read_entry(db, stmt, args), do: Sqlite3NIF.ekv_read_entry(db, stmt, args)
   def fetch_all(db, sql, args), do: Sqlite3NIF.ekv_fetch_all(db, sql, args)
   def backup(source_path, dest_path), do: Sqlite3NIF.ekv_backup(source_path, dest_path)

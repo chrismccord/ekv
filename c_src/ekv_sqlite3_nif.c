@@ -1986,6 +1986,120 @@ static ERL_NIF_TERM ekv_write_snapshot_entry(ErlNifEnv *env, int argc, const ERL
 }
 
 /* ------------------------------------------------------------------ */
+/* NIF: write_snapshot_entries_batch(db, kv_stmt, kv_args_list)       */
+/*   -> {:ok, [boolean()]} | {:error, msg}                             */
+/*                                                                     */
+/* Full-sync chunks are snapshots, so they only update kv. Applying   */
+/* the whole chunk in one transaction avoids one WAL commit per row.   */
+/* The booleans preserve the per-row LWW outcome for subscriptions.    */
+/* ------------------------------------------------------------------ */
+
+static ERL_NIF_TERM ekv_write_snapshot_entries_batch(
+    ErlNifEnv *env,
+    int argc,
+    const ERL_NIF_TERM argv[]
+)
+{
+    (void)argc;
+    connection_t *conn;
+    statement_t *kv_s;
+    unsigned int entry_count = 0;
+    int *applied_flags = NULL;
+    ERL_NIF_TERM list;
+    ERL_NIF_TERM head;
+    unsigned int idx = 0;
+
+    if (!enif_get_resource(env, argv[0], connection_type, (void **)&conn))
+        return enif_make_badarg(env);
+
+    if (!enif_get_resource(env, argv[1], statement_type, (void **)&kv_s))
+        return enif_make_badarg(env);
+
+    if (kv_s->conn != conn)
+        return make_error(env, "statement does not belong to this connection");
+
+    if (!enif_get_list_length(env, argv[2], &entry_count) || entry_count == 0)
+        return enif_make_badarg(env);
+
+    applied_flags = enif_alloc(sizeof(int) * entry_count);
+    if (!applied_flags)
+        return make_error(env, "alloc failed");
+
+    list = argv[2];
+
+    enif_mutex_lock(conn->mutex);
+    if (!conn->db) {
+        enif_mutex_unlock(conn->mutex);
+        enif_free(applied_flags);
+        return make_error(env, "database closed");
+    }
+    if (!kv_s->stmt) {
+        enif_mutex_unlock(conn->mutex);
+        enif_free(applied_flags);
+        return make_error(env, "statement finalized");
+    }
+
+    int rc = begin_immediate(conn->db);
+    if (rc != SQLITE_OK) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        enif_mutex_unlock(conn->mutex);
+        enif_free(applied_flags);
+        return err;
+    }
+
+    while (enif_get_list_cell(env, list, &head, &list)) {
+        int bind_rc = bind_args(env, kv_s->stmt, head);
+        if (bind_rc != 0) {
+            ERL_NIF_TERM err = (bind_rc == -1)
+                ? enif_make_badarg(env)
+                : make_sqlite_error(env, conn->db);
+            sqlite3_reset(kv_s->stmt);
+            rollback_tx(conn->db);
+            enif_mutex_unlock(conn->mutex);
+            enif_free(applied_flags);
+            return err;
+        }
+
+        rc = sqlite3_step(kv_s->stmt);
+        if (rc != SQLITE_DONE) {
+            ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+            sqlite3_reset(kv_s->stmt);
+            rollback_tx(conn->db);
+            enif_mutex_unlock(conn->mutex);
+            enif_free(applied_flags);
+            return err;
+        }
+
+        applied_flags[idx++] = sqlite3_changes(conn->db) > 0;
+        sqlite3_reset(kv_s->stmt);
+    }
+
+    rc = commit_tx(conn->db);
+    if (rc != SQLITE_OK) {
+        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        rollback_tx(conn->db);
+        enif_mutex_unlock(conn->mutex);
+        enif_free(applied_flags);
+        return err;
+    }
+
+    enif_mutex_unlock(conn->mutex);
+
+    ERL_NIF_TERM results = enif_make_list(env, 0);
+    while (idx > 0) {
+        idx--;
+        results = enif_make_list_cell(
+            env,
+            applied_flags[idx] ? atom_true : atom_false,
+            results
+        );
+    }
+
+    enif_free(applied_flags);
+    return enif_make_tuple2(env, atom_ok, results);
+}
+
+/* ------------------------------------------------------------------ */
 /* NIF: read_entry(db, stmt, args) -> {:ok, [cols]} | {:ok, nil} | err */
 /*                                                                     */
 /* Single dirty IO bounce: reset+bind, step, extract row or nil.       */
@@ -3404,6 +3518,8 @@ static ErlNifFunc nif_funcs[] = {
     {"ekv_write_entries_batch", 6, ekv_write_entries_batch, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_write_local_entries_batch", 8, ekv_write_local_entries_batch, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_write_snapshot_entry", 3, ekv_write_snapshot_entry, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"ekv_write_snapshot_entries_batch", 3, ekv_write_snapshot_entries_batch,
+        ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_read_entry",    3, ekv_read_entry,    ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_fetch_all",     3, ekv_fetch_all,     ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_backup",        2, ekv_backup,        ERL_NIF_DIRTY_JOB_IO_BOUND},

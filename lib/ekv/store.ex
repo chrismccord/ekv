@@ -544,6 +544,22 @@ defmodule EKV.Store do
     EKV.Sqlite3.write_snapshot_entry(db, kv_stmt, kv_args)
   end
 
+  @doc """
+  Apply a full-sync snapshot chunk to `kv` in one transaction without
+  appending replay history. The caller must bound the chunk by both entry count
+  and estimated encoded bytes before calling this function.
+  """
+  def write_snapshot_entries_batch(db, kv_stmt, entries) when is_list(entries) do
+    kv_args_list =
+      Enum.map(entries, fn
+        {key, value_binary, timestamp, origin_node, origin_seq, expires_at, deleted_at} ->
+          origin_str = persisted_member_id(origin_node)
+          [key, value_binary, timestamp, origin_str, origin_seq, expires_at, deleted_at]
+      end)
+
+    EKV.Sqlite3.write_snapshot_entries_batch(db, kv_stmt, kv_args_list)
+  end
+
   # =====================================================================
   # KV CRUD
   # =====================================================================
@@ -650,7 +666,7 @@ defmodule EKV.Store do
 
   def next_binary_prefix(prefix) do
     size = byte_size(prefix) - 1
-    <<head::binary-size(size), last_byte>> = prefix
+    <<head::binary-size(^size), last_byte>> = prefix
     <<head::binary, last_byte + 1>>
   end
 

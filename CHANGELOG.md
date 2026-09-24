@@ -1,4 +1,13 @@
 ## 0.4.6 (2026-09-23)
+- Apply each received full-sync chunk in one atomic SQLite transaction instead
+  of committing every snapshot row separately, preserving per-row LWW results
+  while removing full-sync WAL and fsync amplification.
+- Delay member discovery and anti-entropy until every local shard database and
+  WAL checkpointer connection is open; restarted shards rejoin through the same
+  readiness gate.
+- Wait one full configured checkpoint interval before the first background WAL
+  checkpoint so cold-start storage initialization does not immediately compete
+  with repair traffic.
 - Prevent anti-entropy storms after member churn by trying a retained relayed
   delta for disconnected, retired, unknown, and quarantined third-party origins
   before falling back to a full snapshot.
