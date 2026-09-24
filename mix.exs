@@ -1,7 +1,7 @@
 defmodule EKV.MixProject do
   use Mix.Project
 
-  @version "0.4.6"
+  @version "0.4.7"
   # OTP 26+ supports NIF ABI 2.17. Build it once instead of having OTP
   # matrix jobs overwrite the same release assets.
   @nif_versions ["2.17"]
