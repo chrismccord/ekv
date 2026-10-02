@@ -1314,6 +1314,7 @@ defmodule EKV.Replica do
 
   GC (from EKV.GC timer):
     {:gc, now_nanoseconds, tombstone_cutoff_nanoseconds}
+    {:continue_oplog_gc, ref, deleted_rows, elapsed_us}
 
   Subscriber dispatch (shard → SubDispatcher):
     {:dispatch, [%EKV.Event{}]}
@@ -1383,6 +1384,8 @@ defmodule EKV.Replica do
     started_at_ms: nil,
     local_write_batch_max_entries: 32,
     local_write_batch_max_bytes: 256 * 1024,
+    oplog_gc_batch_size: 1_000,
+    oplog_gc_ref: nil,
     replication_batch_flush_ms: 3,
     replication_batch_max_entries: 64,
     replication_batch_max_bytes: 256 * 1024,
@@ -1518,6 +1521,7 @@ defmodule EKV.Replica do
       wire_compression_threshold: config[:wire_compression_threshold],
       local_write_batch_max_entries: config[:local_write_batch_max_entries] || 32,
       local_write_batch_max_bytes: config[:local_write_batch_max_bytes] || 256 * 1024,
+      oplog_gc_batch_size: config[:oplog_gc_batch_size] || 1_000,
       replication_batch_flush_ms: config[:replication_batch_flush_ms] || 3,
       replication_batch_max_entries: config[:replication_batch_max_entries] || 64,
       replication_batch_max_bytes: config[:replication_batch_max_bytes] || 256 * 1024,
@@ -1588,6 +1592,16 @@ defmodule EKV.Replica do
 
     if state.db, do: Store.close(state.db)
     :ok
+  end
+
+  @impl true
+  def code_change(_old_vsn, %Replica{} = state, _extra) do
+    config = EKV.Supervisor.get_config(state.name)
+
+    {:ok,
+     state
+     |> Map.put_new(:oplog_gc_batch_size, config[:oplog_gc_batch_size] || 1_000)
+     |> Map.put_new(:oplog_gc_ref, nil)}
   end
 
   # =====================================================================
@@ -2638,16 +2652,11 @@ defmodule EKV.Replica do
     # 2c. Purge orphan kv_paxos rows (keys that were hard-deleted)
     if state.cluster_size, do: Store.purge_orphan_paxos(db)
 
-    # 3. Prune progress for members outside the replay-retention window
-    {state, retained_members} = retained_member_nodes_for_replay_gc(state)
-    Store.prune_member_progress(db, retained_members)
-
-    # 4. Truncate oplog
-    {truncate_us, truncate_stats} =
-      :timer.tc(Store, :truncate_oplog, [db, retained_members])
-
-    maybe_log_oplog_truncate(state, truncate_stats, truncate_us)
-    state = %{state | local_max_seq: Store.max_seq(db)}
+    # 3. Truncate replay history in bounded transactions. Every continuation
+    # recomputes the retained-member set before deleting another batch, so a
+    # newly connected member with missing progress immediately pins its floor
+    # at zero. The writer process remains the sole serialization boundary.
+    state = start_oplog_gc(state)
 
     # 5. Bump liveness timestamp
     Store.touch_last_active(db)
@@ -2657,6 +2666,14 @@ defmodule EKV.Replica do
     prune_stale_member_seen_markers(state)
 
     cb_noreply(state)
+  end
+
+  def handle_info({:continue_oplog_gc, ref, deleted_rows, elapsed_us}, %Replica{} = state) do
+    if state.oplog_gc_ref == ref do
+      cb_noreply(run_oplog_gc_batch(state, ref, deleted_rows, elapsed_us))
+    else
+      cb_noreply(state)
+    end
   end
 
   def handle_info(:anti_entropy_tick, %Replica{replication_started?: false} = state),
@@ -2759,6 +2776,45 @@ defmodule EKV.Replica do
 
   def handle_info(_msg, %Replica{} = state) do
     cb_noreply(state)
+  end
+
+  defp start_oplog_gc(%Replica{} = state) do
+    ref = make_ref()
+    state = %{state | oplog_gc_ref: ref}
+    run_oplog_gc_batch(state, ref, 0, 0)
+  end
+
+  defp run_oplog_gc_batch(%Replica{} = state, ref, deleted_rows, elapsed_us) do
+    {state, retained_members} = retained_member_nodes_for_replay_gc(state)
+    :ok = Store.prune_member_progress(state.db, retained_members)
+
+    {batch_us, batch_stats} =
+      :timer.tc(Store, :truncate_oplog_batch, [
+        state.db,
+        retained_members,
+        state.oplog_gc_batch_size
+      ])
+
+    total_deleted_rows = deleted_rows + batch_stats.deleted_rows
+    total_elapsed_us = elapsed_us + batch_us
+    state = %{state | local_max_seq: Store.max_seq(state.db)}
+
+    if batch_stats.more? do
+      if batch_us >= 1_000_000 do
+        maybe_log_oplog_truncate(state, batch_stats, batch_us)
+      end
+
+      send(self(), {:continue_oplog_gc, ref, total_deleted_rows, total_elapsed_us})
+      state
+    else
+      final_stats =
+        batch_stats
+        |> Map.delete(:more?)
+        |> Map.put(:deleted_rows, total_deleted_rows)
+
+      maybe_log_oplog_truncate(state, final_stats, total_elapsed_us)
+      %{state | oplog_gc_ref: nil}
+    end
   end
 
   @impl true

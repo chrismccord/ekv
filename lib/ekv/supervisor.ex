@@ -10,6 +10,7 @@ defmodule EKV.Supervisor do
   @default_max_reader_connections 16
   @default_wal_checkpoint_interval 1_000
   @default_wal_size_limit 64 * 1024 * 1024
+  @default_oplog_gc_batch_size 1_000
 
   _archdoc = ~S"""
   Top-level EKV supervisor.
@@ -210,6 +211,7 @@ defmodule EKV.Supervisor do
     :handoff_ack_timeout_ms,
     :local_write_batch_max_entries,
     :local_write_batch_max_bytes,
+    :oplog_gc_batch_size,
     :wal_checkpoint_interval,
     :wal_size_limit,
     :replication_batch_flush_ms,
@@ -312,6 +314,7 @@ defmodule EKV.Supervisor do
     wire_compression_threshold = Keyword.get(opts, :wire_compression_threshold, 256 * 1024)
     local_write_batch_max_entries = Keyword.get(opts, :local_write_batch_max_entries, 32)
     local_write_batch_max_bytes = Keyword.get(opts, :local_write_batch_max_bytes, 256 * 1024)
+    oplog_gc_batch_size = Keyword.get(opts, :oplog_gc_batch_size, @default_oplog_gc_batch_size)
 
     wal_checkpoint_interval =
       Keyword.get(opts, :wal_checkpoint_interval, @default_wal_checkpoint_interval)
@@ -332,6 +335,7 @@ defmodule EKV.Supervisor do
     validate_handoff_ack_timeout_ms!(handoff_ack_timeout_ms)
     validate_local_write_batch_max_entries!(local_write_batch_max_entries)
     validate_local_write_batch_max_bytes!(local_write_batch_max_bytes)
+    validate_oplog_gc_batch_size!(oplog_gc_batch_size)
     validate_wal_checkpoint_interval!(wal_checkpoint_interval)
     validate_wal_size_limit!(wal_size_limit)
     validate_replication_batch_flush_ms!(replication_batch_flush_ms)
@@ -396,6 +400,7 @@ defmodule EKV.Supervisor do
       wire_compression_threshold: wire_compression_threshold,
       local_write_batch_max_entries: local_write_batch_max_entries,
       local_write_batch_max_bytes: local_write_batch_max_bytes,
+      oplog_gc_batch_size: oplog_gc_batch_size,
       wal_checkpoint_interval: wal_checkpoint_interval,
       wal_size_limit: wal_size_limit,
       replication_batch_flush_ms: replication_batch_flush_ms,
@@ -469,6 +474,7 @@ defmodule EKV.Supervisor do
     wire_compression_threshold = Keyword.get(opts, :wire_compression_threshold, 256 * 1024)
     local_write_batch_max_entries = Keyword.get(opts, :local_write_batch_max_entries, 32)
     local_write_batch_max_bytes = Keyword.get(opts, :local_write_batch_max_bytes, 256 * 1024)
+    oplog_gc_batch_size = Keyword.get(opts, :oplog_gc_batch_size, @default_oplog_gc_batch_size)
 
     wal_checkpoint_interval =
       Keyword.get(opts, :wal_checkpoint_interval, @default_wal_checkpoint_interval)
@@ -490,6 +496,7 @@ defmodule EKV.Supervisor do
     validate_handoff_ack_timeout_ms!(handoff_ack_timeout_ms)
     validate_local_write_batch_max_entries!(local_write_batch_max_entries)
     validate_local_write_batch_max_bytes!(local_write_batch_max_bytes)
+    validate_oplog_gc_batch_size!(oplog_gc_batch_size)
     validate_wal_checkpoint_interval!(wal_checkpoint_interval)
     validate_wal_size_limit!(wal_size_limit)
     validate_replication_batch_flush_ms!(replication_batch_flush_ms)
@@ -554,6 +561,7 @@ defmodule EKV.Supervisor do
       wire_compression_threshold: wire_compression_threshold,
       local_write_batch_max_entries: local_write_batch_max_entries,
       local_write_batch_max_bytes: local_write_batch_max_bytes,
+      oplog_gc_batch_size: oplog_gc_batch_size,
       wal_checkpoint_interval: wal_checkpoint_interval,
       wal_size_limit: wal_size_limit,
       replication_batch_flush_ms: replication_batch_flush_ms,
@@ -806,6 +814,7 @@ defmodule EKV.Supervisor do
     reject_client_opt!(opts, :handoff_ack_timeout_ms, [nil])
     reject_client_opt!(opts, :local_write_batch_max_entries, [nil])
     reject_client_opt!(opts, :local_write_batch_max_bytes, [nil])
+    reject_client_opt!(opts, :oplog_gc_batch_size, [nil])
     reject_client_opt!(opts, :wal_checkpoint_interval, [nil])
     reject_client_opt!(opts, :wal_size_limit, [nil])
     reject_client_opt!(opts, :replication_batch_flush_ms, [nil])
@@ -877,6 +886,15 @@ defmodule EKV.Supervisor do
   defp validate_local_write_batch_max_bytes!(bytes) do
     raise ArgumentError,
           "EKV: :local_write_batch_max_bytes must be a positive integer, got: #{inspect(bytes)}"
+  end
+
+  defp validate_oplog_gc_batch_size!(entries)
+       when is_integer(entries) and entries > 0,
+       do: :ok
+
+  defp validate_oplog_gc_batch_size!(entries) do
+    raise ArgumentError,
+          "EKV: :oplog_gc_batch_size must be a positive integer, got: #{inspect(entries)}"
   end
 
   defp validate_wal_checkpoint_interval!(interval)

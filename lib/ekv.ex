@@ -273,6 +273,7 @@ defmodule EKV do
   | `:allow_stale_startup` | `false` | Member and observer mode only. Dangerous recovery override. If `true`, EKV trusts on-disk data even when stale-db detection would normally refuse startup. Intended only for explicit disaster recovery / full cold-cluster restore cases. |
   | `:tombstone_ttl` | `604_800_000` (7 days) | Member and observer mode only. How long tombstones (deleted entries) are kept before being permanently purged, in milliseconds. See "Tombstone Lifetime" below. |
   | `:gc_interval` | `300_000` (5 min) | Member and observer mode only. How often garbage collection runs, in milliseconds. GC emits `:expired` events for TTL expiry, tombstones expired LWW rows, lazily purges expired CAS rows, and truncates the replication oplog. |
+  | `:oplog_gc_batch_size` | `1_000` | Member and observer mode only. Maximum replay-log rows deleted in one serialized SQLite transaction. EKV yields between batches and recomputes retained-member floors before every continuation. |
   | `:log` | `:info` | Logging level. `:info` logs cluster events (connects, syncs). `false` disables logging. `:verbose` logs per-shard detail. |
   | `:partition_ttl_policy` | `:quarantine` | Member and observer mode only. Policy for reconnects after downtime longer than `tombstone_ttl`. `:quarantine` blocks replication with that member identity until operator rebuild. `:ignore` disables that quarantine and allows reconnect/sync anyway. |
   | `:blue_green` | `false` | Member and observer mode only. Enable blue-green deployment mode. See "Blue-Green Deployment" below. |
@@ -564,7 +565,6 @@ defmodule EKV do
 
   alias EKV.Replica
 
-  @default_local_shard_call_timeout 5_000
   @client_rpc_timeout_margin 1_000
 
   # ===========================================================================
@@ -723,7 +723,7 @@ defmodule EKV do
 
           {:error, false} ->
             value_binary = :erlang.term_to_binary(value)
-            call_shard_write(name, shard_index, {:put, key, value_binary, opts})
+            call_shard_write(name, shard_index, {:put, key, value_binary, opts}, timeout)
         end
 
       :member ->
@@ -761,7 +761,7 @@ defmodule EKV do
 
           {:error, false} ->
             value_binary = :erlang.term_to_binary(value)
-            call_shard_write(name, shard_index, {:put, key, value_binary, opts})
+            call_shard_write(name, shard_index, {:put, key, value_binary, opts}, timeout)
         end
     end
   end
@@ -921,7 +921,7 @@ defmodule EKV do
             observer_cas_delete(name, key, expected_vsn, opts, shard_index, timeout)
 
           :error ->
-            call_shard_write(name, shard_index, {:delete, key})
+            call_shard_write(name, shard_index, {:delete, key}, timeout)
         end
 
       :member ->
@@ -942,7 +942,7 @@ defmodule EKV do
             maybe_resolve_unconfirmed_write(result, name, key, opts, :cas_delete)
 
           :error ->
-            call_shard_write(name, shard_index, {:delete, key})
+            call_shard_write(name, shard_index, {:delete, key}, timeout)
         end
     end
   end
@@ -1614,12 +1614,7 @@ defmodule EKV do
     Replica.local_request(Replica.shard_name(name, shard_index), request, timeout)
   end
 
-  defp call_shard_write(
-         name,
-         shard_index,
-         request,
-         timeout \\ @default_local_shard_call_timeout
-       ) do
+  defp call_shard_write(name, shard_index, request, timeout) do
     call_shard(name, shard_index, request, timeout)
   end
 

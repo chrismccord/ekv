@@ -926,6 +926,63 @@ defmodule EKVTest do
       assert length(EKV.Store.oplog_since(db, 0)) == 10
     end
 
+    test "bounded truncation rechecks a newly retained member before the next batch", %{
+      name: name
+    } do
+      key = "bounded_retention_recheck"
+
+      for value <- 1..10 do
+        assert :ok = EKV.put(name, key, value)
+      end
+
+      config = EKV.Supervisor.get_config(name)
+      shard = EKV.Replica.shard_index_for(key, config.num_shards)
+      state = :sys.get_state(EKV.Replica.shard_name(name, shard))
+      origin = local_origin_id(state)
+
+      :ok = EKV.Store.update_peer_progress(state.db, "caught-up-member", origin, 10)
+
+      assert %{deleted_rows: 3, more?: true} =
+               EKV.Store.truncate_oplog_batch(state.db, ["caught-up-member"], 3)
+
+      assert length(EKV.Store.oplog_since(state.db, 0)) == 7
+
+      # The second member has no cursor for this origin. A continuation that
+      # recomputes retained members must therefore stop at floor zero.
+      assert %{deleted_rows: 0, more?: false} =
+               EKV.Store.truncate_oplog_batch(
+                 state.db,
+                 ["caught-up-member", "joining-member"],
+                 3
+               )
+
+      assert length(EKV.Store.oplog_since(state.db, 0)) == 7
+    end
+
+    test "replica finishes a replay backlog through bounded continuations", %{name: name} do
+      key = "bounded_replica_gc"
+
+      for value <- 1..10 do
+        assert :ok = EKV.put(name, key, value)
+      end
+
+      config = EKV.Supervisor.get_config(name)
+      shard = EKV.Replica.shard_index_for(key, config.num_shards)
+      shard_name = EKV.Replica.shard_name(name, shard)
+
+      :sys.replace_state(shard_name, fn state ->
+        %{state | oplog_gc_batch_size: 2}
+      end)
+
+      now = System.system_time(:nanosecond)
+      send(shard_name, {:gc, now, now - config.tombstone_ttl * 1_000_000})
+
+      EKV.TestCluster.assert_eventually(fn ->
+        state = :sys.get_state(shard_name)
+        state.oplog_gc_ref == nil and length(EKV.Store.oplog_since(state.db, 0)) == 1
+      end)
+    end
+
     test "member seen marker cap does not evict a persisted progress anchor", %{name: name} do
       config = EKV.Supervisor.get_config(name)
       shard = EKV.Replica.shard_index_for("marker_cap", config.num_shards)
@@ -2959,6 +3016,26 @@ defmodule EKVTest do
       assert_receive :late_reply_sent, 500
       refute_receive {:ekv_local_reply, _, _}, 50
     end
+
+    test "eventual writes honor the public timeout instead of a fixed local timeout", %{
+      name: name
+    } do
+      shard_name = EKV.Replica.shard_name(name, 0)
+      :ok = :sys.suspend(shard_name)
+      started_at = System.monotonic_time(:millisecond)
+
+      reason =
+        try do
+          catch_exit(EKV.put(name, "timeout/eventual", "value", timeout: 1))
+        after
+          :ok = :sys.resume(shard_name)
+        end
+
+      elapsed_ms = System.monotonic_time(:millisecond) - started_at
+
+      assert {:timeout, {GenServer, :call, [^shard_name, {:put, _, _, _}, 1_001]}} = reason
+      assert elapsed_ms < 3_000
+    end
   end
 
   describe "delta sync returns correct entries" do
@@ -3331,6 +3408,10 @@ defmodule EKVTest do
         [
           sync_chunk_max_bytes: 0,
           expected: ":sync_chunk_max_bytes must be a positive byte count"
+        ],
+        [
+          oplog_gc_batch_size: 0,
+          expected: ":oplog_gc_batch_size must be a positive integer"
         ]
       ]
 

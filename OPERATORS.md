@@ -463,6 +463,18 @@ drop its `kv_member_progress` rows.
 - Intentional scale-down should free replay retention sooner
 - You accept that longer-disconnected members may need a full sync on return
 
+### oplog_gc_batch_size (default: 1,000 rows)
+
+Replay-log truncation remains serialized through the shard replica and commits
+each batch transactionally. The shard yields between batches and recomputes the
+retained-member set and every per-origin progress floor before deleting more
+history. This prevents a newly connected member from racing an old truncation
+plan while bounding how long one GC transaction can delay foreground writes.
+
+Lower this value if oplog GC transactions still cause visible write latency on
+slow storage. Raise it only after measuring transaction latency; larger batches
+retire a backlog faster but make each shard-owner pause longer.
+
 ### Interaction
 
 Stale detection threshold = `tombstone_ttl - gc_interval`. If `gc_interval`

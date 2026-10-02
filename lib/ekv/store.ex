@@ -108,6 +108,8 @@ defmodule EKV.Store do
 
   @schema_version 3
   @default_wal_size_limit 64 * 1024 * 1024
+  @default_oplog_truncate_batch_size 1_000
+  @sqlite_bind_batch_size 500
 
   def open(data_dir, shard_index, tombstone_ttl, num_shards, gc_interval, opts \\ []) do
     allow_stale_startup = Keyword.get(opts, :allow_stale_startup, false)
@@ -1041,31 +1043,10 @@ defmodule EKV.Store do
   should call `truncate_oplog/2` so the no-retained-member case is explicit.
   """
   def truncate_oplog(db) do
-    in_tx(db, fn ->
-      :ok =
-        EKV.Sqlite3.execute(
-          db,
-          """
-          WITH retained AS (
-            SELECT origin_node, MIN(last_seq) AS min_seq
-            FROM kv_member_progress
-            GROUP BY origin_node
-          )
-          DELETE FROM kv_oplog
-          WHERE EXISTS (
-            SELECT 1
-            FROM retained AS r
-            WHERE r.origin_node = kv_oplog.origin_node
-              AND kv_oplog.origin_seq < r.min_seq
-          )
-          """
-        )
-
-      deleted_rows = sqlite_changes(db)
-      purge_orphan_keyrefs(db)
-
-      Map.put(oplog_retention_stats(db), :deleted_rows, deleted_rows)
-    end)
+    case member_progress_members(db) do
+      [] -> %{deleted_rows: 0, retained_floors: [], retention_lag: []}
+      retained_members -> truncate_oplog(db, retained_members)
+    end
   end
 
   @doc """
@@ -1082,77 +1063,30 @@ defmodule EKV.Store do
   across restart. A genuinely new member, or one returning after the configured
   replay window, bootstraps from full state.
   """
-  def truncate_oplog(db, []) do
-    in_tx(db, fn ->
-      :ok =
-        EKV.Sqlite3.execute(
-          db,
-          """
-          WITH origin_heads AS (
-            SELECT origin_node, MAX(origin_seq) AS max_seq
-            FROM kv_oplog
-            GROUP BY origin_node
-          )
-          DELETE FROM kv_oplog
-          WHERE EXISTS (
-            SELECT 1
-            FROM origin_heads AS head
-            WHERE head.origin_node = kv_oplog.origin_node
-              AND kv_oplog.origin_seq < head.max_seq
-          )
-          """
-        )
-
-      deleted_rows = sqlite_changes(db)
-      purge_orphan_keyrefs(db)
-
-      Map.put(oplog_retention_stats(db), :deleted_rows, deleted_rows)
-    end)
+  def truncate_oplog(db, retained_members) when is_list(retained_members) do
+    truncate_oplog_all_batches(db, retained_members, 0)
   end
 
-  def truncate_oplog(db, retained_members) when is_list(retained_members) do
-    retained_members = Enum.map(retained_members, &persisted_member_id/1)
-    placeholders = Enum.map_join(1..length(retained_members), ", ", &"(?#{&1})")
+  @doc false
+  def truncate_oplog_batch(db, retained_members, batch_size)
+      when is_list(retained_members) and is_integer(batch_size) and batch_size > 0 do
+    retained_members =
+      retained_members
+      |> Enum.map(&persisted_member_id/1)
+      |> Enum.uniq()
 
     in_tx(db, fn ->
-      {:ok, stmt} =
-        EKV.Sqlite3.prepare(
-          db,
-          """
-          WITH retained_members(member_node) AS (
-            VALUES #{placeholders}
-          ),
-          origins AS (
-            SELECT DISTINCT origin_node
-            FROM kv_oplog
-          ),
-          retained AS (
-            SELECT origins.origin_node, MIN(COALESCE(progress.last_seq, 0)) AS min_seq
-            FROM origins
-            CROSS JOIN retained_members
-            LEFT JOIN kv_member_progress AS progress
-              ON progress.member_node = retained_members.member_node
-             AND progress.origin_node = origins.origin_node
-            GROUP BY origins.origin_node
-          )
-          DELETE FROM kv_oplog
-          WHERE EXISTS (
-            SELECT 1
-            FROM retained
-            WHERE retained.origin_node = kv_oplog.origin_node
-              AND kv_oplog.origin_seq < retained.min_seq
-          )
-          """
-        )
+      floors = oplog_retention_floors_for_members(db, retained_members)
+      candidates = oplog_truncate_candidates(db, floors, batch_size)
+      deleted_rows = delete_oplog_candidates(db, candidates)
+      purge_candidate_keyrefs(db, candidates)
 
-      :ok = EKV.Sqlite3.bind(stmt, retained_members)
-      :done = EKV.Sqlite3.step(db, stmt)
-      :ok = EKV.Sqlite3.release(db, stmt)
-
-      deleted_rows = sqlite_changes(db)
-      purge_orphan_keyrefs(db)
-
-      Map.put(oplog_retention_stats(db), :deleted_rows, deleted_rows)
+      %{
+        deleted_rows: deleted_rows,
+        more?: length(candidates) == batch_size,
+        retained_floors: format_retained_floors(floors, 5),
+        retention_lag: []
+      }
     end)
   end
 
@@ -1571,6 +1505,144 @@ defmodule EKV.Store do
   defp sqlite_changes(db) do
     {:ok, [[changes]]} = EKV.Sqlite3.fetch_all(db, "SELECT changes()", [])
     changes
+  end
+
+  defp truncate_oplog_all_batches(db, retained_members, deleted_rows) do
+    stats = truncate_oplog_batch(db, retained_members, @default_oplog_truncate_batch_size)
+    deleted_rows = deleted_rows + stats.deleted_rows
+
+    if stats.more? do
+      truncate_oplog_all_batches(db, retained_members, deleted_rows)
+    else
+      stats
+      |> Map.delete(:more?)
+      |> Map.put(:deleted_rows, deleted_rows)
+    end
+  end
+
+  # kv_origin_progress is the authoritative contiguous applied cursor per
+  # origin. Deriving floors from it avoids scanning the oplog just to discover
+  # origins. A missing retained-member cursor is deliberately floor zero.
+  defp oplog_retention_floors_for_members(db, []) do
+    local_progress_summary(db)
+  end
+
+  defp oplog_retention_floors_for_members(db, retained_members) do
+    peer_progress = Enum.map(retained_members, &get_peer_progress(db, &1))
+
+    db
+    |> local_progress_summary()
+    |> Map.new(fn {origin_node, _local_seq} ->
+      floor =
+        peer_progress
+        |> Enum.map(&Map.get(&1, origin_node, 0))
+        |> Enum.min()
+
+      {origin_node, floor}
+    end)
+  end
+
+  defp oplog_truncate_candidates(db, floors, batch_size) do
+    floors
+    |> Enum.sort_by(fn {origin_node, _floor} -> origin_node end)
+    |> Enum.reduce_while([], fn
+      {_origin_node, floor}, acc when floor <= 0 ->
+        {:cont, acc}
+
+      {origin_node, floor}, acc ->
+        remaining = batch_size - length(acc)
+
+        if remaining == 0 do
+          {:halt, acc}
+        else
+          {:ok, rows} =
+            EKV.Sqlite3.fetch_all(
+              db,
+              """
+              SELECT seq, key_id
+              FROM kv_oplog INDEXED BY idx_kv_oplog_origin_seq
+              WHERE origin_node = ?1 AND origin_seq < ?2
+              ORDER BY origin_seq
+              LIMIT ?3
+              """,
+              [origin_node, floor, remaining]
+            )
+
+          {:cont, acc ++ Enum.map(rows, fn [seq, key_id] -> {seq, key_id} end)}
+        end
+    end)
+  end
+
+  defp delete_oplog_candidates(_db, []), do: 0
+
+  defp delete_oplog_candidates(db, candidates) do
+    candidates
+    |> Enum.map(&elem(&1, 0))
+    |> Enum.chunk_every(@sqlite_bind_batch_size)
+    |> Enum.reduce(0, fn seqs, deleted_rows ->
+      execute_delete_by_ids(db, "kv_oplog", seqs)
+      deleted_rows + sqlite_changes(db)
+    end)
+  end
+
+  defp purge_candidate_keyrefs(_db, []), do: :ok
+
+  defp purge_candidate_keyrefs(db, candidates) do
+    candidates
+    |> Enum.map(&elem(&1, 1))
+    |> Enum.uniq()
+    |> Enum.chunk_every(@sqlite_bind_batch_size)
+    |> Enum.each(fn key_ids ->
+      placeholders = bind_placeholders(length(key_ids))
+
+      execute_bound_statement(
+        db,
+        """
+        DELETE FROM kv_keyrefs
+        WHERE id IN (#{placeholders})
+          AND oplog_refs = 0
+          AND NOT EXISTS (
+            SELECT 1
+            FROM kv
+            WHERE kv.key = kv_keyrefs.key
+          )
+        """,
+        key_ids
+      )
+    end)
+
+    :ok
+  end
+
+  defp execute_delete_by_ids(db, table, ids) do
+    execute_bound_statement(
+      db,
+      "DELETE FROM #{table} WHERE seq IN (#{bind_placeholders(length(ids))})",
+      ids
+    )
+  end
+
+  defp execute_bound_statement(db, sql, values) do
+    {:ok, stmt} = EKV.Sqlite3.prepare(db, sql)
+    :ok = EKV.Sqlite3.bind(stmt, values)
+    :done = EKV.Sqlite3.step(db, stmt)
+    :ok = EKV.Sqlite3.release(db, stmt)
+    :ok
+  end
+
+  defp bind_placeholders(count) do
+    Enum.map_join(1..count, ", ", &"?#{&1}")
+  end
+
+  defp format_retained_floors(floors, limit) do
+    floors
+    |> Enum.map(fn {origin_node, retained_min} ->
+      %{origin_node: origin_node, retained_min: retained_min}
+    end)
+    |> Enum.sort_by(fn %{origin_node: origin_node, retained_min: retained_min} ->
+      {retained_min, origin_node}
+    end)
+    |> Enum.take(limit)
   end
 
   defp oplog_retention_floors(db, limit) do
