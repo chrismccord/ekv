@@ -1,9 +1,11 @@
-## 0.4.7 (2026-09-24)
+## 0.4.8 (2026-10-02)
 - Bound replay-log GC to transactional batches that yield between units and
   recheck retained-member floors before every continuation, preventing long GC
   scans from stalling foreground shard writes without weakening replay safety.
 - Honor the public `:timeout` option for ordinary local put/delete calls instead
   of silently applying a fixed five-second local timeout.
+
+## 0.4.7 (2026-09-24)
 - Apply each received full-sync chunk in one atomic SQLite transaction instead
   of committing every snapshot row separately, preserving per-row LWW results
   while removing full-sync WAL and fsync amplification.
