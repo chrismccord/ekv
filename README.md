@@ -34,6 +34,9 @@ If a precompiled binary cannot be downloaded or verified, EKV compiles from
 source (requires a C compiler and `make`). Set `EKV_BUILD=1` to force a source
 build, including when using a runtime image older than the libc baseline.
 
+For development, see [Checking the C NIF](C_TESTING.md) for strict compiler
+warnings, static analysis, and Linux ASan/UBSan tests.
+
 ## Usage
 
 Add EKV to your supervision tree:
