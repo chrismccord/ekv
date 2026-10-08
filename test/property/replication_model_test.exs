@@ -180,7 +180,7 @@ defmodule EKV.ReplicationModelPropertyTest do
       assert Map.get(progress, origin, 0) == contiguous(seen)
 
       # Losing LWW rows still belong to the replay origin stream.
-      replay = Store.replay_since_origin_chunk(db, origin, 0, 100)
+      {replay, false} = Store.replay_since_origin_chunk(db, origin, 0, 100, 1_000_000)
       assert Enum.map(replay, &elem(&1, 4)) == Enum.sort(seen)
       assert Enum.all?(replay, &(elem(&1, 3) == origin))
     end
