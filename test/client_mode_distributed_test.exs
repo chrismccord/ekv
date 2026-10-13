@@ -500,6 +500,48 @@ defmodule EKV.ClientModeDistributedTest do
              TestCluster.rpc!(client_node, EKV, :put, [ekv_name, "seed2", "v2", [if_vsn: nil]])
   end
 
+  test "client RPC timeout cools down the backend and allows failover" do
+    peers = TestCluster.start_peers(3)
+    on_exit(fn -> TestCluster.stop_peers(peers) end)
+    [{_, slow}, {_, healthy}, {_, client}] = peers
+    name = unique_name(:client_rpc_timeout)
+    on_exit(fn -> cleanup_data(peers, name) end)
+
+    for {member, region} <- [{slow, "iad"}, {healthy, "lhr"}] do
+      TestCluster.start_ekv(member,
+        name: name,
+        data_dir: member_data_dir(member, name),
+        shards: 1,
+        region: region
+      )
+    end
+
+    TestCluster.start_ekv(client,
+      name: name,
+      mode: :client,
+      region_routing: ["iad", "lhr"],
+      wait_for_route: 5_000
+    )
+
+    assert {:ok, ^slow} = TestCluster.rpc!(client, EKV.ClientRouter, :backend, [name])
+    shard = EKV.Replica.shard_name(name, 0)
+    :ok = TestCluster.rpc!(slow, :sys, :suspend, [shard])
+
+    try do
+      assert {:error, :unavailable} =
+               TestCluster.rpc!(client, EKV, :put, [name, "slow", "value", [timeout: 20]])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(client, EKV.ClientRouter, :backend, [name]) == {:ok, healthy}
+      end)
+
+      assert :ok = TestCluster.rpc!(client, EKV, :put, [name, "healthy", "value"])
+      assert "value" = TestCluster.rpc!(healthy, EKV, :get, [name, "healthy"])
+    after
+      TestCluster.rpc!(slow, :sys, :resume, [shard])
+    end
+  end
+
   test "blue-green overlap keeps existing client bound to outgoing node while new clients route to incoming node" do
     peers = TestCluster.start_peers(6)
     on_exit(fn -> TestCluster.stop_peers(peers) end)
