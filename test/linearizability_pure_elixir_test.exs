@@ -81,13 +81,16 @@ defmodule EKV.LinearizabilityPureElixirTest do
 
     results =
       for seed <- seeds, retry <- 1..@retries_per_seed do
+        # A timed-out write can outlive its worker. Never reuse its key in a
+        # subsequent history whose initial state is independently seeded.
+        key = "#{key}/#{System.unique_integer([:positive])}"
+
         case TestCluster.rpc!(hd(nodes), EKV, :put, [ekv_name, key, 0, [consistent: true]]) do
           {:ok, _vsn} -> :ok
           other -> flunk("seed write failed for seed=#{seed} retry=#{retry}: #{inspect(other)}")
         end
 
         events = run_workload(nodes, ekv_name, key, @workers, @total_ops, seed)
-        info_writes = Enum.count(events, &(&1.type == :info and &1.f == :write))
         result = RegisterHistory.check(events, 0)
 
         history_path =
@@ -108,15 +111,11 @@ defmodule EKV.LinearizabilityPureElixirTest do
           seed: seed,
           retry: retry,
           total_events: length(events),
-          info_writes: info_writes,
           history_path: history_path
         })
       end
 
-    invalid =
-      Enum.filter(results, fn r ->
-        not r.covered? or (not r.linearizable? and r.info_writes == 0)
-      end)
+    invalid = Enum.reject(results, &RegisterHistory.passes?/1)
 
     assert invalid == [],
            """
@@ -184,34 +183,10 @@ defmodule EKV.LinearizabilityPureElixirTest do
         end
       else
         value = process_id
-        log.(%{process: process_id, type: :invoke, f: :write, value: value})
 
-        try do
-          case TestCluster.rpc!(target, EKV, :put, [ekv_name, key, value, [consistent: true]]) do
-            {:ok, _} ->
-              log.(%{process: process_id, type: :ok, f: :write, value: value})
-
-            {:error, :unconfirmed} ->
-              resolver = Enum.at(nodes, :rand.uniform(length(nodes)) - 1)
-
-              resolved =
-                TestCluster.rpc!(resolver, EKV, :get, [ekv_name, key, [consistent: true]])
-
-              if resolved == value do
-                # Unknown client outcome, but value is now linearizably visible.
-                log.(%{process: process_id, type: :ok, f: :write, value: value})
-              else
-                log.(%{process: process_id, type: :info, f: :write, value: value})
-              end
-
-            _ ->
-              log.(%{process: process_id, type: :fail, f: :write, value: value})
-          end
-        rescue
-          _ -> log.(%{process: process_id, type: :fail, f: :write, value: value})
-        catch
-          _, _ -> log.(%{process: process_id, type: :fail, f: :write, value: value})
-        end
+        RegisterHistory.record_write(log, process_id, value, fn ->
+          TestCluster.rpc!(target, EKV, :put, [ekv_name, key, value, [consistent: true]])
+        end)
       end
 
       if rem(i, 20) == 0, do: Process.sleep(1)
