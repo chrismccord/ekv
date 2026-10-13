@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+source "$(dirname "${BASH_SOURCE[0]}")/result.sh"
+
 # Usage: ./run_lock_matrix.sh [seeds]
 # seeds can be comma-separated (e.g. 1,2,3) or a single integer.
 SEEDS_RAW="${1:-1,2,3}"
@@ -37,6 +39,8 @@ now_utc="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
   echo "|---|---:|---|---:|---|---|"
 } > "$SUMMARY_FILE"
 
+fail_count=0
+
 for scenario in "${SCENARIOS[@]}"; do
   for seed in "${SEEDS[@]}"; do
     run_tag="${RUN_ID}_${scenario}_seed${seed}"
@@ -48,15 +52,11 @@ for scenario in "${SCENARIOS[@]}"; do
     exit_code=$?
     set -e
 
-    valid="error"
-    history_path="(none)"
+    valid="$(jepsen_result "$log_file")"
+    history_path="$(jepsen_history_path "$log_file")"
 
-    if grep -q "valid?:" "$log_file"; then
-      valid="$(grep -E "valid\?:" "$log_file" | tail -1 | awk '{print $2}')"
-    fi
-
-    if grep -q "history path:" "$log_file"; then
-      history_path="$(grep -E "history path:" "$log_file" | tail -1 | sed 's/.*history path:[[:space:]]*//')"
+    if [[ "$valid" != "true" || $exit_code -ne 0 ]]; then
+      fail_count=$((fail_count + 1))
     fi
 
     printf '| %s | %s | %s | %s | %s | %s |\n' \
@@ -71,9 +71,13 @@ done
   echo
   echo "- \`valid=true\` means checker accepted the history."
   echo "- \`valid=false\` means checker found a violation."
-  echo "- \`valid=:unknown\` means checker was inconclusive (often search/resource bound)."
+  echo "- \`valid=unknown\` means checker was inconclusive (often search/resource bound)."
   echo "- \`valid=error\` means scenario failed before checker output; inspect log."
+  echo "- Non-passing runs: ${fail_count}"
 } >> "$SUMMARY_FILE"
 
 echo "Wrote ${SUMMARY_FILE}"
 echo "Logs: ${DETAILS_DIR}"
+if (( fail_count > 0 )); then
+  exit 1
+fi

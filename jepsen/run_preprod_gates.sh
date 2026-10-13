@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+source "$(dirname "${BASH_SOURCE[0]}")/result.sh"
+
 # Usage:
 #   ./run_preprod_gates.sh            # seeds 1..20
 #   ./run_preprod_gates.sh 1 10       # seeds 1..10
@@ -61,21 +63,13 @@ for scenario in "${SCENARIOS[@]}"; do
     exit_code=$?
     set -e
 
-    valid="error"
-    history_path="(none)"
+    valid="$(jepsen_result "$log_file")"
+    history_path="$(jepsen_history_path "$log_file")"
 
-    if grep -q "valid?:" "$log_file"; then
-      valid="$(grep -E "valid\?:" "$log_file" | tail -1 | awk '{print $2}')"
-    fi
-
-    if grep -q "history path:" "$log_file"; then
-      history_path="$(grep -E "history path:" "$log_file" | tail -1 | sed 's/.*history path:[[:space:]]*//')"
-    fi
-
-    if [[ "$valid" == "false" || "$valid" == "error" || $exit_code -ne 0 ]]; then
+    if [[ "$valid" != "true" || $exit_code -ne 0 ]]; then
       fail_count=$((fail_count + 1))
     fi
-    if [[ "$valid" == ":unknown" ]]; then
+    if [[ "$valid" == "unknown" ]]; then
       unknown_count=$((unknown_count + 1))
     fi
 
@@ -89,7 +83,7 @@ done
   echo
   echo "## Totals"
   echo
-  echo "- Failing/error runs: ${fail_count}"
+  echo "- Non-passing runs (including unknown): ${fail_count}"
   echo "- Unknown runs: ${unknown_count}"
 } >> "$SUMMARY_FILE"
 
