@@ -618,7 +618,7 @@ defmodule EKV.Store do
   @scan_prefix_sql """
   SELECT key, value FROM kv
   WHERE key >= ?1 AND key < ?2
-    AND (deleted_at IS NULL OR deleted_at > ?3)
+    AND deleted_at IS NULL
     AND (expires_at IS NULL OR expires_at > ?3)
   ORDER BY key
   """
@@ -626,7 +626,7 @@ defmodule EKV.Store do
   @scan_prefix_keys_sql """
   SELECT key FROM kv
   WHERE key >= ?1 AND key < ?2
-    AND (deleted_at IS NULL OR deleted_at > ?3)
+    AND deleted_at IS NULL
     AND (expires_at IS NULL OR expires_at > ?3)
   ORDER BY key
   """
@@ -656,7 +656,7 @@ defmodule EKV.Store do
     {:ok, stmt} =
       EKV.Sqlite3.prepare(db, """
       SELECT COUNT(*) FROM kv
-      WHERE (deleted_at IS NULL OR deleted_at > ?1)
+      WHERE deleted_at IS NULL
         AND (expires_at IS NULL OR expires_at > ?1)
       """)
 

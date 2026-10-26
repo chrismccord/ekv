@@ -1037,10 +1037,12 @@ defmodule EKV do
 
   @scan_chunk_size 500
 
+  # A tombstone has no value, even when its delete timestamp is newer than the
+  # clock sampled for the query. Only expiration is relative to that clock.
   @scan_first_chunk_sql """
   SELECT key, value, timestamp, origin_node FROM kv
   WHERE key >= ?1 AND key < ?2
-    AND (deleted_at IS NULL OR deleted_at > ?3)
+    AND deleted_at IS NULL
     AND (expires_at IS NULL OR expires_at > ?3)
   ORDER BY key LIMIT ?4
   """
@@ -1048,7 +1050,7 @@ defmodule EKV do
   @scan_next_chunk_sql """
   SELECT key, value, timestamp, origin_node FROM kv
   WHERE key > ?1 AND key < ?2
-    AND (deleted_at IS NULL OR deleted_at > ?3)
+    AND deleted_at IS NULL
     AND (expires_at IS NULL OR expires_at > ?3)
   ORDER BY key LIMIT ?4
   """
@@ -1056,7 +1058,7 @@ defmodule EKV do
   @keys_first_chunk_sql """
   SELECT key, timestamp, origin_node FROM kv
   WHERE key >= ?1 AND key < ?2
-    AND (deleted_at IS NULL OR deleted_at > ?3)
+    AND deleted_at IS NULL
     AND (expires_at IS NULL OR expires_at > ?3)
   ORDER BY key LIMIT ?4
   """
@@ -1064,7 +1066,7 @@ defmodule EKV do
   @keys_next_chunk_sql """
   SELECT key, timestamp, origin_node FROM kv
   WHERE key > ?1 AND key < ?2
-    AND (deleted_at IS NULL OR deleted_at > ?3)
+    AND deleted_at IS NULL
     AND (expires_at IS NULL OR expires_at > ?3)
   ORDER BY key LIMIT ?4
   """
