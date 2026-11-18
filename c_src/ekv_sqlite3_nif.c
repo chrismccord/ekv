@@ -7,9 +7,26 @@
 /* Resource types                                                      */
 /* ------------------------------------------------------------------ */
 
+/*
+ * fetch_all statements, prepared once per connection and kept by SQL text.
+ * Scans pass the same few SQL strings on every call; parsing and planning
+ * them each time cost about three quarters of a one-shard range scan
+ * (33 us against 6 us for a prepared point read).
+ */
+#define FETCH_STMT_CACHE_SIZE 16
+
+typedef struct {
+    char         *sql;
+    size_t        sql_len;
+    sqlite3_stmt *stmt;
+    unsigned long last_used;
+} fetch_stmt_t;
+
 typedef struct {
     sqlite3      *db;
     ErlNifMutex  *mutex;
+    fetch_stmt_t  fetch_stmts[FETCH_STMT_CACHE_SIZE];
+    unsigned long fetch_stmt_clock;
     sqlite3_stmt *select_local_origin_seq_stmt;
     sqlite3_stmt *upsert_local_origin_seq_stmt;
     sqlite3_stmt *select_origin_progress_stmt;
@@ -122,6 +139,71 @@ static void finalize_cached_connection_stmts(connection_t *conn)
     finalize_stmt(&conn->upsert_origin_progress_stmt);
     finalize_stmt(&conn->scan_origin_oplog_stmt);
     finalize_stmt(&conn->cas_managed_key_check_stmt);
+
+    for (int i = 0; i < FETCH_STMT_CACHE_SIZE; i++) {
+        fetch_stmt_t *entry = &conn->fetch_stmts[i];
+        finalize_stmt(&entry->stmt);
+        if (entry->sql) {
+            enif_free(entry->sql);
+            entry->sql = NULL;
+        }
+        entry->sql_len = 0;
+        entry->last_used = 0;
+    }
+}
+
+/*
+ * The connection's prepared statement for this SQL, preparing and caching it
+ * on a miss (evicting the least recently used). The caller holds conn->mutex
+ * and must reset the statement and clear its bindings before unlocking, so
+ * no cached statement keeps a read transaction open between calls.
+ */
+static int fetch_stmt(connection_t *conn, const char *sql, size_t sql_len,
+                      sqlite3_stmt **out)
+{
+    fetch_stmt_t *victim = &conn->fetch_stmts[0];
+
+    for (int i = 0; i < FETCH_STMT_CACHE_SIZE; i++) {
+        fetch_stmt_t *entry = &conn->fetch_stmts[i];
+
+        if (entry->stmt && entry->sql_len == sql_len &&
+            memcmp(entry->sql, sql, sql_len) == 0) {
+            entry->last_used = ++conn->fetch_stmt_clock;
+            *out = entry->stmt;
+            return SQLITE_OK;
+        }
+
+        if (!entry->stmt)
+            victim = entry;
+        else if (victim->stmt && entry->last_used < victim->last_used)
+            victim = entry;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v3(conn->db, sql, (int)sql_len,
+                                SQLITE_PREPARE_PERSISTENT, &stmt, NULL);
+    if (rc != SQLITE_OK)
+        return rc;
+    if (!stmt)  /* no statement in the SQL (empty or a comment) */
+        return SQLITE_MISUSE;
+
+    char *copy = enif_alloc(sql_len ? sql_len : 1);
+    if (!copy) {
+        sqlite3_finalize(stmt);
+        return SQLITE_NOMEM;
+    }
+    memcpy(copy, sql, sql_len);
+
+    finalize_stmt(&victim->stmt);
+    if (victim->sql)
+        enif_free(victim->sql);
+
+    victim->sql = copy;
+    victim->sql_len = sql_len;
+    victim->stmt = stmt;
+    victim->last_used = ++conn->fetch_stmt_clock;
+    *out = stmt;
+    return SQLITE_OK;
 }
 
 static int ensure_cached_stmt(sqlite3 *db, sqlite3_stmt **stmt, const char *sql)
@@ -2190,6 +2272,13 @@ static ERL_NIF_TERM ekv_read_entry(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
 /* Returns {:ok, [[col1, col2, ...], ...]}.                            */
 /* ------------------------------------------------------------------ */
 
+/* A cached fetch_all statement goes back ready for its next call. */
+static void release_fetch_stmt(sqlite3_stmt *stmt)
+{
+    sqlite3_reset(stmt);
+    sqlite3_clear_bindings(stmt);
+}
+
 static ERL_NIF_TERM ekv_fetch_all(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
     (void)argc;
@@ -2207,10 +2296,9 @@ static ERL_NIF_TERM ekv_fetch_all(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
         return make_error(env, "database closed");
     }
 
-    /* 1. Prepare */
+    /* 1. Prepare, or reuse this connection's statement for the SQL */
     sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v3(conn->db, (const char *)sql_bin.data,
-        (int)sql_bin.size, 0, &stmt, NULL);
+    int rc = fetch_stmt(conn, (const char *)sql_bin.data, sql_bin.size, &stmt);
     if (rc != SQLITE_OK) {
         ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
         enif_mutex_unlock(conn->mutex);
@@ -2220,7 +2308,7 @@ static ERL_NIF_TERM ekv_fetch_all(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
     /* 2. Bind */
     int br = bind_args(env, stmt, argv[2]);
     if (br != 0) {
-        sqlite3_finalize(stmt);
+        release_fetch_stmt(stmt);
         enif_mutex_unlock(conn->mutex);
         return (br == -1) ? enif_make_badarg(env)
                           : make_sqlite_error(env, conn->db);
@@ -2231,7 +2319,7 @@ static ERL_NIF_TERM ekv_fetch_all(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
     size_t len = 0;
     ERL_NIF_TERM *rows = enif_alloc(sizeof(ERL_NIF_TERM) * cap);
     if (!rows) {
-        sqlite3_finalize(stmt);
+        release_fetch_stmt(stmt);
         enif_mutex_unlock(conn->mutex);
         return make_error(env, "alloc failed");
     }
@@ -2244,7 +2332,7 @@ static ERL_NIF_TERM ekv_fetch_all(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
         } else {
             ERL_NIF_TERM *cols = enif_alloc(sizeof(ERL_NIF_TERM) * (size_t)ncols);
             if (!cols) {
-                sqlite3_finalize(stmt);
+                release_fetch_stmt(stmt);
                 enif_free(rows);
                 enif_mutex_unlock(conn->mutex);
                 return make_error(env, "alloc failed");
@@ -2252,7 +2340,7 @@ static ERL_NIF_TERM ekv_fetch_all(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
             for (int i = 0; i < ncols; i++) {
                 if (!make_column(env, stmt, i, &cols[i])) {
                     enif_free(cols);
-                    sqlite3_finalize(stmt);
+                    release_fetch_stmt(stmt);
                     enif_free(rows);
                     enif_mutex_unlock(conn->mutex);
                     return make_error(env, "alloc failed");
@@ -2266,7 +2354,7 @@ static ERL_NIF_TERM ekv_fetch_all(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
             size_t new_cap = cap * 2;
             ERL_NIF_TERM *new_rows = enif_realloc(rows, sizeof(ERL_NIF_TERM) * new_cap);
             if (!new_rows) {
-                sqlite3_finalize(stmt);
+                release_fetch_stmt(stmt);
                 enif_free(rows);
                 enif_mutex_unlock(conn->mutex);
                 return make_error(env, "alloc failed");
@@ -2279,14 +2367,14 @@ static ERL_NIF_TERM ekv_fetch_all(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
 
     if (rc != SQLITE_DONE) {
         ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
-        sqlite3_finalize(stmt);
+        release_fetch_stmt(stmt);
         enif_free(rows);
         enif_mutex_unlock(conn->mutex);
         return err;
     }
 
-    /* 4. Finalize */
-    sqlite3_finalize(stmt);
+    /* 4. Release the cached statement */
+    release_fetch_stmt(stmt);
     enif_mutex_unlock(conn->mutex);
 
     /* 5. Build result list — rows are already in order */
