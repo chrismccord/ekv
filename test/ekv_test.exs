@@ -365,6 +365,166 @@ defmodule EKVTest do
     end
   end
 
+  describe "scan_many/get_many" do
+    defp sequential_scans(name, prefixes),
+      do: Enum.map(prefixes, &Enum.to_list(EKV.scan(name, &1)))
+
+    defp sequential_gets(name, keys), do: Enum.map(keys, &EKV.get(name, &1))
+
+    defp seed_mixed_rows(name) do
+      :ok = EKV.put(name, "a/live", %{n: 1})
+      :ok = EKV.put(name, "a/deleted", "gone")
+      :ok = EKV.delete(name, "a/deleted")
+      :ok = EKV.put(name, "a/expired", "old", ttl: 1)
+      :ok = EKV.put(name, "a/ttl_live", "fresh", ttl: :timer.minutes(5))
+      :ok = EKV.put(name, "a/nested/x", {:ok, 2})
+      :ok = EKV.put(name, "ab/sibling", "outside a/")
+      :ok = EKV.put(name, "b/1", "b1")
+      :ok = EKV.put(name, "b/2", "b2")
+      :ok = EKV.delete(name, "b/2")
+      Process.sleep(10)
+    end
+
+    test "scan_many returns what each scan returns, with tombstones and expired rows", %{
+      name: name
+    } do
+      seed_mixed_rows(name)
+      prefixes = ["a/", "b/", "ab/", "a/nested/"]
+
+      assert EKV.scan_many(name, prefixes) == sequential_scans(name, prefixes)
+
+      assert [a, b, ab, nested] = EKV.scan_many(name, prefixes)
+      assert a |> Enum.map(&elem(&1, 0)) |> Enum.sort() == ["a/live", "a/nested/x", "a/ttl_live"]
+      assert Enum.map(b, &elem(&1, 0)) == ["b/1"]
+      assert Enum.map(ab, &elem(&1, 0)) == ["ab/sibling"]
+      assert Enum.map(nested, &elem(&1, 0)) == ["a/nested/x"]
+    end
+
+    test "scan_many pages past full first pages per prefix and shard", %{name: name} do
+      big = for i <- 1..1_300, do: "big/#{String.pad_leading(Integer.to_string(i), 5, "0")}"
+      for key <- big, do: :ok = EKV.put(name, key, key)
+
+      other = for i <- 1..1_100, do: "other/#{String.pad_leading(Integer.to_string(i), 5, "0")}"
+      for key <- other, do: :ok = EKV.put(name, key, %{key: key})
+
+      for key <- Enum.take_every(big, 7), do: :ok = EKV.delete(name, key)
+      :ok = EKV.put(name, "bigger/1", "outside the prefix")
+      :ok = EKV.put(name, "small/1", "s")
+
+      prefixes = ["big/", "small/", "other/", "big/"]
+      result = EKV.scan_many(name, prefixes)
+
+      assert result == sequential_scans(name, prefixes)
+      assert Enum.map(result, &length/1) == [1_300 - 186, 1, 1_100, 1_300 - 186]
+
+      config = EKV.Supervisor.get_config(name)
+
+      shard_counts =
+        Enum.frequencies_by(other, &EKV.Replica.shard_index_for(&1, config.num_shards))
+
+      assert Enum.any?(shard_counts, fn {_shard, count} -> count > 500 end)
+    end
+
+    test "scan_many handles empty and duplicate prefixes", %{name: name} do
+      seed_mixed_rows(name)
+
+      assert EKV.scan_many(name, []) == []
+      assert EKV.scan_many(name, ["none/"]) == [[]]
+
+      prefixes = ["a/", "none/", "a/", "b/", "none/"]
+      result = EKV.scan_many(name, prefixes)
+      assert result == sequential_scans(name, prefixes)
+      assert [a, [], a, [_], []] = result
+    end
+
+    test "scan_many raises where scan raises", %{name: name} do
+      assert_raise MatchError, fn -> Enum.to_list(EKV.scan(name, "")) end
+      assert_raise MatchError, fn -> EKV.scan_many(name, ["a/", ""]) end
+    end
+
+    test "get_many returns what each get returns", %{name: name} do
+      seed_mixed_rows(name)
+
+      keys = [
+        "a/live",
+        "a/deleted",
+        "a/expired",
+        "a/ttl_live",
+        "missing",
+        "b/1",
+        "b/2",
+        "a/live",
+        "missing"
+      ]
+
+      result = EKV.get_many(name, keys)
+      assert result == sequential_gets(name, keys)
+      assert result == [%{n: 1}, nil, nil, "fresh", nil, "b1", nil, %{n: 1}, nil]
+      assert EKV.get_many(name, []) == []
+    end
+
+    test "get_many reads keys across every shard", %{name: name} do
+      keys = for i <- 1..64, do: "spread/#{i}"
+      for key <- Enum.take_every(keys, 2), do: :ok = EKV.put(name, key, key)
+
+      config = EKV.Supervisor.get_config(name)
+
+      assert keys
+             |> Enum.map(&EKV.Replica.shard_index_for(&1, config.num_shards))
+             |> Enum.uniq()
+             |> length() ==
+               config.num_shards
+
+      assert EKV.get_many(name, keys) == sequential_gets(name, keys)
+    end
+
+    test "scan_many and get_many read in one dirty call", %{name: name} do
+      seed_mixed_rows(name)
+
+      assert fetch_all_each_calls(fn -> EKV.scan_many(name, ["a/", "b/", "none/"]) end) == 1
+      assert fetch_all_each_calls(fn -> EKV.get_many(name, ["a/live", "b/1", "missing"]) end) == 1
+    end
+
+    test "a prefix after one with a full first page is read after that one's pages", %{
+      name: name
+    } do
+      for i <- 1..1_300, do: :ok = EKV.put(name, "big/#{i}", i)
+      :ok = EKV.put(name, "small/1", "s")
+
+      # The batch, then a fresh scan of "small/" once "big/" has paged on.
+      assert fetch_all_each_calls(fn -> EKV.scan_many(name, ["small/", "big/", "small/"]) end) ==
+               2
+
+      assert fetch_all_each_calls(fn -> EKV.scan_many(name, ["small/", "big/"]) end) == 1
+    end
+
+    defp fetch_all_each_calls(fun) do
+      mfa = {EKV.Sqlite3, :fetch_all_each, 3}
+      1 = :erlang.trace_pattern(mfa, true, [:call_count])
+
+      try do
+        fun.()
+        {:call_count, count} = :erlang.trace_info(mfa, :call_count)
+        count
+      after
+        :erlang.trace_pattern(mfa, false, [:call_count])
+      end
+    end
+
+    test "scan_many and get_many see writes made before the call", %{name: name} do
+      assert EKV.scan_many(name, ["w/"]) == [[]]
+      assert EKV.get_many(name, ["w/1"]) == [nil]
+
+      :ok = EKV.put(name, "w/1", "one")
+      assert [[{"w/1", "one", _vsn}]] = EKV.scan_many(name, ["w/"])
+      assert EKV.get_many(name, ["w/1"]) == ["one"]
+
+      :ok = EKV.delete(name, "w/1")
+      assert EKV.scan_many(name, ["w/"]) == [[]]
+      assert EKV.get_many(name, ["w/1"]) == [nil]
+    end
+  end
+
   describe "restart rehydration" do
     test "replication starts after local storage and restarts with a crashed shard", %{name: name} do
       shard_name = EKV.Replica.shard_name(name, 0)

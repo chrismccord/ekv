@@ -320,6 +320,16 @@ defmodule EKV.ClientModeDistributedTest do
       timeout: 10_000
     )
 
+    assert [pages, []] =
+             TestCluster.rpc!(client_node, EKV, :scan_many, [ekv_name, ["page/", "none/"]])
+
+    assert length(pages) == 550
+
+    assert TestCluster.rpc!(client_node, EKV, :get_many, [
+             ekv_name,
+             ["client/lww", "missing", "client/cas"]
+           ]) == ["value", nil, "SEED!"]
+
     TestCluster.subscribe_on(client_node, ekv_name, "notify/", self())
 
     TestCluster.assert_eventually(

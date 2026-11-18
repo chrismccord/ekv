@@ -69,6 +69,9 @@ defmodule EKV.Store do
   FROM kv WHERE key = ?1
   """
 
+  @doc false
+  def get_sql, do: @get_sql
+
   # SQL for the 2 hot cached statements
   @kv_upsert_sql """
   INSERT INTO kv (key, value, timestamp, origin_node, origin_seq, expires_at, deleted_at)

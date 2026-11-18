@@ -805,26 +805,7 @@ defmodule EKV do
         else
           shard_index = Replica.shard_index_for(key, config.num_shards)
           {db, get_stmt} = read_conn(name, shard_index)
-
-          case EKV.Store.get_cached(db, get_stmt, key) do
-            nil ->
-              nil
-
-            {_value_binary, _ts, _origin, _expires_at, deleted_at} when is_integer(deleted_at) ->
-              nil
-
-            {value_binary, _ts, _origin, expires_at, nil} when is_integer(expires_at) ->
-              now = System.system_time(:nanosecond)
-
-              if expires_at <= now do
-                nil
-              else
-                :erlang.binary_to_term(value_binary)
-              end
-
-            {value_binary, _ts, _origin, _expires_at, nil} ->
-              :erlang.binary_to_term(value_binary)
-          end
+          get_entry_value(EKV.Store.get_cached(db, get_stmt, key))
         end
 
       :member ->
@@ -841,29 +822,72 @@ defmodule EKV do
         else
           shard_index = Replica.shard_index_for(key, config.num_shards)
           {db, get_stmt} = read_conn(name, shard_index)
-
-          case EKV.Store.get_cached(db, get_stmt, key) do
-            nil ->
-              nil
-
-            {_value_binary, _ts, _origin, _expires_at, deleted_at} when is_integer(deleted_at) ->
-              nil
-
-            {value_binary, _ts, _origin, expires_at, nil} when is_integer(expires_at) ->
-              now = System.system_time(:nanosecond)
-
-              if expires_at <= now do
-                nil
-              else
-                :erlang.binary_to_term(value_binary)
-              end
-
-            {value_binary, _ts, _origin, _expires_at, nil} ->
-              :erlang.binary_to_term(value_binary)
-          end
+          get_entry_value(EKV.Store.get_cached(db, get_stmt, key))
         end
     end
   end
+
+  @doc """
+  Get several keys. Returns one value per key, in order, each exactly what
+  `get/2` returns for it: `nil` for missing, expired, or deleted entries.
+
+  In member and observer mode every key is read from its shard's reader
+  connection in one dirty NIF call, in the order given. Like a sequence of
+  `get/2` calls, it is not a snapshot: a write may land between two keys'
+  reads. In client mode it is a sequence of `get/2` calls.
+  """
+  def get_many(name, keys) when is_list(keys) do
+    config = EKV.Supervisor.get_config(name)
+
+    case mode(config) do
+      :client ->
+        Enum.map(keys, &get(name, &1))
+
+      mode when mode in [:member, :observer] ->
+        local_get_many(name, keys, config.num_shards)
+    end
+  end
+
+  defp local_get_many(_name, [], _num_shards), do: []
+
+  defp local_get_many(name, keys, num_shards) do
+    dbs =
+      Enum.map(keys, fn key ->
+        name |> read_conn(Replica.shard_index_for(key, num_shards)) |> elem(0)
+      end)
+
+    args = Enum.map(keys, &[&1])
+    {:ok, results} = EKV.Sqlite3.fetch_all_each(dbs, EKV.Store.get_sql(), args)
+
+    Enum.map(results, fn
+      [] ->
+        get_entry_value(nil)
+
+      [[value, ts, origin, expires_at, deleted_at]] ->
+        get_entry_value({value, ts, origin, expires_at, deleted_at})
+    end)
+  end
+
+  # What `get/2` returns for a row read with `EKV.Store.get_cached/3`.
+  defp get_entry_value(nil), do: nil
+
+  defp get_entry_value({_value_binary, _ts, _origin, _expires_at, deleted_at})
+       when is_integer(deleted_at),
+       do: nil
+
+  defp get_entry_value({value_binary, _ts, _origin, expires_at, nil})
+       when is_integer(expires_at) do
+    now = System.system_time(:nanosecond)
+
+    if expires_at <= now do
+      nil
+    else
+      :erlang.binary_to_term(value_binary)
+    end
+  end
+
+  defp get_entry_value({value_binary, _ts, _origin, _expires_at, nil}),
+    do: :erlang.binary_to_term(value_binary)
 
   @doc """
   Delete a key.
@@ -1091,6 +1115,28 @@ defmodule EKV do
 
       mode when mode in [:member, :observer] ->
         member_scan_stream(name, prefix)
+    end
+  end
+
+  @doc """
+  Scan several prefixes. Returns one list per prefix, in order, each exactly
+  `Enum.to_list(scan(name, prefix))`.
+
+  In member and observer mode the first page of every (prefix, shard) is read
+  in one dirty NIF call; a (prefix, shard) whose first page came back full
+  goes on paging on its own, as `scan/2` does. Like a sequence of `scan/2`
+  calls, it is not a snapshot. In client mode it is a sequence of `scan/2`
+  calls.
+  """
+  def scan_many(name, prefixes) when is_list(prefixes) do
+    config = EKV.Supervisor.get_config(name)
+
+    case mode(config) do
+      :client ->
+        Enum.map(prefixes, &Enum.to_list(scan(name, &1)))
+
+      mode when mode in [:member, :observer] ->
+        member_scan_many(name, prefixes, config.num_shards)
     end
   end
 
@@ -2020,6 +2066,63 @@ defmodule EKV do
       end)
       |> Stream.concat()
     end)
+  end
+
+  # Every (prefix, shard) first page in one dirty NIF call. Each prefix's
+  # items come out in the order `member_scan_stream/2` yields them.
+  defp member_scan_many(_name, [], _num_shards), do: []
+
+  defp member_scan_many(name, prefixes, num_shards) do
+    ranges = Enum.map(prefixes, &{&1, EKV.Store.next_binary_prefix(&1)})
+    shards = Enum.to_list(0..(num_shards - 1))
+    now = System.system_time(:nanosecond)
+    shard_dbs = Enum.map(shards, fn shard -> name |> read_conn(shard) |> elem(0) end)
+    dbs = Enum.flat_map(ranges, fn _ -> shard_dbs end)
+
+    args =
+      for {prefix, prefix_end} <- ranges, _shard <- shards do
+        [prefix, prefix_end, now, @scan_chunk_size]
+      end
+
+    {:ok, pages} = EKV.Sqlite3.fetch_all_each(dbs, @scan_first_chunk_sql, args)
+
+    scan_many_results(name, Enum.zip(ranges, Enum.chunk_every(pages, num_shards)), shards, [])
+  end
+
+  # A prefix with a full first page on some shard pages on, shard by shard,
+  # before any later prefix is read, as a sequence of `scan/2` calls would:
+  # the later prefixes' first pages from the batch are dropped and those
+  # prefixes are scanned afresh.
+  defp scan_many_results(_name, [], _shards, acc), do: Enum.reverse(acc)
+
+  defp scan_many_results(name, [{{prefix, prefix_end}, prefix_pages} | rest], shards, acc) do
+    full? = Enum.any?(prefix_pages, &(length(&1) >= @scan_chunk_size))
+
+    items =
+      shards
+      |> Enum.zip(prefix_pages)
+      |> Enum.flat_map(fn {shard, rows} ->
+        items = Enum.map(rows, &decode_scan_row/1)
+
+        if length(rows) < @scan_chunk_size do
+          items
+        else
+          [last_key | _] = List.last(rows)
+          next = member_scan_shard_stream(name, shard, prefix, prefix_end, {last_key, :next})
+          items ++ Enum.to_list(next)
+        end
+      end)
+
+    if full? do
+      later =
+        Enum.map(rest, fn {{later_prefix, _}, _} ->
+          Enum.to_list(member_scan_stream(name, later_prefix))
+        end)
+
+      Enum.reverse([items | acc], later)
+    else
+      scan_many_results(name, rest, shards, [items | acc])
+    end
   end
 
   # One shard's scan from `start` ({cursor, phase}) onward, a page at a time.
