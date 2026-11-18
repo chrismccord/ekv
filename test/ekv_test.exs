@@ -329,6 +329,32 @@ defmodule EKVTest do
       assert result == %{"user/2" => "b"}
     end
 
+    test "scan pages past each shard's first page, in shard then key order", %{name: name} do
+      keys = for i <- 1..1_300, do: "big/#{String.pad_leading(Integer.to_string(i), 5, "0")}"
+      for key <- keys, do: :ok = EKV.put(name, key, key)
+      :ok = EKV.put(name, "bigger/1", "outside the prefix")
+
+      config = EKV.Supervisor.get_config(name)
+
+      expected =
+        keys
+        |> Enum.group_by(&EKV.Replica.shard_index_for(&1, config.num_shards))
+        |> Enum.sort()
+        |> Enum.flat_map(fn {_shard, shard_keys} -> Enum.sort(shard_keys) end)
+
+      assert Enum.map(EKV.scan(name, "big/"), fn {key, value, _vsn} -> {key, value} end) ==
+               Enum.map(expected, &{&1, &1})
+    end
+
+    test "scan reads when enumerated, not when built", %{name: name} do
+      :ok = EKV.put(name, "user/1", "a")
+      stream = EKV.scan(name, "user/")
+      :ok = EKV.put(name, "user/2", "b")
+
+      assert stream |> Enum.map(fn {key, _value, _vsn} -> key end) |> Enum.sort() ==
+               ["user/1", "user/2"]
+    end
+
     test "scan excludes expired entries", %{name: name} do
       :ok = EKV.put(name, "user/1", "a", ttl: 1)
       :ok = EKV.put(name, "user/2", "b")

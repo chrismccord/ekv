@@ -1986,50 +1986,79 @@ defmodule EKV do
   end
 
   # Runs on a member node; builds the local shard-backed scan stream.
+  #
+  # Every shard's first page is read in one dirty NIF call when the stream
+  # is first enumerated (most prefixes fit in one page per shard); a shard
+  # whose first page came back full goes on paging on its own. Items come
+  # out in the same order as paging each shard in turn.
   defp member_scan_stream(name, prefix) do
     prefix_end = EKV.Store.next_binary_prefix(prefix)
     config = EKV.Supervisor.get_config(name)
 
-    shard_streams =
-      for shard <- 0..(config.num_shards - 1) do
-        Stream.resource(
-          fn -> {prefix, :first} end,
-          fn
-            :done ->
-              {:halt, :done}
+    Stream.flat_map([:first_pages], fn :first_pages ->
+      shards = Enum.to_list(0..(config.num_shards - 1))
+      now = System.system_time(:nanosecond)
+      dbs = Enum.map(shards, fn shard -> name |> read_conn(shard) |> elem(0) end)
+      args = Enum.map(shards, fn _ -> [prefix, prefix_end, now, @scan_chunk_size] end)
+      {:ok, pages} = EKV.Sqlite3.fetch_all_each(dbs, @scan_first_chunk_sql, args)
 
-            {cursor, phase} ->
-              {items, next_cursor} =
-                page_shard_rows(
-                  name,
-                  shard,
-                  prefix,
-                  prefix_end,
-                  cursor,
-                  phase,
-                  @scan_chunk_size,
-                  @scan_first_chunk_sql,
-                  @scan_next_chunk_sql,
-                  &decode_scan_row/1
-                )
+      shards
+      |> Enum.zip(pages)
+      |> Enum.map(fn {shard, rows} ->
+        items = Enum.map(rows, &decode_scan_row/1)
 
-              next_state =
-                case next_cursor do
-                  {^shard, next_phase, next_key_cursor} -> {next_key_cursor, next_phase}
-                  _ -> :done
-                end
+        if length(rows) < @scan_chunk_size do
+          items
+        else
+          [last_key | _] = List.last(rows)
 
-              if items == [] do
-                {:halt, :done}
-              else
-                {items, next_state}
-              end
-          end,
-          fn _ -> :ok end
-        )
-      end
+          Stream.concat(
+            items,
+            member_scan_shard_stream(name, shard, prefix, prefix_end, {last_key, :next})
+          )
+        end
+      end)
+      |> Stream.concat()
+    end)
+  end
 
-    Stream.concat(shard_streams)
+  # One shard's scan from `start` ({cursor, phase}) onward, a page at a time.
+  defp member_scan_shard_stream(name, shard, prefix, prefix_end, start) do
+    Stream.resource(
+      fn -> start end,
+      fn
+        :done ->
+          {:halt, :done}
+
+        {cursor, phase} ->
+          {items, next_cursor} =
+            page_shard_rows(
+              name,
+              shard,
+              prefix,
+              prefix_end,
+              cursor,
+              phase,
+              @scan_chunk_size,
+              @scan_first_chunk_sql,
+              @scan_next_chunk_sql,
+              &decode_scan_row/1
+            )
+
+          next_state =
+            case next_cursor do
+              {^shard, next_phase, next_key_cursor} -> {next_key_cursor, next_phase}
+              _ -> :done
+            end
+
+          if items == [] do
+            {:halt, :done}
+          else
+            {items, next_state}
+          end
+      end,
+      fn _ -> :ok end
+    )
   end
 
   # Runs on a member node; builds the local shard-backed keys stream.

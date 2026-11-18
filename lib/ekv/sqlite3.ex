@@ -81,6 +81,9 @@ defmodule EKV.Sqlite3 do
 
   def read_entry(db, stmt, args), do: Sqlite3NIF.ekv_read_entry(db, stmt, args)
   def fetch_all(db, sql, args), do: Sqlite3NIF.ekv_fetch_all(db, sql, args)
+
+  # The same query on each connection, in order, in one dirty NIF call.
+  def fetch_all_each(dbs, sql, args), do: Sqlite3NIF.ekv_fetch_all_each(dbs, sql, args)
   def backup(source_path, dest_path), do: Sqlite3NIF.ekv_backup(source_path, dest_path)
 
   def merge_local_progress_summary(db, entries),

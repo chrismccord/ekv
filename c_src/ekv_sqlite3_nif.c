@@ -180,8 +180,11 @@ static int fetch_stmt(connection_t *conn, const char *sql, size_t sql_len,
     }
 
     sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v3(conn->db, sql, (int)sql_len,
-                                SQLITE_PREPARE_PERSISTENT, &stmt, NULL);
+    /* Not SQLITE_PREPARE_PERSISTENT: that keeps the statement off the
+     * connection's lookaside memory, and the global allocator it falls back
+     * to serializes every reader connection on one mutex (scans fell from
+     * 26k/s to 3.8k/s at 64 concurrent readers). */
+    int rc = sqlite3_prepare_v3(conn->db, sql, (int)sql_len, 0, &stmt, NULL);
     if (rc != SQLITE_OK)
         return rc;
     if (!stmt)  /* no statement in the SQL (empty or a comment) */
@@ -2279,16 +2282,11 @@ static void release_fetch_stmt(sqlite3_stmt *stmt)
     sqlite3_clear_bindings(stmt);
 }
 
-static ERL_NIF_TERM ekv_fetch_all(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+/* Runs one fetch_all query on conn: {:ok, rows} or an error term. */
+static ERL_NIF_TERM fetch_rows(ErlNifEnv *env, connection_t *conn,
+                               const ErlNifBinary *sql, ERL_NIF_TERM args)
 {
-    (void)argc;
-    connection_t *conn;
-    if (!enif_get_resource(env, argv[0], connection_type, (void **)&conn))
-        return enif_make_badarg(env);
-
-    ErlNifBinary sql_bin;
-    if (!enif_inspect_iolist_as_binary(env, argv[1], &sql_bin))
-        return enif_make_badarg(env);
+    ErlNifBinary sql_bin = *sql;
 
     enif_mutex_lock(conn->mutex);
     if (!conn->db) {
@@ -2306,7 +2304,7 @@ static ERL_NIF_TERM ekv_fetch_all(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
     }
 
     /* 2. Bind */
-    int br = bind_args(env, stmt, argv[2]);
+    int br = bind_args(env, stmt, args);
     if (br != 0) {
         release_fetch_stmt(stmt);
         enif_mutex_unlock(conn->mutex);
@@ -2382,6 +2380,69 @@ static ERL_NIF_TERM ekv_fetch_all(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
     enif_free(rows);
 
     return enif_make_tuple2(env, atom_ok, result);
+}
+
+static ERL_NIF_TERM ekv_fetch_all(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    (void)argc;
+    connection_t *conn;
+    if (!enif_get_resource(env, argv[0], connection_type, (void **)&conn))
+        return enif_make_badarg(env);
+
+    ErlNifBinary sql_bin;
+    if (!enif_inspect_iolist_as_binary(env, argv[1], &sql_bin))
+        return enif_make_badarg(env);
+
+    return fetch_rows(env, conn, &sql_bin, argv[2]);
+}
+
+/*
+ * NIF: fetch_all_each([db], sql, [args]) -> {:ok, [rows]} | error
+ *
+ * The same query on each connection, in order, in one dirty call. A scan's
+ * first page on every shard went out as one dirty NIF call per shard, and
+ * the handoff to and from the dirty scheduler cost about what the query did.
+ */
+static ERL_NIF_TERM ekv_fetch_all_each(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    (void)argc;
+    unsigned n, nargs;
+    if (!enif_get_list_length(env, argv[0], &n) ||
+        !enif_get_list_length(env, argv[2], &nargs) || n != nargs)
+        return enif_make_badarg(env);
+
+    ErlNifBinary sql_bin;
+    if (!enif_inspect_iolist_as_binary(env, argv[1], &sql_bin))
+        return enif_make_badarg(env);
+
+    ERL_NIF_TERM *results = enif_alloc(sizeof(ERL_NIF_TERM) * (n ? n : 1));
+    if (!results) return make_error(env, "alloc failed");
+
+    ERL_NIF_TERM dbs = argv[0], arg_lists = argv[2], db_term, args;
+    for (unsigned i = 0; i < n; i++) {
+        connection_t *conn;
+        enif_get_list_cell(env, dbs, &db_term, &dbs);
+        enif_get_list_cell(env, arg_lists, &args, &arg_lists);
+
+        if (!enif_get_resource(env, db_term, connection_type, (void **)&conn)) {
+            enif_free(results);
+            return enif_make_badarg(env);
+        }
+
+        ERL_NIF_TERM result = fetch_rows(env, conn, &sql_bin, args);
+        const ERL_NIF_TERM *tuple;
+        int arity;
+        if (!enif_get_tuple(env, result, &arity, &tuple) || arity != 2 ||
+            enif_compare(tuple[0], atom_ok) != 0) {
+            enif_free(results);
+            return result;
+        }
+        results[i] = tuple[1];
+    }
+
+    ERL_NIF_TERM list = enif_make_list_from_array(env, results, n);
+    enif_free(results);
+    return enif_make_tuple2(env, atom_ok, list);
 }
 
 /* ------------------------------------------------------------------ */
@@ -3610,6 +3671,7 @@ static ErlNifFunc nif_funcs[] = {
         ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_read_entry",    3, ekv_read_entry,    ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_fetch_all",     3, ekv_fetch_all,     ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"ekv_fetch_all_each", 3, ekv_fetch_all_each, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_backup",        2, ekv_backup,        ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_merge_local_progress_summary", 2, ekv_merge_local_progress_summary,
         ERL_NIF_DIRTY_JOB_IO_BOUND},

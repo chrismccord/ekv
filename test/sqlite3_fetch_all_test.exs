@@ -77,5 +77,22 @@ defmodule EKV.Sqlite3FetchAllTest do
     assert {:ok, [["a", 1, 7]]} = Sqlite3.fetch_all(r, "SELECT * FROM t", [])
   end
 
+  test "fetch_all_each runs the query on each connection in order", %{writer: w, reader: r} do
+    {:ok, []} = Sqlite3.fetch_all(w, "INSERT INTO t (k, v) VALUES ('a', 1), ('b', 2)", [])
+
+    assert {:ok, [[["a", 1]], [["b", 2]], []]} =
+             Sqlite3.fetch_all_each([r, w, r], "SELECT k, v FROM t WHERE k = ?1", [
+               ["a"],
+               ["b"],
+               ["c"]
+             ])
+  end
+
+  test "fetch_all_each answers the first error", %{reader: r} do
+    assert {:error, _} = Sqlite3.fetch_all_each([r, r], "SELECT FROM nowhere", [[], []])
+    assert_raise ArgumentError, fn -> Sqlite3.fetch_all_each([r, r], "SELECT ?1", [[1]]) end
+    assert {:ok, [[[1]], [[2]]]} = Sqlite3.fetch_all_each([r, r], "SELECT ?1", [[1], [2]])
+  end
+
   defp pad(i), do: String.pad_leading(Integer.to_string(i), 3, "0")
 end
