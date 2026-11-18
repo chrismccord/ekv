@@ -6,4 +6,5 @@ end
 
 :application.set_env(:kernel, :prevent_overlapping_partitions, false)
 
-ExUnit.start()
+# :nif_stress runs only on request (scripts/nif_asan_stress.sh, or --only nif_stress).
+ExUnit.start(exclude: [:nif_stress])
