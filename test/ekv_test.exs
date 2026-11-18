@@ -478,11 +478,14 @@ defmodule EKVTest do
       assert EKV.get_many(name, keys) == sequential_gets(name, keys)
     end
 
-    test "scan_many and get_many read in one dirty call", %{name: name} do
+    test "scan_many and get_many read in one NIF call", %{name: name} do
       seed_mixed_rows(name)
 
       assert fetch_all_each_calls(fn -> EKV.scan_many(name, ["a/", "b/", "none/"]) end) == 1
-      assert fetch_all_each_calls(fn -> EKV.get_many(name, ["a/live", "b/1", "missing"]) end) == 1
+
+      assert calls({EKV.Sqlite3, :fetch_each_fast, 3}, fn ->
+               EKV.get_many(name, ["a/live", "b/1", "missing"])
+             end) == 1
     end
 
     test "a prefix after one with a full first page is read after that one's pages", %{
@@ -498,8 +501,9 @@ defmodule EKVTest do
       assert fetch_all_each_calls(fn -> EKV.scan_many(name, ["small/", "big/"]) end) == 1
     end
 
-    defp fetch_all_each_calls(fun) do
-      mfa = {EKV.Sqlite3, :fetch_all_each, 3}
+    defp fetch_all_each_calls(fun), do: calls({EKV.Sqlite3, :fetch_all_each, 3}, fun)
+
+    defp calls(mfa, fun) do
       1 = :erlang.trace_pattern(mfa, true, [:call_count])
 
       try do

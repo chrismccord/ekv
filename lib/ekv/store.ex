@@ -606,17 +606,18 @@ defmodule EKV.Store do
   end
 
   @doc """
-  Single-bounce read using a cached prepared statement
+  Single-bounce read using a cached prepared statement, on any free reader
+  of a shard's `{db, get_stmt}` tuple: on the caller's scheduler, or on a
+  dirty scheduler when every reader is busy.
   """
-  def get_cached(db, get_stmt, key) do
-    case EKV.Sqlite3.read_entry(db, get_stmt, [key]) do
-      {:ok, nil} ->
-        nil
-
-      {:ok, [value, timestamp, origin_node, expires_at, deleted_at]} ->
-        {value, timestamp, origin_node, expires_at, deleted_at}
-    end
+  def get_from_readers(readers, key) do
+    decode_entry(EKV.Sqlite3.read_entry_fast(readers, [key]))
   end
+
+  defp decode_entry({:ok, nil}), do: nil
+
+  defp decode_entry({:ok, [value, timestamp, origin_node, expires_at, deleted_at]}),
+    do: {value, timestamp, origin_node, expires_at, deleted_at}
 
   @scan_prefix_sql """
   SELECT key, value FROM kv

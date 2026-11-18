@@ -82,6 +82,14 @@ defmodule EKV.Sqlite3 do
   def read_entry(db, stmt, args), do: Sqlite3NIF.ekv_read_entry(db, stmt, args)
   def fetch_all(db, sql, args), do: Sqlite3NIF.ekv_fetch_all(db, sql, args)
 
+  # Point reads on a normal scheduler: `read_entry/3` and `fetch_all_each/3`
+  # answers, taking any free reader of the shard's `{db, stmt}` tuple, and
+  # moving to the dirty NIF when every reader is busy or the read is large.
+  def read_entry_fast(readers, args), do: Sqlite3NIF.ekv_read_entry_fast(readers, args)
+
+  def fetch_each_fast(readers_list, sql, args),
+    do: Sqlite3NIF.ekv_fetch_each_fast(readers_list, sql, args)
+
   # The same query on each connection, in order, in one dirty NIF call.
   def fetch_all_each(dbs, sql, args), do: Sqlite3NIF.ekv_fetch_all_each(dbs, sql, args)
   def backup(source_path, dest_path), do: Sqlite3NIF.ekv_backup(source_path, dest_path)

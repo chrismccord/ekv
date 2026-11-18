@@ -1,4 +1,5 @@
 #include <limits.h>
+#include <stdint.h>
 #include <string.h>
 #include <erl_nif.h>
 #include "sqlite3.h"
@@ -14,6 +15,10 @@
  * (33 us against 6 us for a prepared point read).
  */
 #define FETCH_STMT_CACHE_SIZE 16
+
+/* Every connection's busy timeout. The fast point reads clear the busy
+ * handler while they step and put this one back. */
+#define EKV_BUSY_TIMEOUT_MS 5000
 
 typedef struct {
     char         *sql;
@@ -170,20 +175,32 @@ static void finalize_cached_connection_stmts(connection_t *conn)
  * and must reset the statement and clear its bindings before unlocking, so
  * no cached statement keeps a read transaction open between calls.
  */
-static int fetch_stmt(connection_t *conn, const char *sql, size_t sql_len,
-                      sqlite3_stmt **out)
+/* The connection's cached statement for this SQL, or NULL. Never prepares. */
+static sqlite3_stmt *cached_fetch_stmt(connection_t *conn, const char *sql, size_t sql_len)
 {
-    fetch_stmt_t *victim = &conn->fetch_stmts[0];
-
     for (int i = 0; i < FETCH_STMT_CACHE_SIZE; i++) {
         fetch_stmt_t *entry = &conn->fetch_stmts[i];
 
         if (entry->stmt && entry->sql_len == sql_len &&
             memcmp(entry->sql, sql, sql_len) == 0) {
             entry->last_used = ++conn->fetch_stmt_clock;
-            *out = entry->stmt;
-            return SQLITE_OK;
+            return entry->stmt;
         }
+    }
+    return NULL;
+}
+
+static int fetch_stmt(connection_t *conn, const char *sql, size_t sql_len,
+                      sqlite3_stmt **out)
+{
+    *out = cached_fetch_stmt(conn, sql, sql_len);
+    if (*out)
+        return SQLITE_OK;
+
+    fetch_stmt_t *victim = &conn->fetch_stmts[0];
+
+    for (int i = 0; i < FETCH_STMT_CACHE_SIZE; i++) {
+        fetch_stmt_t *entry = &conn->fetch_stmts[i];
 
         if (!entry->stmt)
             victim = entry;
@@ -296,7 +313,7 @@ static ERL_NIF_TERM ekv_open(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
         return err;
     }
 
-    sqlite3_busy_timeout(db, 5000);
+    sqlite3_busy_timeout(db, EKV_BUSY_TIMEOUT_MS);
 
     connection_t *conn = enif_alloc_resource(connection_type, sizeof(connection_t));
     if (!conn) {
@@ -2205,11 +2222,204 @@ static ERL_NIF_TERM ekv_write_snapshot_entries_batch(
 }
 
 /* ------------------------------------------------------------------ */
+/* Point reads                                                         */
+/*                                                                     */
+/* read_entry and fetch_all_each run on dirty IO schedulers. Their     */
+/* _fast twins answer the same for a few keys on the caller's normal   */
+/* scheduler: a point read is about 2 us of work, and on loaded nodes  */
+/* the wait for a dirty IO scheduler was about 330 us.                 */
+/*                                                                     */
+/* A normal scheduler never waits for a reader. The _fast NIFs take    */
+/* one with enif_mutex_trylock, from a random one of the shard's       */
+/* readers on; the read runs without SQLite's busy wait and stops      */
+/* after a bounded number of VM steps. When every reader is busy, or   */
+/* the read passes a limit (keys, rows, bytes, VM steps, an uncached   */
+/* statement, a busy database), the lock is released and               */
+/* enif_schedule_nif hands the same arguments to the dirty NIF, which  */
+/* answers as it always has.                                           */
+/* ------------------------------------------------------------------ */
+
+#define FAST_READ_MAX_KEYS    8
+#define FAST_READ_MAX_ROWS    1           /* per key */
+#define FAST_READ_MAX_BYTES   (64 * 1024) /* text and blob columns, per call */
+#define FAST_READ_MAX_VM_OPS  2000        /* a primary key lookup takes ~20 */
+
+enum { READ_OK, READ_ERROR, READ_OVER_BUDGET };
+
+typedef struct {
+    size_t bytes_left;
+} read_budget_t;
+
+static int stop_vm(void *arg)
+{
+    (void)arg;
+    return 1;
+}
+
+/* No busy wait, and SQLITE_INTERRUPT after FAST_READ_MAX_VM_OPS VM steps.
+ * The caller holds conn->mutex and undoes it with fast_limits_off before
+ * unlocking. */
+static void fast_limits_on(sqlite3 *db)
+{
+    sqlite3_busy_handler(db, NULL, NULL);
+    sqlite3_progress_handler(db, FAST_READ_MAX_VM_OPS, stop_vm, NULL);
+}
+
+static void fast_limits_off(sqlite3 *db)
+{
+    sqlite3_progress_handler(db, 0, NULL, NULL);
+    sqlite3_busy_timeout(db, EKV_BUSY_TIMEOUT_MS);
+}
+
+/* A step result the dirty NIF may answer differently: it waits out a busy
+ * database, and runs any number of VM steps. */
+static int fast_step_gave_up(int rc)
+{
+    return (rc & 0xff) == SQLITE_BUSY || (rc & 0xff) == SQLITE_INTERRUPT;
+}
+
+/* Bytes the row's text and blob columns copy into terms. Only text and blob
+ * columns are measured: sqlite3_column_bytes converts a number to text. */
+static size_t row_bytes(sqlite3_stmt *stmt)
+{
+    size_t total = 0;
+    int ncols = sqlite3_column_count(stmt);
+
+    for (int i = 0; i < ncols; i++) {
+        int type = sqlite3_column_type(stmt, i);
+        if (type == SQLITE_TEXT || type == SQLITE_BLOB)
+            total += (size_t)sqlite3_column_bytes(stmt, i);
+    }
+    return total;
+}
+
+/* Takes the row's bytes from the budget, or answers 0 if it has too few. */
+static int spend_row(read_budget_t *budget, sqlite3_stmt *stmt)
+{
+    size_t bytes = row_bytes(stmt);
+    if (bytes > budget->bytes_left)
+        return 0;
+    budget->bytes_left -= bytes;
+    return 1;
+}
+
+/* The current row as a list of column terms; 0 on allocation failure. */
+static int make_row(ErlNifEnv *env, sqlite3_stmt *stmt, ERL_NIF_TERM *row)
+{
+    int ncols = sqlite3_column_count(stmt);
+    if (ncols == 0) {
+        *row = enif_make_list(env, 0);
+        return 1;
+    }
+
+    ERL_NIF_TERM *cols = enif_alloc(sizeof(ERL_NIF_TERM) * (size_t)ncols);
+    if (!cols)
+        return 0;
+
+    for (int i = 0; i < ncols; i++) {
+        if (!make_column(env, stmt, i, &cols[i])) {
+            enif_free(cols);
+            return 0;
+        }
+    }
+
+    *row = enif_make_list_from_array(env, cols, (unsigned)ncols);
+    enif_free(cols);
+    return 1;
+}
+
+/* Random in [0, n), per scheduler thread. Spreads callers over a shard's
+ * readers; it needs no quality beyond that. */
+static unsigned fast_rand(unsigned n)
+{
+    static __thread unsigned long long state;
+
+    if (state == 0)
+        state = ((unsigned long long)enif_monotonic_time(ERL_NIF_NSEC) ^
+                 (unsigned long long)(uintptr_t)&state) | 1;
+
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    return (unsigned)(state % n);
+}
+
+/* A shard reader, {db, stmt}: the pair and its connection. */
+static int get_reader(ErlNifEnv *env, ERL_NIF_TERM term,
+                      const ERL_NIF_TERM **pair, connection_t **conn)
+{
+    int arity;
+    return enif_get_tuple(env, term, &arity, pair) && arity == 2 &&
+           enif_get_resource(env, (*pair)[0], connection_type, (void **)conn);
+}
+
+/* ------------------------------------------------------------------ */
 /* NIF: read_entry(db, stmt, args) -> {:ok, [cols]} | {:ok, nil} | err */
 /*                                                                     */
 /* Single dirty IO bounce: reset+bind, step, extract row or nil.       */
 /* The statement is NOT finalized — it's cached for reuse.             */
 /* ------------------------------------------------------------------ */
+
+/*
+ * read_entry's work; the caller holds conn->mutex. *out is the answer for
+ * READ_OK and READ_ERROR. With a budget, a read that passes it is reset and
+ * answers READ_OVER_BUDGET.
+ */
+static int read_entry_locked(ErlNifEnv *env, connection_t *conn, statement_t *s,
+                             ERL_NIF_TERM args, read_budget_t *budget,
+                             ERL_NIF_TERM *out)
+{
+    if (!conn->db) {
+        *out = make_error(env, "database closed");
+        return READ_ERROR;
+    }
+    if (!s->stmt) {
+        *out = make_error(env, "statement finalized");
+        return READ_ERROR;
+    }
+
+    /* 1. Reset + bind */
+    int br = bind_args(env, s->stmt, args);
+    if (br != 0) {
+        *out = bind_error(env, conn->db, br);
+        sqlite3_reset(s->stmt);
+        return READ_ERROR;
+    }
+
+    /* 2. Step */
+    if (budget) fast_limits_on(conn->db);
+    int rc = sqlite3_step(s->stmt);
+    if (budget) fast_limits_off(conn->db);
+
+    if (budget && (fast_step_gave_up(rc) ||
+                   (rc == SQLITE_ROW && !spend_row(budget, s->stmt)))) {
+        sqlite3_reset(s->stmt);
+        return READ_OVER_BUDGET;
+    }
+
+    if (rc == SQLITE_ROW) {
+        ERL_NIF_TERM row;
+        int made = make_row(env, s->stmt, &row);
+        sqlite3_reset(s->stmt);
+        if (!made) {
+            *out = make_error(env, "alloc failed");
+            return READ_ERROR;
+        }
+        *out = enif_make_tuple2(env, atom_ok, row);
+        return READ_OK;
+    }
+
+    if (rc == SQLITE_DONE) {
+        sqlite3_reset(s->stmt);
+        *out = enif_make_tuple2(env, atom_ok, atom_nil);
+        return READ_OK;
+    }
+
+    /* Error */
+    *out = make_sqlite_error(env, conn->db);
+    sqlite3_reset(s->stmt);
+    return READ_ERROR;
+}
 
 static ERL_NIF_TERM ekv_read_entry(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
@@ -2225,67 +2435,70 @@ static ERL_NIF_TERM ekv_read_entry(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
     if (s->conn != conn)
         return make_error(env, "statement does not belong to this connection");
 
+    ERL_NIF_TERM out;
     enif_mutex_lock(conn->mutex);
-    if (!conn->db) {
-        enif_mutex_unlock(conn->mutex);
-        return make_error(env, "database closed");
-    }
-    if (!s->stmt) {
-        enif_mutex_unlock(conn->mutex);
-        return make_error(env, "statement finalized");
-    }
-
-    /* 1. Reset + bind */
-    int br = bind_args(env, s->stmt, argv[2]);
-    if (br != 0) {
-        ERL_NIF_TERM err = bind_error(env, conn->db, br);
-        sqlite3_reset(s->stmt);
-        enif_mutex_unlock(conn->mutex);
-        return err;
-    }
-
-    /* 2. Step */
-    int rc = sqlite3_step(s->stmt);
-
-    if (rc == SQLITE_ROW) {
-        int ncols = sqlite3_column_count(s->stmt);
-        if (ncols == 0) {
-            sqlite3_reset(s->stmt);
-            enif_mutex_unlock(conn->mutex);
-            return enif_make_tuple2(env, atom_ok, enif_make_list(env, 0));
-        }
-        ERL_NIF_TERM *cols = enif_alloc(sizeof(ERL_NIF_TERM) * (size_t)ncols);
-        if (!cols) {
-            sqlite3_reset(s->stmt);
-            enif_mutex_unlock(conn->mutex);
-            return make_error(env, "alloc failed");
-        }
-        for (int i = 0; i < ncols; i++) {
-            if (!make_column(env, s->stmt, i, &cols[i])) {
-                enif_free(cols);
-                sqlite3_reset(s->stmt);
-                enif_mutex_unlock(conn->mutex);
-                return make_error(env, "alloc failed");
-            }
-        }
-        ERL_NIF_TERM row_list = enif_make_list_from_array(env, cols, (unsigned)ncols);
-        enif_free(cols);
-        sqlite3_reset(s->stmt);
-        enif_mutex_unlock(conn->mutex);
-        return enif_make_tuple2(env, atom_ok, row_list);
-    }
-
-    if (rc == SQLITE_DONE) {
-        sqlite3_reset(s->stmt);
-        enif_mutex_unlock(conn->mutex);
-        return enif_make_tuple2(env, atom_ok, atom_nil);
-    }
-
-    /* Error */
-    ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
-    sqlite3_reset(s->stmt);
+    read_entry_locked(env, conn, s, argv[2], NULL, &out);
     enif_mutex_unlock(conn->mutex);
-    return err;
+    return out;
+}
+
+/*
+ * NIF (normal scheduler): read_entry_fast(readers, args)
+ *
+ * read_entry's answer, on any free reader of the shard's {db, stmt} tuple,
+ * or by ekv_read_entry on a dirty scheduler.
+ */
+static ERL_NIF_TERM ekv_read_entry_fast(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    (void)argc;
+    const ERL_NIF_TERM *readers;
+    int n;
+    if (!enif_get_tuple(env, argv[0], &n, &readers) || n < 1)
+        return enif_make_badarg(env);
+
+    for (int i = 0; i < n; i++) {
+        const ERL_NIF_TERM *pair;
+        connection_t *conn;
+        statement_t *s;
+        if (!get_reader(env, readers[i], &pair, &conn) ||
+            !enif_get_resource(env, pair[1], statement_type, (void **)&s))
+            return enif_make_badarg(env);
+        if (s->conn != conn)
+            return make_error(env, "statement does not belong to this connection");
+    }
+
+    unsigned start = fast_rand((unsigned)n);
+    unsigned pick = start;
+
+    for (unsigned i = 0; i < (unsigned)n; i++) {
+        unsigned idx = (start + i) % (unsigned)n;
+        const ERL_NIF_TERM *pair;
+        connection_t *conn;
+        statement_t *s;
+        get_reader(env, readers[idx], &pair, &conn);
+        enif_get_resource(env, pair[1], statement_type, (void **)&s);
+
+        if (enif_mutex_trylock(conn->mutex) != 0)
+            continue;
+
+        ERL_NIF_TERM out;
+        read_budget_t budget = { FAST_READ_MAX_BYTES };
+        int r = read_entry_locked(env, conn, s, argv[1], &budget, &out);
+        enif_mutex_unlock(conn->mutex);
+
+        if (r != READ_OVER_BUDGET)
+            return out;
+        pick = idx;
+        break;
+    }
+
+    /* No lock is held here. */
+    const ERL_NIF_TERM *pair;
+    connection_t *conn;
+    get_reader(env, readers[pick], &pair, &conn);
+    ERL_NIF_TERM dirty_argv[3] = { pair[0], pair[1], argv[1] };
+    return enif_schedule_nif(env, "ekv_read_entry", ERL_NIF_DIRTY_JOB_IO_BOUND,
+                             ekv_read_entry, 3, dirty_argv);
 }
 
 /* ------------------------------------------------------------------ */
@@ -2302,104 +2515,109 @@ static void release_fetch_stmt(sqlite3_stmt *stmt)
     sqlite3_clear_bindings(stmt);
 }
 
-/* Runs one fetch_all query on conn: {:ok, rows} or an error term. */
-static ERL_NIF_TERM fetch_rows(ErlNifEnv *env, connection_t *conn,
-                               const ErlNifBinary *sql, ERL_NIF_TERM args)
+/*
+ * One fetch_all query on conn; the caller holds conn->mutex. *out is the
+ * rows for READ_OK and an error term for READ_ERROR. With a budget the
+ * statement must already be cached, and a query that passes the budget
+ * answers READ_OVER_BUDGET.
+ */
+static int fetch_rows_locked(ErlNifEnv *env, connection_t *conn,
+                             const ErlNifBinary *sql, ERL_NIF_TERM args,
+                             read_budget_t *budget, ERL_NIF_TERM *out)
 {
-    ErlNifBinary sql_bin = *sql;
-
-    enif_mutex_lock(conn->mutex);
     if (!conn->db) {
-        enif_mutex_unlock(conn->mutex);
-        return make_error(env, "database closed");
+        *out = make_error(env, "database closed");
+        return READ_ERROR;
     }
 
     /* 1. Prepare, or reuse this connection's statement for the SQL */
     sqlite3_stmt *stmt = NULL;
-    int rc = fetch_stmt(conn, (const char *)sql_bin.data, sql_bin.size, &stmt);
-    if (rc != SQLITE_OK) {
-        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
-        enif_mutex_unlock(conn->mutex);
-        return err;
+    if (budget) {
+        /* Parsing and planning is the dirty NIF's work. */
+        stmt = cached_fetch_stmt(conn, (const char *)sql->data, sql->size);
+        if (!stmt)
+            return READ_OVER_BUDGET;
+    } else if (fetch_stmt(conn, (const char *)sql->data, sql->size, &stmt) != SQLITE_OK) {
+        *out = make_sqlite_error(env, conn->db);
+        return READ_ERROR;
     }
 
     /* 2. Bind */
     int br = bind_args(env, stmt, args);
     if (br != 0) {
-        ERL_NIF_TERM err = bind_error(env, conn->db, br);
+        *out = bind_error(env, conn->db, br);
         release_fetch_stmt(stmt);
-        enif_mutex_unlock(conn->mutex);
-        return err;
+        return READ_ERROR;
     }
 
     /* 3. Step all rows, collecting into a dynamic array */
-    size_t cap = 64;
+    size_t cap = budget ? FAST_READ_MAX_ROWS : 64;
     size_t len = 0;
     ERL_NIF_TERM *rows = enif_alloc(sizeof(ERL_NIF_TERM) * cap);
     if (!rows) {
         release_fetch_stmt(stmt);
-        enif_mutex_unlock(conn->mutex);
-        return make_error(env, "alloc failed");
+        *out = make_error(env, "alloc failed");
+        return READ_ERROR;
     }
 
+    int rc, over = 0, failed = 0;
+    if (budget) fast_limits_on(conn->db);
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-        int ncols = sqlite3_column_count(stmt);
+        if (budget && (len == FAST_READ_MAX_ROWS || !spend_row(budget, stmt))) {
+            over = 1;
+            break;
+        }
+
         ERL_NIF_TERM row;
-        if (ncols == 0) {
-            row = enif_make_list(env, 0);
-        } else {
-            ERL_NIF_TERM *cols = enif_alloc(sizeof(ERL_NIF_TERM) * (size_t)ncols);
-            if (!cols) {
-                release_fetch_stmt(stmt);
-                enif_free(rows);
-                enif_mutex_unlock(conn->mutex);
-                return make_error(env, "alloc failed");
-            }
-            for (int i = 0; i < ncols; i++) {
-                if (!make_column(env, stmt, i, &cols[i])) {
-                    enif_free(cols);
-                    release_fetch_stmt(stmt);
-                    enif_free(rows);
-                    enif_mutex_unlock(conn->mutex);
-                    return make_error(env, "alloc failed");
-                }
-            }
-            row = enif_make_list_from_array(env, cols, (unsigned)ncols);
-            enif_free(cols);
+        if (!make_row(env, stmt, &row)) {
+            failed = 1;
+            break;
         }
 
         if (len == cap) {
             size_t new_cap = cap * 2;
             ERL_NIF_TERM *new_rows = enif_realloc(rows, sizeof(ERL_NIF_TERM) * new_cap);
             if (!new_rows) {
-                release_fetch_stmt(stmt);
-                enif_free(rows);
-                enif_mutex_unlock(conn->mutex);
-                return make_error(env, "alloc failed");
+                failed = 1;
+                break;
             }
             rows = new_rows;
             cap = new_cap;
         }
         rows[len++] = row;
     }
+    if (budget) fast_limits_off(conn->db);
 
-    if (rc != SQLITE_DONE) {
-        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
-        release_fetch_stmt(stmt);
-        enif_free(rows);
-        enif_mutex_unlock(conn->mutex);
-        return err;
+    int status;
+    if (over || (budget && fast_step_gave_up(rc))) {
+        status = READ_OVER_BUDGET;
+    } else if (failed) {
+        *out = make_error(env, "alloc failed");
+        status = READ_ERROR;
+    } else if (rc != SQLITE_DONE) {
+        *out = make_sqlite_error(env, conn->db);
+        status = READ_ERROR;
+    } else {
+        /* 4. Rows are already in order */
+        *out = enif_make_list_from_array(env, rows, (unsigned)len);
+        status = READ_OK;
     }
 
-    /* 4. Release the cached statement */
+    /* 5. Release the cached statement */
     release_fetch_stmt(stmt);
-    enif_mutex_unlock(conn->mutex);
-
-    /* 5. Build result list — rows are already in order */
-    ERL_NIF_TERM result = enif_make_list_from_array(env, rows, (unsigned)len);
     enif_free(rows);
+    return status;
+}
 
-    return enif_make_tuple2(env, atom_ok, result);
+/* Runs one fetch_all query on conn: {:ok, rows} or an error term. */
+static ERL_NIF_TERM fetch_rows(ErlNifEnv *env, connection_t *conn,
+                               const ErlNifBinary *sql, ERL_NIF_TERM args)
+{
+    ERL_NIF_TERM out;
+    enif_mutex_lock(conn->mutex);
+    int r = fetch_rows_locked(env, conn, sql, args, NULL, &out);
+    enif_mutex_unlock(conn->mutex);
+    return r == READ_OK ? enif_make_tuple2(env, atom_ok, out) : out;
 }
 
 static ERL_NIF_TERM ekv_fetch_all(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
@@ -2449,20 +2667,131 @@ static ERL_NIF_TERM ekv_fetch_all_each(ErlNifEnv *env, int argc, const ERL_NIF_T
             return enif_make_badarg(env);
         }
 
-        ERL_NIF_TERM result = fetch_rows(env, conn, &sql_bin, args);
-        const ERL_NIF_TERM *tuple;
-        int arity;
-        if (!enif_get_tuple(env, result, &arity, &tuple) || arity != 2 ||
-            enif_compare(tuple[0], atom_ok) != 0) {
+        ERL_NIF_TERM out;
+        enif_mutex_lock(conn->mutex);
+        int r = fetch_rows_locked(env, conn, &sql_bin, args, NULL, &out);
+        enif_mutex_unlock(conn->mutex);
+        if (r != READ_OK) {
             enif_free(results);
-            return result;
+            return out;
         }
-        results[i] = tuple[1];
+        results[i] = out;
     }
 
     ERL_NIF_TERM list = enif_make_list_from_array(env, results, n);
     enif_free(results);
     return enif_make_tuple2(env, atom_ok, list);
+}
+
+/*
+ * NIF (normal scheduler): fetch_each_fast([readers], sql, [args])
+ *
+ * fetch_all_each's answer, each key's query on any free reader of that
+ * key's shard ({db, stmt} tuple), for at most FAST_READ_MAX_KEYS keys of at
+ * most FAST_READ_MAX_ROWS row each. Otherwise, or when one key's readers are
+ * all busy, ekv_fetch_all_each answers on a dirty scheduler, every key read
+ * again: on the reader it found free, else on a random one of its shard.
+ */
+static ERL_NIF_TERM ekv_fetch_each_fast(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    (void)argc;
+    unsigned n, nargs;
+    if (!enif_get_list_length(env, argv[0], &n) ||
+        !enif_get_list_length(env, argv[2], &nargs) || n != nargs)
+        return enif_make_badarg(env);
+
+    ErlNifBinary sql_bin;
+    if (!inspect_text(env, argv[1], &sql_bin))
+        return enif_make_badarg(env);
+
+    ERL_NIF_TERM list, readers_term;
+
+    /* The reader each key goes to on the dirty NIF: the one it found free
+     * (its statement not cached, or the read too big), else any. */
+    unsigned picks[FAST_READ_MAX_KEYS];
+    unsigned picked = 0;
+
+    if (n <= FAST_READ_MAX_KEYS) {
+        /* Every key's readers well formed before any is read. */
+        list = argv[0];
+        while (enif_get_list_cell(env, list, &readers_term, &list)) {
+            const ERL_NIF_TERM *readers;
+            int m;
+            if (!enif_get_tuple(env, readers_term, &m, &readers) || m < 1)
+                return enif_make_badarg(env);
+            for (int j = 0; j < m; j++) {
+                const ERL_NIF_TERM *pair;
+                connection_t *conn;
+                if (!get_reader(env, readers[j], &pair, &conn))
+                    return enif_make_badarg(env);
+            }
+        }
+
+        ERL_NIF_TERM results[FAST_READ_MAX_KEYS];
+        read_budget_t budget = { FAST_READ_MAX_BYTES };
+        ERL_NIF_TERM arg_lists = argv[2], args;
+        int status = READ_OK;
+        list = argv[0];
+
+        for (unsigned i = 0; i < n && status == READ_OK; i++) {
+            const ERL_NIF_TERM *readers;
+            int m;
+            enif_get_list_cell(env, list, &readers_term, &list);
+            enif_get_list_cell(env, arg_lists, &args, &arg_lists);
+            enif_get_tuple(env, readers_term, &m, &readers);
+
+            ERL_NIF_TERM out;
+            unsigned start = fast_rand((unsigned)m);
+            picks[picked++] = start;
+            status = READ_OVER_BUDGET;  /* unless a reader is free */
+            for (unsigned k = 0; k < (unsigned)m; k++) {
+                const ERL_NIF_TERM *pair;
+                connection_t *conn;
+                unsigned idx = (start + k) % (unsigned)m;
+                get_reader(env, readers[idx], &pair, &conn);
+
+                if (enif_mutex_trylock(conn->mutex) != 0)
+                    continue;
+                picks[i] = idx;
+                status = fetch_rows_locked(env, conn, &sql_bin, args, &budget, &out);
+                enif_mutex_unlock(conn->mutex);
+                break;
+            }
+
+            if (status == READ_ERROR)
+                return out;
+            if (status == READ_OK)
+                results[i] = out;
+        }
+
+        if (status == READ_OK)
+            return enif_make_tuple2(env, atom_ok, enif_make_list_from_array(env, results, n));
+    }
+
+    /* No lock is held here. Past FAST_READ_MAX_KEYS keys, only the readers
+     * picked are checked: this loop is all the normal scheduler does. */
+    ERL_NIF_TERM *db_terms = enif_alloc(sizeof(ERL_NIF_TERM) * (n ? n : 1));
+    if (!db_terms) return make_error(env, "alloc failed");
+    list = argv[0];
+    for (unsigned i = 0; i < n; i++) {
+        const ERL_NIF_TERM *readers, *pair;
+        connection_t *conn;
+        int m;
+        enif_get_list_cell(env, list, &readers_term, &list);
+        if (!enif_get_tuple(env, readers_term, &m, &readers) || m < 1 ||
+            !get_reader(env, readers[i < picked ? picks[i] : fast_rand((unsigned)m)],
+                        &pair, &conn)) {
+            enif_free(db_terms);
+            return enif_make_badarg(env);
+        }
+        db_terms[i] = pair[0];
+    }
+    ERL_NIF_TERM dbs = enif_make_list_from_array(env, db_terms, n);
+    enif_free(db_terms);
+
+    ERL_NIF_TERM dirty_argv[3] = { dbs, argv[1], argv[2] };
+    return enif_schedule_nif(env, "ekv_fetch_all_each", ERL_NIF_DIRTY_JOB_IO_BOUND,
+                             ekv_fetch_all_each, 3, dirty_argv);
 }
 
 /* ------------------------------------------------------------------ */
@@ -3713,6 +4042,9 @@ static ErlNifFunc nif_funcs[] = {
     {"ekv_read_entry",    3, ekv_read_entry,    ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_fetch_all",     3, ekv_fetch_all,     ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_fetch_all_each", 3, ekv_fetch_all_each, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    /* Normal schedulers: they never wait, and hand off to the two above. */
+    {"ekv_read_entry_fast", 2, ekv_read_entry_fast, 0},
+    {"ekv_fetch_each_fast", 3, ekv_fetch_each_fast, 0},
     {"ekv_backup",        2, ekv_backup,        ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_merge_local_progress_summary", 2, ekv_merge_local_progress_summary,
         ERL_NIF_DIRTY_JOB_IO_BOUND},

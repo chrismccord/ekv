@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Builds the SQLite NIF with AddressSanitizer and runs the NIF tests under it:
-# the :nif_stress concurrency test plus the NIF safety and fetch_all suites.
+# the :nif_stress concurrency test plus the NIF safety, fetch_all and fast
+# point-read suites.
 # Run it before changing c_src/ekv_sqlite3_nif.c.
 #
 #   scripts/nif_asan_stress.sh [seconds] [concurrency]
@@ -20,7 +21,7 @@ rm -f "$so"
 CFLAGS="-fsanitize=address -fno-omit-frame-pointer -g" LDFLAGS="-fsanitize=address" mix compile
 
 # EKV_NIF_TESTS overrides the test files (space separated).
-read -r -a tests <<< "${EKV_NIF_TESTS:-test/nif_stress_test.exs test/sqlite3_nif_safety_test.exs test/sqlite3_fetch_all_test.exs}"
+read -r -a tests <<< "${EKV_NIF_TESTS:-test/nif_stress_test.exs test/sqlite3_nif_safety_test.exs test/sqlite3_fetch_all_test.exs test/sqlite3_fast_read_test.exs}"
 export ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:verify_interceptors=0
 
 case "$(uname -s)" in

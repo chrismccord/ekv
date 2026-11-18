@@ -604,9 +604,8 @@ defmodule EKV do
 
       mode when mode in [:member, :observer] ->
         shard_index = Replica.shard_index_for(key, config.num_shards)
-        {db, get_stmt} = read_conn(name, shard_index)
 
-        case EKV.Store.get_cached(db, get_stmt, key) do
+        case EKV.Store.get_from_readers(readers(name, shard_index), key) do
           nil ->
             nil
 
@@ -804,8 +803,7 @@ defmodule EKV do
           observer_consistent_get(name, key, opts, config, timeout)
         else
           shard_index = Replica.shard_index_for(key, config.num_shards)
-          {db, get_stmt} = read_conn(name, shard_index)
-          get_entry_value(EKV.Store.get_cached(db, get_stmt, key))
+          get_entry_value(EKV.Store.get_from_readers(readers(name, shard_index), key))
         end
 
       :member ->
@@ -821,8 +819,7 @@ defmodule EKV do
           end
         else
           shard_index = Replica.shard_index_for(key, config.num_shards)
-          {db, get_stmt} = read_conn(name, shard_index)
-          get_entry_value(EKV.Store.get_cached(db, get_stmt, key))
+          get_entry_value(EKV.Store.get_from_readers(readers(name, shard_index), key))
         end
     end
   end
@@ -831,10 +828,11 @@ defmodule EKV do
   Get several keys. Returns one value per key, in order, each exactly what
   `get/2` returns for it: `nil` for missing, expired, or deleted entries.
 
-  In member and observer mode every key is read from its shard's reader
-  connection in one dirty NIF call, in the order given. Like a sequence of
-  `get/2` calls, it is not a snapshot: a write may land between two keys'
-  reads. In client mode it is a sequence of `get/2` calls.
+  In member and observer mode every key is read from a reader connection of
+  its shard in one NIF call, in the order given: on the caller's scheduler
+  for up to 8 small rows when readers are free, else on a dirty scheduler.
+  Like a sequence of `get/2` calls, it is not a snapshot: a write may land
+  between two keys' reads. In client mode it is a sequence of `get/2` calls.
   """
   def get_many(name, keys) when is_list(keys) do
     config = EKV.Supervisor.get_config(name)
@@ -851,13 +849,9 @@ defmodule EKV do
   defp local_get_many(_name, [], _num_shards), do: []
 
   defp local_get_many(name, keys, num_shards) do
-    dbs =
-      Enum.map(keys, fn key ->
-        name |> read_conn(Replica.shard_index_for(key, num_shards)) |> elem(0)
-      end)
-
+    readers = Enum.map(keys, &readers(name, Replica.shard_index_for(&1, num_shards)))
     args = Enum.map(keys, &[&1])
-    {:ok, results} = EKV.Sqlite3.fetch_all_each(dbs, EKV.Store.get_sql(), args)
+    {:ok, results} = EKV.Sqlite3.fetch_each_fast(readers, EKV.Store.get_sql(), args)
 
     Enum.map(results, fn
       [] ->
@@ -868,7 +862,7 @@ defmodule EKV do
     end)
   end
 
-  # What `get/2` returns for a row read with `EKV.Store.get_cached/3`.
+  # What `get/2` returns for a row read with `EKV.Store.get_from_readers/2`.
   defp get_entry_value(nil), do: nil
 
   defp get_entry_value({_value_binary, _ts, _origin, _expires_at, deleted_at})
@@ -1776,9 +1770,7 @@ defmodule EKV do
   end
 
   defp current_row_state(name, shard_index, key) do
-    {db, get_stmt} = read_conn(name, shard_index)
-
-    case EKV.Store.get_cached(db, get_stmt, key) do
+    case EKV.Store.get_from_readers(readers(name, shard_index), key) do
       nil ->
         :absent
 
@@ -2370,9 +2362,12 @@ defmodule EKV do
     {key, {ts, origin_str}}
   end
 
+  # A random reader: callers on one scheduler queued on one connection when
+  # it was picked by scheduler id.
   defp read_conn(name, shard_index) do
-    readers = :persistent_term.get({EKV, name, :readers, shard_index})
-    sid = :erlang.system_info(:scheduler_id)
-    elem(readers, rem(sid - 1, tuple_size(readers)))
+    readers = readers(name, shard_index)
+    elem(readers, :erlang.phash2(:erlang.unique_integer(), tuple_size(readers)))
   end
+
+  defp readers(name, shard_index), do: :persistent_term.get({EKV, name, :readers, shard_index})
 end

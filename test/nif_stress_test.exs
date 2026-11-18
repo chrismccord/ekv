@@ -23,15 +23,18 @@ defmodule EKV.NifStressTest do
     File.rm_rf!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
 
-    start_supervised!(
-      {EKV,
-       name: name,
-       data_dir: dir,
-       shards: 8,
-       log: false,
-       gc_interval: :timer.hours(1),
-       tombstone_ttl: :timer.hours(24 * 7)}
-    )
+    start_supervised!({
+      EKV,
+      # Few readers, so point reads often find every reader of a shard
+      # busy and hand off to the dirty NIFs.
+      name: name,
+      data_dir: dir,
+      shards: 8,
+      reader_connections: 2,
+      log: false,
+      gc_interval: :timer.hours(1),
+      tombstone_ttl: :timer.hours(24 * 7)
+    })
 
     %{name: name, dir: dir}
   end
@@ -43,11 +46,19 @@ defmodule EKV.NifStressTest do
 
     Enum.each(values, fn {k, v} -> :ok = EKV.put(name, k, v) end)
 
+    # Rows past the fast reads' byte budget go to the dirty NIFs.
+    big = for i <- 1..4, into: %{}, do: {"big/#{i}", :binary.copy(<<i>>, 70_000 + i)}
+    Enum.each(big, fn {k, v} -> :ok = EKV.put(name, k, v) end)
+
     shard = &EKV.Replica.shard_index_for(&1, 8)
     keys = Map.keys(values)
     [a | _] = keys
     same = Enum.find(keys, &(&1 != a and shard.(&1) == shard.(a)))
     diff = Enum.find(keys, &(shard.(&1) != shard.(a)))
+
+    many = Enum.take(keys, 12)
+    readers = &:persistent_term.get({EKV, name, :readers, shard.(&1)})
+    get_sql = EKV.Store.get_sql()
 
     batches = [
       [a, same],
@@ -66,7 +77,7 @@ defmodule EKV.NifStressTest do
     deadline = System.monotonic_time(:millisecond) + @secs * 1000
 
     step = fn id, n ->
-      case rem(n + id, 12) do
+      case rem(n + id, 15) do
         r when r < 5 ->
           batch = Enum.at(batches, rem(n, length(batches)))
           assert EKV.get_many(name, batch) == Enum.map(batch, &values[&1])
@@ -113,6 +124,65 @@ defmodule EKV.NifStressTest do
 
           {:error, "column index out of range"} =
             Sqlite3.fetch_all_each([raw], "SELECT ?1", [[1, 2]])
+
+        12 ->
+          # Over the fast reads' key and byte limits: the dirty NIFs answer.
+          assert EKV.get_many(name, many) == Enum.map(many, &values[&1])
+          k = "big/#{rem(n, 4) + 1}"
+          assert EKV.get(name, k) == big[k]
+          assert EKV.get_many(name, [k, a]) == [big[k], values[a]]
+
+        13 ->
+          # The fast NIFs directly, while another caller holds a reader of
+          # the shard for a few ms.
+          {db, _} = elem(readers.(a), rem(n, 2))
+
+          holder =
+            Task.async(fn ->
+              Sqlite3.fetch_all(
+                db,
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 50000) SELECT count(*) FROM c",
+                []
+              )
+            end)
+
+          assert {:ok, [_ | _]} = Sqlite3.read_entry_fast(readers.(a), [a])
+          assert {:ok, nil} = Sqlite3.read_entry_fast(readers.("missing/9"), ["missing/9"])
+
+          assert {:ok, [[[_ | _]], [], [[_ | _]]]} =
+                   Sqlite3.fetch_each_fast(
+                     [readers.(a), readers.("missing/9"), readers.(diff)],
+                     get_sql,
+                     [[a], ["missing/9"], [diff]]
+                   )
+
+          assert {:ok, [[50_000]]} = Task.await(holder, :infinity)
+
+        14 ->
+          # Fast reads racing a close of their connection.
+          {:ok, db} = Sqlite3.open(Path.join(dir, "raw.sqlite"))
+          {:ok, stmt} = Sqlite3.prepare(db, "SELECT v FROM t WHERE k = ?1")
+          {:ok, _} = Sqlite3.fetch_all(db, "SELECT v FROM t WHERE k = ?1", ["k1"])
+
+          reader =
+            Task.async(fn ->
+              for i <- 1..20 do
+                assert {tag, _} = Sqlite3.read_entry_fast({{db, stmt}}, ["k#{i}"])
+                assert tag in [:ok, :error]
+
+                assert {tag, _} =
+                         Sqlite3.fetch_each_fast([{{db, stmt}}], "SELECT v FROM t WHERE k = ?1", [
+                           ["k#{i}"]
+                         ])
+
+                assert tag in [:ok, :error]
+              end
+            end)
+
+          Process.sleep(rem(n, 3))
+          :ok = Sqlite3.close(db)
+          Task.await(reader, :infinity)
+          assert {:error, _} = Sqlite3.read_entry_fast({{db, stmt}}, ["k1"])
       end
     end
 

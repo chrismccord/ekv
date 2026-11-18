@@ -129,9 +129,10 @@ defmodule EKV.Replica do
     - 1 checkpoint connection owned by `EKV.WALCheckpointer`
 
   Reader connections are stored as a tuple of `{db, get_stmt}` in
-  persistent_term keyed by `{EKV, name, :readers, shard_index}`. Reads
-  pick a connection by `rem(scheduler_id - 1, num_readers)` — no pool,
-  no GenServer hop. WAL mode ensures readers don't block the writer.
+  persistent_term keyed by `{EKV, name, :readers, shard_index}`. Point
+  reads take any free connection of the tuple; scans pick one at random —
+  no pool, no GenServer hop. WAL mode ensures readers don't block the
+  writer.
 
   Writer auto-checkpointing is disabled so the commit that crosses SQLite's
   WAL threshold never performs checkpoint I/O in the Replica process. One
@@ -456,17 +457,22 @@ defmodule EKV.Replica do
 
       Client             SQLite (reader connection)
         │                 │
-        │ read_entry NIF  │
-        │────────────────>│   via read_conn(name, shard)
-        │<────────────────│   1 dirty bounce: reset+bind+step
+        │ read_entry_fast │
+        │────────────────>│   on the shard's readers tuple
+        │<────────────────│   reset+bind+step on the caller's scheduler
         │                 │
         │  check deleted_at, expires_at
         │  binary_to_term if live
         │
         │  return value | nil
 
-  No serialization, no message passing. The read_entry NIF reuses a
-  cached prepared statement — reset+bind+step in a single dirty bounce.
+  No serialization, no message passing. The read_entry_fast NIF reuses a
+  cached prepared statement — reset+bind+step on the caller's normal
+  scheduler, on a reader it takes with a trylock. It never waits there:
+  when every reader of the shard is busy, or the read passes its limits
+  (big rows, a busy database, too many VM steps), it hands the same call
+  to the dirty read_entry NIF. `get_many/2` of up to 8 keys does the same
+  with fetch_each_fast and fetch_all_each.
 
 
   ## Conflict Resolution: Last-Writer-Wins (LWW)
@@ -7376,16 +7382,10 @@ defmodule EKV.Replica do
     :ok
   end
 
-  defp read_conn(%Replica{} = state) do
-    readers = :persistent_term.get({EKV, state.name, :readers, state.shard_index})
-    sid = :erlang.system_info(:scheduler_id)
-    elem(readers, rem(sid - 1, tuple_size(readers)))
-  end
-
   defp read_previous_value(%Replica{} = state, key) do
-    {db, get_stmt} = read_conn(state)
+    readers = :persistent_term.get({EKV, state.name, :readers, state.shard_index})
 
-    case Store.get_cached(db, get_stmt, key) do
+    case Store.get_from_readers(readers, key) do
       nil ->
         nil
 
