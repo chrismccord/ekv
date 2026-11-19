@@ -4450,10 +4450,11 @@ defmodule EKVTest do
     end
 
     test "with TTL expires as expected", %{cas_name: name} do
-      assert {:ok, _} = EKV.put(name, "cp/3", "val", consistent: true, ttl: 1)
+      # Long enough for the read below to land inside the TTL on a slow runner.
+      assert {:ok, _} = EKV.put(name, "cp/3", "val", consistent: true, ttl: 200)
       assert EKV.get(name, "cp/3", consistent: true) == "val"
 
-      Process.sleep(10)
+      Process.sleep(300)
       assert EKV.get(name, "cp/3") == nil
       assert EKV.get(name, "cp/3", consistent: true) == nil
     end

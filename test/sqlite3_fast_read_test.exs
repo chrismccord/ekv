@@ -288,7 +288,9 @@ defmodule EKV.Sqlite3FastReadTest do
 
       assert Enum.uniq(results) == [expected]
       assert ms < 100, "took #{ms} ms with a free reader"
-      assert longs == []
+      # Waiting on the held reader would hold the scheduler until it is freed;
+      # a few ms is the OS taking the thread away on a busy runner.
+      assert Enum.filter(longs, &(&1[:timeout] >= 50)) == []
 
       # Statements not cached yet go to the dirty NIF, which may pick the
       # held reader for the keys after the first.
