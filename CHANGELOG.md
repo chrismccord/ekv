@@ -1,3 +1,21 @@
+## 0.4.9 (2026-11-19)
+- Add `EKV.scan_many/2` and `EKV.get_many/2`: read several prefixes or keys
+  in one dirty NIF call, with the same results, ordering, tombstone and
+  expiry rules as a sequence of `scan/2` and `get/2` calls.
+- Point reads (`get`, `lookup`, `get_many` of up to 8 keys, CAS and replica
+  previous-value reads) run on normal schedulers when a reader connection is
+  free and the read is small, instead of waiting for a dirty IO scheduler.
+  Busy readers, large rows, uncached SQL, `SQLITE_BUSY` and long-running
+  statements still go to the dirty NIF.
+- Scans read every shard's first page in one dirty call, and dirty reads pick
+  a random reader connection instead of one fixed per scheduler.
+- `fetch_all` reuses a prepared statement per connection and SQL (up to 16,
+  least recently used), and cached statements stay on lookaside memory instead
+  of serializing readers on the global allocator.
+- Fix a NULL dereference when a statement was released while another call was
+  binding on its connection, error messages read after the lock was released,
+  iolists over `INT_MAX` bytes, and a NULL `strcmp` in Paxos ballot reads.
+
 ## 0.4.8 (2026-10-02)
 - Bound replay-log GC to transactional batches that yield between units and
   recheck retained-member floors before every continuation, preventing long GC
