@@ -312,7 +312,15 @@ defmodule EKV.Sqlite3FastReadTest do
   # calls, and scans run on dirty schedulers. The probes call the fast NIFs
   # directly under a :running trace: a call with no schedule-out inside it
   # ran on the normal scheduler throughout, so its duration is the NIF's.
-  @long_ms 5
+  #
+  # The bounds are wall clock, so they also count time the OS took the
+  # scheduler thread away: on a 2-vCPU CI runner under this load, worker
+  # long schedules reach about 6 ms and the probes' p99 about 400 us, against
+  # under 1 ms and about 50 us on an 8-core laptop. A fast read that waited on
+  # a reader lock or SQLite's busy handler would hold its scheduler far past
+  # @stuck_ms; one that did real work there would push the p99 past @p99_us.
+  @stuck_ms 50
+  @p99_us 1_000
 
   test "point reads never hold a normal scheduler during a mixed load", %{name: name} do
     for i <- 1..2_000,
@@ -347,7 +355,7 @@ defmodule EKV.Sqlite3FastReadTest do
     {probes, loads} = Enum.split_with(results, &match?({:probe, _, _}, &1))
     workers = MapSet.new(results, &elem(&1, 1))
     longs = Enum.filter(drain_long_schedules(), fn {pid, _} -> MapSet.member?(workers, pid) end)
-    too_long = Enum.filter(longs, fn {_, info} -> info[:timeout] >= @long_ms end)
+    too_long = Enum.filter(longs, fn {_, info} -> info[:timeout] >= @stuck_ms end)
 
     {on_sched, off_sched} =
       probes
@@ -361,7 +369,7 @@ defmodule EKV.Sqlite3FastReadTest do
 
     IO.puts(
       "\nmixed load: #{loaded} load-worker point reads; long_schedule in workers: " <>
-        "#{length(longs)} >= 1 ms, #{length(too_long)} >= #{@long_ms} ms; " <>
+        "#{length(longs)} >= 1 ms, #{length(too_long)} >= #{@stuck_ms} ms; " <>
         "probe NIF calls: #{length(on_sched)} on the normal scheduler (p99 #{p99} us, max #{max_us} us), " <>
         "#{length(off_sched)} descheduled (dirty hand-off or preempted)"
     )
@@ -369,6 +377,7 @@ defmodule EKV.Sqlite3FastReadTest do
     assert loaded > 0
     assert length(on_sched) > 1_000
     assert too_long == []
+    assert p99 < @p99_us
   end
 
   defp load(name, keys, prefixes, deadline, id) do
