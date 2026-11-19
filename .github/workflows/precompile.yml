@@ -51,9 +51,11 @@ jobs:
 
   macos:
     needs: create-release
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       MIX_ENV: prod
+      # Built on macOS 15, still loadable on macOS 14 and later.
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
     steps:
       - uses: actions/checkout@v4
 

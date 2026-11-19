@@ -62,7 +62,7 @@ The compiler map and NIF versions in `mix.exs` define the expected artifacts:
 
 - `x86_64-linux-gnu`, `aarch64-linux-gnu`: Ubuntu Jammy / glibc 2.35.
 - `x86_64-linux-musl`, `aarch64-linux-musl`: Alpine 3.20 / musl 1.2.5.
-- `x86_64-apple-darwin`, `aarch64-apple-darwin`: macOS 14.
+- `x86_64-apple-darwin`, `aarch64-apple-darwin`: built on macOS 15 with a macOS 14 deployment target.
 
 Linux jobs build natively on x86-64 and ARM64 runners inside pinned containers.
 Do not build glibc artifacts directly on `ubuntu-latest`: its libc may be newer
